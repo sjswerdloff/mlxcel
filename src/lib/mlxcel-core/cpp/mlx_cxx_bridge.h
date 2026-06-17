@@ -1404,6 +1404,15 @@ std::unique_ptr<MlxArray> bitlinear_matmul(
     bool invert_weight_scales
 );
 
+// MSA top-K block selection via per-warp min-heap Metal kernel.
+// block_scores: [batch, num_heads, num_blocks] float32
+// Returns: [batch, num_heads, K] int32
+std::unique_ptr<MlxArray> sparse_topk_select(
+    const MlxArray& block_scores,
+    int32_t k,
+    int32_t num_blocks
+);
+
 // Fused MoE forward: gate + switch_mlp + score weighting + optional shared expert
 // Combines ~25 FFI calls into a single C++ function
 // Used by: NemotronH, NemotronNAS

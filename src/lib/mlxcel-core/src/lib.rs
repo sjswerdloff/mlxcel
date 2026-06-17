@@ -1468,6 +1468,15 @@ mod ffi {
             invert_weight_scales: bool,
         ) -> UniquePtr<MlxArray>;
 
+        /// MSA top-K block selection via per-warp min-heap Metal kernel.
+        /// block_scores: [batch, num_heads, num_blocks] float32
+        /// Returns: [batch, num_heads, K] int32
+        fn sparse_topk_select(
+            block_scores: &MlxArray,
+            k: i32,
+            num_blocks: i32,
+        ) -> UniquePtr<MlxArray>;
+
         /// Fused gated-delta single-token decode step.
         /// Combines: decay → kv_mem → delta → state_update → output into one C++ call.
         /// Replaces ~26 FFI round-trips with 1.

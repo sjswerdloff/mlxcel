@@ -1714,4 +1714,124 @@ void fused_mamba2_forward(
     ssm_state_out  = std::move(new_ssm_state);
 }
 
+// ============================================================================
+// MSA Top-K Block Selection
+//
+// Selects the top-K blocks per (batch, head) from block_scores.
+// Uses MLX's metal_kernel with a per-warp min-heap approach.
+// ============================================================================
+
+namespace {
+    static const char* SPARSE_TOPK_METAL_SOURCE = R"(
+        kernel void sparse_topk_select(
+            device const float* block_scores [[buffer(0)]],
+            device int* out_indices [[buffer(1)]],
+            uint3 gid [[thread_position_in_grid]],
+            uint tid_in_simd [[thread_position_in_simdgroup]]
+        ) {
+            uint bh_idx = gid.x;
+            device const float* head_scores = block_scores + bh_idx * NUM_BLOCKS;
+            device int* head_out = out_indices + bh_idx * K;
+
+            float heap_s[16];
+            int heap_i[16];
+            uint heap_size = min(uint(K), 16u);
+
+            for (uint i = 0; i < heap_size; i++) {
+                heap_s[i] = -INFINITY;
+                heap_i[i] = -1;
+            }
+
+            for (uint b = tid_in_simd; b < uint(NUM_BLOCKS); b += 32) {
+                float score = head_scores[b];
+                if (score > heap_s[0]) {
+                    heap_s[0] = score;
+                    heap_i[0] = int(b);
+                    uint p = 0;
+                    while (true) {
+                        uint l = 2*p+1, r = 2*p+2, s = p;
+                        if (l < heap_size && heap_s[l] < heap_s[s]) s = l;
+                        if (r < heap_size && heap_s[r] < heap_s[s]) s = r;
+                        if (s == p) break;
+                        float ts = heap_s[p]; int ti = heap_i[p];
+                        heap_s[p] = heap_s[s]; heap_i[p] = heap_i[s];
+                        heap_s[s] = ts; heap_i[s] = ti;
+                        p = s;
+                    }
+                }
+            }
+
+            if (tid_in_simd == 0) {
+                for (int i = 1; i < int(heap_size); i++) {
+                    float ks = heap_s[i]; int ki = heap_i[i];
+                    int j = i - 1;
+                    while (j >= 0 && heap_s[j] < ks) {
+                        heap_s[j+1] = heap_s[j]; heap_i[j+1] = heap_i[j]; j--;
+                    }
+                    heap_s[j+1] = ks; heap_i[j+1] = ki;
+                }
+                for (uint i = 0; i < uint(K); i++) {
+                    head_out[i] = heap_i[i];
+                }
+            }
+        }
+    )";
+
+    struct SparseTopKKernelHolder {
+        std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+        bool initialized = false;
+        mlx::core::fast::CustomKernelFunction& get() {
+            if (!initialized) {
+                kernel = mlx::core::fast::metal_kernel(
+                    "sparse_topk_select",
+                    {"block_scores"},
+                    {"out_indices"},
+                    SPARSE_TOPK_METAL_SOURCE);
+                initialized = true;
+            }
+            return *kernel;
+        }
+    };
+
+    static SparseTopKKernelHolder& get_sparse_topk_kernel() {
+        static SparseTopKKernelHolder holder;
+        return holder;
+    }
+}
+
+std::unique_ptr<MlxArray> sparse_topk_select(
+    const MlxArray& block_scores,
+    int32_t K,
+    int32_t num_blocks
+) {
+    using namespace mlx::core;
+
+    auto& scores = block_scores.inner;
+    auto shape = scores.shape();
+
+    int batch = shape[0];
+    int num_heads = shape[1];
+
+    std::vector<int> out_shape = {batch, num_heads, K};
+
+    auto& kernel = get_sparse_topk_kernel().get();
+
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> ta = {
+        {"K", K},
+        {"NUM_BLOCKS", num_blocks},
+    };
+
+    std::vector<array> inputs = {scores};
+    auto results = kernel(
+        inputs,
+        {Shape{batch * num_heads}},
+        {int32},
+        std::make_tuple(batch * num_heads, 1, 1),
+        std::make_tuple(32, 1, 1),
+        ta, std::nullopt, false, {}
+    );
+
+    return std::make_unique<MlxArray>(MlxArray{reshape(results[0], Shape(out_shape.begin(), out_shape.end()))});
+}
+
 }  // namespace mlx_cxx
