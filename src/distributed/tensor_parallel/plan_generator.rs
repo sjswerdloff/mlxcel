@@ -131,6 +131,7 @@ pub fn generate_shard_plan(
 
         // MiniMax (large MoE)
         "minimax" => build_generic_moe_plan(num_layers, config, "minimax"),
+        "minimax_m3_vl" | "minimax_m3" => build_generic_moe_plan(num_layers, config, "minimax"),
 
         // MiniCPM
         "minicpm" | "minicpm3" => build_llama_plan(num_layers, config),
