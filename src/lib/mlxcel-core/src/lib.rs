@@ -1477,6 +1477,14 @@ mod ffi {
             num_blocks: i32,
         ) -> UniquePtr<MlxArray>;
 
+        /// MXFP8 dequantization: unpacked uint8 weight * uint8 scale -> f16
+        /// weight: [M, N] uint8, scales: [M, N/32] uint8
+        /// Returns: [M, N] f16
+        fn mxfp8_dequant_to_f16(
+            weight: &MlxArray,
+            scales: &MlxArray,
+        ) -> UniquePtr<MlxArray>;
+
         /// Fused gated-delta single-token decode step.
         /// Combines: decay → kv_mem → delta → state_update → output into one C++ call.
         /// Replaces ~26 FFI round-trips with 1.

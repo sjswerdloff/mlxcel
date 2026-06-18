@@ -36,6 +36,52 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
+/// Dequantize an MXFP8 weight to f16 for use with standard matmul.
+/// Uses a GPU-accelerated Metal kernel for fast dequantization.
+fn dequantize_mxfp8_to_f16(
+    weights: &WeightMap,
+    prefix: &str,
+    _group_size: i32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    let weight_key = format!("{}.weight", prefix);
+    let scales_key = format!("{}.scales", prefix);
+
+    let weight = weights
+        .get(&weight_key)
+        .map(|w| mlxcel_core::copy(w))
+        .ok_or_else(|| format!("Weight not found: {}", weight_key))?;
+    let scales = weights
+        .get(&scales_key)
+        .map(|w| mlxcel_core::copy(w))
+        .ok_or_else(|| format!("Scales not found: {}", scales_key))?;
+
+    // Use Metal kernel for GPU-accelerated dequantization
+    Ok(mlxcel_core::mxfp8_dequant_to_f16(&weight, &scales))
+}
+
+/// Load a UnifiedLinear, dequantizing MXFP8 to f16 if needed.
+fn load_linear(
+    weights: &WeightMap,
+    prefix: &str,
+    g: i32,
+    b: i32,
+    is_mxfp8: bool,
+) -> Result<UnifiedLinear, String> {
+    if is_mxfp8 {
+        eprintln!("[MXFP8] Dequantizing {}", prefix);
+        let w = dequantize_mxfp8_to_f16(weights, prefix, g)?;
+        let w_shape = mlxcel_core::array_shape(&w);
+        let w_dtype = mlxcel_core::array_dtype(&w);
+        eprintln!("[MXFP8] Dequantized {} -> shape {:?}, dtype={:?}", prefix, w_shape, w_dtype);
+        let linear = mlxcel_core::layers::Linear::new(w, None);
+        let lin_shape = mlxcel_core::array_shape(&linear.weight);
+        eprintln!("[MXFP8] Linear weight shape: {:?}", lin_shape);
+        Ok(UnifiedLinear::Regular(linear))
+    } else {
+        UnifiedLinear::from_weights(weights, prefix, g, b)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub text_config: TextConfig,
@@ -404,10 +450,21 @@ impl SparseAttention {
         let b = args.bits();
         let cfg = &args.text_config;
 
-        let q_proj = UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), g, b)?;
-        let k_proj = UnifiedLinear::from_weights(weights, &format!("{}.k_proj", prefix), g, b)?;
-        let v_proj = UnifiedLinear::from_weights(weights, &format!("{}.v_proj", prefix), g, b)?;
-        let o_proj = UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), g, b)?;
+        // Check if weights are MXFP8 (has scales but no biases)
+        let q_scales_key = format!("{}.scales", format!("{}.q_proj", prefix));
+        let q_biases_key = format!("{}.biases", format!("{}.q_proj", prefix));
+        let is_mxfp8 = weights.get(&q_scales_key).is_some()
+            && weights.get(&q_biases_key).is_none();
+
+        eprintln!("[MXFP8] prefix={}: is_mxfp8={}, has_scales={}",
+            prefix, is_mxfp8, weights.contains_key(&q_scales_key));
+
+        let (q_proj, k_proj, v_proj, o_proj) = (
+            load_linear(weights, &format!("{}.q_proj", prefix), g, b, is_mxfp8)?,
+            load_linear(weights, &format!("{}.k_proj", prefix), g, b, is_mxfp8)?,
+            load_linear(weights, &format!("{}.v_proj", prefix), g, b, is_mxfp8)?,
+            load_linear(weights, &format!("{}.o_proj", prefix), g, b, is_mxfp8)?,
+        );
 
         // Per-head Q/K norm on head_dim
         let (q_norm, k_norm) = if cfg.use_qk_norm {
@@ -422,10 +479,8 @@ impl SparseAttention {
         };
 
         let (index_q_proj, index_k_proj, index_q_norm, index_k_norm) = if has_index {
-            let iqp =
-                UnifiedLinear::from_weights(weights, &format!("{}.index_q_proj", prefix), g, b)?;
-            let ikp =
-                UnifiedLinear::from_weights(weights, &format!("{}.index_k_proj", prefix), g, b)?;
+            let iqp = load_linear(weights, &format!("{}.index_q_proj", prefix), g, b, is_mxfp8)?;
+            let ikp = load_linear(weights, &format!("{}.index_k_proj", prefix), g, b, is_mxfp8)?;
             let iqn = get_weight(weights, &format!("{}.index_q_norm.weight", prefix))
                 .ok()
                 .map(|w| RMSNorm::new(w, cfg.rms_norm_eps));
@@ -532,21 +587,11 @@ impl SharedExperts {
         )
     }
 
-    pub fn from_weights(weights: &WeightMap, prefix: &str, g: i32, b: i32) -> Result<Self, String> {
+    pub fn from_weights(weights: &WeightMap, prefix: &str, g: i32, b: i32, is_mxfp8: bool) -> Result<Self, String> {
         Ok(Self {
-            gate_proj: UnifiedLinear::from_weights(
-                weights,
-                &format!("{}.gate_proj", prefix),
-                g,
-                b,
-            )?,
-            up_proj: UnifiedLinear::from_weights(weights, &format!("{}.up_proj", prefix), g, b)?,
-            down_proj: UnifiedLinear::from_weights(
-                weights,
-                &format!("{}.down_proj", prefix),
-                g,
-                b,
-            )?,
+            gate_proj: load_linear(weights, &format!("{}.gate_proj", prefix), g, b, is_mxfp8)?,
+            up_proj: load_linear(weights, &format!("{}.up_proj", prefix), g, b, is_mxfp8)?,
+            down_proj: load_linear(weights, &format!("{}.down_proj", prefix), g, b, is_mxfp8)?,
         })
     }
 }
@@ -635,11 +680,17 @@ impl SparseMoeBlock {
         )?;
 
         let shared = if cfg.n_shared_experts > 0 {
+            let shared_prefix = format!("{}.shared_experts", prefix);
+            let shared_scales = format!("{}.scales", format!("{}.gate_proj", shared_prefix));
+            let shared_biases = format!("{}.biases", format!("{}.gate_proj", shared_prefix));
+            let shared_mxfp8 = weights.get(&shared_scales).is_some()
+                && weights.get(&shared_biases).is_none();
             Some(SharedExperts::from_weights(
                 weights,
-                &format!("{}.shared_experts", prefix),
+                &shared_prefix,
                 g,
                 b,
+                shared_mxfp8,
             )?)
         } else {
             None
@@ -701,21 +752,12 @@ impl DenseMLP {
         b: i32,
         alpha: f32,
         limit: f32,
+        is_mxfp8: bool,
     ) -> Result<Self, String> {
         Ok(Self {
-            gate_proj: UnifiedLinear::from_weights(
-                weights,
-                &format!("{}.gate_proj", prefix),
-                g,
-                b,
-            )?,
-            up_proj: UnifiedLinear::from_weights(weights, &format!("{}.up_proj", prefix), g, b)?,
-            down_proj: UnifiedLinear::from_weights(
-                weights,
-                &format!("{}.down_proj", prefix),
-                g,
-                b,
-            )?,
+            gate_proj: load_linear(weights, &format!("{}.gate_proj", prefix), g, b, is_mxfp8)?,
+            up_proj: load_linear(weights, &format!("{}.up_proj", prefix), g, b, is_mxfp8)?,
+            down_proj: load_linear(weights, &format!("{}.down_proj", prefix), g, b, is_mxfp8)?,
             swiglu_alpha: alpha,
             swiglu_limit: limit,
         })
@@ -761,12 +803,20 @@ impl DecoderLayer {
         args: &ModelArgs,
         layer_idx: usize,
     ) -> Result<Self, String> {
-        let prefix = format!("model.layers.{}", layer_idx);
+        let prefix = format!("language_model.model.layers.{}", layer_idx);
         let use_msa = args.use_msa_for_layer(layer_idx);
 
-        let self_attn = SparseAttention::from_weights(weights, args, &prefix, use_msa)?;
+        let self_attn = SparseAttention::from_weights(weights, args, &format!("{}.self_attn", prefix), use_msa)?;
 
         let is_moe = args.text_config.moe_layer_freq[layer_idx];
+
+        // Detect MXFP8 for this layer
+        let mlp_prefix = format!("{}.mlp", prefix);
+        let mlp_scales = format!("{}.scales", format!("{}.gate_proj", mlp_prefix));
+        let mlp_biases = format!("{}.biases", format!("{}.gate_proj", mlp_prefix));
+        let is_mxfp8 = weights.get(&mlp_scales).is_some()
+            && weights.get(&mlp_biases).is_none();
+
         let (mlp, moe) = if is_moe {
             let moe_prefix = format!("{}.block_sparse_moe", prefix);
             (
@@ -774,7 +824,6 @@ impl DecoderLayer {
                 Some(SparseMoeBlock::from_weights(weights, args, &moe_prefix)?),
             )
         } else {
-            let mlp_prefix = format!("{}.mlp", prefix);
             let mlp = DenseMLP::from_weights(
                 weights,
                 &mlp_prefix,
@@ -782,6 +831,7 @@ impl DecoderLayer {
                 args.bits(),
                 args.text_config.swiglu_alpha,
                 args.text_config.swiglu_limit,
+                is_mxfp8,
             )?;
             (Some(mlp), None)
         };

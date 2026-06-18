@@ -1114,9 +1114,21 @@ pub fn load_text_weights<P: AsRef<std::path::Path>>(
         .as_ref()
         .is_some_and(|c| c.get("model_type").and_then(|m| m.as_str()) == Some("bitnet"));
 
+    // Detect MXFP8 quantization: quant_method=mxfp8 in config
+    let is_mxfp8 = parsed_config
+        .as_ref()
+        .is_some_and(|c| {
+            c.get("quantization_config")
+                .and_then(|qc| qc.get("quant_method"))
+                .and_then(|m| m.as_str())
+                == Some("mxfp8")
+        });
+
     let mut weights = if is_gemma4 {
         load_gemma4_text_weights(model_dir)?
     } else {
+        // Use MLX native loader (fast, mmap-based) for all models including MXFP8
+        // MXFP8 weights are dequantized lazily in the model's forward pass
         mlxcel_core::weights::load_weights_from_dir(model_dir)?
     };
 
@@ -1144,6 +1156,26 @@ pub fn load_text_weights<P: AsRef<std::path::Path>>(
                 .get("text_config")
                 .and_then(|tc| tc.get("quantization"))
                 .is_some();
+    }
+
+    // Normalize MXFP8 scale tensor names: weight_scale_inv -> scales
+    // The MXFP8 checkpoint format uses weight_scale_inv but the quantized
+    // linear code expects scales. Rename keys so from_weights finds them.
+    let mxfp8_scale_keys: Vec<String> = weights
+        .keys()
+        .filter(|k| k.ends_with(".weight_scale_inv"))
+        .cloned()
+        .collect();
+    if !mxfp8_scale_keys.is_empty() {
+        eprintln!("[MXFP8] Renaming {} weight_scale_inv keys to .scales", mxfp8_scale_keys.len());
+    }
+    for key in mxfp8_scale_keys {
+        if let Some(new_key) = key.strip_suffix(".weight_scale_inv") {
+            let scales_key = format!("{}.scales", new_key);
+            if let Some(arr) = weights.remove(&key) {
+                weights.insert(scales_key, arr);
+            }
+        }
     }
 
     // Axis A weight-load surgery hook. Runs after sanitization

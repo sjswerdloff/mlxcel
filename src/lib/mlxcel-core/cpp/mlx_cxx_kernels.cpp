@@ -1834,4 +1834,102 @@ std::unique_ptr<MlxArray> sparse_topk_select(
     return std::make_unique<MlxArray>(MlxArray{reshape(results[0], Shape(out_shape.begin(), out_shape.end()))});
 }
 
+// ============================================================================
+// MXFP8 Dequantization: unpacked uint8 weight * uint8 scale -> f16
+// Uses a Metal kernel for GPU-accelerated dequantization.
+// ============================================================================
+
+namespace {
+    static const char* MXFP8_DEQUANT_SOURCE = R"(
+        float e4m3_to_f32_1(uint8_t val) {
+            if (val == 0) return 0.0f;
+            uint sign = (val >> 7) & 1;
+            uint exponent = (val >> 3) & 0xF;
+            uint mantissa = val & 0x7;
+            float exp_val;
+            if (exponent == 0) {
+                exp_val = ldexp(1.0f + (float)mantissa / 8.0f, -6);
+            } else {
+                exp_val = ldexp(1.0f + (float)mantissa / 8.0f, (int)exponent - 7);
+            }
+            return sign ? -exp_val : exp_val;
+        }
+
+        kernel void mxfp8_dequant(
+            device const uint8_t* weight [[buffer(0)]],
+            device const uint8_t* scales [[buffer(1)]],
+            device half* out [[buffer(2)]],
+            constant int& M [[buffer(3)]],
+            constant int& N [[buffer(4)]],
+            constant int& N_blocks [[buffer(5)]],
+            uint gid [[thread_position_in_grid]]
+        ) {
+            if (gid >= (uint)(M * N)) return;
+            int col = gid % N;
+            int row = gid / N;
+            float w = e4m3_to_f32_1(weight[gid]);
+            int scale_idx = row * N_blocks + (col / 32);
+            float s = e4m3_to_f32_1(scales[scale_idx]);
+            out[gid] = half(w * s);
+        }
+    )";
+
+    struct Mxfp8DequantKernelHolder {
+        std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+        bool initialized = false;
+        mlx::core::fast::CustomKernelFunction& get() {
+            if (!initialized) {
+                kernel = mlx::core::fast::metal_kernel(
+                    "mxfp8_dequant",
+                    {"weight", "scales"},
+                    {"out"},
+                    MXFP8_DEQUANT_SOURCE);
+                initialized = true;
+            }
+            return *kernel;
+        }
+    };
+
+    static Mxfp8DequantKernelHolder& get_mxfp8_dequant_kernel() {
+        static Mxfp8DequantKernelHolder holder;
+        return holder;
+    }
+}
+
+// Dequantize MXFP8 (unpacked uint8 + uint8 scale) to f16 on GPU.
+// weight: [M, N] uint8, scales: [M, N/32] uint8
+// Returns: [M, N] f16
+std::unique_ptr<MlxArray> mxfp8_dequant_to_f16(
+    const MlxArray& weight,
+    const MlxArray& scales
+) {
+    using namespace mlx::core;
+
+    auto w_shape = weight.inner.shape();
+    auto s_shape = scales.inner.shape();
+
+    int M = w_shape[0];
+    int N = w_shape[1];
+    int N_blocks = s_shape[1];
+
+    auto& kernel = get_mxfp8_dequant_kernel().get();
+
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> ta = {};
+    std::vector<array> inputs = {weight.inner, scales.inner};
+
+    int grid_size = M * N;
+    int threadgroup_size = 256;
+
+    auto results = kernel(
+        inputs,
+        {Shape{M, N}},
+        {float16},
+        std::make_tuple(grid_size, 1, 1),
+        std::make_tuple(threadgroup_size, 1, 1),
+        ta, std::nullopt, false, {}
+    );
+
+    return std::make_unique<MlxArray>(results[0]);
+}
+
 }  // namespace mlx_cxx

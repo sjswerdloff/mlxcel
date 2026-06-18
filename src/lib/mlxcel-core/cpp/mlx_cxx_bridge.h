@@ -1413,6 +1413,14 @@ std::unique_ptr<MlxArray> sparse_topk_select(
     int32_t num_blocks
 );
 
+// MXFP8 dequantization: unpacked uint8 weight * uint8 scale -> f16
+// weight: [M, N] uint8, scales: [M, N/32] uint8
+// Returns: [M, N] f16
+std::unique_ptr<MlxArray> mxfp8_dequant_to_f16(
+    const MlxArray& weight,
+    const MlxArray& scales
+);
+
 // Fused MoE forward: gate + switch_mlp + score weighting + optional shared expert
 // Combines ~25 FFI calls into a single C++ function
 // Used by: NemotronH, NemotronNAS
