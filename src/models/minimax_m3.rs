@@ -36,9 +36,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Load a UnifiedLinear. For MXFP8, keeps weights in uint8 and dispatches to our
-/// fused mxfp8_matmul kernel (dequant on-the-fly inside the matmul, no separate
-/// dequant pass, no lazy Metal ops in the graph).
+/// Load a UnifiedLinear, dequantizing MXFP8 to f16 if needed.
 fn load_linear(
     weights: &WeightMap,
     prefix: &str,
@@ -47,10 +45,33 @@ fn load_linear(
     is_mxfp8: bool,
 ) -> Result<UnifiedLinear, String> {
     if is_mxfp8 {
-        UnifiedLinear::from_weights_with_mode(weights, prefix, g, b, "mxfp8")
+        let w = dequantize_mxfp8_to_f16(weights, prefix, g)?;
+        let linear = mlxcel_core::layers::Linear::new(w, None);
+        Ok(UnifiedLinear::Regular(linear))
     } else {
         UnifiedLinear::from_weights(weights, prefix, g, b)
     }
+}
+
+/// Dequantize an MXFP8 weight to f16.
+fn dequantize_mxfp8_to_f16(
+    weights: &WeightMap,
+    prefix: &str,
+    _group_size: i32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    let weight_key = format!("{}.weight", prefix);
+    let scales_key = format!("{}.scales", prefix);
+
+    let weight = weights
+        .get(&weight_key)
+        .map(|w| mlxcel_core::copy(w))
+        .ok_or_else(|| format!("Weight not found: {}", weight_key))?;
+    let scales = weights
+        .get(&scales_key)
+        .map(|w| mlxcel_core::copy(w))
+        .ok_or_else(|| format!("Scales not found: {}", scales_key))?;
+
+    Ok(mlxcel_core::mxfp8_dequant_to_f16(&weight, &scales))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -853,6 +874,8 @@ impl MiniMaxM3Model {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
+        let seq_len = mlxcel_core::array_shape(input_ids);
+        let is_prefill = seq_len.last().copied().unwrap_or(1) > 1;
         let seq_len = mlxcel_core::array_shape(input_ids);
         let is_prefill = seq_len.last().copied().unwrap_or(1) > 1;
         let mut h = self.embed_tokens.forward(input_ids);
