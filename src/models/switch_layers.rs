@@ -221,12 +221,33 @@ impl SwitchLinear {
     ) -> Self {
         match scales {
             Some(scales) => {
-                // Infer the actual bit width from the packed weight and scales
-                // shapes (group_size fixed): mixed-precision checkpoints such as
-                // dots.llm1 quantize some expert projections at 6-bit while the
-                // model default is 4-bit, so the passed `bits` is only the
-                // default. The invariant is `packed_in * 32 == bits * num_groups *
-                // group_size`.
+                // MXFP8: scales present but no biases — dequantize to f16
+                // and use the Regular path (gather_qmm requires biases)
+                if biases.is_none()
+                    && mlxcel_core::array_dtype(&weight) == mlxcel_core::dtype::UINT8
+                {
+                    let w_shape = mlxcel_core::array_shape(&weight);
+                    let s_shape = mlxcel_core::array_shape(&scales);
+                    let w_2d = if w_shape.len() > 2 {
+                        let flat_rows: i32 = w_shape[..w_shape.len()-1].iter().product();
+                        mlxcel_core::reshape(&weight, &[flat_rows, *w_shape.last().unwrap()])
+                    } else {
+                        weight
+                    };
+                    let s_2d = if s_shape.len() > 2 {
+                        let flat_rows: i32 = s_shape[..s_shape.len()-1].iter().product();
+                        mlxcel_core::reshape(&scales, &[flat_rows, *s_shape.last().unwrap()])
+                    } else {
+                        scales
+                    };
+                    let dequant_w = unsafe {
+                        mlxcel_core::mxfp8_dequant_to_f16(&w_2d, &s_2d)
+                    };
+                    let orig_shape: Vec<i32> = w_shape.iter().map(|&x| x).collect();
+                    let dequant_w = mlxcel_core::reshape(&dequant_w, &orig_shape);
+                    return Self::Regular { weight: dequant_w };
+                }
+
                 let w_shape = mlxcel_core::array_shape(&weight);
                 let s_shape = mlxcel_core::array_shape(&scales);
                 let packed_in = *w_shape.last().unwrap_or(&0);

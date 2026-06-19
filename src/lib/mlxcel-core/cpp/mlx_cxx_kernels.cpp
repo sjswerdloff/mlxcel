@@ -1841,37 +1841,35 @@ std::unique_ptr<MlxArray> sparse_topk_select(
 
 namespace {
     static const char* MXFP8_DEQUANT_SOURCE = R"(
-        float e4m3_to_f32_1(uint8_t val) {
-            if (val == 0) return 0.0f;
-            uint sign = (val >> 7) & 1;
-            uint exponent = (val >> 3) & 0xF;
-            uint mantissa = val & 0x7;
-            float exp_val;
-            if (exponent == 0) {
-                exp_val = ldexp(1.0f + (float)mantissa / 8.0f, -6);
-            } else {
-                exp_val = ldexp(1.0f + (float)mantissa / 8.0f, (int)exponent - 7);
-            }
-            return sign ? -exp_val : exp_val;
-        }
+            uint gid = thread_position_in_grid.x;
+            int gN = *d_N, gM = *d_M, gNblocks = *d_Nblocks;
+            if (gid >= (uint)(gM * gN)) return;
+            int col = gid % gN;
+            int row = gid / gN;
 
-        kernel void mxfp8_dequant(
-            device const uint8_t* weight [[buffer(0)]],
-            device const uint8_t* scales [[buffer(1)]],
-            device half* out [[buffer(2)]],
-            constant int& M [[buffer(3)]],
-            constant int& N [[buffer(4)]],
-            constant int& N_blocks [[buffer(5)]],
-            uint gid [[thread_position_in_grid]]
-        ) {
-            if (gid >= (uint)(M * N)) return;
-            int col = gid % N;
-            int row = gid / N;
-            float w = e4m3_to_f32_1(weight[gid]);
-            int scale_idx = row * N_blocks + (col / 32);
-            float s = e4m3_to_f32_1(scales[scale_idx]);
+            // Inline E4M3 to float: 1 sign, 4 exponent, 3 mantissa, bias=7
+            uint w_raw = weight[gid];
+            float w;
+            if (w_raw == 0u) { w = 0.0f; }
+            else {
+                uint ws = (w_raw >> 7) & 1u, we = (w_raw >> 3) & 0xFu, wm = w_raw & 0x7u;
+                float ev = (we == 0u) ? ldexp(1.0f + float(wm) / 8.0f, -6)
+                                      : ldexp(1.0f + float(wm) / 8.0f, int(we) - 7);
+                w = ws ? -ev : ev;
+            }
+
+            int scale_idx = row * gNblocks + (col / 32);
+            uint s_raw = scales[scale_idx];
+            float s;
+            if (s_raw == 0u) { s = 0.0f; }
+            else {
+                uint ss = (s_raw >> 7) & 1u, se = (s_raw >> 3) & 0xFu, sm = s_raw & 0x7u;
+                float ev = (se == 0u) ? ldexp(1.0f + float(sm) / 8.0f, -6)
+                                      : ldexp(1.0f + float(sm) / 8.0f, int(se) - 7);
+                s = ss ? -ev : ev;
+            }
+
             out[gid] = half(w * s);
-        }
     )";
 
     struct Mxfp8DequantKernelHolder {
@@ -1881,7 +1879,7 @@ namespace {
             if (!initialized) {
                 kernel = mlx::core::fast::metal_kernel(
                     "mxfp8_dequant",
-                    {"weight", "scales"},
+                    {"weight", "scales", "d_M", "d_N", "d_Nblocks"},
                     {"out"},
                     MXFP8_DEQUANT_SOURCE);
                 initialized = true;
@@ -1915,7 +1913,10 @@ std::unique_ptr<MlxArray> mxfp8_dequant_to_f16(
     auto& kernel = get_mxfp8_dequant_kernel().get();
 
     std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> ta = {};
-    std::vector<array> inputs = {weight.inner, scales.inner};
+    array a_M = array({M});
+    array a_N = array({N});
+    array a_Nb = array({N_blocks});
+    std::vector<array> inputs = {weight.inner, scales.inner, a_M, a_N, a_Nb};
 
     int grid_size = M * N;
     int threadgroup_size = 256;
@@ -1930,6 +1931,181 @@ std::unique_ptr<MlxArray> mxfp8_dequant_to_f16(
     );
 
     return std::make_unique<MlxArray>(results[0]);
+}
+
+// ============================================================================
+// MXFP8 Fused MatMul: A[f32] @ dequant(W[u8], scales[u8]) -> C[f32]
+// Dequantizes MXFP8 weights on-the-fly inside the matmul, no separate dequant pass.
+// A: [M, K] f32, W: [K, N] uint8, scales: [K/32, N] uint8, C: [M, N] f32
+// Tiled: BM=64, BN=64, BK=32 (aligns with MXFP8 scale blocks), 256 threads.
+// ============================================================================
+
+namespace {
+    static const char* MXFP8_MATMUL_SOURCE = R"(
+        constexpr int BM = 64, BN = 64, BK = 32, TM = 4, TN = 4;
+
+            int tx = thread_position_in_threadgroup.x;
+            int ty = thread_position_in_threadgroup.y;
+            int m0 = threadgroup_position_in_grid.y * BM;
+            int n0 = threadgroup_position_in_grid.x * BN;
+            int M = *d_M, N = *d_N, K = *d_K;
+            int do_transpose = *d_transpose;
+
+            threadgroup half a_tile[BM * BK];
+            threadgroup uint8_t b_tile[BK * BN];
+            threadgroup uint8_t s_tile[BN];
+
+            half acc[TM][TN];
+            for (int ti = 0; ti < TM; ti++)
+                for (int tj = 0; tj < TN; tj++)
+                    acc[ti][tj] = 0.0h;
+
+            int k_blocks = (K + BK - 1) / BK;
+
+            for (int kb = 0; k_blocks > 0; kb--, k_blocks--) {
+                // Load A tile [BM, BK]
+                for (int idx = ty * 16 + tx; idx < BM * BK; idx += 256) {
+                    int r = idx / BK, c = idx % BK;
+                    int mi = m0 + r, ki = kb * BK + c;
+                    a_tile[idx] = (mi < M && ki < K) ? half(A[mi * K + ki]) : 0.0h;
+                }
+                // Load B tile [BK, BN] — transpose support
+                for (int idx = ty * 16 + tx; idx < BK * BN; idx += 256) {
+                    int r = idx / BN, c = idx % BN;
+                    int ki = kb * BK + r, ni = n0 + c;
+                    uint8_t val = 0;
+                    if (ki < K && ni < N) {
+                        val = do_transpose ? W[ni * K + ki] : W[ki * N + ni];
+                    }
+                    b_tile[idx] = val;
+                }
+                // Load scales for this block: [1, BN] — transpose support
+                for (int c = ty * 16 + tx; c < BN; c += 256) {
+                    int ni = n0 + c;
+                    s_tile[c] = (ni < N) ? scales[kb * (do_transpose ? N : N) + ni] : 0;
+                }
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                for (int k = 0; k < BK; k++) {
+                    half a_vals[TM];
+                    #pragma unroll
+                    for (int ti = 0; ti < TM; ti++)
+                        a_vals[ti] = a_tile[(ty * TM + ti) * BK + k];
+
+                    half b_vals[TN];
+                    #pragma unroll
+                    for (int tj = 0; tj < TN; tj++) {
+                        uint8_t wv_raw = b_tile[k * BN + tx * TN + tj];
+                        uint8_t sv_raw = s_tile[tx * TN + tj];
+
+                        // Inline E4M3 dequant for weight
+                        half wv;
+                        if (wv_raw == 0u) { wv = 0.0h; }
+                        else {
+                            uint ws = (wv_raw >> 7) & 1u, we = (wv_raw >> 3) & 0xFu, wm = wv_raw & 0x7u;
+                            half ev = (we == 0u) ? half(ldexp(1.0f + float(wm) / 8.0f, -6))
+                                                  : half(ldexp(1.0f + float(wm) / 8.0f, int(we) - 7));
+                            wv = ws ? -ev : ev;
+                        }
+                        // Inline E4M3 dequant for scale
+                        half sv;
+                        if (sv_raw == 0u) { sv = 0.0h; }
+                        else {
+                            uint ss = (sv_raw >> 7) & 1u, se = (sv_raw >> 3) & 0xFu, sm = sv_raw & 0x7u;
+                            half ev = (se == 0u) ? half(ldexp(1.0f + float(sm) / 8.0f, -6))
+                                                  : half(ldexp(1.0f + float(sm) / 8.0f, int(se) - 7));
+                            sv = ss ? -ev : ev;
+                        }
+                        b_vals[tj] = wv * sv;
+                    }
+
+                    #pragma unroll
+                    for (int ti = 0; ti < TM; ti++)
+                        #pragma unroll
+                        for (int tj = 0; tj < TN; tj++)
+                            acc[ti][tj] += a_vals[ti] * b_vals[tj];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            #pragma unroll
+            for (int ti = 0; ti < TM; ti++)
+                #pragma unroll
+                for (int tj = 0; tj < TN; tj++) {
+                    int mi = m0 + ty * TM + ti, ni = n0 + tx * TN + tj;
+                    if (mi < M && ni < N)
+                        C[mi * N + ni] = acc[ti][tj];
+                }
+    )";
+
+    struct Mxfp8MatmulKernelHolder {
+        std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+        bool initialized = false;
+        mlx::core::fast::CustomKernelFunction& get() {
+            if (!initialized) {
+                kernel = mlx::core::fast::metal_kernel(
+                    "mxfp8_matmul",
+                    {"A", "W", "scales", "d_M", "d_N", "d_K", "d_transpose"},
+                    {"C"},
+                    MXFP8_MATMUL_SOURCE);
+                initialized = true;
+            }
+            return *kernel;
+        }
+    };
+
+    static Mxfp8MatmulKernelHolder& get_mxfp8_matmul_kernel() {
+        static Mxfp8MatmulKernelHolder holder;
+        return holder;
+    }
+}
+
+// Fused MXFP8 matmul: C = A @ dequant(W, scales)
+// A: [..., K] f32 (any leading dims), W: [N, K] uint8 (transpose=true), scales: [K/32, N] uint8
+// Returns: [..., N] f32
+std::unique_ptr<MlxArray> mxfp8_matmul(
+    const MlxArray& A,
+    const MlxArray& W,
+    const MlxArray& scales,
+    bool transpose
+) {
+    using namespace mlx::core;
+
+    auto a_shape = A.inner.shape();
+    int K = a_shape.back();
+    int N = transpose ? W.inner.shape()[0] : W.inner.shape()[1];
+    int M = 1;
+    for (int i = 0; i + 1 < (int)a_shape.size(); i++) {
+        M *= a_shape[i];
+    }
+
+    // Flatten leading dims: [..., K] -> [M, K]
+    auto a_flat = reshape(A.inner, Shape{M, K});
+
+    auto& kernel = get_mxfp8_matmul_kernel().get();
+
+    int grid_n = (N + 64 - 1) / 64;
+    int grid_m = (M + 64 - 1) / 64;
+
+    array a_M = array({M});
+    array a_N = array({N});
+    array a_K = array({K});
+    array a_T = array({transpose ? 1 : 0});
+
+    auto results = kernel(
+        {a_flat, W.inner, scales.inner, a_M, a_N, a_K, a_T},
+        {Shape{M, N}},
+        {float16},
+        std::make_tuple(grid_n, grid_m, 1),
+        std::make_tuple(16, 16, 1),
+        {}, std::nullopt, false, {}
+    );
+
+    // Reshape output back to [..., N]
+    auto out_shape = a_shape;
+    out_shape.back() = N;
+    return std::make_unique<MlxArray>(reshape(results[0], Shape(out_shape.begin(), out_shape.end())));
 }
 
 }  // namespace mlx_cxx

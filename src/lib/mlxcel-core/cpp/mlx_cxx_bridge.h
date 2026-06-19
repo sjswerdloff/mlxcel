@@ -1421,6 +1421,16 @@ std::unique_ptr<MlxArray> mxfp8_dequant_to_f16(
     const MlxArray& scales
 );
 
+// MXFP8 fused matmul: C = A @ dequant(W, scales)
+// A: [M, K] f32, W: [K, N] uint8 or [N, K] if transpose, scales: [K/32, N] uint8
+// Returns: [M, N] f32
+std::unique_ptr<MlxArray> mxfp8_matmul(
+    const MlxArray& A,
+    const MlxArray& W,
+    const MlxArray& scales,
+    bool transpose
+);
+
 // Fused MoE forward: gate + switch_mlp + score weighting + optional shared expert
 // Combines ~25 FFI calls into a single C++ function
 // Used by: NemotronH, NemotronNAS

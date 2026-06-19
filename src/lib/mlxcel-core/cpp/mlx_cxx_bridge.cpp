@@ -964,7 +964,14 @@ std::unique_ptr<MlxArray> quantized_linear_forward(
     rust::Str mode
 ) {
     bool is_affine = (mode.size() == 6 && std::memcmp(mode.data(), "affine", 6) == 0);
+    bool is_mxfp8 = (mode.size() == 5 && std::memcmp(mode.data(), "mxfp8", 5) == 0);
+
     array result = [&]() {
+        if (is_mxfp8) {
+            // Fused kernel: dequant on-the-fly inside matmul, no lazy Metal ops
+            auto out = mxfp8_matmul(x, weight, scales, /*transpose=*/true);
+            return out->inner;
+        }
         if (is_affine) {
             if (biases) {
                 return mlx::core::quantized_matmul(

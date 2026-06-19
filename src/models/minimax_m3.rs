@@ -36,30 +36,9 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Dequantize an MXFP8 weight to f16 for use with standard matmul.
-/// Uses a GPU-accelerated Metal kernel for fast dequantization.
-fn dequantize_mxfp8_to_f16(
-    weights: &WeightMap,
-    prefix: &str,
-    _group_size: i32,
-) -> Result<UniquePtr<MlxArray>, String> {
-    let weight_key = format!("{}.weight", prefix);
-    let scales_key = format!("{}.scales", prefix);
-
-    let weight = weights
-        .get(&weight_key)
-        .map(|w| mlxcel_core::copy(w))
-        .ok_or_else(|| format!("Weight not found: {}", weight_key))?;
-    let scales = weights
-        .get(&scales_key)
-        .map(|w| mlxcel_core::copy(w))
-        .ok_or_else(|| format!("Scales not found: {}", scales_key))?;
-
-    // Use Metal kernel for GPU-accelerated dequantization
-    Ok(mlxcel_core::mxfp8_dequant_to_f16(&weight, &scales))
-}
-
-/// Load a UnifiedLinear, dequantizing MXFP8 to f16 if needed.
+/// Load a UnifiedLinear. For MXFP8, keeps weights in uint8 and dispatches to our
+/// fused mxfp8_matmul kernel (dequant on-the-fly inside the matmul, no separate
+/// dequant pass, no lazy Metal ops in the graph).
 fn load_linear(
     weights: &WeightMap,
     prefix: &str,
@@ -68,15 +47,7 @@ fn load_linear(
     is_mxfp8: bool,
 ) -> Result<UnifiedLinear, String> {
     if is_mxfp8 {
-        eprintln!("[MXFP8] Dequantizing {}", prefix);
-        let w = dequantize_mxfp8_to_f16(weights, prefix, g)?;
-        let w_shape = mlxcel_core::array_shape(&w);
-        let w_dtype = mlxcel_core::array_dtype(&w);
-        eprintln!("[MXFP8] Dequantized {} -> shape {:?}, dtype={:?}", prefix, w_shape, w_dtype);
-        let linear = mlxcel_core::layers::Linear::new(w, None);
-        let lin_shape = mlxcel_core::array_shape(&linear.weight);
-        eprintln!("[MXFP8] Linear weight shape: {:?}", lin_shape);
-        Ok(UnifiedLinear::Regular(linear))
+        UnifiedLinear::from_weights_with_mode(weights, prefix, g, b, "mxfp8")
     } else {
         UnifiedLinear::from_weights(weights, prefix, g, b)
     }
@@ -226,6 +197,7 @@ impl SparseAttention {
         let v = self.v_proj.forward(x);
 
         let q = mlxcel_core::reshape(&q_raw, &[b, l, self.num_heads, self.head_dim]);
+
         let k = mlxcel_core::reshape(&k_raw, &[b, l, self.num_kv_heads, self.head_dim]);
         let v = mlxcel_core::reshape(&v, &[b, l, self.num_kv_heads, self.head_dim]);
 
@@ -437,7 +409,13 @@ impl SparseAttention {
         let mask_ptr = mask
             .map(|m| m as *const MlxArray)
             .unwrap_or(std::ptr::null());
-        unsafe { mlxcel_core::layers::attention_from_ptr(q, k, v, self.scale, mask_ptr, 0.0, 0) }
+        let raw = unsafe { mlxcel_core::layers::attention_from_ptr(q, k, v, self.scale, mask_ptr, 0.0, 0) };
+        let shape = mlxcel_core::array_shape(&raw);
+        let b = shape[0];
+        let l = shape[2];
+        let out = mlxcel_core::transpose_axes(&raw, &[0, 2, 1, 3]);
+        let out = mlxcel_core::reshape(&out, &[b, l, self.num_heads * self.head_dim]);
+        self.o_proj.forward(&out)
     }
 
     pub fn from_weights(
@@ -450,14 +428,13 @@ impl SparseAttention {
         let b = args.bits();
         let cfg = &args.text_config;
 
-        // Check if weights are MXFP8 (has scales but no biases)
+        // Detect MXFP8 (scales present, no biases, uint8 weight)
         let q_scales_key = format!("{}.scales", format!("{}.q_proj", prefix));
         let q_biases_key = format!("{}.biases", format!("{}.q_proj", prefix));
+        let q_weight_key = format!("{}.weight", format!("{}.q_proj", prefix));
         let is_mxfp8 = weights.get(&q_scales_key).is_some()
-            && weights.get(&q_biases_key).is_none();
-
-        eprintln!("[MXFP8] prefix={}: is_mxfp8={}, has_scales={}",
-            prefix, is_mxfp8, weights.contains_key(&q_scales_key));
+            && weights.get(&q_biases_key).is_none()
+            && weights.get(&q_weight_key).map(|w| mlxcel_core::array_dtype(w) == mlxcel_core::dtype::UINT8).unwrap_or(false);
 
         let (q_proj, k_proj, v_proj, o_proj) = (
             load_linear(weights, &format!("{}.q_proj", prefix), g, b, is_mxfp8)?,
@@ -683,8 +660,10 @@ impl SparseMoeBlock {
             let shared_prefix = format!("{}.shared_experts", prefix);
             let shared_scales = format!("{}.scales", format!("{}.gate_proj", shared_prefix));
             let shared_biases = format!("{}.biases", format!("{}.gate_proj", shared_prefix));
+            let shared_weight = format!("{}.weight", format!("{}.gate_proj", shared_prefix));
             let shared_mxfp8 = weights.get(&shared_scales).is_some()
-                && weights.get(&shared_biases).is_none();
+                && weights.get(&shared_biases).is_none()
+                && weights.get(&shared_weight).map(|w| mlxcel_core::array_dtype(w) == mlxcel_core::dtype::UINT8).unwrap_or(false);
             Some(SharedExperts::from_weights(
                 weights,
                 &shared_prefix,
@@ -809,13 +788,15 @@ impl DecoderLayer {
         let self_attn = SparseAttention::from_weights(weights, args, &format!("{}.self_attn", prefix), use_msa)?;
 
         let is_moe = args.text_config.moe_layer_freq[layer_idx];
-
-        // Detect MXFP8 for this layer
         let mlp_prefix = format!("{}.mlp", prefix);
+
+        // Detect MXFP8 for dense MLP layers
         let mlp_scales = format!("{}.scales", format!("{}.gate_proj", mlp_prefix));
         let mlp_biases = format!("{}.biases", format!("{}.gate_proj", mlp_prefix));
+        let mlp_weight = format!("{}.weight", format!("{}.gate_proj", mlp_prefix));
         let is_mxfp8 = weights.get(&mlp_scales).is_some()
-            && weights.get(&mlp_biases).is_none();
+            && weights.get(&mlp_biases).is_none()
+            && weights.get(&mlp_weight).map(|w| mlxcel_core::array_dtype(w) == mlxcel_core::dtype::UINT8).unwrap_or(false);
 
         let (mlp, moe) = if is_moe {
             let moe_prefix = format!("{}.block_sparse_moe", prefix);
@@ -872,9 +853,14 @@ impl MiniMaxM3Model {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
+        let seq_len = mlxcel_core::array_shape(input_ids);
+        let is_prefill = seq_len.last().copied().unwrap_or(1) > 1;
         let mut h = self.embed_tokens.forward(input_ids);
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &mut caches[i], mask);
+            if is_prefill && (i + 1) % 10 == 0 {
+                mlxcel_core::eval(&h);
+            }
         }
         let h = self.norm.forward(&h);
         if let Some(ref head) = self.lm_head {

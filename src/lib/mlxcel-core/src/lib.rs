@@ -1485,6 +1485,16 @@ mod ffi {
             scales: &MlxArray,
         ) -> UniquePtr<MlxArray>;
 
+        /// MXFP8 fused matmul: C = A @ dequant(W, scales)
+        /// A: [M, K] f32, W: [K, N] uint8 or [N, K] if transpose, scales: [K/32, N] uint8
+        /// Returns: [M, N] f32
+        fn mxfp8_matmul(
+            a: &MlxArray,
+            w: &MlxArray,
+            scales: &MlxArray,
+            transpose: bool,
+        ) -> UniquePtr<MlxArray>;
+
         /// Fused gated-delta single-token decode step.
         /// Combines: decay → kv_mem → delta → state_update → output into one C++ call.
         /// Replaces ~26 FFI round-trips with 1.
