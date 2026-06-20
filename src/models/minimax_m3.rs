@@ -36,9 +36,8 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Load a UnifiedLinear. For MXFP8, converts to MLX affine format (packed uint32
-/// + float16 scales + zero biases) so MLX's native optimized quantized_matmul
-/// kernels are used instead of our custom kernel.
+/// Load a UnifiedLinear. For MXFP8, keeps weights in uint8 and routes to the
+/// fused mxfp8_matmul kernel (dequant on-the-fly, no lazy Metal ops).
 fn load_linear(
     weights: &WeightMap,
     prefix: &str,
@@ -47,7 +46,7 @@ fn load_linear(
     is_mxfp8: bool,
 ) -> Result<UnifiedLinear, String> {
     if is_mxfp8 {
-        convert_mxfp8_to_affine(weights, prefix, g, b)
+        UnifiedLinear::from_weights_with_mode(weights, prefix, g, b, "mxfp8")
     } else {
         UnifiedLinear::from_weights(weights, prefix, g, b)
     }

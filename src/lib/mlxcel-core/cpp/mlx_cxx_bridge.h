@@ -1431,6 +1431,19 @@ std::unique_ptr<MlxArray> mxfp8_matmul(
     bool transpose
 );
 
+// Convert MXFP8 (unpacked uint8 + uint8 scales) to MLX affine format
+// (packed uint32 + float16 scales + zero biases) for use with MLX's native
+// optimized quantized_matmul kernels.
+struct Mxfp8AffineResult {
+    std::unique_ptr<MlxArray> weight;
+    std::unique_ptr<MlxArray> scales;
+    std::unique_ptr<MlxArray> biases;
+};
+Mxfp8AffineResult mxfp8_to_affine(
+    const MlxArray& weight_u8,
+    const MlxArray& scales_u8
+);
+
 // Fused MoE forward: gate + switch_mlp + score weighting + optional shared expert
 // Combines ~25 FFI calls into a single C++ function
 // Used by: NemotronH, NemotronNAS
