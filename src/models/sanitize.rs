@@ -400,15 +400,15 @@ fn dequantize_nvfp4_weights(weights: &mut mlxcel_core::weights::WeightMap) {
 ///
 /// Modelopt NVFP4 uses 3-tier scaling: FP4 weights + FP8 per-16 block scales
 /// + FP32 global scale. MLX's native `quantized_matmul` with mode="nvfp4"
-/// expects 2-tier (weights + block scales only). This function:
+/// expects 2-tier (weights + block scales only) with uint32 packed weights.
 ///
+/// This function:
 /// 1. Detects weight groups by `weight_scale_2` keys
-/// 2. Multiplies each per-block scale by the global scalar
-/// 3. Converts the result to float16 (MLX expects float16 scales)
-/// 4. Removes `weight_scale_2` and `input_scale` auxiliary keys
-/// 5. Leaves FP4 weight data untouched (MLX handles unpacking natively)
+/// 2. Repacks FP4 weights from modelopt uint8 (2 FP4/byte) to uint32 (8 FP4/uint32)
+/// 3. Multiplies each per-block scale by the global scalar
+/// 4. Converts the result to float16 (MLX expects float16 scales)
+/// 5. Removes `weight_scale_2` and `input_scale` auxiliary keys
 fn fold_nvfp4_global_scale(weights: &mut mlxcel_core::weights::WeightMap) {
-    // Collect prefixes first to avoid borrowing conflicts during mutation.
     let fp4_prefixes: Vec<String> = weights
         .keys()
         .filter(|k| k.ends_with(".weight_scale_2"))
@@ -420,11 +420,12 @@ fn fold_nvfp4_global_scale(weights: &mut mlxcel_core::weights::WeightMap) {
     }
 
     eprintln!(
-        "Folding NVFP4 global scale into per-block scales for {} weight groups...",
+        "Folding NVFP4 3-tier format: repacking + folding global scale for {} weight groups...",
         fp4_prefixes.len()
     );
 
     for prefix in fp4_prefixes {
+        let weight_key = format!("{prefix}.weight");
         let scale_key = format!("{prefix}.weight_scale");
         let scale2_key = format!("{prefix}.weight_scale_2");
         let input_scale_key = format!("{prefix}.input_scale");
@@ -441,7 +442,32 @@ fn fold_nvfp4_global_scale(weights: &mut mlxcel_core::weights::WeightMap) {
             mlxcel_core::item_f32(scale2_arr)
         };
 
-        // Read the per-block scales (uint8 FP8 E4M3)
+                // Repack FP4 weights from uint8 (2 per byte) to uint32 (8 per uint32)
+                if let Some(weight_arr) = weights.get(&weight_key) {
+                    if mlxcel_core::array_dtype(weight_arr) == mlxcel_core::dtype::UINT8 {
+                        mlxcel_core::eval(weight_arr);
+                        let w_shape = mlxcel_core::array_shape(weight_arr);
+                        let w_bytes = mlxcel_core::array_to_raw_bytes(weight_arr);
+
+                        if w_shape.len() >= 2 {
+                            let m = w_shape[0] as usize;
+                            let n_packed = w_shape[1] as usize;
+                            let n_uint32 = n_packed / 4;
+
+                            if n_uint32 > 0 {
+                                let repacked = repack_fp4_uint8_to_uint32(&w_bytes, m, n_packed);
+                                let repacked_shape = vec![m as i32, n_uint32 as i32];
+                                let repacked_arr = mlxcel_core::from_slice_u32(&repacked, &repacked_shape);
+                                eprintln!(
+                                    "[NVFP4] {prefix}: weight {w_shape:?} (u8) -> [{m},{n_uint32}] (u32), global_scale={scale2_val:.6}"
+                                );
+                                weights.insert(weight_key, repacked_arr);
+                            }
+                        }
+                    }
+                }
+
+        // Fold global scale into per-block scales
         let (scale_shape, scale_bytes) = {
             let scale_arr = weights.get(&scale_key).unwrap();
             mlxcel_core::eval(scale_arr);
@@ -450,7 +476,6 @@ fn fold_nvfp4_global_scale(weights: &mut mlxcel_core::weights::WeightMap) {
             (shape, bytes)
         };
 
-        // Convert uint8 FP8 E4M3 scales to float, multiply by global scale, store as float16
         let scale_f32: Vec<f32> = scale_bytes
             .iter()
             .map(|&v| fp8_e4m3_to_f32(v) * scale2_val)
@@ -484,6 +509,27 @@ fn fp8_e4m3_to_f32(val: u8) -> f32 {
     } else {
         exp_val
     }
+}
+
+/// Repack FP4 weights from modelopt uint8 format (2 FP4 per byte) to
+/// MLX's expected uint32 format (8 FP4 per uint32).
+///
+/// Modelopt stores FP4 as: byte[n] contains nibble 2n (low) and 2n+1 (high)
+/// MLX expects: uint32[i] contains 8 nibbles packed as bits 0-3, 4-7, ..., 28-31
+///
+/// Input:  weight [M, N] uint8 (modelopt packed)
+/// Output: weight [M, N/4] uint32 (MLX packed)
+fn repack_fp4_uint8_to_uint32(weight_bytes: &[u8], m: usize, n: usize) -> Vec<u32> {
+    let n_packed = n / 4; // uint32 has 8 nibbles, but we're reading 4 uint8 = 8 nibbles
+    let mut result = vec![0u32; m * n_packed];
+    for i in 0..(m * n_packed) {
+        let byte_base = i * 4;
+        result[i] = (weight_bytes[byte_base] as u32)
+            | ((weight_bytes[byte_base + 1] as u32) << 8)
+            | ((weight_bytes[byte_base + 2] as u32) << 16)
+            | ((weight_bytes[byte_base + 3] as u32) << 24);
+    }
+    result
 }
 
 /// Drop k_proj / v_proj / k_norm weight entries that belong to KV-shared
@@ -1230,10 +1276,11 @@ pub fn load_text_weights<P: AsRef<std::path::Path>>(
     }
 
     // Dequantize NVFP4 3-tier weights for ANY model that has them
-    // (detected by presence of weight_scale_2 keys). This folds the global
-    // FP32 scale into per-block scales and converts uint8 scales to f16
-    // so MLX's native quantized_matmul with mode="nvfp4" can handle them.
-    fold_nvfp4_global_scale(&mut weights);
+    // (detected by presence of weight_scale_2 keys).
+    // Uses dequant-to-f16 approach which is proven correct for Gemma 4.
+    // MLX's native quantized_matmul path has format compatibility issues
+    // with modelopt's uint8 packing layout.
+    dequantize_nvfp4_weights(&mut weights);
 
     let mut is_quantized = false;
     if let Some(config) = parsed_config.as_ref() {
