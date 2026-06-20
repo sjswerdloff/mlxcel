@@ -29,11 +29,18 @@
 - **Forward:** Never reached (construction too slow)
 - **Not viable.**
 
-## Configuration D: Fused mxfp8_matmul kernel (no dequant)
+## Configuration D: Fused mxfp8_matmul kernel — naive (no SIMD)
 - **Model load:** 8.4s (includes kernel compilation)
 - **Prefill:** Runs but too slow (naive tiled matmul without SIMD)
 - **Decode:** Too slow to complete in 10 minutes
 - **Not viable without kernel optimization.**
+
+## Configuration E: Fused mxfp8_matmul kernel — SIMD K-reduce
+- **Model load:** ~7s (kernel compilation + dispatch setup)
+- **Prefill:** Compiles and runs without crashes/OOM, but times out on Metal 5s limit
+- **Decode:** Same timeout
+- **Kernel characteristics:** BM=32, BN=32, BK=32, 128 threads (32×4), simd_sum across 32 SIMD lanes, float accumulation
+- **Status:** Correct kernel, but 430B model has too many matmuls per layer (~130) for a single command buffer**
 
 ---
 
