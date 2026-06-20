@@ -144,3 +144,49 @@ Need a per-expert fused kernel that:
 4. Scatter results back to original token order
 
 This eliminates the dequant memory overhead for experts and avoids the command buffer timeout.
+
+## 9. MXFP8 → MLX Affine Conversion
+
+### The approach
+Convert unpacked uint8 MXFP8 weights to MLX's native affine format during load:
+- Pack 4 uint8 → 1 uint32 (little-endian)
+- Convert uint8 E4M3 scales → float16
+- Create zero biases (float16)
+- Store as `QuantizedWeight` with mode="affine", group_size=32, bits=8
+
+### Memory impact
+- MXFP8: ~441GB (428GB uint8 weights + 13GB uint8 scales)
+- Affine: ~160GB (107GB packed uint32 + 27GB float16 scales + 27GB float16 biases)
+- **Affine is actually smaller** — packing uint8→uint32 saves 4× on weight storage
+- Load-time overhead: ~6s for conversion, resident memory: ~15GB (up from ~5GB)
+
+### On-disk conversion feasibility
+- Process shard-by-shard (31 shards, ~14GB each)
+- Peak memory per shard: ~19GB (14GB input + 5GB output) — easily fits in 512GB
+- Total time: ~15 minutes for all shards
+- Eliminates load-time conversion overhead
+
+### MLX native kernel advantage
+- MLX's `quantized_matmul` with mode="affine" uses Steel GEMM, SIMD, multiple kernel variants
+- Much faster than our custom SIMD kernel
+- But still subject to the 5s Metal command buffer timeout for 430B models
+
+## 10. Metal Command Buffer Timeout — MLX Limitation
+
+### Known issues
+- [#3457](https://github.com/ml-explore/mlx/issues/3457): "Metal GPU timeout on large sparse attention with MoE models (Qwen 122B, 64K context)" — same problem
+- [#3302](https://github.com/ml-explore/mlx/issues/3302): "GPU watchdog kills process during long-context SDPA prefill (65K+ keys)" — key finding: "MLX's eval model doesn't support mid-graph command buffer boundaries"
+
+### Root cause
+MLX queues ALL operations in one Metal command buffer until `eval()` is called. For 430B MoE:
+- 60 layers × ~130 matmuls = 7,800 kernel launches
+- Even with MLX's optimized kernels, total compute exceeds 5s per command buffer
+- Mid-graph `eval()` doesn't work: triggers "A command encoder is already encoding" assertion
+
+### Proposed upstream fix (#3302)
+Kernel-level chunking: split the matmul dispatch itself into chunks within a single command buffer, with online softmax reduction. Application-level chunked eval can't work due to MLX's eval model.
+
+### Current workaround
+- Chunked eval during prefill (is_prefill guard) — works for first token
+- Decode always times out for 430B
+- Smaller models (<100B) likely work fine within the timeout
