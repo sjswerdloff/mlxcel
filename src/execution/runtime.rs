@@ -71,6 +71,14 @@ pub struct RuntimeSetup {
 }
 
 pub fn initialize_runtime() -> RuntimeSetup {
+    // Disable Metal GPU watchdog for large models that exceed the 5s command
+    // buffer timeout. Only applies on Apple Silicon GPU; no-op on other platforms.
+    // See: https://github.com/ml-explore/mlx/issues/3302
+    if cfg!(target_os = "macos") {
+        // SAFETY: Single-threaded at startup, before any GPU operations
+        unsafe { std::env::set_var("AGX_RELAX_CDM_CTXSTORE_TIMEOUT", "1") };
+    }
+
     let (requested_device, invalid_device_override) =
         resolve_runtime_device(std::env::var(RUNTIME_DEVICE_ENV).ok().as_deref());
 
