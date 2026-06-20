@@ -778,21 +778,12 @@ impl UnifiedLinear {
                     .map_err(|e| format!("{} (prefix: {})", e, prefix))?;
                 (eb, group_size)
             } else {
-                let w_shape = ffi::array_shape(&weight);
-                let s_shape = ffi::array_shape(&scales);
-                let egs = if w_shape.len() >= 2 && s_shape.len() >= 2 && bits > 0 {
-                    let packed_in = *w_shape.last().unwrap();
-                    let num_groups = *s_shape.last().unwrap();
-                    let in_features = packed_in * (32 / bits);
-                    if num_groups > 0 && in_features % num_groups == 0 {
-                        in_features / num_groups
-                    } else {
-                        group_size
-                    }
-                } else {
-                    group_size
-                };
-                (bits, egs)
+                // For non-affine modes (nvfp4, mxfp4, mxfp8), use the caller's
+                // group_size directly. The previous formula (packed_in * 32/bits)
+                // assumed uint32 packing, but modelopt uses uint8 packing which
+                // has different dimensions. MLX's native quantized_matmul handles
+                // the weight format internally.
+                (bits, group_size)
             };
 
             let qweight = QuantizedWeight {
