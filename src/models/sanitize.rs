@@ -365,11 +365,11 @@ fn dequantize_nvfp4_weights(weights: &mut mlxcel_core::weights::WeightMap) {
                 };
                 let fp4_val = fp4_e2m1_to_f32(nibble);
 
-                // Block scale: uint8 E4M3 or f16
+                // Block scale: uint8 FP8 E4M3 or f16
                 let group_idx = col / group_size;
                 let scale_flat_idx = row * num_groups + group_idx;
                 let scale_val = if use_uint8_scales {
-                    fp4_e2m1_to_f32(scale_bytes[scale_flat_idx]) // treat uint8 as FP8 E4M3
+                    fp8_e4m3_to_f32(scale_bytes[scale_flat_idx])
                 } else {
                     let scale_f16_bits = u16::from_le_bytes([
                         scale_bytes[scale_flat_idx * 2],
@@ -393,6 +393,96 @@ fn dequantize_nvfp4_weights(weights: &mut mlxcel_core::weights::WeightMap) {
         weights.remove(&scale_key);
         weights.remove(&scale2_key);
         weights.remove(&input_scale_key); // may not exist; remove is a no-op then
+    }
+}
+
+/// Fold NVFP4 3-tier global scale into per-block scales for MLX native loading.
+///
+/// Modelopt NVFP4 uses 3-tier scaling: FP4 weights + FP8 per-16 block scales
+/// + FP32 global scale. MLX's native `quantized_matmul` with mode="nvfp4"
+/// expects 2-tier (weights + block scales only). This function:
+///
+/// 1. Detects weight groups by `weight_scale_2` keys
+/// 2. Multiplies each per-block scale by the global scalar
+/// 3. Converts the result to float16 (MLX expects float16 scales)
+/// 4. Removes `weight_scale_2` and `input_scale` auxiliary keys
+/// 5. Leaves FP4 weight data untouched (MLX handles unpacking natively)
+fn fold_nvfp4_global_scale(weights: &mut mlxcel_core::weights::WeightMap) {
+    // Collect prefixes first to avoid borrowing conflicts during mutation.
+    let fp4_prefixes: Vec<String> = weights
+        .keys()
+        .filter(|k| k.ends_with(".weight_scale_2"))
+        .map(|k| k.strip_suffix(".weight_scale_2").unwrap().to_string())
+        .collect();
+
+    if fp4_prefixes.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "Folding NVFP4 global scale into per-block scales for {} weight groups...",
+        fp4_prefixes.len()
+    );
+
+    for prefix in fp4_prefixes {
+        let scale_key = format!("{prefix}.weight_scale");
+        let scale2_key = format!("{prefix}.weight_scale_2");
+        let input_scale_key = format!("{prefix}.input_scale");
+
+        if !weights.contains_key(&scale_key) || !weights.contains_key(&scale2_key) {
+            weights.remove(&scale2_key);
+            continue;
+        }
+
+        // Read the global scalar scale
+        let scale2_val = {
+            let scale2_arr = weights.get(&scale2_key).unwrap();
+            mlxcel_core::eval(scale2_arr);
+            mlxcel_core::item_f32(scale2_arr)
+        };
+
+        // Read the per-block scales (uint8 FP8 E4M3)
+        let (scale_shape, scale_bytes) = {
+            let scale_arr = weights.get(&scale_key).unwrap();
+            mlxcel_core::eval(scale_arr);
+            let shape = mlxcel_core::array_shape(scale_arr);
+            let bytes = mlxcel_core::array_to_raw_bytes(scale_arr);
+            (shape, bytes)
+        };
+
+        // Convert uint8 FP8 E4M3 scales to float, multiply by global scale, store as float16
+        let scale_f32: Vec<f32> = scale_bytes
+            .iter()
+            .map(|&v| fp8_e4m3_to_f32(v) * scale2_val)
+            .collect();
+        let new_scales = mlxcel_core::from_slice_f32(&scale_f32, &scale_shape);
+        let new_scales_f16 = mlxcel_core::astype(&new_scales, mlxcel_core::dtype::FLOAT16);
+        mlxcel_core::eval(&new_scales_f16);
+
+        weights.insert(scale_key, new_scales_f16);
+        weights.remove(&scale2_key);
+        weights.remove(&input_scale_key);
+    }
+}
+
+/// Convert FP8 E4M3 (8-bit) to float32.
+/// Format: 1 sign, 4 exponent, 3 mantissa, bias=7
+fn fp8_e4m3_to_f32(val: u8) -> f32 {
+    if val == 0 {
+        return 0.0;
+    }
+    let sign = (val >> 7) & 1;
+    let exponent = (val >> 3) & 0xF;
+    let mantissa = val & 0x7;
+    let exp_val = if exponent == 0 {
+        (1.0 + mantissa as f32 / 8.0) * 2.0f32.powi(-6)
+    } else {
+        (1.0 + mantissa as f32 / 8.0) * 2.0f32.powi(exponent as i32 - 7)
+    };
+    if sign != 0 {
+        -exp_val
+    } else {
+        exp_val
     }
 }
 
@@ -1141,8 +1231,9 @@ pub fn load_text_weights<P: AsRef<std::path::Path>>(
 
     // Dequantize NVFP4 3-tier weights for ANY model that has them
     // (detected by presence of weight_scale_2 keys). This folds the global
-    // FP32 scale into per-block scales and unpacks FP4 nibbles to f16.
-    dequantize_nvfp4_weights(&mut weights);
+    // FP32 scale into per-block scales and converts uint8 scales to f16
+    // so MLX's native quantized_matmul with mode="nvfp4" can handle them.
+    fold_nvfp4_global_scale(&mut weights);
 
     let mut is_quantized = false;
     if let Some(config) = parsed_config.as_ref() {
