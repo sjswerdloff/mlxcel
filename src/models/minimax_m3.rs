@@ -45,9 +45,7 @@ fn load_linear(
     is_mxfp8: bool,
 ) -> Result<UnifiedLinear, String> {
     if is_mxfp8 {
-        let w = dequantize_mxfp8_to_f16(weights, prefix, g)?;
-        let linear = mlxcel_core::layers::Linear::new(w, None);
-        Ok(UnifiedLinear::Regular(linear))
+        UnifiedLinear::from_weights_with_mode(weights, prefix, g, b, "mxfp8")
     } else {
         UnifiedLinear::from_weights(weights, prefix, g, b)
     }

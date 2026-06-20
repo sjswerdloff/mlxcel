@@ -1942,101 +1942,115 @@ std::unique_ptr<MlxArray> mxfp8_dequant_to_f16(
 
 namespace {
     static const char* MXFP8_MATMUL_SOURCE = R"(
-        constexpr int BM = 64, BN = 64, BK = 32, TM = 4, TN = 4;
+        // MXFP8 fused matmul with SIMD K-reduction.
+        // BK=32 = SIMD width → 32 lanes each handle 1 K element → simd_sum reduces.
+        //
+        // BM=32, BN=32, BK=32. Threadgroup: 32 × 4 = 128 threads.
+        // tx = SIMD lane (0..31) → K dimension
+        // ty = 0..3 → each handles BM/4=8 output rows
+        // Output cols: BN=32, all handled by each thread (accumulated across K)
+        //
+        // For each output element: simd_sum across 32 lanes gives the dot product.
+        // Float accumulation, f16 output.
 
-            int tx = thread_position_in_threadgroup.x;
-            int ty = thread_position_in_threadgroup.y;
+        constexpr int BM = 32, BN = 32, BK = 32;
+
+            int tx = thread_position_in_threadgroup.x;  // 0..31
+            int ty = thread_position_in_threadgroup.y;  // 0..3
             int m0 = threadgroup_position_in_grid.y * BM;
             int n0 = threadgroup_position_in_grid.x * BN;
             int M = *d_M, N = *d_N, K = *d_K;
             int do_transpose = *d_transpose;
 
-            threadgroup half a_tile[BM * BK];
-            threadgroup uint8_t b_tile[BK * BN];
-            threadgroup uint8_t s_tile[BN];
-
-            half acc[TM][TN];
-            for (int ti = 0; ti < TM; ti++)
-                for (int tj = 0; tj < TN; tj++)
-                    acc[ti][tj] = 0.0h;
+            // Each thread accumulates for 8 rows × 32 cols = 256 output elements
+            float acc[8][32];
+            for (int i = 0; i < 8; i++)
+                for (int j = 0; j < 32; j++)
+                    acc[i][j] = 0.0f;
 
             int k_blocks = (K + BK - 1) / BK;
 
             for (int kb = 0; k_blocks > 0; kb--, k_blocks--) {
-                // Load A tile [BM, BK]
-                for (int idx = ty * 16 + tx; idx < BM * BK; idx += 256) {
-                    int r = idx / BK, c = idx % BK;
-                    int mi = m0 + r, ki = kb * BK + c;
-                    a_tile[idx] = (mi < M && ki < K) ? half(A[mi * K + ki]) : 0.0h;
-                }
-                // Load B tile [BK, BN] — transpose support
-                for (int idx = ty * 16 + tx; idx < BK * BN; idx += 256) {
-                    int r = idx / BN, c = idx % BN;
-                    int ki = kb * BK + r, ni = n0 + c;
-                    uint8_t val = 0;
-                    if (ki < K && ni < N) {
-                        val = do_transpose ? W[ni * K + ki] : W[ki * N + ni];
+                int k = tx;  // SIMD lane maps to K element
+                int ki = kb * BK + k;
+
+                if (ki < K) {
+                    // Load A values for this K element across 8 rows
+                    half a_vals[8];
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        int mi = m0 + ty * 8 + i;
+                        a_vals[i] = (mi < M) ? half(A[mi * K + ki]) : 0.0h;
                     }
-                    b_tile[idx] = val;
-                }
-                // Load scales for this block: [1, BN] — transpose support
-                for (int c = ty * 16 + tx; c < BN; c += 256) {
-                    int ni = n0 + c;
-                    s_tile[c] = (ni < N) ? scales[kb * (do_transpose ? N : N) + ni] : 0;
-                }
 
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                for (int k = 0; k < BK; k++) {
-                    half a_vals[TM];
+                    // Load and dequant B values for this K element across 32 cols
+                    half b_vals[32];
                     #pragma unroll
-                    for (int ti = 0; ti < TM; ti++)
-                        a_vals[ti] = a_tile[(ty * TM + ti) * BK + k];
-
-                    half b_vals[TN];
-                    #pragma unroll
-                    for (int tj = 0; tj < TN; tj++) {
-                        uint8_t wv_raw = b_tile[k * BN + tx * TN + tj];
-                        uint8_t sv_raw = s_tile[tx * TN + tj];
-
+                    for (int j = 0; j < 32; j++) {
+                        int ni = n0 + j;
+                        uint8_t val = (ni < N)
+                            ? (do_transpose ? W[ni * K + ki] : W[ki * N + ni])
+                            : 0;
                         // Inline E4M3 dequant for weight
                         half wv;
-                        if (wv_raw == 0u) { wv = 0.0h; }
+                        if (val == 0u) { wv = 0.0h; }
                         else {
-                            uint ws = (wv_raw >> 7) & 1u, we = (wv_raw >> 3) & 0xFu, wm = wv_raw & 0x7u;
-                            half ev = (we == 0u) ? half(ldexp(1.0f + float(wm) / 8.0f, -6))
-                                                  : half(ldexp(1.0f + float(wm) / 8.0f, int(we) - 7));
-                            wv = ws ? -ev : ev;
+                            uint ws = (val >> 7) & 1u, we = (val >> 3) & 0xFu, wm = val & 0x7u;
+                            float ev = (we == 0u) ? ldexp(1.0f + float(wm) / 8.0f, -6)
+                                                   : ldexp(1.0f + float(wm) / 8.0f, int(we) - 7);
+                            wv = ws ? half(-ev) : half(ev);
                         }
                         // Inline E4M3 dequant for scale
+                        uint8_t sc = (ni < N) ? scales[kb * N + ni] : 0;
                         half sv;
-                        if (sv_raw == 0u) { sv = 0.0h; }
+                        if (sc == 0u) { sv = 0.0h; }
                         else {
-                            uint ss = (sv_raw >> 7) & 1u, se = (sv_raw >> 3) & 0xFu, sm = sv_raw & 0x7u;
-                            half ev = (se == 0u) ? half(ldexp(1.0f + float(sm) / 8.0f, -6))
-                                                  : half(ldexp(1.0f + float(sm) / 8.0f, int(se) - 7));
-                            sv = ss ? -ev : ev;
+                            uint ss = (sc >> 7) & 1u, se = (sc >> 3) & 0xFu, sm = sc & 0x7u;
+                            float ev = (se == 0u) ? ldexp(1.0f + float(sm) / 8.0f, -6)
+                                                   : ldexp(1.0f + float(sm) / 8.0f, int(se) - 7);
+                            sv = ss ? half(-ev) : half(ev);
                         }
-                        b_vals[tj] = wv * sv;
+                        b_vals[j] = wv * sv;
                     }
 
+                    // Outer product: acc[i][j] += a_vals[i] * b_vals[j]
                     #pragma unroll
-                    for (int ti = 0; ti < TM; ti++)
+                    for (int i = 0; i < 8; i++) {
+                        float av = float(a_vals[i]);
                         #pragma unroll
-                        for (int tj = 0; tj < TN; tj++)
-                            acc[ti][tj] += a_vals[ti] * b_vals[tj];
+                        for (int j = 0; j < 32; j++) {
+                            acc[i][j] += av * float(b_vals[j]);
+                        }
+                    }
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
 
+            // SIMD K-reduction: sum across 32 lanes (each held one K element)
             #pragma unroll
-            for (int ti = 0; ti < TM; ti++)
+            for (int i = 0; i < 8; i++) {
                 #pragma unroll
-                for (int tj = 0; tj < TN; tj++) {
-                    int mi = m0 + ty * TM + ti, ni = n0 + tx * TN + tj;
-                    if (mi < M && ni < N)
-                        C[mi * N + ni] = acc[ti][tj];
+                for (int j = 0; j < 32; j++) {
+                    acc[i][j] = simd_sum(acc[i][j]);
                 }
+            }
+
+            // All threads now have the same result; any lane can write.
+            // Use lane 0 to avoid redundant writes.
+            if (tx == 0) {
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    int mi = m0 + ty * 8 + i;
+                    if (mi < M) {
+                        #pragma unroll
+                        for (int j = 0; j < 32; j++) {
+                            int ni = n0 + j;
+                            if (ni < N) {
+                                C[mi * N + ni] = half(acc[i][j]);
+                            }
+                        }
+                    }
+                }
+            }
     )";
 
     struct Mxfp8MatmulKernelHolder {
@@ -2085,8 +2099,8 @@ std::unique_ptr<MlxArray> mxfp8_matmul(
 
     auto& kernel = get_mxfp8_matmul_kernel().get();
 
-    int grid_n = (N + 64 - 1) / 64;
-    int grid_m = (M + 64 - 1) / 64;
+    int grid_n = (N + 32 - 1) / 32;
+    int grid_m = (M + 32 - 1) / 32;
 
     array a_M = array({M});
     array a_N = array({N});
@@ -2098,7 +2112,7 @@ std::unique_ptr<MlxArray> mxfp8_matmul(
         {Shape{M, N}},
         {float16},
         std::make_tuple(grid_n, grid_m, 1),
-        std::make_tuple(16, 16, 1),
+        std::make_tuple(32, 4, 1),
         {}, std::nullopt, false, {}
     );
 
