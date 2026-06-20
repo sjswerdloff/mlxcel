@@ -36,7 +36,8 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Load a UnifiedLinear, dequantizing MXFP8 to f16 if needed.
+/// Load a UnifiedLinear. For MXFP8, keeps weights in uint8 and routes to the
+/// fused mxfp8_matmul kernel (dequant on-the-fly, no lazy Metal ops).
 fn load_linear(
     weights: &WeightMap,
     prefix: &str,
@@ -872,14 +873,10 @@ impl MiniMaxM3Model {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let seq_len = mlxcel_core::array_shape(input_ids);
-        let is_prefill = seq_len.last().copied().unwrap_or(1) > 1;
-        let seq_len = mlxcel_core::array_shape(input_ids);
-        let is_prefill = seq_len.last().copied().unwrap_or(1) > 1;
         let mut h = self.embed_tokens.forward(input_ids);
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &mut caches[i], mask);
-            if is_prefill && (i + 1) % 10 == 0 {
+            if (i + 1) % 5 == 0 {
                 mlxcel_core::eval(&h);
             }
         }
