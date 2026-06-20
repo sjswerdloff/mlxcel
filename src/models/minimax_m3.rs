@@ -36,8 +36,9 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Load a UnifiedLinear. For MXFP8, keeps weights in uint8 and routes to the
-/// fused mxfp8_matmul kernel (dequant on-the-fly, no lazy Metal ops).
+/// Load a UnifiedLinear. For MXFP8, converts to MLX affine format (packed uint32
+/// + float16 scales + zero biases) so MLX's native optimized quantized_matmul
+/// kernels are used instead of our custom kernel.
 fn load_linear(
     weights: &WeightMap,
     prefix: &str,
@@ -46,10 +47,94 @@ fn load_linear(
     is_mxfp8: bool,
 ) -> Result<UnifiedLinear, String> {
     if is_mxfp8 {
-        UnifiedLinear::from_weights_with_mode(weights, prefix, g, b, "mxfp8")
+        convert_mxfp8_to_affine(weights, prefix, g, b)
     } else {
         UnifiedLinear::from_weights(weights, prefix, g, b)
     }
+}
+
+/// Convert MXFP8 weights (unpacked uint8 + uint8 scales) to MLX affine format
+/// (packed uint32 + float16 scales + zero biases) for use with MLX's native
+/// optimized quantized_matmul kernels.
+fn convert_mxfp8_to_affine(
+    weights: &WeightMap,
+    prefix: &str,
+    g: i32,
+    b: i32,
+) -> Result<UnifiedLinear, String> {
+    let weight_key = format!("{}.weight", prefix);
+    let scales_key = format!("{}.scales", prefix);
+
+    let w_arr = weights.get(&weight_key)
+        .ok_or_else(|| format!("Weight not found: {}", weight_key))?;
+    let s_arr = weights.get(&scales_key)
+        .ok_or_else(|| format!("Scales not found: {}", scales_key))?;
+
+    let w_shape = mlxcel_core::array_shape(w_arr);
+    let s_shape = mlxcel_core::array_shape(s_arr);
+    let m = w_shape[0] as usize;
+    let n = w_shape[1] as usize;
+    let n_packed = n / 4;
+    let n_groups = n / 32;
+
+    // Read uint8 weight data via raw bytes
+    let w_bytes = mlxcel_core::array_to_raw_bytes(w_arr);
+    let s_bytes = mlxcel_core::array_to_raw_bytes(s_arr);
+
+    // Pack 4 uint8 → 1 uint32 (little-endian, matching MLX convention)
+    let mut packed = vec![0u32; m * n_packed];
+    for row in 0..m {
+        let base = row * n;
+        let dst = row * n_packed;
+        for col in 0..n_packed {
+            let s = base + col * 4;
+            packed[dst + col] = (w_bytes[s] as u32)
+                | ((w_bytes[s + 1] as u32) << 8)
+                | ((w_bytes[s + 2] as u32) << 16)
+                | ((w_bytes[s + 3] as u32) << 24);
+        }
+    }
+
+    // Convert uint8 E4M3 scales → float32 → float16
+    let scales_f32: Vec<f32> = s_bytes.iter().map(|&v| mxfp8_e4m3_to_f32(v)).collect();
+    let scales_arr = mlxcel_core::from_slice_f32(&scales_f32, &[m as i32, n_groups as i32]);
+    let scales_arr = mlxcel_core::astype(&scales_arr, mlxcel_core::dtype::FLOAT16);
+
+    // Zero biases (MXFP8 has no zero-point)
+    let biases_arr = mlxcel_core::zeros(&[m as i32, n_groups as i32], mlxcel_core::dtype::FLOAT16);
+
+    // Create packed uint32 weight array
+    let weight_arr = mlxcel_core::from_slice_u32(&packed, &[m as i32, n_packed as i32]);
+
+    // Build QuantizedWeight with affine mode — MLX's native optimized kernels handle the rest
+    // MXFP8 uses group_size=32, bits=8 regardless of model config defaults
+    let qweight = mlxcel_core::layers::QuantizedWeight::new_with_mode(
+        weight_arr,
+        scales_arr,
+        Some(biases_arr),
+        32,
+        8,
+        "affine".to_string(),
+    );
+
+    let bias_key = format!("{}.bias", prefix);
+    let bias = weights.get(&bias_key).map(|w| mlxcel_core::copy(w));
+
+    Ok(UnifiedLinear::Quantized { weight: qweight, bias })
+}
+
+/// Convert MXFP8 E4M3 uint8 to float32
+fn mxfp8_e4m3_to_f32(val: u8) -> f32 {
+    if val == 0 { return 0.0; }
+    let sign = (val >> 7) & 1;
+    let exponent = (val >> 3) & 0xF;
+    let mantissa = val & 0x7;
+    let exp_val = if exponent == 0 {
+        (1.0 + mantissa as f32 / 8.0) * 2.0f32.powi(-6)
+    } else {
+        (1.0 + mantissa as f32 / 8.0) * 2.0f32.powi(exponent as i32 - 7)
+    };
+    if sign != 0 { -exp_val } else { exp_val }
 }
 
 /// Dequantize an MXFP8 weight to f16.
