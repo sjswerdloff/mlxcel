@@ -1136,8 +1136,12 @@ pub fn load_text_weights<P: AsRef<std::path::Path>>(
     // checkpoints before tied-embedding sanitization so that lookups succeed.
     if is_gemma4 {
         normalize_nvfp4_keys(&mut weights);
-        dequantize_nvfp4_weights(&mut weights);
     }
+
+    // Dequantize NVFP4 3-tier weights for ANY model that has them
+    // (detected by presence of weight_scale_2 keys). This folds the global
+    // FP32 scale into per-block scales and unpacks FP4 nibbles to f16.
+    dequantize_nvfp4_weights(&mut weights);
 
     let mut is_quantized = false;
     if let Some(config) = parsed_config.as_ref() {
