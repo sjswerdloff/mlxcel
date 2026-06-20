@@ -336,27 +336,24 @@ fn dequantize_nvfp4_weights(weights: &mut mlxcel_core::weights::WeightMap) {
 
         // Validate raw byte buffer lengths match expected sizes before indexing.
         let expected_weight_bytes = out_dim * packed_dim;
-        let expected_scale_bytes = out_dim * num_groups * 2; // F16 = 2 bytes each
-        if weight_bytes.len() < expected_weight_bytes {
+        let expected_f16_scale_bytes = out_dim * num_groups * 2;
+        let expected_uint8_scale_bytes = out_dim * num_groups;
+        let use_uint8_scales = scale_bytes.len() == expected_uint8_scale_bytes;
+        if !use_uint8_scales && scale_bytes.len() < expected_f16_scale_bytes {
             eprintln!(
-                "Skipping NVFP4 dequant for {prefix}: weight_bytes length {} < expected {}",
-                weight_bytes.len(),
-                expected_weight_bytes
-            );
-            weights.remove(&scale2_key);
-            continue;
-        }
-        if scale_bytes.len() < expected_scale_bytes {
-            eprintln!(
-                "Skipping NVFP4 dequant for {prefix}: scale_bytes length {} < expected {}",
+                "Skipping NVFP4 dequant for {prefix}: scale_bytes length {} < expected {} (f16)",
                 scale_bytes.len(),
-                expected_scale_bytes
+                expected_f16_scale_bytes
             );
             weights.remove(&scale2_key);
             continue;
         }
 
         let mut dequant_f32 = Vec::with_capacity(out_dim * in_dim);
+
+        // Detect scale format: uint8 (1 byte) or f16 (2 bytes)
+        let expected_f16_scale_bytes = out_dim * num_groups * 2;
+        let use_uint8_scales = scale_bytes.len() == out_dim * num_groups;
 
         for row in 0..out_dim {
             for col in 0..in_dim {
@@ -368,14 +365,18 @@ fn dequantize_nvfp4_weights(weights: &mut mlxcel_core::weights::WeightMap) {
                 };
                 let fp4_val = fp4_e2m1_to_f32(nibble);
 
-                // Block scale (F16 stored as 2-byte little-endian).
+                // Block scale: uint8 E4M3 or f16
                 let group_idx = col / group_size;
                 let scale_flat_idx = row * num_groups + group_idx;
-                let scale_f16_bits = u16::from_le_bytes([
-                    scale_bytes[scale_flat_idx * 2],
-                    scale_bytes[scale_flat_idx * 2 + 1],
-                ]);
-                let scale_val = f16_to_f32(scale_f16_bits);
+                let scale_val = if use_uint8_scales {
+                    fp4_e2m1_to_f32(scale_bytes[scale_flat_idx]) // treat uint8 as FP8 E4M3
+                } else {
+                    let scale_f16_bits = u16::from_le_bytes([
+                        scale_bytes[scale_flat_idx * 2],
+                        scale_bytes[scale_flat_idx * 2 + 1],
+                    ]);
+                    f16_to_f32(scale_f16_bits)
+                };
 
                 dequant_f32.push(fp4_val * scale_val * scale2_val);
             }
