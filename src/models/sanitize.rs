@@ -349,50 +349,36 @@ fn dequantize_nvfp4_weights(weights: &mut mlxcel_core::weights::WeightMap) {
             continue;
         }
 
-        let mut dequant_f32 = Vec::with_capacity(out_dim * in_dim);
+        // Dequantize NVFP4 weights on GPU.
+        // MLX's dequantize expects uint32 packed weights, but modelopt stores
+        // uint8 packed. We repack uint8→uint32 first, then use GPU dequant.
+        let weight_arr = weights.get(&weight_key).unwrap();
+        let scale_arr = weights.get(&scale_key).unwrap();
+        mlxcel_core::eval(weight_arr);
+        mlxcel_core::eval(scale_arr);
 
-        // Detect scale format: uint8 (1 byte) or f16 (2 bytes)
-        let expected_f16_scale_bytes = out_dim * num_groups * 2;
-        let use_uint8_scales = scale_bytes.len() == out_dim * num_groups;
+        let w_shape = mlxcel_core::array_shape(weight_arr);
+        let w_bytes = mlxcel_core::array_to_raw_bytes(weight_arr);
+        let m = w_shape[0] as usize;
+        let n_packed = w_shape[1] as usize;
 
-        for row in 0..out_dim {
-            for col in 0..in_dim {
-                let byte_idx = row * packed_dim + col / 2;
-                let nibble = if col % 2 == 0 {
-                    weight_bytes[byte_idx] & 0x0F // low nibble
-                } else {
-                    (weight_bytes[byte_idx] >> 4) & 0x0F // high nibble
-                };
-                let fp4_val = fp4_e2m1_to_f32(nibble);
+        // Repack uint8 (2 FP4/byte) → uint32 (8 FP4/uint32)
+        let n_uint32 = n_packed / 4;
+        if n_uint32 > 0 {
+            let repacked = repack_fp4_uint8_to_uint32(&w_bytes, m, n_packed);
+            let repacked_arr = mlxcel_core::from_slice_u32(&repacked, &[m as i32, n_uint32 as i32]);
 
-                // Block scale: uint8 FP8 E4M3 or f16
-                let group_idx = col / group_size;
-                let scale_flat_idx = row * num_groups + group_idx;
-                let scale_val = if use_uint8_scales {
-                    fp8_e4m3_to_f32(scale_bytes[scale_flat_idx])
-                } else {
-                    let scale_f16_bits = u16::from_le_bytes([
-                        scale_bytes[scale_flat_idx * 2],
-                        scale_bytes[scale_flat_idx * 2 + 1],
-                    ]);
-                    f16_to_f32(scale_f16_bits)
-                };
+            // Now dequantize on GPU using MLX's native function
+            let new_arr_f16 = unsafe {
+                mlxcel_core::dequantize(&repacked_arr, scale_arr, std::ptr::null(), group_size as i32, 4, "nvfp4")
+            };
+            mlxcel_core::eval(&new_arr_f16);
 
-                dequant_f32.push(fp4_val * scale_val * scale2_val);
-            }
+            weights.insert(weight_key, new_arr_f16);
+            weights.remove(&scale_key);
+            weights.remove(&scale2_key);
+            weights.remove(&input_scale_key);
         }
-
-        // Create a new f16 array with shape [out_dim, in_dim].
-        let new_shape = vec![out_dim as i32, in_dim as i32];
-        let new_arr = mlxcel_core::from_slice_f32(&dequant_f32, &new_shape);
-        let new_arr_f16 = mlxcel_core::astype(&new_arr, mlxcel_core::dtype::FLOAT16);
-        mlxcel_core::eval(&new_arr_f16);
-
-        // Replace the packed weight and remove auxiliary keys.
-        weights.insert(weight_key, new_arr_f16);
-        weights.remove(&scale_key);
-        weights.remove(&scale2_key);
-        weights.remove(&input_scale_key); // may not exist; remove is a no-op then
     }
 }
 
