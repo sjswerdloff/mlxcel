@@ -124,7 +124,17 @@ impl SwitchLinear {
         group_size: i32,
         bits: i32,
     ) -> Result<Self, String> {
-        Self::from_weights_with_mode(weights, prefix, group_size, bits, "affine")
+        // Auto-detect mode: no .biases → block-float scheme, not affine
+        let mode = if weights.get(&format!("{}.biases", prefix)).is_some() {
+            "affine"
+        } else if bits == 8 {
+            "mxfp8"
+        } else if group_size == 16 {
+            "nvfp4"
+        } else {
+            "mxfp4"
+        };
+        Self::from_weights_with_mode(weights, prefix, group_size, bits, mode)
     }
 
     /// Expose the quantized triple (weight, scales, biases, group_size,

@@ -49,6 +49,14 @@ fn load_linear(
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub text_config: TextConfig,
+    #[serde(default)]
+    pub quantization: Option<M3Quantization>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct M3Quantization {
+    pub group_size: i32,
+    pub bits: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,10 +132,12 @@ fn default_local_block() -> usize {
 
 impl ModelArgs {
     pub fn group_size(&self) -> i32 {
-        64
+        let gs = self.quantization.as_ref().map(|q| q.group_size).unwrap_or(64);
+        eprintln!("[M3 ModelArgs] group_size={} (quantization={:?})", gs, self.quantization);
+        gs
     }
     pub fn bits(&self) -> i32 {
-        4
+        self.quantization.as_ref().map(|q| q.bits).unwrap_or(4)
     }
     pub fn gate_bits(&self) -> i32 {
         8
@@ -851,6 +861,7 @@ impl MiniMaxM3Model {
             .ok_or("Missing text_config")?;
         let args: ModelArgs = serde_json::from_value(serde_json::json!({
             "text_config": text_config,
+            "quantization": full_config.get("quantization"),
         }))
         .map_err(|e| format!("Failed to parse ModelArgs: {}", e))?;
         let weights = crate::models::load_text_weights(model_dir, None)?;
