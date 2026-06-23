@@ -2458,6 +2458,14 @@ std::unique_ptr<MlxArray> gather_qmm(
     std::optional<array> rhs_opt = rhs_indices ? std::optional(rhs_indices->inner) : std::nullopt;
 
     std::optional<array> biases_opt = biases ? std::optional(biases->inner) : std::nullopt;
+
+    // Override group_size for nvfp4 — modelopt NVFP4 always uses group_size=16.
+    std::string mode_str(mode.data(), mode.size());
+    int effective_gs = group_size;
+    if (mode_str == "nvfp4") {
+        effective_gs = 16;
+    }
+
     if (is_affine) {
         // Omit mode parameter to use default "affine" path (avoids MLX dispatch overhead)
         return std::make_unique<MlxArray>(mlx::core::gather_qmm(
@@ -2469,7 +2477,7 @@ std::unique_ptr<MlxArray> gather_qmm(
     return std::make_unique<MlxArray>(mlx::core::gather_qmm(
         x.inner, w.inner, scales.inner, biases_opt,
         lhs_opt, rhs_opt, transpose,
-        std::optional<int>(group_size), std::optional<int>(bits),
+        std::optional<int>(effective_gs), std::optional<int>(bits),
         std::string(mode.data(), mode.size()), sorted_indices));
 }
 

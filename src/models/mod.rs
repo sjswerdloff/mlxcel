@@ -77,6 +77,7 @@ pub mod mimo;
 pub mod minicpm;
 pub mod minicpm3;
 pub mod minimax;
+pub mod minimax_m3;
 pub mod ministral3;
 pub mod mistral4;
 pub mod mixtral;
@@ -169,6 +170,7 @@ pub use mimo::MiMoModel;
 pub use minicpm::MiniCPMModel;
 pub use minicpm3::MiniCPM3Model;
 pub use minimax::MiniMaxModel;
+pub use minimax_m3::MiniMaxM3Model;
 pub use ministral3::{Ministral3Model, Ministral3Wrapper};
 pub use mistral4::Mistral4Model;
 pub use mixtral::MixtralModel;
@@ -274,6 +276,7 @@ pub enum ModelType {
     // MoE models
     GptOss,
     MiniMax,
+    MiniMaxM3,
     Mixtral,
     Qwen2Moe,
     OLMoE,
@@ -672,6 +675,7 @@ impl ModelType {
             // ----- MoE (other) -----
             ModelType::GptOss => ("gpt-oss (MoE)", "MoE (other)"),
             ModelType::MiniMax => ("MiniMax-M2 (MoE, 256 experts)", "MoE (other)"),
+            ModelType::MiniMaxM3 => ("MiniMax-M3 (MoE + MSA, 128 experts)", "MoE (other)"),
             ModelType::Mixtral => ("Mixtral (MoE)", "MoE (other)"),
             ModelType::KimiLinear => ("Kimi Linear (MLA + GatedDeltaNet hybrid)", "MoE (other)"),
             ModelType::LongcatFlash => ("LongCat Flash (MLA + MoE, dual sublayer)", "MoE (other)"),
@@ -836,6 +840,7 @@ mod metadata_tests {
             PhiMoe,
             GptOss,
             MiniMax,
+            MiniMaxM3,
             Mixtral,
             Qwen2Moe,
             OLMoE,

@@ -1079,8 +1079,19 @@ impl FusedQKVLinear {
         n_kv_heads: i32,
         head_dim: i32,
     ) -> Result<Self, String> {
+        // Auto-detect mode the same way UnifiedLinear::from_weights does
+        let q_prefix = format!("{}.q_proj", prefix);
+        let mode = if weights.get(&format!("{}.biases", q_prefix)).is_some() {
+            "affine"
+        } else if bits == 8 {
+            "mxfp8"
+        } else if group_size == 16 {
+            "nvfp4"
+        } else {
+            "mxfp4"
+        };
         Self::from_weights_separate_with_mode(
-            weights, prefix, group_size, bits, n_heads, n_kv_heads, head_dim, "affine",
+            weights, prefix, group_size, bits, n_heads, n_kv_heads, head_dim, mode,
         )
     }
 
