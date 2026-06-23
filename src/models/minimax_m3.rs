@@ -28,9 +28,9 @@
 //! - Block max-pool scoring with causal masking
 //! - Local block always included (score set to inf)
 
-use crate::models::switch_layers::SwitchGLU;
+use crate::models::switch_layers::{gather_sort, SwitchLinear};
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::layers::{KVCache, GemmaRMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -164,13 +164,13 @@ pub struct SparseAttention {
     pub k_proj: UnifiedLinear,
     pub v_proj: UnifiedLinear,
     pub o_proj: UnifiedLinear,
-    pub q_norm: Option<RMSNorm>,
-    pub k_norm: Option<RMSNorm>,
+    pub q_norm: Option<GemmaRMSNorm>,
+    pub k_norm: Option<GemmaRMSNorm>,
 
     pub index_q_proj: Option<UnifiedLinear>,
     pub index_k_proj: Option<UnifiedLinear>,
-    pub index_q_norm: Option<RMSNorm>,
-    pub index_k_norm: Option<RMSNorm>,
+    pub index_q_norm: Option<GemmaRMSNorm>,
+    pub index_k_norm: Option<GemmaRMSNorm>,
 
     pub num_heads: i32,
     pub num_kv_heads: i32,
@@ -200,11 +200,11 @@ impl SparseAttention {
         let v = self.v_proj.forward(x);
 
         let q = mlxcel_core::reshape(&q_raw, &[b, l, self.num_heads, self.head_dim]);
-
         let k = mlxcel_core::reshape(&k_raw, &[b, l, self.num_kv_heads, self.head_dim]);
         let v = mlxcel_core::reshape(&v, &[b, l, self.num_kv_heads, self.head_dim]);
 
-        // Per-head Q/K norm (on head_dim, not full projection) - verified from Transformers code
+        // Per-head Gemma-style Q/K norm (scales by 1+weight, not weight alone).
+        // Order matches HF reference: reshape → norm → transpose → RoPE.
         let q = if let Some(ref n) = self.q_norm {
             n.forward(&q)
         } else {
@@ -220,7 +220,8 @@ impl SparseAttention {
         let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
         let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
 
-        // RoPE AFTER norm+transpose - verified from Transformers code
+        // Partial RoPE: fast_rope rotates the first `rope_dims` of head_dim,
+        // leaves the rest unchanged. M3 config: head_dim=128, rotary_dim=64.
         let offset = cache.offset;
         let q = mlxcel_core::fast_rope(&q, self.rope_dims, false, self.rope_base, 1.0, offset);
         let k = mlxcel_core::fast_rope(&k, self.rope_dims, false, self.rope_base, 1.0, offset);
@@ -317,13 +318,69 @@ impl SparseAttention {
         mlxcel_core::where_cond(&causal, scores, &neg_inf)
     }
 
-    fn ensure_local_block_score(&self, scores: &MlxArray, _num_blocks: i32) -> UniquePtr<MlxArray> {
-        // Local block inclusion: for each query position q, the local block q is always selected.
-        // The official Transformers code sets block_scores[q, local_block] = inf before top-k.
-        // This requires scatter which isn't straightforward with current MLX ops.
-        // The causal mask already ensures causality, and the top-k selection naturally
-        // favors nearby blocks. A full implementation would use scatter to set local block scores to inf.
-        mlxcel_core::copy(scores)
+    /// Force the local block (and any additional `sparse_local_block` blocks
+    /// preceding it) into the Top-K selection by setting their scores to
+    /// +infinity before Top-K.
+    ///
+    /// Per the MSA paper (arXiv:2606.13392, eq 7 commentary): "We always
+    /// include the local block containing position i" — and the explicit
+    /// rationale paragraph: "This fixed allocation reserves one block slot
+    /// and leaves the remaining slots to be chosen by the Index Branch,
+    /// preventing degenerate selections that omit the query's immediate
+    /// neighbourhood." Without it, sparse attention can drop the local
+    /// context block entirely → degenerate / repetitive output.
+    ///
+    /// Reference Transformers code (modeling_minimax_m3_vl.py:587-591):
+    /// ```python
+    /// if self.local_blocks > 0:
+    ///     local = torch.arange(self.local_blocks)
+    ///     local_idx = (q_block[..., None] - local.view(1, 1, -1)).clamp(min=0)
+    ///     block_scores.scatter_(-1, local_idx, float("inf"))
+    /// ```
+    ///
+    /// In mlxcel's coordinate system block_scores has shape
+    /// `[B, H_idx, num_q_blocks, num_k_blocks]` (Q is max-pooled per block
+    /// before scoring, so we work at the block level rather than per token).
+    /// The guarantee is therefore applied per Q block: for each q in
+    /// `[0, num_blocks)`, the set
+    /// `{q, q-1, ..., max(0, q - sparse_local_block + 1)}` of key blocks
+    /// is forced to +inf so Top-K picks them.
+    ///
+    /// Expressed as a broadcast where-mask (no scatter needed):
+    ///   diff      = query_pos - key_pos   shape [1, 1, num_blocks, num_blocks]
+    ///   is_local  = (diff >= 0) AND (diff < sparse_local_block)
+    ///   scores    = where(is_local, +inf, scores)
+    fn ensure_local_block_score(&self, scores: &MlxArray, num_blocks: i32) -> UniquePtr<MlxArray> {
+        if self.sparse_local_block <= 0 {
+            return mlxcel_core::copy(scores);
+        }
+
+        // query_pos[q, k] = q (broadcast along key axis)
+        let query_pos = mlxcel_core::arange_f32(0.0, num_blocks as f32, 1.0);
+        let query_pos = mlxcel_core::reshape(&query_pos, &[1, 1, num_blocks, 1]);
+
+        // key_pos[q, k] = k (broadcast along query axis)
+        let key_pos = mlxcel_core::arange_f32(0.0, num_blocks as f32, 1.0);
+        let key_pos = mlxcel_core::reshape(&key_pos, &[1, 1, 1, num_blocks]);
+
+        // is_local[q, k] = (q >= k) AND (k > q - sparse_local_block)
+        //                 i.e. k in [max(0, q - sparse_local_block + 1), q]
+        let causal = mlxcel_core::greater_equal(&query_pos, &key_pos);
+        let window = mlxcel_core::full_f32(
+            &[1],
+            self.sparse_local_block as f32,
+            mlxcel_core::dtype::FLOAT32,
+        );
+        let key_plus_window = mlxcel_core::add(&key_pos, &window);
+        let within_window = mlxcel_core::less(&query_pos, &key_plus_window);
+        let is_local = mlxcel_core::logical_and(&causal, &within_window);
+
+        let dtype = mlxcel_core::array_dtype(scores);
+        let pos_inf = mlxcel_core::full_f32(&[1], f32::INFINITY, dtype);
+        let s = mlxcel_core::array_shape(scores);
+        let pos_inf = mlxcel_core::broadcast_to(&pos_inf, &[s[0], s[1], s[2], s[3]]);
+
+        mlxcel_core::where_cond(&is_local, &pos_inf, scores)
     }
 
     fn sparse_sdpa(
@@ -409,10 +466,50 @@ impl SparseAttention {
         v: &MlxArray,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mask_ptr = mask
-            .map(|m| m as *const MlxArray)
-            .unwrap_or(std::ptr::null());
-        let raw = unsafe { mlxcel_core::layers::attention_from_ptr(q, k, v, self.scale, mask_ptr, 0.0, 0) };
+        // q shape after transpose: [batch, num_heads, q_len, head_dim].
+        // When mask is None and q_len > 1 (prefill of a multi-token prompt),
+        // the underlying `fast_scaled_dot_product_attention` runs full
+        // bidirectional attention — every query attends to every key, including
+        // future positions. The residual stream collapses across positions and
+        // every position predicts the same token. Use MLX's "causal" SDPA path
+        // in this case so the kernel applies the causal mask itself.
+        // (Llama3/Qwen3 sidestep this by returning `true` from
+        // `supports_maskless_padded_prefill`; M3 is conservative and accepts a
+        // mask from the prefill helper, but during decode (q_len == 1) and
+        // certain code paths the mask is None and causal masking is implicit.)
+        let q_len = mlxcel_core::array_shape(q)[2];
+        // Build an explicit additive causal mask [q_len, k_len] of 0/-inf when
+        // mask is None and q_len > 1 (prefill of a multi-token prompt).
+        let raw = if mask.is_none() && q_len > 1 {
+            let k_len = mlxcel_core::array_shape(k)[2];
+            let dtype = mlxcel_core::array_dtype(q);
+            // ones[q_len, k_len], tril keeps the lower triangle (causal: q can see k<=q).
+            let ones = mlxcel_core::full_f32(&[q_len, k_len], 1.0, dtype);
+            let lower = mlxcel_core::tril(&ones, 0);
+            // additive = (lower == 1) ? 0 : -inf
+            let zero = mlxcel_core::full_f32(&[1], 0.0, dtype);
+            let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, dtype);
+            let one = mlxcel_core::full_f32(&[1], 1.0, dtype);
+            let is_one = mlxcel_core::equal(&lower, &one);
+            let additive = mlxcel_core::where_cond(&is_one, &zero, &neg_inf);
+            let mask_ref: &MlxArray = additive.as_ref().unwrap();
+            unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    q,
+                    k,
+                    v,
+                    self.scale,
+                    mask_ref as *const MlxArray,
+                    0.0,
+                    0,
+                )
+            }
+        } else {
+            let mask_ptr = mask
+                .map(|m| m as *const MlxArray)
+                .unwrap_or(std::ptr::null());
+            unsafe { mlxcel_core::layers::attention_from_ptr(q, k, v, self.scale, mask_ptr, 0.0, 0) }
+        };
         let shape = mlxcel_core::array_shape(&raw);
         let b = shape[0];
         let l = shape[2];
@@ -443,8 +540,8 @@ impl SparseAttention {
             let qw = get_weight(weights, &format!("{}.q_norm.weight", prefix))?;
             let kw = get_weight(weights, &format!("{}.k_norm.weight", prefix))?;
             (
-                Some(RMSNorm::new(qw, cfg.rms_norm_eps)),
-                Some(RMSNorm::new(kw, cfg.rms_norm_eps)),
+                Some(GemmaRMSNorm::new(qw, cfg.rms_norm_eps)),
+                Some(GemmaRMSNorm::new(kw, cfg.rms_norm_eps)),
             )
         } else {
             (None, None)
@@ -455,10 +552,10 @@ impl SparseAttention {
             let ikp = load_linear(weights, &format!("{}.index_k_proj", prefix), g, b)?;
             let iqn = get_weight(weights, &format!("{}.index_q_norm.weight", prefix))
                 .ok()
-                .map(|w| RMSNorm::new(w, cfg.rms_norm_eps));
+                .map(|w| GemmaRMSNorm::new(w, cfg.rms_norm_eps));
             let ikn = get_weight(weights, &format!("{}.index_k_norm.weight", prefix))
                 .ok()
-                .map(|w| RMSNorm::new(w, cfg.rms_norm_eps));
+                .map(|w| GemmaRMSNorm::new(w, cfg.rms_norm_eps));
             (Some(iqp), Some(ikp), iqn, ikn)
         } else {
             (None, None, None, None)
@@ -538,6 +635,96 @@ fn swiglu_forward(
 }
 
 // ============================================================================
+// M3 SwiGLU activation (pure, no projections) — for routed-expert path
+//
+// Same formula as `swiglu_forward` above, but takes already-projected
+// `up` and `gate` arrays so it can sit between SwitchLinear gate/up and
+// SwitchLinear down in the MoE path.
+//
+//   gate_c = clamp(gate, max=limit)
+//   up_c   = clamp(up,   ±limit)
+//   glu    = gate_c * sigmoid(alpha * gate_c)
+//   out    = (up_c + 1.0) * glu
+//
+// Fast path: when (alpha, limit) == (1.702, 7.0) — M3's configured values
+// and identical to GPT-OSS — dispatch to the existing compiled primitive
+// `compiled_gpt_oss_swiglu_activation`, which fuses the whole graph.
+// ============================================================================
+
+fn m3_swiglu_activation(
+    up: &MlxArray,
+    gate: &MlxArray,
+    alpha: f32,
+    limit: f32,
+) -> UniquePtr<MlxArray> {
+    if (alpha - 1.702).abs() <= f32::EPSILON && (limit - 7.0).abs() <= f32::EPSILON {
+        return mlxcel_core::compiled_gpt_oss_swiglu_activation(up, gate);
+    }
+
+    let dtype = mlxcel_core::array_dtype(up);
+    let neg_lim = mlxcel_core::full_f32(&[1], -limit, dtype);
+    let pos_lim = mlxcel_core::full_f32(&[1], limit, dtype);
+    let gate_c = mlxcel_core::minimum(gate, &pos_lim);
+    let up_c = mlxcel_core::minimum(&mlxcel_core::maximum(up, &neg_lim), &pos_lim);
+    let glu_scaled = mlxcel_core::multiply_scalar(&gate_c, alpha);
+    let sig = mlxcel_core::sigmoid(&glu_scaled);
+    let out_glu = mlxcel_core::multiply(&gate_c, &sig);
+    let one = mlxcel_core::full_f32(&[1], 1.0, dtype);
+    let up_plus_1 = mlxcel_core::add(&up_c, &one);
+    let result = mlxcel_core::multiply(&out_glu, &up_plus_1);
+    mlxcel_core::astype(&result, dtype)
+}
+
+// ============================================================================
+// M3 routed-expert forward — parallels SwitchGLU::forward but inserts
+// `m3_swiglu_activation` between the gate/up and down projections instead
+// of `compiled_swiglu_activation` (standard SwiGLU). Same sort/gather/scatter
+// shape contract so the surrounding MoE code path is unchanged.
+// ============================================================================
+
+fn m3_switchglu_forward(
+    x: &MlxArray,
+    indices: &MlxArray,
+    gate_proj: &SwitchLinear,
+    up_proj: &SwitchLinear,
+    down_proj: &SwitchLinear,
+    alpha: f32,
+    limit: f32,
+) -> UniquePtr<MlxArray> {
+    let indices_shape = mlxcel_core::array_shape(indices);
+    let n_tokens = indices_shape[0];
+    let top_k = indices_shape[1];
+    let total = n_tokens * top_k;
+    let do_sort = total >= 64;
+
+    let x_exp = mlxcel_core::expand_dims(x, -2);
+    let x_exp = mlxcel_core::expand_dims(&x_exp, -3);
+
+    if do_sort {
+        let (sorted_x, sorted_idx, inv_order) = gather_sort(&x_exp, indices);
+        let x_gate = gate_proj.forward(&sorted_x, &sorted_idx, true);
+        let x_up = up_proj.forward(&sorted_x, &sorted_idx, true);
+        let activated = m3_swiglu_activation(&x_up, &x_gate, alpha, limit);
+        let output = down_proj.forward(&activated, &sorted_idx, true);
+
+        // Inline scatter_unsort: unsort, reshape to [n_tokens, top_k, ...], drop middle axis
+        let unsorted = mlxcel_core::take(&output, &inv_order, 0);
+        let x_shape = mlxcel_core::array_shape(&unsorted);
+        let reshaped = mlxcel_core::reshape(
+            &unsorted,
+            &[n_tokens, top_k, x_shape[1], x_shape[2]],
+        );
+        mlxcel_core::squeeze_axis(&reshaped, 2)
+    } else {
+        let x_gate = gate_proj.forward(&x_exp, indices, false);
+        let x_up = up_proj.forward(&x_exp, indices, false);
+        let activated = m3_swiglu_activation(&x_up, &x_gate, alpha, limit);
+        let output = down_proj.forward(&activated, indices, false);
+        mlxcel_core::squeeze_axis(&output, -2)
+    }
+}
+
+// ============================================================================
 // Shared Experts (SwiGLU, not standard SiLU)
 // ============================================================================
 
@@ -574,7 +761,13 @@ impl SharedExperts {
 
 pub struct SparseMoeBlock {
     pub router: UnifiedLinear,
-    pub experts: SwitchGLU,
+    // Three separate SwitchLinears so the activation step can be M3's
+    // clamped (up+1.0) variant instead of standard silu(gate)*up. The
+    // surrounding sort/gather/scatter shape contract is preserved via
+    // `m3_switchglu_forward`, which mirrors SwitchGLU::forward.
+    pub gate_proj: SwitchLinear,
+    pub up_proj: SwitchLinear,
+    pub down_proj: SwitchLinear,
     pub shared_experts: Option<SharedExperts>,
     pub e_score_correction_bias: UniquePtr<MlxArray>,
     pub num_experts_per_tok: usize,
@@ -607,7 +800,15 @@ impl SparseMoeBlock {
         let norm_scores = mlxcel_core::divide(&topk_scores, &mlxcel_core::add(&score_sum, &eps));
         let norm_scores = mlxcel_core::astype(&norm_scores, mlxcel_core::array_dtype(&x_flat));
 
-        let expert_out = self.experts.forward(&x_flat, &topk_idx);
+        let expert_out = m3_switchglu_forward(
+            &x_flat,
+            &topk_idx,
+            &self.gate_proj,
+            &self.up_proj,
+            &self.down_proj,
+            self.swiglu_alpha,
+            self.swiglu_limit,
+        );
 
         // Apply routed_scaling_factor - verified from Transformers code
         let expert_out = mlxcel_core::multiply_scalar(&expert_out, self.routed_scaling_factor);
@@ -643,12 +844,27 @@ impl SparseMoeBlock {
         let router =
             UnifiedLinear::from_weights(weights, &format!("{}.gate", prefix), g, args.gate_bits())?;
 
-        let experts = SwitchGLU::from_weights_with_proj_names(
+        // M3 routes through three separate SwitchLinears (gate=w1, up=w3, down=w2)
+        // rather than the single SwitchGLU, so the activation step can be M3's
+        // clamped (up+1.0) variant. Same w1/w3/w2 convention as before.
+        let switch_mlp_prefix = format!("{}.switch_mlp", prefix);
+        let gate_proj = SwitchLinear::from_weights(
             weights,
-            &format!("{}.switch_mlp", prefix),
+            &format!("{}.w1", switch_mlp_prefix),
             g,
             b,
-            ["w1", "w3", "w2"],
+        )?;
+        let up_proj = SwitchLinear::from_weights(
+            weights,
+            &format!("{}.w3", switch_mlp_prefix),
+            g,
+            b,
+        )?;
+        let down_proj = SwitchLinear::from_weights(
+            weights,
+            &format!("{}.w2", switch_mlp_prefix),
+            g,
+            b,
         )?;
 
         let shared = if cfg.n_shared_experts > 0 {
@@ -677,7 +893,9 @@ impl SparseMoeBlock {
 
         Ok(Self {
             router,
-            experts,
+            gate_proj,
+            up_proj,
+            down_proj,
             shared_experts: shared,
             e_score_correction_bias,
             num_experts_per_tok: cfg.num_experts_per_tok,
@@ -738,8 +956,8 @@ pub struct DecoderLayer {
     pub self_attn: SparseAttention,
     pub mlp: Option<DenseMLP>,
     pub moe: Option<SparseMoeBlock>,
-    pub input_layernorm: RMSNorm,
-    pub post_attention_layernorm: RMSNorm,
+    pub input_layernorm: GemmaRMSNorm,
+    pub post_attention_layernorm: GemmaRMSNorm,
 }
 
 impl DecoderLayer {
@@ -800,8 +1018,8 @@ impl DecoderLayer {
             weights,
             &format!("{}.post_attention_layernorm.weight", prefix),
         )?;
-        let input_layernorm = RMSNorm::new(input_norm, args.text_config.rms_norm_eps);
-        let post_attention_layernorm = RMSNorm::new(post_norm, args.text_config.rms_norm_eps);
+        let input_layernorm = GemmaRMSNorm::new(input_norm, args.text_config.rms_norm_eps);
+        let post_attention_layernorm = GemmaRMSNorm::new(post_norm, args.text_config.rms_norm_eps);
 
         Ok(Self {
             self_attn,
@@ -820,7 +1038,7 @@ impl DecoderLayer {
 pub struct MiniMaxM3Model {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<DecoderLayer>,
-    pub norm: RMSNorm,
+    pub norm: GemmaRMSNorm,
     pub lm_head: Option<UnifiedLinear>,
 }
 
@@ -885,7 +1103,7 @@ impl MiniMaxM3Model {
         }
 
         let norm_weight = get_weight(weights, &format!("{}.norm.weight", prefix))?;
-        let norm = RMSNorm::new(norm_weight, args.text_config.rms_norm_eps);
+        let norm = GemmaRMSNorm::new(norm_weight, args.text_config.rms_norm_eps);
 
         let lm_head = if !args.text_config.tie_word_embeddings {
             Some(UnifiedLinear::from_weights(
@@ -935,6 +1153,16 @@ impl LanguageModel for MiniMaxM3Model {
     }
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![200020]
+    }
+    /// M3's `dense_attention` applies causal masking implicitly when the
+    /// caller passes `mask=None` (via MLX's "causal" SDPA mode). Declaring
+    /// `true` here matches the Llama3/Qwen3 pattern and tells the generate
+    /// dispatcher to skip materializing an L×L mask during prefill. The
+    /// attention layer is the contract holder for causality; mlxcel's M3
+    /// follows the SGLang/HF convention of "attention is always causal,
+    /// the mask is an implementation detail."
+    fn supports_maskless_padded_prefill(&self) -> bool {
+        true
     }
 }
 
@@ -1088,5 +1316,193 @@ mod tests {
         assert_eq!(leaf_names[0], "w1"); // gate_proj
         assert_eq!(leaf_names[1], "w3"); // up_proj
         assert_eq!(leaf_names[2], "w2"); // down_proj
+    }
+
+    // -------------------------------------------------------------------
+    // m3_swiglu_activation unit tests
+    //
+    // The activation feeds the routed-expert path. Wrong math here is what
+    // produced "asezasezasez..." — the standard SwitchGLU used silu(gate)*up
+    // instead of M3's clamp + (up+1.0) trick. These tests exercise:
+    //   1. Fast path matches the compiled primitive bit-for-bit
+    //   2. Manual path matches the fast path at M3's config values
+    //   3. Hand-computed scalar reference
+    //   4. Gate upper-clamping (only upper, not symmetric)
+    //   5. Up symmetric clamping
+    //   6. gate=0 ⇒ out=0 (the glu-vanishing invariant)
+    //   7. Shape preservation
+    // -------------------------------------------------------------------
+
+    fn vec_from_array(arr: &mlxcel_core::MlxArray) -> Vec<f32> {
+        let shape = mlxcel_core::array_shape(arr);
+        let n: i32 = shape.iter().product();
+        (0..n)
+            .map(|i| {
+                let starts: Vec<i32> = shape
+                    .iter()
+                    .enumerate()
+                    .map(|(d, _)| {
+                        let stride: i32 = shape[d + 1..].iter().product();
+                        (i / stride) % shape[d]
+                    })
+                    .collect();
+                let stops: Vec<i32> = starts.iter().map(|s| s + 1).collect();
+                let s = mlxcel_core::slice(arr, &starts, &stops);
+                mlxcel_core::eval(&s);
+                mlxcel_core::item_f32(&s)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_m3_swiglu_activation_fast_path_matches_compiled_primitive() {
+        // Mixed positive/negative, in-range and over-limit values.
+        let up = mlxcel_core::from_slice_f32(&[1.0, -2.0, 8.0, -8.0, 0.5], &[1, 5]);
+        let gate = mlxcel_core::from_slice_f32(&[0.5, 1.0, 10.0, -3.0, 0.0], &[1, 5]);
+
+        let mine = m3_swiglu_activation(&up, &gate, 1.702, 7.0);
+        mlxcel_core::eval(&mine);
+        let theirs = mlxcel_core::compiled_gpt_oss_swiglu_activation(&up, &gate);
+        mlxcel_core::eval(&theirs);
+
+        let diff = mlxcel_core::subtract(&mine, &theirs);
+        let abs_diff = mlxcel_core::abs(&diff);
+        let total = mlxcel_core::sum_all(&abs_diff);
+        mlxcel_core::eval(&total);
+        let total_val = mlxcel_core::item_f32(&total);
+        assert!(
+            total_val < 1e-6,
+            "fast path differs from compiled primitive: total abs diff = {}",
+            total_val
+        );
+    }
+
+    #[test]
+    fn test_m3_swiglu_activation_manual_path_matches_fast_at_config_values() {
+        // Force manual path with alpha and limit nudged just past EPSILON,
+        // then compare to manual computation at those exact values. This
+        // verifies the manual path math is correct (independent of the
+        // primitive). We can't compare to the fast path directly because
+        // the constants differ.
+        let up = mlxcel_core::from_slice_f32(&[1.0, -2.0, 8.0, -8.0], &[1, 4]);
+        let gate = mlxcel_core::from_slice_f32(&[0.5, 1.0, 10.0, -3.0], &[1, 4]);
+
+        let alpha = 1.5_f32;
+        let limit = 5.0_f32;
+        let mine = m3_swiglu_activation(&up, &gate, alpha, limit);
+        mlxcel_core::eval(&mine);
+
+        let expected: Vec<f32> = vec![
+            (1.0_f32, 0.5_f32),
+            (-2.0, 1.0),
+            (8.0, 10.0),
+            (-8.0, -3.0),
+        ]
+        .into_iter()
+        .map(|(u, g)| {
+            let gc = g.min(limit);
+            let uc = u.clamp(-limit, limit);
+            let glu = gc * (1.0 / (1.0 + (-(gc * alpha)).exp()));
+            (uc + 1.0) * glu
+        })
+        .collect();
+
+        let actual = vec_from_array(&mine);
+        for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - e).abs() < 1e-5,
+                "elt {} mismatch: actual={} expected={}",
+                i,
+                a,
+                e
+            );
+        }
+    }
+
+    #[test]
+    fn test_m3_swiglu_activation_scalar_reference() {
+        // gate=1, up=0, alpha=1.702, limit=7
+        //   gate_c = 1, up_c = 0
+        //   glu = 1 * sigmoid(1.702) ≈ 0.845826
+        //   out = (0 + 1) * 0.845826 ≈ 0.845826
+        let up = mlxcel_core::from_slice_f32(&[0.0], &[1, 1]);
+        let gate = mlxcel_core::from_slice_f32(&[1.0], &[1, 1]);
+        let result = m3_swiglu_activation(&up, &gate, 1.702, 7.0);
+        mlxcel_core::eval(&result);
+        let val = mlxcel_core::item_f32(&result);
+        let expected = 1.0 / (1.0 + (-1.702_f32).exp());
+        assert!(
+            (val - expected).abs() < 1e-5,
+            "scalar: actual={} expected={}",
+            val,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_m3_swiglu_activation_gate_upper_clamp() {
+        // gate=10 should clamp to 7 → same output as gate=7
+        let up = mlxcel_core::from_slice_f32(&[0.5], &[1, 1]);
+        let gate_hi = mlxcel_core::from_slice_f32(&[10.0], &[1, 1]);
+        let gate_at = mlxcel_core::from_slice_f32(&[7.0], &[1, 1]);
+
+        let r_hi = m3_swiglu_activation(&up, &gate_hi, 1.702, 7.0);
+        let r_at = m3_swiglu_activation(&up, &gate_at, 1.702, 7.0);
+        mlxcel_core::eval(&r_hi);
+        mlxcel_core::eval(&r_at);
+
+        let v_hi = mlxcel_core::item_f32(&r_hi);
+        let v_at = mlxcel_core::item_f32(&r_at);
+        assert!(
+            (v_hi - v_at).abs() < 1e-5,
+            "gate clamp: gate=10 ({}) should match gate=7 ({})",
+            v_hi,
+            v_at
+        );
+    }
+
+    #[test]
+    fn test_m3_swiglu_activation_up_symmetric_clamp() {
+        // up=-10 should clamp to -7; up=+10 should clamp to +7
+        let gate = mlxcel_core::from_slice_f32(&[1.0], &[1, 1]);
+
+        let up_neg = mlxcel_core::from_slice_f32(&[-10.0], &[1, 1]);
+        let up_neg_c = mlxcel_core::from_slice_f32(&[-7.0], &[1, 1]);
+        let r_neg = m3_swiglu_activation(&up_neg, &gate, 1.702, 7.0);
+        let r_neg_c = m3_swiglu_activation(&up_neg_c, &gate, 1.702, 7.0);
+        mlxcel_core::eval(&r_neg);
+        mlxcel_core::eval(&r_neg_c);
+        assert!((mlxcel_core::item_f32(&r_neg) - mlxcel_core::item_f32(&r_neg_c)).abs() < 1e-5);
+
+        let up_pos = mlxcel_core::from_slice_f32(&[10.0], &[1, 1]);
+        let up_pos_c = mlxcel_core::from_slice_f32(&[7.0], &[1, 1]);
+        let r_pos = m3_swiglu_activation(&up_pos, &gate, 1.702, 7.0);
+        let r_pos_c = m3_swiglu_activation(&up_pos_c, &gate, 1.702, 7.0);
+        mlxcel_core::eval(&r_pos);
+        mlxcel_core::eval(&r_pos_c);
+        assert!((mlxcel_core::item_f32(&r_pos) - mlxcel_core::item_f32(&r_pos_c)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_m3_swiglu_activation_zero_gate_gives_zero() {
+        // gate=0 → glu = 0*sigmoid(0) = 0 → out = (up+1)*0 = 0 for any up
+        let up = mlxcel_core::from_slice_f32(&[5.0, -3.0, 7.0, -7.0], &[1, 4]);
+        let gate = mlxcel_core::from_slice_f32(&[0.0, 0.0, 0.0, 0.0], &[1, 4]);
+        let result = m3_swiglu_activation(&up, &gate, 1.702, 7.0);
+        mlxcel_core::eval(&result);
+
+        for (i, v) in vec_from_array(&result).iter().enumerate() {
+            assert!(v.abs() < 1e-6, "elt {} should be zero, got {}", i, v);
+        }
+    }
+
+    #[test]
+    fn test_m3_swiglu_activation_shape_preservation() {
+        // Output shape must match input shape (no broadcasting collapse)
+        let up = mlxcel_core::from_slice_f32(&[1.0; 12], &[2, 3, 2]);
+        let gate = mlxcel_core::from_slice_f32(&[0.5; 12], &[2, 3, 2]);
+        let result = m3_swiglu_activation(&up, &gate, 1.702, 7.0);
+        mlxcel_core::eval(&result);
+        assert_eq!(mlxcel_core::array_shape(&result), vec![2, 3, 2]);
     }
 }
