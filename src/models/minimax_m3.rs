@@ -35,6 +35,7 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
+use tracing::{debug, trace};
 
 /// Load a UnifiedLinear. Auto-detects quantization mode from weight shapes.
 fn load_linear(
@@ -182,6 +183,10 @@ pub struct SparseAttention {
     pub top_k: i32,
     pub index_dim: i32,
     pub sparse_local_block: i32,
+
+    // Set at construction by DecoderLayer::from_weights. Used by tracing
+    // events so we can attribute attention dispatch + shapes to a layer.
+    pub layer_idx: usize,
 }
 
 impl SparseAttention {
@@ -194,6 +199,15 @@ impl SparseAttention {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
         let l = shape[1];
+
+        trace!(
+            layer = self.layer_idx,
+            b = b,
+            l = l,
+            cache_offset = cache.offset,
+            mask_present = mask.is_some(),
+            "attn.forward entry"
+        );
 
         let q_raw = self.q_proj.forward(x);
         let k_raw = self.k_proj.forward(x);
@@ -229,13 +243,48 @@ impl SparseAttention {
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
 
         if self.index_q_proj.is_none() || l <= self.block_size {
+            debug!(
+                layer = self.layer_idx,
+                b = b,
+                l = l,
+                block_size = self.block_size,
+                has_index_proj = self.index_q_proj.is_some(),
+                branch = "dense",
+                reason = if self.index_q_proj.is_none() {
+                    "no_index_proj"
+                } else {
+                    "l_le_block_size"
+                },
+                "attn.dispatch"
+            );
             return self.dense_attention(&q, &cache_k, &cache_v, mask);
         }
 
         let num_blocks = l / self.block_size;
         if num_blocks <= self.top_k {
+            debug!(
+                layer = self.layer_idx,
+                b = b,
+                l = l,
+                num_blocks = num_blocks,
+                top_k = self.top_k,
+                branch = "dense",
+                reason = "num_blocks_le_top_k",
+                "attn.dispatch"
+            );
             return self.dense_attention(&q, &cache_k, &cache_v, mask);
         }
+
+        debug!(
+            layer = self.layer_idx,
+            b = b,
+            l = l,
+            num_blocks = num_blocks,
+            top_k = self.top_k,
+            block_size = self.block_size,
+            branch = "msa",
+            "attn.dispatch"
+        );
 
         // Index Branch - verified from Transformers MiniMaxM3VLIndexer
         let idx_q_raw = self.index_q_proj.as_ref().unwrap().forward(x);
@@ -393,6 +442,15 @@ impl SparseAttention {
         l: i32,
         num_blocks: i32,
     ) -> UniquePtr<MlxArray> {
+        debug!(
+            layer = self.layer_idx,
+            b = b,
+            l = l,
+            num_blocks = num_blocks,
+            top_k = self.top_k,
+            selected_shape = ?mlxcel_core::array_shape(selected),
+            "sparse_sdpa.entry"
+        );
         let k_blocked = mlxcel_core::reshape(
             k,
             &[
@@ -417,8 +475,23 @@ impl SparseAttention {
         let indices_flat =
             mlxcel_core::reshape(selected, &[b * self.num_kv_heads * num_blocks * self.top_k]);
 
+        debug!(
+            layer = self.layer_idx,
+            indices_flat_shape = ?mlxcel_core::array_shape(&indices_flat),
+            k_blocked_shape = ?mlxcel_core::array_shape(&k_blocked),
+            "sparse_sdpa.pre_gather"
+        );
+
         let k_gathered = mlxcel_core::take(&k_blocked, &indices_flat, 2);
         let v_gathered = mlxcel_core::take(&v_blocked, &indices_flat, 2);
+
+        debug!(
+            layer = self.layer_idx,
+            k_gathered_shape = ?mlxcel_core::array_shape(&k_gathered),
+            v_gathered_shape = ?mlxcel_core::array_shape(&v_gathered),
+            target_kv_len = self.top_k * self.block_size,
+            "sparse_sdpa.post_gather (next reshape may fail by num_kv_heads× if take semantics are wrong)"
+        );
 
         let kv_len = self.top_k * self.block_size;
         let k_flat = mlxcel_core::reshape(
@@ -484,8 +557,17 @@ impl SparseAttention {
             let k_len = mlxcel_core::array_shape(k)[2];
             let dtype = mlxcel_core::array_dtype(q);
             // ones[q_len, k_len], tril keeps the lower triangle (causal: q can see k<=q).
+            //
+            // CHUNKED PREFILL: q is the current chunk only; k is the FULL cache (prior chunks +
+            // current). The causal boundary for absolute position `cache_offset + i` (i in [0, q_len))
+            // is at k-position `cache_offset + i`, so the tril offset must be `cache_offset`, derivable
+            // from shapes as `k_len - q_len`. Using `0` here was correct only for the first chunk
+            // (cache_offset=0) and silently truncated every subsequent chunk's attention to the first
+            // `q_len` cached tokens — producing the "model can't attend to late prompt content"
+            // hallucination signature observed at any prompt length above the chunk size.
+            let causal_offset = k_len - q_len;
             let ones = mlxcel_core::full_f32(&[q_len, k_len], 1.0, dtype);
-            let lower = mlxcel_core::tril(&ones, 0);
+            let lower = mlxcel_core::tril(&ones, causal_offset);
             // additive = (lower == 1) ? 0 : -inf
             let zero = mlxcel_core::full_f32(&[1], 0.0, dtype);
             let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, dtype);
@@ -523,6 +605,7 @@ impl SparseAttention {
         args: &ModelArgs,
         prefix: &str,
         has_index: bool,
+        layer_idx: usize,
     ) -> Result<Self, String> {
         let g = args.group_size();
         let b = args.bits();
@@ -585,6 +668,7 @@ impl SparseAttention {
             top_k: sparse_cfg.sparse_topk_blocks as i32,
             index_dim: sparse_cfg.sparse_index_dim as i32,
             sparse_local_block: sparse_cfg.sparse_local_block as i32,
+            layer_idx,
         })
     }
 }
@@ -958,6 +1042,7 @@ pub struct DecoderLayer {
     pub moe: Option<SparseMoeBlock>,
     pub input_layernorm: GemmaRMSNorm,
     pub post_attention_layernorm: GemmaRMSNorm,
+    pub layer_idx: usize,
 }
 
 impl DecoderLayer {
@@ -967,6 +1052,11 @@ impl DecoderLayer {
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
+        trace!(
+            layer = self.layer_idx,
+            is_moe = self.moe.is_some(),
+            "decoder_layer.forward entry"
+        );
         let normed = self.input_layernorm.forward(x);
         let attn_out = self.self_attn.forward(&normed, cache, mask);
         let h = mlxcel_core::add(x, &attn_out);
@@ -990,7 +1080,13 @@ impl DecoderLayer {
         let prefix = format!("language_model.model.layers.{}", layer_idx);
         let use_msa = args.use_msa_for_layer(layer_idx);
 
-        let self_attn = SparseAttention::from_weights(weights, args, &format!("{}.self_attn", prefix), use_msa)?;
+        let self_attn = SparseAttention::from_weights(
+            weights,
+            args,
+            &format!("{}.self_attn", prefix),
+            use_msa,
+            layer_idx,
+        )?;
 
         let is_moe = args.text_config.moe_layer_freq[layer_idx];
         let mlp_prefix = format!("{}.mlp", prefix);
@@ -1027,6 +1123,7 @@ impl DecoderLayer {
             moe,
             input_layernorm,
             post_attention_layernorm,
+            layer_idx,
         })
     }
 }
@@ -1049,6 +1146,14 @@ impl MiniMaxM3Model {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
+        let in_shape = mlxcel_core::array_shape(input_ids);
+        debug!(
+            input_shape = ?in_shape,
+            cache_offset = caches.first().map(|c| c.offset).unwrap_or(-1),
+            mask_present = mask.is_some(),
+            num_layers = self.layers.len(),
+            "model.forward entry"
+        );
         let mut h = self.embed_tokens.forward(input_ids);
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &mut caches[i], mask);
