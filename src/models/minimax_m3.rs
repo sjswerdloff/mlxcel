@@ -668,63 +668,72 @@ impl SparseAttention {
         );
         let scores = mlxcel_core::multiply_scalar(&scores, self.scale);
 
-        // Key-position mask. The K-positions gathered for each q_block correspond to
-        // (selected_block * block_size + block_pos). With ceil-div padding, only the
-        // last block (index num_blocks - 1) contains zero-padded positions, and only
-        // at block_pos >= block_size - pad. When a q_block selects the last block,
-        // those tail positions must not contribute to softmax (else the padded
-        // K contributes weight to V=0 — output zero per position, but the softmax
-        // denominator is inflated and real attention is scaled down).
-        let scores = if pad > 0 {
-            let real_positions = self.block_size - pad;
-            let last_block_idx = mlxcel_core::from_slice_i32(&[num_blocks - 1], &[1]);
-            let is_last_block = mlxcel_core::equal(selected, &last_block_idx);
-            let pos_axis = mlxcel_core::arange_i32(0, self.block_size, 1);
-            let real_scalar = mlxcel_core::from_slice_i32(&[real_positions], &[1]);
-            let tail_invalid = mlxcel_core::greater_equal(&pos_axis, &real_scalar);
-            let is_last_block_5 = mlxcel_core::reshape(
-                &is_last_block,
-                &[b, self.num_kv_heads, num_blocks, self.top_k, 1],
-            );
-            let tail_invalid_5 =
-                mlxcel_core::reshape(&tail_invalid, &[1, 1, 1, 1, self.block_size]);
-            let invalid_shape =
-                [b, self.num_kv_heads, num_blocks, self.top_k, self.block_size];
-            let invalid = mlxcel_core::logical_and(
-                &mlxcel_core::broadcast_to(&is_last_block_5, &invalid_shape),
-                &mlxcel_core::broadcast_to(&tail_invalid_5, &invalid_shape),
-            );
-            let kv_len = self.top_k * self.block_size;
-            let invalid_flat =
-                mlxcel_core::reshape(&invalid, &[b, self.num_kv_heads, num_blocks, kv_len]);
-            // Expand num_kv_heads → num_heads via GQA-style broadcast.
-            let invalid_with_rep_dim = mlxcel_core::reshape(
-                &invalid_flat,
-                &[b, self.num_kv_heads, 1, num_blocks, kv_len],
-            );
-            let invalid_repeated = mlxcel_core::broadcast_to(
-                &invalid_with_rep_dim,
-                &[b, self.num_kv_heads, n_rep, num_blocks, kv_len],
-            );
-            let invalid_per_head = mlxcel_core::reshape(
-                &invalid_repeated,
-                &[b, self.num_heads, num_blocks, kv_len],
-            );
-            // Insert q-position axis (broadcast over block_size of q): final shape
-            // [b, num_heads, num_blocks, 1, kv_len] broadcasts against scores
-            // [b, num_heads, num_blocks, block_size, kv_len].
-            let invalid_with_q = mlxcel_core::reshape(
-                &invalid_per_head,
-                &[b, self.num_heads, num_blocks, 1, kv_len],
-            );
-            let scores_dtype = mlxcel_core::array_dtype(&scores);
-            let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, scores_dtype);
-            let zero = mlxcel_core::full_f32(&[1], 0.0, scores_dtype);
-            let additive = mlxcel_core::where_cond(&invalid_with_q, &neg_inf, &zero);
-            mlxcel_core::add(&scores, &additive)
-        } else {
-            scores
-        };
+        // Unified causal + padding + sentinel mask. For each (q absolute position p_q,
+        // gathered K absolute position p_k), the score is valid iff p_k <= p_q.
+        // This one mask subsumes three previously separate concerns:
+        //
+        //   1. Within-block causality. Q at q_block 7 pos 5 cannot attend to K at
+        //      q_block 7 pos 10 (HF reference encodes this through build_block_mask).
+        //   2. Future-block leakage via the top_k -1 sentinel issue. Early q_blocks
+        //      have fewer than top_k causally-valid k_blocks; argpartition picks
+        //      future blocks whose index-branch scores are -inf, but the gather
+        //      happily reads them. Their absolute K positions are > q's, so they
+        //      mask out here.
+        //   3. Divisibility padding. Padded K positions in the last block have
+        //      absolute positions >= l, and every real Q has position < l, so they
+        //      mask out here. (Subsumes the previous pad>0-only mask.)
+        //
+        // Applied unconditionally — causality concerns are independent of
+        // divisibility, and the cost is one extra elementwise compare per element.
+        //
+        // Reference: modeling_minimax_m3_vl.py:632-634 in MiniMaxM3VLIndexer.build_block_mask
+        // computes the same "k_positions > position_ids" causal mask over the full
+        // K span.
+        let p_q = mlxcel_core::arange_i32(0, padded_l, 1);
+        let p_q = mlxcel_core::reshape(&p_q, &[num_blocks, self.block_size]);
+
+        let selected_5 = mlxcel_core::reshape(
+            selected,
+            &[b, self.num_kv_heads, num_blocks, self.top_k, 1],
+        );
+        let block_size_scalar = mlxcel_core::from_slice_i32(&[self.block_size], &[1]);
+        let selected_x_bs = mlxcel_core::multiply(&selected_5, &block_size_scalar);
+        let k_pos_axis = mlxcel_core::arange_i32(0, self.block_size, 1);
+        let k_pos_axis_5 =
+            mlxcel_core::reshape(&k_pos_axis, &[1, 1, 1, 1, self.block_size]);
+        let p_k = mlxcel_core::add(&selected_x_bs, &k_pos_axis_5);
+        let p_k =
+            mlxcel_core::reshape(&p_k, &[b, self.num_kv_heads, num_blocks, kv_len]);
+
+        let mask_shape = [b, self.num_kv_heads, num_blocks, self.block_size, kv_len];
+        let p_q_5 = mlxcel_core::reshape(&p_q, &[1, 1, num_blocks, self.block_size, 1]);
+        let p_k_5 = mlxcel_core::reshape(
+            &p_k,
+            &[b, self.num_kv_heads, num_blocks, 1, kv_len],
+        );
+        let p_q_full = mlxcel_core::broadcast_to(&p_q_5, &mask_shape);
+        let p_k_full = mlxcel_core::broadcast_to(&p_k_5, &mask_shape);
+        let invalid_kv = mlxcel_core::greater(&p_k_full, &p_q_full);
+
+        // Expand num_kv_heads → num_heads via GQA-style 5D broadcast.
+        let invalid_with_rep_dim = mlxcel_core::reshape(
+            &invalid_kv,
+            &[b, self.num_kv_heads, 1, num_blocks, self.block_size, kv_len],
+        );
+        let invalid_repeated = mlxcel_core::broadcast_to(
+            &invalid_with_rep_dim,
+            &[b, self.num_kv_heads, n_rep, num_blocks, self.block_size, kv_len],
+        );
+        let invalid_per_head = mlxcel_core::reshape(
+            &invalid_repeated,
+            &[b, self.num_heads, num_blocks, self.block_size, kv_len],
+        );
+
+        let scores_dtype = mlxcel_core::array_dtype(&scores);
+        let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, scores_dtype);
+        let zero = mlxcel_core::full_f32(&[1], 0.0, scores_dtype);
+        let additive = mlxcel_core::where_cond(&invalid_per_head, &neg_inf, &zero);
+        let scores = mlxcel_core::add(&scores, &additive);
 
         let weights = mlxcel_core::softmax(&scores, -1);
         let out = mlxcel_core::matmul(&weights, &v_expanded);
