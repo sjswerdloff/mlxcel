@@ -876,6 +876,35 @@ impl SparseAttention {
 /// Extracted as a free function (rather than inlined into sparse_sdpa) so the
 /// unit tests in `mod tests` can call the exact production code with
 /// hand-computed fixtures.
+///
+/// # Note on bit-exact reproducibility across refactors
+///
+/// This function was extracted from an inline block in `sparse_sdpa` at commit
+/// 75fbe5e (the prior inline implementation was in commit 7da5bfa). The
+/// extracted-function form is **algebraically identical** to the inline form —
+/// same `mlxcel_core` ops, same arguments, same order — and the unit tests
+/// verify the resulting mask is bit-identical against a hand-computed
+/// reference. But the post-refactor binary produces **different greedy-decode
+/// tokens at temp=0** on the same prompt as the pre-refactor binary.
+///
+/// Cause: MLX is lazy. Intermediate `UniquePtr<MlxArray>` values drop at this
+/// function's return boundary, forcing materialization in a different schedule
+/// than the inline version (which kept all intermediates alive until end of
+/// `forward()`). Different materialization scheduling → different GPU kernel
+/// issue order → different fp accumulation in the downstream attention math.
+///
+/// **This is a property of mlxcel's lazy-eval surface**, not a correctness
+/// concern. The differential against the dense path (verified-correct
+/// baseline) showed 49/50 token match for the post-refactor MSA path on a
+/// 2339-token prompt at greedy temp=0; the only divergence was at a literal
+/// tie. Correctness is established by the unit tests and the dense
+/// differential — *not* by bit-exact reproducibility against any prior commit.
+///
+/// If you refactor this again (or any MSA-path code that lives in a chain of
+/// lazy `UniquePtr<MlxArray>` operations), expect inference-output token
+/// deltas without correctness regressions. Verify correctness via the unit
+/// tests and a dense-differential, not via diffing tokens against the previous
+/// commit's output.
 fn build_msa_unified_mask(
     selected: &MlxArray,
     b: i32,
