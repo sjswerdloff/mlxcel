@@ -260,7 +260,14 @@ impl SparseAttention {
             return self.dense_attention(&q, &cache_k, &cache_v, mask);
         }
 
-        let num_blocks = l / self.block_size;
+        // Ceil-div: the trailing partial block is a real block. Floor-div would silently
+        // drop the tail tokens (l - floor(l/bs)*bs of them), so any prompt whose length
+        // isn't a multiple of block_size would crash on the downstream reshape from
+        // `[..., l, d]` to `[..., num_blocks, block_size, d]`. Matches HF reference
+        // modeling_minimax_m3_vl.py:572 (`num_key_blocks = -(-k_len // block_size)`).
+        let num_blocks = (l + self.block_size - 1) / self.block_size;
+        let padded_l = num_blocks * self.block_size;
+        let pad = padded_l - l;
         if num_blocks <= self.top_k {
             debug!(
                 layer = self.layer_idx,
@@ -320,6 +327,32 @@ impl SparseAttention {
             mlxcel_core::fast_rope(&idx_q, self.rope_dims, false, self.rope_base, 1.0, offset);
         let idx_k =
             mlxcel_core::fast_rope(&idx_k, self.rope_dims, false, self.rope_base, 1.0, offset);
+
+        // Pad idx_q/idx_k along the sequence axis with -inf so the upcoming block reshape
+        // and max-pool can never let padded positions win. The real positions in the
+        // partial last block dominate the per-block max (any finite value beats -inf),
+        // so block scores stay real-valued. -inf appears in idx_q/idx_k only at padded
+        // tokens that are subsequently summarized away by max_axis; it never reaches a
+        // matmul.
+        let (idx_q, idx_k) = if pad > 0 {
+            let idx_dtype = mlxcel_core::array_dtype(&idx_q);
+            let pad_q = mlxcel_core::full_f32(
+                &[b, self.num_kv_heads, pad, self.index_dim],
+                f32::NEG_INFINITY,
+                idx_dtype,
+            );
+            let pad_k = mlxcel_core::full_f32(
+                &[b, 1, pad, self.index_dim],
+                f32::NEG_INFINITY,
+                idx_dtype,
+            );
+            (
+                mlxcel_core::concatenate(&idx_q, &pad_q, 2),
+                mlxcel_core::concatenate(&idx_k, &pad_k, 2),
+            )
+        } else {
+            (idx_q, idx_k)
+        };
 
         // Block max-pool scoring
         let k_blocked =
@@ -449,15 +482,61 @@ impl SparseAttention {
         l: i32,
         num_blocks: i32,
     ) -> UniquePtr<MlxArray> {
+        // Divisibility padding. The block reshapes below require q/k/v's seq axis to
+        // equal num_blocks * block_size. Caller has already used ceil-div for
+        // num_blocks; we pad Q, K, V (and later, the SDPA output) here. Pad value is
+        // zero — neutral in matmul — and an additive mask below sets padded-K scores
+        // to -inf before softmax so they contribute nothing.
+        let padded_l = num_blocks * self.block_size;
+        let pad = padded_l - l;
         debug!(
             layer = self.layer_idx,
             b = b,
             l = l,
+            padded_l = padded_l,
+            pad = pad,
             num_blocks = num_blocks,
             top_k = self.top_k,
             selected_shape = ?mlxcel_core::array_shape(selected),
             "sparse_sdpa.entry"
         );
+
+        // Materialize padded q/k/v if pad > 0; otherwise borrow input refs as-is.
+        // Storage variables live for the full function scope so the &MlxArray
+        // borrows below remain valid.
+        let q_padded_storage;
+        let k_padded_storage;
+        let v_padded_storage;
+        let (q, k, v): (&MlxArray, &MlxArray, &MlxArray) = if pad > 0 {
+            let q_dtype = mlxcel_core::array_dtype(q);
+            let kv_dtype = mlxcel_core::array_dtype(k);
+            let pad_q = mlxcel_core::full_f32(
+                &[b, self.num_heads, pad, self.head_dim],
+                0.0,
+                q_dtype,
+            );
+            let pad_k = mlxcel_core::full_f32(
+                &[b, self.num_kv_heads, pad, self.head_dim],
+                0.0,
+                kv_dtype,
+            );
+            let pad_v = mlxcel_core::full_f32(
+                &[b, self.num_kv_heads, pad, self.head_dim],
+                0.0,
+                kv_dtype,
+            );
+            q_padded_storage = mlxcel_core::concatenate(q, &pad_q, 2);
+            k_padded_storage = mlxcel_core::concatenate(k, &pad_k, 2);
+            v_padded_storage = mlxcel_core::concatenate(v, &pad_v, 2);
+            (
+                q_padded_storage.as_ref().unwrap(),
+                k_padded_storage.as_ref().unwrap(),
+                v_padded_storage.as_ref().unwrap(),
+            )
+        } else {
+            (q, k, v)
+        };
+
         let k_blocked = mlxcel_core::reshape(
             k,
             &[
@@ -560,18 +639,103 @@ impl SparseAttention {
         );
 
         let n_rep = self.num_heads / self.num_kv_heads;
-        let k_expanded = mlxcel_core::utils::repeat_kv(&k_flat, n_rep);
-        let v_expanded = mlxcel_core::utils::repeat_kv(&v_flat, n_rep);
+        // 5D GQA expansion. mlxcel_core::utils::repeat_kv assumes a 4D shape
+        // [batch, n_kv_heads, seq_len, head_dim] and reads shape[3] as head_dim. Our
+        // tensors here are 5D [b, num_kv_heads, num_blocks, kv_len, head_dim]; calling
+        // repeat_kv on them mis-derives head_dim = kv_len and crashes the downstream
+        // reshape with a 128× size mismatch. Inline the broadcast pattern for 5D so
+        // each kv_head's [num_blocks, kv_len, head_dim] block is repeated n_rep times.
+        let kv_5d_with_rep = |x: &MlxArray| -> UniquePtr<MlxArray> {
+            let x_view = mlxcel_core::reshape(
+                x,
+                &[b, self.num_kv_heads, 1, num_blocks, kv_len, self.head_dim],
+            );
+            let x_broad = mlxcel_core::broadcast_to(
+                &x_view,
+                &[b, self.num_kv_heads, n_rep, num_blocks, kv_len, self.head_dim],
+            );
+            mlxcel_core::reshape(
+                &x_broad,
+                &[b, self.num_heads, num_blocks, kv_len, self.head_dim],
+            )
+        };
+        let k_expanded = kv_5d_with_rep(&k_flat);
+        let v_expanded = kv_5d_with_rep(&v_flat);
 
         let scores = mlxcel_core::matmul(
             &q_blocked,
             &mlxcel_core::transpose_axes(&k_expanded, &[0, 1, 2, 4, 3]),
         );
         let scores = mlxcel_core::multiply_scalar(&scores, self.scale);
+
+        // Key-position mask. The K-positions gathered for each q_block correspond to
+        // (selected_block * block_size + block_pos). With ceil-div padding, only the
+        // last block (index num_blocks - 1) contains zero-padded positions, and only
+        // at block_pos >= block_size - pad. When a q_block selects the last block,
+        // those tail positions must not contribute to softmax (else the padded
+        // K contributes weight to V=0 — output zero per position, but the softmax
+        // denominator is inflated and real attention is scaled down).
+        let scores = if pad > 0 {
+            let real_positions = self.block_size - pad;
+            let last_block_idx = mlxcel_core::from_slice_i32(&[num_blocks - 1], &[1]);
+            let is_last_block = mlxcel_core::equal(selected, &last_block_idx);
+            let pos_axis = mlxcel_core::arange_i32(0, self.block_size, 1);
+            let real_scalar = mlxcel_core::from_slice_i32(&[real_positions], &[1]);
+            let tail_invalid = mlxcel_core::greater_equal(&pos_axis, &real_scalar);
+            let is_last_block_5 = mlxcel_core::reshape(
+                &is_last_block,
+                &[b, self.num_kv_heads, num_blocks, self.top_k, 1],
+            );
+            let tail_invalid_5 =
+                mlxcel_core::reshape(&tail_invalid, &[1, 1, 1, 1, self.block_size]);
+            let invalid_shape =
+                [b, self.num_kv_heads, num_blocks, self.top_k, self.block_size];
+            let invalid = mlxcel_core::logical_and(
+                &mlxcel_core::broadcast_to(&is_last_block_5, &invalid_shape),
+                &mlxcel_core::broadcast_to(&tail_invalid_5, &invalid_shape),
+            );
+            let kv_len = self.top_k * self.block_size;
+            let invalid_flat =
+                mlxcel_core::reshape(&invalid, &[b, self.num_kv_heads, num_blocks, kv_len]);
+            // Expand num_kv_heads → num_heads via GQA-style broadcast.
+            let invalid_with_rep_dim = mlxcel_core::reshape(
+                &invalid_flat,
+                &[b, self.num_kv_heads, 1, num_blocks, kv_len],
+            );
+            let invalid_repeated = mlxcel_core::broadcast_to(
+                &invalid_with_rep_dim,
+                &[b, self.num_kv_heads, n_rep, num_blocks, kv_len],
+            );
+            let invalid_per_head = mlxcel_core::reshape(
+                &invalid_repeated,
+                &[b, self.num_heads, num_blocks, kv_len],
+            );
+            // Insert q-position axis (broadcast over block_size of q): final shape
+            // [b, num_heads, num_blocks, 1, kv_len] broadcasts against scores
+            // [b, num_heads, num_blocks, block_size, kv_len].
+            let invalid_with_q = mlxcel_core::reshape(
+                &invalid_per_head,
+                &[b, self.num_heads, num_blocks, 1, kv_len],
+            );
+            let scores_dtype = mlxcel_core::array_dtype(&scores);
+            let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, scores_dtype);
+            let zero = mlxcel_core::full_f32(&[1], 0.0, scores_dtype);
+            let additive = mlxcel_core::where_cond(&invalid_with_q, &neg_inf, &zero);
+            mlxcel_core::add(&scores, &additive)
+        } else {
+            scores
+        };
+
         let weights = mlxcel_core::softmax(&scores, -1);
         let out = mlxcel_core::matmul(&weights, &v_expanded);
 
-        let out = mlxcel_core::reshape(&out, &[b, self.num_heads, l, self.head_dim]);
+        // Reshape to padded length first, then slice back to the real q length.
+        let out = mlxcel_core::reshape(&out, &[b, self.num_heads, padded_l, self.head_dim]);
+        let out = if pad > 0 {
+            mlxcel_core::slice(&out, &[0, 0, 0, 0], &[b, self.num_heads, l, self.head_dim])
+        } else {
+            out
+        };
         let out = mlxcel_core::transpose_axes(&out, &[0, 2, 1, 3]);
         let out = mlxcel_core::reshape(&out, &[b, l, self.num_heads * self.head_dim]);
         self.o_proj.forward(&out)
