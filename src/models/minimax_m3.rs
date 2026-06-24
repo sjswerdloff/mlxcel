@@ -668,71 +668,21 @@ impl SparseAttention {
         );
         let scores = mlxcel_core::multiply_scalar(&scores, self.scale);
 
-        // Unified causal + padding + sentinel mask. For each (q absolute position p_q,
-        // gathered K absolute position p_k), the score is valid iff p_k <= p_q.
-        // This one mask subsumes three previously separate concerns:
-        //
-        //   1. Within-block causality. Q at q_block 7 pos 5 cannot attend to K at
-        //      q_block 7 pos 10 (HF reference encodes this through build_block_mask).
-        //   2. Future-block leakage via the top_k -1 sentinel issue. Early q_blocks
-        //      have fewer than top_k causally-valid k_blocks; argpartition picks
-        //      future blocks whose index-branch scores are -inf, but the gather
-        //      happily reads them. Their absolute K positions are > q's, so they
-        //      mask out here.
-        //   3. Divisibility padding. Padded K positions in the last block have
-        //      absolute positions >= l, and every real Q has position < l, so they
-        //      mask out here. (Subsumes the previous pad>0-only mask.)
-        //
-        // Applied unconditionally — causality concerns are independent of
-        // divisibility, and the cost is one extra elementwise compare per element.
-        //
-        // Reference: modeling_minimax_m3_vl.py:632-634 in MiniMaxM3VLIndexer.build_block_mask
-        // computes the same "k_positions > position_ids" causal mask over the full
-        // K span.
-        let p_q = mlxcel_core::arange_i32(0, padded_l, 1);
-        let p_q = mlxcel_core::reshape(&p_q, &[num_blocks, self.block_size]);
-
-        let selected_5 = mlxcel_core::reshape(
-            selected,
-            &[b, self.num_kv_heads, num_blocks, self.top_k, 1],
-        );
-        let block_size_scalar = mlxcel_core::from_slice_i32(&[self.block_size], &[1]);
-        let selected_x_bs = mlxcel_core::multiply(&selected_5, &block_size_scalar);
-        let k_pos_axis = mlxcel_core::arange_i32(0, self.block_size, 1);
-        let k_pos_axis_5 =
-            mlxcel_core::reshape(&k_pos_axis, &[1, 1, 1, 1, self.block_size]);
-        let p_k = mlxcel_core::add(&selected_x_bs, &k_pos_axis_5);
-        let p_k =
-            mlxcel_core::reshape(&p_k, &[b, self.num_kv_heads, num_blocks, kv_len]);
-
-        let mask_shape = [b, self.num_kv_heads, num_blocks, self.block_size, kv_len];
-        let p_q_5 = mlxcel_core::reshape(&p_q, &[1, 1, num_blocks, self.block_size, 1]);
-        let p_k_5 = mlxcel_core::reshape(
-            &p_k,
-            &[b, self.num_kv_heads, num_blocks, 1, kv_len],
-        );
-        let p_q_full = mlxcel_core::broadcast_to(&p_q_5, &mask_shape);
-        let p_k_full = mlxcel_core::broadcast_to(&p_k_5, &mask_shape);
-        let invalid_kv = mlxcel_core::greater(&p_k_full, &p_q_full);
-
-        // Expand num_kv_heads → num_heads via GQA-style 5D broadcast.
-        let invalid_with_rep_dim = mlxcel_core::reshape(
-            &invalid_kv,
-            &[b, self.num_kv_heads, 1, num_blocks, self.block_size, kv_len],
-        );
-        let invalid_repeated = mlxcel_core::broadcast_to(
-            &invalid_with_rep_dim,
-            &[b, self.num_kv_heads, n_rep, num_blocks, self.block_size, kv_len],
-        );
-        let invalid_per_head = mlxcel_core::reshape(
-            &invalid_repeated,
-            &[b, self.num_heads, num_blocks, self.block_size, kv_len],
-        );
-
+        // Unified causal + padding + sentinel mask. See build_msa_unified_mask
+        // below for the full rationale and the HF cross-reference.
         let scores_dtype = mlxcel_core::array_dtype(&scores);
-        let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, scores_dtype);
-        let zero = mlxcel_core::full_f32(&[1], 0.0, scores_dtype);
-        let additive = mlxcel_core::where_cond(&invalid_per_head, &neg_inf, &zero);
+        let additive = build_msa_unified_mask(
+            selected,
+            b,
+            self.num_kv_heads,
+            self.num_heads,
+            n_rep,
+            num_blocks,
+            self.top_k,
+            self.block_size,
+            padded_l,
+            scores_dtype,
+        );
         let scores = mlxcel_core::add(&scores, &additive);
 
         let weights = mlxcel_core::softmax(&scores, -1);
@@ -889,6 +839,94 @@ impl SparseAttention {
             layer_idx,
         })
     }
+}
+
+// ============================================================================
+// MSA unified causal+padding+sentinel mask
+// ============================================================================
+
+/// Build the unified causal+padding+sentinel mask for MSA's sparse_sdpa.
+///
+/// For each (q absolute position p_q, gathered K absolute position p_k), the
+/// score is valid iff `p_k <= p_q`. Returns an additive mask of shape
+/// `[b, num_heads, num_blocks, block_size, top_k * block_size]` containing
+/// `-inf` at invalid positions and `0` at valid positions, ready to be added
+/// to the score tensor before softmax.
+///
+/// One mask subsumes three previously separate concerns:
+///
+///   1. **Within-block causality.** Q at q_block 7 pos 5 cannot attend to K at
+///      q_block 7 pos 10 (HF reference encodes this through build_block_mask).
+///   2. **Future-block leakage via the top_k -1 sentinel issue.** Early q_blocks
+///      have fewer than top_k causally-valid k_blocks; argpartition picks
+///      future blocks whose index-branch scores are -inf, but the gather
+///      happily reads them. Their absolute K positions are > q's, so they
+///      mask out here.
+///   3. **Divisibility padding.** Padded K positions in the last block have
+///      absolute positions >= l, and every real Q has position < l, so they
+///      mask out here.
+///
+/// Applied unconditionally — causality concerns are independent of
+/// divisibility, and the cost is one extra elementwise compare per element.
+///
+/// Reference: `modeling_minimax_m3_vl.py:632-634` in
+/// `MiniMaxM3VLIndexer.build_block_mask` computes the same
+/// `k_positions > position_ids` causal mask over the full K span.
+///
+/// Extracted as a free function (rather than inlined into sparse_sdpa) so the
+/// unit tests in `mod tests` can call the exact production code with
+/// hand-computed fixtures.
+fn build_msa_unified_mask(
+    selected: &MlxArray,
+    b: i32,
+    num_kv_heads: i32,
+    num_heads: i32,
+    n_rep: i32,
+    num_blocks: i32,
+    top_k: i32,
+    block_size: i32,
+    padded_l: i32,
+    scores_dtype: i32,
+) -> UniquePtr<MlxArray> {
+    let kv_len = top_k * block_size;
+
+    let p_q = mlxcel_core::arange_i32(0, padded_l, 1);
+    let p_q = mlxcel_core::reshape(&p_q, &[num_blocks, block_size]);
+
+    let selected_5 = mlxcel_core::reshape(
+        selected,
+        &[b, num_kv_heads, num_blocks, top_k, 1],
+    );
+    let block_size_scalar = mlxcel_core::from_slice_i32(&[block_size], &[1]);
+    let selected_x_bs = mlxcel_core::multiply(&selected_5, &block_size_scalar);
+    let k_pos_axis = mlxcel_core::arange_i32(0, block_size, 1);
+    let k_pos_axis_5 = mlxcel_core::reshape(&k_pos_axis, &[1, 1, 1, 1, block_size]);
+    let p_k = mlxcel_core::add(&selected_x_bs, &k_pos_axis_5);
+    let p_k = mlxcel_core::reshape(&p_k, &[b, num_kv_heads, num_blocks, kv_len]);
+
+    let mask_shape = [b, num_kv_heads, num_blocks, block_size, kv_len];
+    let p_q_5 = mlxcel_core::reshape(&p_q, &[1, 1, num_blocks, block_size, 1]);
+    let p_k_5 = mlxcel_core::reshape(&p_k, &[b, num_kv_heads, num_blocks, 1, kv_len]);
+    let p_q_full = mlxcel_core::broadcast_to(&p_q_5, &mask_shape);
+    let p_k_full = mlxcel_core::broadcast_to(&p_k_5, &mask_shape);
+    let invalid_kv = mlxcel_core::greater(&p_k_full, &p_q_full);
+
+    let invalid_with_rep_dim = mlxcel_core::reshape(
+        &invalid_kv,
+        &[b, num_kv_heads, 1, num_blocks, block_size, kv_len],
+    );
+    let invalid_repeated = mlxcel_core::broadcast_to(
+        &invalid_with_rep_dim,
+        &[b, num_kv_heads, n_rep, num_blocks, block_size, kv_len],
+    );
+    let invalid_per_head = mlxcel_core::reshape(
+        &invalid_repeated,
+        &[b, num_heads, num_blocks, block_size, kv_len],
+    );
+
+    let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, scores_dtype);
+    let zero = mlxcel_core::full_f32(&[1], 0.0, scores_dtype);
+    mlxcel_core::where_cond(&invalid_per_head, &neg_inf, &zero)
 }
 
 // ============================================================================
@@ -1591,6 +1629,200 @@ mod tests {
                 rust_result,
                 py_result
             );
+        }
+    }
+
+    /// Read one element from the mask at (head, q_block, q_pos, k_idx) for batch 0.
+    /// Returns 0.0 (valid) or -inf (invalid).
+    fn mask_at(mask: &MlxArray, head: i32, q_block: i32, q_pos: i32, k_idx: i32) -> f32 {
+        let single = mlxcel_core::slice(
+            mask,
+            &[0, head, q_block, q_pos, k_idx],
+            &[1, head + 1, q_block + 1, q_pos + 1, k_idx + 1],
+        );
+        mlxcel_core::eval(&single);
+        mlxcel_core::item_f32(&single)
+    }
+
+    /// Unit fixture for build_msa_unified_mask. Small dimensions so every position
+    /// is enumerable by hand, but large enough to exercise GQA replication
+    /// (n_rep=2), future-block selection (kv_head 1 picks block 2 from q_block 0),
+    /// and the divisibility-padding case (padded_l=6, l=5 → last block holds one
+    /// real position and one padded position).
+    ///
+    /// Layout:
+    ///   b=1, num_kv_heads=2, num_heads=4, n_rep=2,
+    ///   num_blocks=3, top_k=2, block_size=2, kv_len=4, padded_l=6
+    ///
+    /// selected[1, 2, 3, 2]:
+    ///   kv_head 0 picks blocks [0,1] for every q_block — pure past selections
+    ///   kv_head 1 picks [0,2], [1,2], [0,1] — future-block selection at q_blocks 0, 1
+    ///
+    /// Reference computation (in the test body):
+    ///   p_q[q_block, q_pos] = q_block * block_size + q_pos
+    ///   p_k[kv_head, q_block, top_k_idx, block_pos]
+    ///     = selected[kv_head, q_block, top_k_idx] * block_size + block_pos
+    ///   invalid = (p_k > p_q)
+    ///
+    /// GQA: head 0,1 use kv_head 0; head 2,3 use kv_head 1.
+    fn msa_mask_fixture() -> UniquePtr<MlxArray> {
+        let selected_data: &[i32] = &[
+            // kv_head 0: blocks [0,1] for each q_block (past selections)
+            0, 1, 0, 1, 0, 1,
+            // kv_head 1: blocks [0,2], [1,2], [0,1] (future-block at q_blocks 0,1)
+            0, 2, 1, 2, 0, 1,
+        ];
+        let selected = mlxcel_core::from_slice_i32(selected_data, &[1, 2, 3, 2]);
+        build_msa_unified_mask(
+            &selected,
+            /* b */ 1,
+            /* num_kv_heads */ 2,
+            /* num_heads */ 4,
+            /* n_rep */ 2,
+            /* num_blocks */ 3,
+            /* top_k */ 2,
+            /* block_size */ 2,
+            /* padded_l */ 6,
+            /* scores_dtype */ mlxcel_core::dtype::FLOAT32,
+        )
+    }
+
+    #[test]
+    fn test_msa_mask_self_attention_is_valid() {
+        // head 0, q_block 0, q_pos 0 (p_q=0), k_idx 0 (k_block 0 pos 0, p_k=0).
+        // p_k == p_q → valid. Smallest-stakes sanity check.
+        let mask = msa_mask_fixture();
+        assert_eq!(mask_at(&mask, 0, 0, 0, 0), 0.0, "self-attention must be valid");
+    }
+
+    #[test]
+    fn test_msa_mask_within_block_causality() {
+        // head 0, q_block 0, q_pos 0 (p_q=0), k_idx 1 (k_block 0 pos 1, p_k=1).
+        // Same block, K position is future → must be invalid.
+        // This was THE bug pre-unified-mask: the prior sparse_sdpa applied
+        // only block-level causality and let within-block future K positions
+        // contribute to softmax.
+        let mask = msa_mask_fixture();
+        let v = mask_at(&mask, 0, 0, 0, 1);
+        assert!(
+            v.is_infinite() && v < 0.0,
+            "within-block causality must mask: got {} expected -inf",
+            v
+        );
+    }
+
+    #[test]
+    fn test_msa_mask_future_block_leakage_masked() {
+        // head 2 (kv_head 1), q_block 0 selects k_blocks [0, 2].
+        // q_pos 0 (p_q=0), k_idx 2 = k_block 2 pos 0 (p_k=4).
+        // Pre-unified mask, the gather happily read this -inf-scored future
+        // block. Unified mask: p_k > p_q → invalid.
+        let mask = msa_mask_fixture();
+        let v = mask_at(&mask, 2, 0, 0, 2);
+        assert!(
+            v.is_infinite() && v < 0.0,
+            "future-block selection must mask: got {} expected -inf",
+            v
+        );
+    }
+
+    #[test]
+    fn test_msa_mask_padded_position_masked() {
+        // head 2, q_block 0 selects k_block 2 which contains positions {4, 5}.
+        // Position 5 is the padded position (l=5, padded_l=6).
+        // q_pos 0 (p_q=0), k_idx 3 = k_block 2 pos 1 (p_k=5) → invalid.
+        let mask = msa_mask_fixture();
+        let v = mask_at(&mask, 2, 0, 0, 3);
+        assert!(
+            v.is_infinite() && v < 0.0,
+            "padded K position must mask: got {} expected -inf",
+            v
+        );
+    }
+
+    #[test]
+    fn test_msa_mask_causally_past_block_valid() {
+        // head 0, q_block 2, q_pos 0 (p_q=4). Selected = [0, 1] both in the past.
+        // k_idx 0 = k_block 0 pos 0 (p_k=0) → 0 <= 4 → valid.
+        // k_idx 3 = k_block 1 pos 1 (p_k=3) → 3 <= 4 → valid.
+        let mask = msa_mask_fixture();
+        assert_eq!(mask_at(&mask, 0, 2, 0, 0), 0.0, "past block must be valid");
+        assert_eq!(mask_at(&mask, 0, 2, 0, 3), 0.0, "past block last pos must be valid");
+    }
+
+    #[test]
+    fn test_msa_mask_gqa_replication_within_kv_group() {
+        // head 1 shares kv_head 0 with head 0; head 3 shares kv_head 1 with head 2.
+        // The mask MUST be identical inside each GQA group at every (q, k) position.
+        let mask = msa_mask_fixture();
+        for q_block in 0..3 {
+            for q_pos in 0..2 {
+                for k_idx in 0..4 {
+                    let h0 = mask_at(&mask, 0, q_block, q_pos, k_idx);
+                    let h1 = mask_at(&mask, 1, q_block, q_pos, k_idx);
+                    let h2 = mask_at(&mask, 2, q_block, q_pos, k_idx);
+                    let h3 = mask_at(&mask, 3, q_block, q_pos, k_idx);
+                    // Compare as bit patterns so -inf == -inf passes.
+                    assert_eq!(
+                        h0.to_bits(),
+                        h1.to_bits(),
+                        "kv_head 0 group (heads 0,1) mismatch at q_block={} q_pos={} k_idx={}",
+                        q_block,
+                        q_pos,
+                        k_idx,
+                    );
+                    assert_eq!(
+                        h2.to_bits(),
+                        h3.to_bits(),
+                        "kv_head 1 group (heads 2,3) mismatch at q_block={} q_pos={} k_idx={}",
+                        q_block,
+                        q_pos,
+                        k_idx,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_msa_mask_full_exhaustive_table() {
+        // Ground truth: every (head, q_block, q_pos, k_idx) compared to a hand
+        // table. If anything in the mask construction regresses, this catches it.
+        // Layout repeats the fixture math: see msa_mask_fixture doc comment.
+        let mask = msa_mask_fixture();
+        // selected[kv_head][q_block][top_k_idx]:
+        let selected = [
+            [[0i32, 1], [0, 1], [0, 1]], // kv_head 0
+            [[0, 2], [1, 2], [0, 1]],    // kv_head 1
+        ];
+        let block_size = 2i32;
+        for head in 0..4 {
+            let kv_head = (head / 2) as usize;
+            for q_block in 0..3 {
+                for q_pos in 0..2 {
+                    let p_q = q_block * block_size + q_pos;
+                    for k_idx in 0..4 {
+                        let top_k_idx = (k_idx / block_size) as usize;
+                        let block_pos = k_idx % block_size;
+                        let p_k =
+                            selected[kv_head][q_block as usize][top_k_idx] * block_size
+                                + block_pos;
+                        let expected_invalid = p_k > p_q;
+                        let actual = mask_at(&mask, head, q_block, q_pos, k_idx);
+                        if expected_invalid {
+                            assert!(
+                                actual.is_infinite() && actual < 0.0,
+                                "expected -inf at head={head} qb={q_block} qp={q_pos} ki={k_idx} (p_q={p_q} p_k={p_k}); got {actual}",
+                            );
+                        } else {
+                            assert_eq!(
+                                actual, 0.0,
+                                "expected 0.0 at head={head} qb={q_block} qp={q_pos} ki={k_idx} (p_q={p_q} p_k={p_k})",
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
