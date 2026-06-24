@@ -286,23 +286,30 @@ impl SparseAttention {
             "attn.dispatch"
         );
 
-        // Index Branch - verified from Transformers MiniMaxM3VLIndexer
+        // Index Branch - verified from Transformers MiniMaxM3VLIndexer.
+        //
+        // Order must be RESHAPE → NORM (matching the regular Q/K norm path above and
+        // the HF reference). GemmaRMSNorm's `weight` is shape [index_dim] = [128];
+        // applying it to the raw projection output (last dim = num_kv_heads * index_dim
+        // = 512) throws "[rms_norm] (*weight) must have the same size as the last
+        // dimension of x but has 128 elements." Reshape into per-head shape first so the
+        // 128-element norm weight aligns with the head-dim axis.
         let idx_q_raw = self.index_q_proj.as_ref().unwrap().forward(x);
         let idx_k_raw = self.index_k_proj.as_ref().unwrap().forward(x);
 
+        let idx_q = mlxcel_core::reshape(&idx_q_raw, &[b, l, self.num_kv_heads, self.index_dim]);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[b, l, 1, self.index_dim]);
+
         let idx_q = if let Some(ref n) = self.index_q_norm {
-            n.forward(&idx_q_raw)
+            n.forward(&idx_q)
         } else {
-            idx_q_raw
+            idx_q
         };
         let idx_k = if let Some(ref n) = self.index_k_norm {
-            n.forward(&idx_k_raw)
+            n.forward(&idx_k)
         } else {
-            idx_k_raw
+            idx_k
         };
-
-        let idx_q = mlxcel_core::reshape(&idx_q, &[b, l, self.num_kv_heads, self.index_dim]);
-        let idx_k = mlxcel_core::reshape(&idx_k, &[b, l, 1, self.index_dim]);
 
         let idx_q = mlxcel_core::transpose_axes(&idx_q, &[0, 2, 1, 3]);
         let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
@@ -472,25 +479,63 @@ impl SparseAttention {
             ],
         );
 
-        let indices_flat =
-            mlxcel_core::reshape(selected, &[b * self.num_kv_heads * num_blocks * self.top_k]);
+        // Per-(kv_head, q_block) gather: each q_block has its own top_k key block
+        // indices into the same global set of num_blocks key blocks. take_along_axis
+        // requires indices to match the source rank with broadcast along non-gather
+        // axes. We add a q_block axis to k/v_blocked (broadcast view, not materialized
+        // — MLX evaluates lazily) and reshape `selected` to broadcast over block_size
+        // and head_dim. take_along_axis on the new k_blocks axis (axis=3) then
+        // produces the per-(kv_head, q_block) gather we actually want.
+        //
+        // Shape walk:
+        //   k_blocked:                       [b, kv_h, num_blocks, block_size, head_dim]
+        //   → reshape (unsqueeze q_block):   [b, kv_h, 1, num_blocks, block_size, head_dim]
+        //   → broadcast to q_block axis:     [b, kv_h, num_blocks, num_blocks, block_size, head_dim]
+        //   selected:                        [b, kv_h, num_blocks, top_k]
+        //   → reshape (unsqueeze 2 trailing):[b, kv_h, num_blocks, top_k, 1, 1]
+        //   → broadcast over inner dims:     [b, kv_h, num_blocks, top_k, block_size, head_dim]
+        //   take_along_axis on axis 3:       [b, kv_h, num_blocks, top_k, block_size, head_dim]
+        //   reshape to combine top_k+block:  [b, kv_h, num_blocks, top_k*block_size, head_dim]
+        //
+        // This replaces the previous `take(..., axis=2)` path, which used global gather
+        // semantics (single indices array applied uniformly across all kv_heads and
+        // q_blocks). That produced a result with a `num_kv_heads`-fold element-count
+        // mismatch on the subsequent reshape and would have crashed any prompt long
+        // enough to make MSA fire (l > 2048 in a single forward call). Unreachable
+        // under mlxcel's default prefill_chunk_size=512, hence latent until now.
+        let bk_view = [b, self.num_kv_heads, 1, num_blocks, self.block_size, self.head_dim];
+        let bk_target = [b, self.num_kv_heads, num_blocks, num_blocks, self.block_size, self.head_dim];
+        let k_expanded = mlxcel_core::broadcast_to(
+            &mlxcel_core::reshape(&k_blocked, &bk_view),
+            &bk_target,
+        );
+        let v_expanded = mlxcel_core::broadcast_to(
+            &mlxcel_core::reshape(&v_blocked, &bk_view),
+            &bk_target,
+        );
+
+        let sel_view = [b, self.num_kv_heads, num_blocks, self.top_k, 1, 1];
+        let sel_target =
+            [b, self.num_kv_heads, num_blocks, self.top_k, self.block_size, self.head_dim];
+        let sel_broadcast = mlxcel_core::broadcast_to(
+            &mlxcel_core::reshape(selected, &sel_view),
+            &sel_target,
+        );
 
         debug!(
             layer = self.layer_idx,
-            indices_flat_shape = ?mlxcel_core::array_shape(&indices_flat),
-            k_blocked_shape = ?mlxcel_core::array_shape(&k_blocked),
-            "sparse_sdpa.pre_gather"
+            k_expanded_shape = ?mlxcel_core::array_shape(&k_expanded),
+            sel_broadcast_shape = ?mlxcel_core::array_shape(&sel_broadcast),
+            "sparse_sdpa.pre_gather (take_along_axis on axis=3)"
         );
 
-        let k_gathered = mlxcel_core::take(&k_blocked, &indices_flat, 2);
-        let v_gathered = mlxcel_core::take(&v_blocked, &indices_flat, 2);
+        let k_gathered = mlxcel_core::take_along_axis(&k_expanded, &sel_broadcast, 3);
+        let v_gathered = mlxcel_core::take_along_axis(&v_expanded, &sel_broadcast, 3);
 
         debug!(
             layer = self.layer_idx,
             k_gathered_shape = ?mlxcel_core::array_shape(&k_gathered),
-            v_gathered_shape = ?mlxcel_core::array_shape(&v_gathered),
-            target_kv_len = self.top_k * self.block_size,
-            "sparse_sdpa.post_gather (next reshape may fail by num_kv_heads× if take semantics are wrong)"
+            "sparse_sdpa.post_gather"
         );
 
         let kv_len = self.top_k * self.block_size;
