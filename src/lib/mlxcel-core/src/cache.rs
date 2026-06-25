@@ -428,6 +428,30 @@ pub struct KVCache {
     /// `Send` analysis in the introducing PR — `KVCache` is never required to
     /// be `Send`/`Sync`).
     pub(crate) paged_backing: Option<PagedBacking>,
+
+    // ─── M3 indexer K cache (model-specific opt-in state) ──────────────────
+    //
+    // MiniMax-M3's MSA path has a SECOND projection (`index_k_proj`) whose
+    // output is used to score key BLOCKS for top-k block selection. This
+    // projection is per-token like main K, and like main K it must accumulate
+    // across chunked-prefill / multi-turn calls so the selector sees the
+    // full cached prefix (not just the current chunk). Other models do not
+    // use this field; it stays `None` for them. Documented here to keep
+    // KVCache the single per-layer per-request state container without
+    // forcing a per-model branch into the model `forward` trait.
+    //
+    // Shape (when populated): `[b, 1, m3_idx_offset, index_dim]`, holding the
+    // POST-RoPE idx_k projections accumulated over every prior forward. The
+    // single head dim (1) matches `index_k_proj`'s output (one projection
+    // per token, shared across kv_heads — the indexer is a per-head selector
+    // built on a shared key-side representation).
+    //
+    // Offset is tracked separately because the cached idx_k may be `None`
+    // even when the main K cache has been written (defensive — fresh-init
+    // path), and zero offset with `Some(idx_k)` is theoretically possible
+    // during weird in-place mutations.
+    pub(crate) m3_idx_k: Option<UniquePtr<MlxArray>>,
+    pub(crate) m3_idx_offset: i32,
 }
 
 /// Shared handle that makes one [`KVCache`] write/read through a pooled paged
@@ -488,6 +512,8 @@ impl KVCache {
             delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
             delegated_fp16_sidecar_policy: turbo::delegated_fp16_sidecar_policy(),
             paged_backing: None,
+            m3_idx_k: None,
+            m3_idx_offset: 0,
         }
     }
 
@@ -536,6 +562,8 @@ impl KVCache {
             delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
             delegated_fp16_sidecar_policy: turbo::delegated_fp16_sidecar_policy(),
             paged_backing: None,
+            m3_idx_k: None,
+            m3_idx_offset: 0,
         }
     }
 
@@ -3643,6 +3671,83 @@ impl KVCache {
         }
         self.nbytes() / capacity as usize
     }
+
+    // ─── M3 indexer K cache methods ─────────────────────────────────────────
+    //
+    // MiniMax-M3-specific API. See the `m3_idx_k` field comment for context.
+    // Other models do not use these methods; the underlying state stays
+    // `None` / `0`.
+
+    /// Append a chunk of post-RoPE idx_k to the indexer cache and return
+    /// the full cached idx_k.
+    ///
+    /// `new_idx_k` shape: `[b, 1, chunk_len, index_dim]` (the indexer has a
+    /// single head). Returned tensor shape: `[b, 1, m3_idx_offset_after,
+    /// index_dim]` where `m3_idx_offset_after = m3_idx_offset_before +
+    /// chunk_len`.
+    ///
+    /// On the first call (cache empty), the returned tensor IS the input
+    /// chunk (no allocation beyond a clone). On subsequent calls, the new
+    /// chunk is concatenated to the prior cached state along the sequence
+    /// axis (axis 2).
+    ///
+    /// The indexer offset is tracked independently of `self.offset` (the
+    /// main K/V offset) because the two caches are written in lockstep but
+    /// MAY be conceptually independent: a future M3-variant could write
+    /// idx_k without writing main K (e.g. when re-projecting for a fresh
+    /// indexer). Today's mlxcel-M3 keeps them in lockstep — the caller is
+    /// expected to invoke this method exactly once per `forward()`, before
+    /// or after `update_and_fetch` for main K/V.
+    ///
+    /// This does NOT route through the paged backing — the idx_k cache is
+    /// a dense per-request tensor regardless of paging mode (paging is for
+    /// the larger main K/V where memory pressure justifies the indirection
+    /// cost; the idx_k tensor is small enough that dense storage is fine).
+    pub fn m3_idx_k_update_and_fetch(
+        &mut self,
+        new_idx_k: &MlxArray,
+    ) -> UniquePtr<MlxArray> {
+        let new_shape = ffi::array_shape(new_idx_k);
+        let chunk_len = new_shape[2];
+        let combined = match self.m3_idx_k.as_ref() {
+            None => {
+                // First write: produce an independently-owned copy via a
+                // full-range slice. The simpler path would be to store
+                // `new_idx_k` directly, but the caller passes `&MlxArray`
+                // (we don't take ownership of a `UniquePtr`).
+                ffi::slice(
+                    new_idx_k,
+                    &[0, 0, 0, 0],
+                    &[new_shape[0], new_shape[1], new_shape[2], new_shape[3]],
+                )
+            }
+            Some(prev) => concatenate(prev, new_idx_k, 2),
+        };
+        self.m3_idx_offset += chunk_len;
+        self.m3_idx_k = Some(combined);
+        // Return another independently-owned slice of the full cached idx_k.
+        let full = self.m3_idx_k.as_ref().unwrap();
+        let full_shape = ffi::array_shape(full);
+        ffi::slice(
+            full,
+            &[0, 0, 0, 0],
+            &[full_shape[0], full_shape[1], full_shape[2], full_shape[3]],
+        )
+    }
+
+    /// Current indexer K cache length (number of positions accumulated).
+    /// `0` if the indexer cache has never been written.
+    pub fn m3_idx_offset(&self) -> i32 {
+        self.m3_idx_offset
+    }
+
+    /// Whether the indexer K cache has any state (used by M3's dispatch
+    /// logic to distinguish "first call ever" from "cache_offset==0 but
+    /// indexer has prior state" — defensive; lockstep callers won't see
+    /// this distinguish).
+    pub fn has_m3_idx_k_state(&self) -> bool {
+        self.m3_idx_k.is_some()
+    }
 }
 
 impl Default for KVCache {
@@ -6531,6 +6636,112 @@ impl CachePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── M3 indexer K cache tests ───────────────────────────────────────────
+    // The MSA chunked-prefill path needs idx_k accumulated across forward
+    // calls (the indexer projects per-token and the top-k block selection
+    // must see the full cached K, not just the current chunk's portion).
+
+    #[test]
+    fn m3_idx_k_cache_initial_state_is_empty() {
+        let cache = KVCache::new();
+        assert_eq!(cache.m3_idx_offset(), 0);
+        assert!(!cache.has_m3_idx_k_state());
+    }
+
+    #[test]
+    fn m3_idx_k_cache_first_write_stores_chunk_and_advances_offset() {
+        let mut cache = KVCache::new();
+        // [b=1, head=1, len=3, dim=2]
+        let chunk = ffi::from_slice_f32(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            &[1, 1, 3, 2],
+        );
+        let full = cache.m3_idx_k_update_and_fetch(&chunk);
+        assert_eq!(cache.m3_idx_offset(), 3);
+        assert!(cache.has_m3_idx_k_state());
+        // Returned tensor is the full cached idx_k.
+        assert_eq!(ffi::array_shape(&full), vec![1, 1, 3, 2]);
+        ffi::eval(&full);
+        let bytes = ffi::array_to_raw_bytes(&full);
+        let vals: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn m3_idx_k_cache_second_write_concatenates_along_seq_axis() {
+        let mut cache = KVCache::new();
+        let chunk1 = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2]);
+        let _ = cache.m3_idx_k_update_and_fetch(&chunk1);
+        assert_eq!(cache.m3_idx_offset(), 2);
+
+        let chunk2 = ffi::from_slice_f32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 2, 2]);
+        let full = cache.m3_idx_k_update_and_fetch(&chunk2);
+        assert_eq!(cache.m3_idx_offset(), 4);
+        assert_eq!(ffi::array_shape(&full), vec![1, 1, 4, 2]);
+        ffi::eval(&full);
+        let bytes = ffi::array_to_raw_bytes(&full);
+        let vals: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // Sequence axis (axis=2) concat: chunk1's positions then chunk2's.
+        // Layout per (b=0, h=0): [pos0_dim0, pos0_dim1, pos1_dim0, pos1_dim1,
+        //   pos2_dim0, pos2_dim1, pos3_dim0, pos3_dim1]
+        assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn m3_idx_k_cache_three_chunks_accumulate() {
+        // Four-chunk durability is the target (Stuart, task #82); this is the
+        // smaller cache-only check that the append chain doesn't lose state.
+        let mut cache = KVCache::new();
+        let chunk_len = 2;
+        let dim = 2;
+        for chunk_idx in 0..3 {
+            let base = (chunk_idx * chunk_len * dim) as f32;
+            let chunk = ffi::from_slice_f32(
+                &[base, base + 1.0, base + 2.0, base + 3.0],
+                &[1, 1, chunk_len as i32, dim as i32],
+            );
+            let full = cache.m3_idx_k_update_and_fetch(&chunk);
+            let expected_offset = (chunk_idx + 1) * chunk_len as i32;
+            assert_eq!(cache.m3_idx_offset(), expected_offset);
+            assert_eq!(
+                ffi::array_shape(&full),
+                vec![1, 1, expected_offset, dim as i32]
+            );
+        }
+        // Final state: full cache should contain values 0..12.
+        let full_shape = vec![1, 1, 6, 2];
+        let full = ffi::slice(
+            cache.m3_idx_k.as_ref().unwrap(),
+            &[0, 0, 0, 0],
+            &full_shape,
+        );
+        ffi::eval(&full);
+        let bytes = ffi::array_to_raw_bytes(&full);
+        let vals: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let expected: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        assert_eq!(vals, expected);
+    }
+
+    #[test]
+    fn m3_idx_k_cache_is_independent_of_main_kv_offset() {
+        // The indexer cache offset is tracked separately from the main K/V
+        // offset. Writing to m3_idx_k does not advance the main offset.
+        let mut cache = KVCache::new();
+        let chunk = ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 1, 2]);
+        let _ = cache.m3_idx_k_update_and_fetch(&chunk);
+        assert_eq!(cache.m3_idx_offset(), 1);
+        assert_eq!(cache.offset, 0, "main K/V offset must be unaffected");
+    }
 
     #[test]
     fn kv_cache_trim_clears_storage_when_fully_rewound() {
