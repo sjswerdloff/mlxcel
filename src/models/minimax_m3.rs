@@ -391,7 +391,36 @@ impl SparseAttention {
             &[b, self.num_kv_heads, num_blocks, self.top_k],
         );
 
-        self.sparse_sdpa(&q, &cache_k, &cache_v, &selected, b, l, num_blocks)
+        // Asymmetric q/k for chunked-prefill / cached case.
+        // - q has shape [..., l, ...] (current chunk only).
+        // - cache_k/v have shape [..., kv_len, ...] (cache_offset + l in seq dim).
+        //   kv_len read from cache_k's actual shape (most robust).
+        // - cache_offset = kv_len - l (where the current chunk starts in absolute coords).
+        //
+        // KNOWN GAP (closed by task #80, the indexer K cache): the `selected`
+        // indices above were computed from idx_q/idx_k of the CURRENT CHUNK
+        // only, so values are in [0, num_query_blocks) — chunk-relative.
+        // sparse_sdpa interprets them as absolute indices into num_key_blocks
+        // = ceil(kv_len / block_size). In the no-cache case (cache_offset=0)
+        // num_query_blocks == num_key_blocks and the two coordinate systems
+        // coincide. In the cached case they diverge; sparse_sdpa won't crash
+        // (chunk-relative indices are still valid into num_key_blocks because
+        // num_query_blocks ≤ num_key_blocks), but attention attends to the
+        // wrong blocks. End-to-end correctness gated on task #80 wiring the
+        // indexer K cache so selected becomes absolute-coord by construction.
+        let cache_k_shape = mlxcel_core::array_shape(&cache_k);
+        let kv_len = cache_k_shape[2];
+        let cache_offset_at_chunk_start = kv_len - l;
+        self.sparse_sdpa(
+            &q,
+            &cache_k,
+            &cache_v,
+            &selected,
+            b,
+            l,
+            kv_len,
+            cache_offset_at_chunk_start,
+        )
     }
 
     fn apply_causal_block_mask(&self, scores: &MlxArray, num_blocks: i32) -> UniquePtr<MlxArray> {
@@ -479,62 +508,84 @@ impl SparseAttention {
         v: &MlxArray,
         selected: &MlxArray,
         b: i32,
-        l: i32,
-        num_blocks: i32,
+        q_len: i32,
+        kv_len: i32,
+        cache_offset: i32,
     ) -> UniquePtr<MlxArray> {
-        // Divisibility padding. The block reshapes below require q/k/v's seq axis to
-        // equal num_blocks * block_size. Caller has already used ceil-div for
-        // num_blocks; we pad Q, K, V (and later, the SDPA output) here. Pad value is
-        // zero — neutral in matmul — and an additive mask below sets padded-K scores
-        // to -inf before softmax so they contribute nothing.
-        let padded_l = num_blocks * self.block_size;
-        let pad = padded_l - l;
+        // Asymmetric q/k blocking for chunked-prefill / cached case.
+        // q_len: the current chunk's query length.
+        // kv_len: the full cached K/V length (cache_offset + q_len).
+        // cache_offset: where the current chunk starts in absolute coords.
+        //
+        // num_query_blocks = ceil(q_len / block_size) — used to block Q.
+        // num_key_blocks   = ceil(kv_len / block_size) — used to block K/V and
+        //                    bound `selected`'s value range.
+        //
+        // Divisibility padding. The block reshapes below require q's seq axis
+        // to equal num_query_blocks * block_size and k/v's seq axis to equal
+        // num_key_blocks * block_size. Pad value is zero — neutral in matmul —
+        // and the additive mask below sets padded-K scores to -inf before
+        // softmax so they contribute nothing.
+        let num_query_blocks = (q_len + self.block_size - 1) / self.block_size;
+        let num_key_blocks = (kv_len + self.block_size - 1) / self.block_size;
+        let padded_q_len = num_query_blocks * self.block_size;
+        let padded_k_len = num_key_blocks * self.block_size;
+        let pad_q_amt = padded_q_len - q_len;
+        let pad_k_amt = padded_k_len - kv_len;
         debug!(
             layer = self.layer_idx,
             b = b,
-            l = l,
-            padded_l = padded_l,
-            pad = pad,
-            num_blocks = num_blocks,
+            q_len = q_len,
+            kv_len = kv_len,
+            cache_offset = cache_offset,
+            num_query_blocks = num_query_blocks,
+            num_key_blocks = num_key_blocks,
+            padded_q_len = padded_q_len,
+            padded_k_len = padded_k_len,
             top_k = self.top_k,
             selected_shape = ?mlxcel_core::array_shape(selected),
             "sparse_sdpa.entry"
         );
 
-        // Materialize padded q/k/v if pad > 0; otherwise borrow input refs as-is.
+        // Materialize padded q if pad_q > 0; otherwise borrow input ref as-is.
+        // Same for k, v (with their own potentially different pad amount).
         // Storage variables live for the full function scope so the &MlxArray
         // borrows below remain valid.
         let q_padded_storage;
-        let k_padded_storage;
-        let v_padded_storage;
-        let (q, k, v): (&MlxArray, &MlxArray, &MlxArray) = if pad > 0 {
+        let q: &MlxArray = if pad_q_amt > 0 {
             let q_dtype = mlxcel_core::array_dtype(q);
-            let kv_dtype = mlxcel_core::array_dtype(k);
             let pad_q = mlxcel_core::full_f32(
-                &[b, self.num_heads, pad, self.head_dim],
+                &[b, self.num_heads, pad_q_amt, self.head_dim],
                 0.0,
                 q_dtype,
             );
+            q_padded_storage = mlxcel_core::concatenate(q, &pad_q, 2);
+            q_padded_storage.as_ref().unwrap()
+        } else {
+            q
+        };
+        let k_padded_storage;
+        let v_padded_storage;
+        let (k, v): (&MlxArray, &MlxArray) = if pad_k_amt > 0 {
+            let kv_dtype = mlxcel_core::array_dtype(k);
             let pad_k = mlxcel_core::full_f32(
-                &[b, self.num_kv_heads, pad, self.head_dim],
+                &[b, self.num_kv_heads, pad_k_amt, self.head_dim],
                 0.0,
                 kv_dtype,
             );
             let pad_v = mlxcel_core::full_f32(
-                &[b, self.num_kv_heads, pad, self.head_dim],
+                &[b, self.num_kv_heads, pad_k_amt, self.head_dim],
                 0.0,
                 kv_dtype,
             );
-            q_padded_storage = mlxcel_core::concatenate(q, &pad_q, 2);
             k_padded_storage = mlxcel_core::concatenate(k, &pad_k, 2);
             v_padded_storage = mlxcel_core::concatenate(v, &pad_v, 2);
             (
-                q_padded_storage.as_ref().unwrap(),
                 k_padded_storage.as_ref().unwrap(),
                 v_padded_storage.as_ref().unwrap(),
             )
         } else {
-            (q, k, v)
+            (k, v)
         };
 
         let k_blocked = mlxcel_core::reshape(
@@ -542,7 +593,7 @@ impl SparseAttention {
             &[
                 b,
                 self.num_kv_heads,
-                num_blocks,
+                num_key_blocks,
                 self.block_size,
                 self.head_dim,
             ],
@@ -552,38 +603,51 @@ impl SparseAttention {
             &[
                 b,
                 self.num_kv_heads,
-                num_blocks,
+                num_key_blocks,
                 self.block_size,
                 self.head_dim,
             ],
         );
 
-        // Per-(kv_head, q_block) gather: each q_block has its own top_k key block
-        // indices into the same global set of num_blocks key blocks. take_along_axis
-        // requires indices to match the source rank with broadcast along non-gather
-        // axes. We add a q_block axis to k/v_blocked (broadcast view, not materialized
-        // — MLX evaluates lazily) and reshape `selected` to broadcast over block_size
-        // and head_dim. take_along_axis on the new k_blocks axis (axis=3) then
-        // produces the per-(kv_head, q_block) gather we actually want.
+        // Per-(kv_head, q_block) gather: each q_block has its own top_k key
+        // block indices into the same global set of num_key_blocks key blocks.
+        // take_along_axis requires indices to match the source rank with
+        // broadcast along non-gather axes. We add a q_block axis to k/v_blocked
+        // (broadcast view, not materialized — MLX evaluates lazily) and reshape
+        // `selected` to broadcast over block_size and head_dim. take_along_axis
+        // on the new k_blocks axis (axis=3) then produces the per-(kv_head,
+        // q_block) gather we actually want.
         //
-        // Shape walk:
-        //   k_blocked:                       [b, kv_h, num_blocks, block_size, head_dim]
-        //   → reshape (unsqueeze q_block):   [b, kv_h, 1, num_blocks, block_size, head_dim]
-        //   → broadcast to q_block axis:     [b, kv_h, num_blocks, num_blocks, block_size, head_dim]
-        //   selected:                        [b, kv_h, num_blocks, top_k]
-        //   → reshape (unsqueeze 2 trailing):[b, kv_h, num_blocks, top_k, 1, 1]
-        //   → broadcast over inner dims:     [b, kv_h, num_blocks, top_k, block_size, head_dim]
-        //   take_along_axis on axis 3:       [b, kv_h, num_blocks, top_k, block_size, head_dim]
-        //   reshape to combine top_k+block:  [b, kv_h, num_blocks, top_k*block_size, head_dim]
+        // Shape walk (asymmetric):
+        //   k_blocked:                       [b, kv_h, num_key_blocks, block_size, head_dim]
+        //   → reshape (unsqueeze q_block):   [b, kv_h, 1, num_key_blocks, block_size, head_dim]
+        //   → broadcast to q_block axis:     [b, kv_h, num_query_blocks, num_key_blocks, block_size, head_dim]
+        //   selected:                        [b, kv_h, num_query_blocks, top_k]
+        //   → reshape (unsqueeze 2 trailing):[b, kv_h, num_query_blocks, top_k, 1, 1]
+        //   → broadcast over inner dims:     [b, kv_h, num_query_blocks, top_k, block_size, head_dim]
+        //   take_along_axis on axis 3:       [b, kv_h, num_query_blocks, top_k, block_size, head_dim]
+        //   reshape to combine top_k+block:  [b, kv_h, num_query_blocks, top_k*block_size, head_dim]
         //
-        // This replaces the previous `take(..., axis=2)` path, which used global gather
-        // semantics (single indices array applied uniformly across all kv_heads and
-        // q_blocks). That produced a result with a `num_kv_heads`-fold element-count
-        // mismatch on the subsequent reshape and would have crashed any prompt long
-        // enough to make MSA fire (l > 2048 in a single forward call). Unreachable
-        // under mlxcel's default prefill_chunk_size=512, hence latent until now.
-        let bk_view = [b, self.num_kv_heads, 1, num_blocks, self.block_size, self.head_dim];
-        let bk_target = [b, self.num_kv_heads, num_blocks, num_blocks, self.block_size, self.head_dim];
+        // Symmetric history (latent bug fixed cycle 65): the prior `take(...,
+        // axis=2)` used global-gather semantics (single indices array applied
+        // uniformly across all kv_heads and q_blocks). It produced a
+        // num_kv_heads-fold element-count mismatch on the downstream reshape
+        // and would have crashed any prompt long enough to make MSA fire
+        // (l > 2048 in a single forward call). The per-(kv_head, q_block)
+        // gather above replaced it. THIS cycle (#79): the variables previously
+        // named `num_blocks` are split into `num_query_blocks` and
+        // `num_key_blocks` so cached prefill no longer mismatches K's actual
+        // sequence dim (kv_len > q_len when cache_offset > 0).
+        let bk_view =
+            [b, self.num_kv_heads, 1, num_key_blocks, self.block_size, self.head_dim];
+        let bk_target = [
+            b,
+            self.num_kv_heads,
+            num_query_blocks,
+            num_key_blocks,
+            self.block_size,
+            self.head_dim,
+        ];
         let k_expanded = mlxcel_core::broadcast_to(
             &mlxcel_core::reshape(&k_blocked, &bk_view),
             &bk_target,
@@ -593,9 +657,16 @@ impl SparseAttention {
             &bk_target,
         );
 
-        let sel_view = [b, self.num_kv_heads, num_blocks, self.top_k, 1, 1];
-        let sel_target =
-            [b, self.num_kv_heads, num_blocks, self.top_k, self.block_size, self.head_dim];
+        let sel_view =
+            [b, self.num_kv_heads, num_query_blocks, self.top_k, 1, 1];
+        let sel_target = [
+            b,
+            self.num_kv_heads,
+            num_query_blocks,
+            self.top_k,
+            self.block_size,
+            self.head_dim,
+        ];
         let sel_broadcast = mlxcel_core::broadcast_to(
             &mlxcel_core::reshape(selected, &sel_view),
             &sel_target,
@@ -617,14 +688,14 @@ impl SparseAttention {
             "sparse_sdpa.post_gather"
         );
 
-        let kv_len = self.top_k * self.block_size;
+        let kv_per_q_block = self.top_k * self.block_size;
         let k_flat = mlxcel_core::reshape(
             &k_gathered,
-            &[b, self.num_kv_heads, num_blocks, kv_len, self.head_dim],
+            &[b, self.num_kv_heads, num_query_blocks, kv_per_q_block, self.head_dim],
         );
         let v_flat = mlxcel_core::reshape(
             &v_gathered,
-            &[b, self.num_kv_heads, num_blocks, kv_len, self.head_dim],
+            &[b, self.num_kv_heads, num_query_blocks, kv_per_q_block, self.head_dim],
         );
 
         let q_blocked = mlxcel_core::reshape(
@@ -632,7 +703,7 @@ impl SparseAttention {
             &[
                 b,
                 self.num_heads,
-                num_blocks,
+                num_query_blocks,
                 self.block_size,
                 self.head_dim,
             ],
@@ -640,23 +711,24 @@ impl SparseAttention {
 
         let n_rep = self.num_heads / self.num_kv_heads;
         // 5D GQA expansion. mlxcel_core::utils::repeat_kv assumes a 4D shape
-        // [batch, n_kv_heads, seq_len, head_dim] and reads shape[3] as head_dim. Our
-        // tensors here are 5D [b, num_kv_heads, num_blocks, kv_len, head_dim]; calling
-        // repeat_kv on them mis-derives head_dim = kv_len and crashes the downstream
-        // reshape with a 128× size mismatch. Inline the broadcast pattern for 5D so
-        // each kv_head's [num_blocks, kv_len, head_dim] block is repeated n_rep times.
+        // [batch, n_kv_heads, seq_len, head_dim] and reads shape[3] as
+        // head_dim. Our tensors here are 5D [b, num_kv_heads, num_query_blocks,
+        // kv_per_q_block, head_dim]; calling repeat_kv on them mis-derives
+        // head_dim = kv_per_q_block and crashes the downstream reshape. Inline
+        // the broadcast pattern for 5D so each kv_head's [num_query_blocks,
+        // kv_per_q_block, head_dim] block is repeated n_rep times.
         let kv_5d_with_rep = |x: &MlxArray| -> UniquePtr<MlxArray> {
             let x_view = mlxcel_core::reshape(
                 x,
-                &[b, self.num_kv_heads, 1, num_blocks, kv_len, self.head_dim],
+                &[b, self.num_kv_heads, 1, num_query_blocks, kv_per_q_block, self.head_dim],
             );
             let x_broad = mlxcel_core::broadcast_to(
                 &x_view,
-                &[b, self.num_kv_heads, n_rep, num_blocks, kv_len, self.head_dim],
+                &[b, self.num_kv_heads, n_rep, num_query_blocks, kv_per_q_block, self.head_dim],
             );
             mlxcel_core::reshape(
                 &x_broad,
-                &[b, self.num_heads, num_blocks, kv_len, self.head_dim],
+                &[b, self.num_heads, num_query_blocks, kv_per_q_block, self.head_dim],
             )
         };
         let k_expanded = kv_5d_with_rep(&k_flat);
@@ -668,19 +740,24 @@ impl SparseAttention {
         );
         let scores = mlxcel_core::multiply_scalar(&scores, self.scale);
 
-        // Unified causal + padding + sentinel mask. See build_msa_unified_mask
-        // below for the full rationale and the HF cross-reference.
+        // Asymmetric unified causal + padding + sentinel mask.
+        // See build_msa_unified_mask_asymmetric below for the rationale. p_q
+        // uses absolute coords (cache_offset + i); p_k stays in [0, num_key_
+        // blocks * block_size); the `p_k > p_q ⇒ invalid` rule subsumes
+        // within-block causality, future-block leakage, divisibility padding,
+        // AND cached-prefix causality.
         let scores_dtype = mlxcel_core::array_dtype(&scores);
-        let additive = build_msa_unified_mask(
+        let additive = build_msa_unified_mask_asymmetric(
             selected,
             b,
             self.num_kv_heads,
             self.num_heads,
             n_rep,
-            num_blocks,
+            num_query_blocks,
+            num_key_blocks,
             self.top_k,
             self.block_size,
-            padded_l,
+            cache_offset,
             scores_dtype,
         );
         let scores = mlxcel_core::add(&scores, &additive);
@@ -688,15 +765,15 @@ impl SparseAttention {
         let weights = mlxcel_core::softmax(&scores, -1);
         let out = mlxcel_core::matmul(&weights, &v_expanded);
 
-        // Reshape to padded length first, then slice back to the real q length.
-        let out = mlxcel_core::reshape(&out, &[b, self.num_heads, padded_l, self.head_dim]);
-        let out = if pad > 0 {
-            mlxcel_core::slice(&out, &[0, 0, 0, 0], &[b, self.num_heads, l, self.head_dim])
+        // Reshape to padded q-length first, then slice back to the real q_len.
+        let out = mlxcel_core::reshape(&out, &[b, self.num_heads, padded_q_len, self.head_dim]);
+        let out = if pad_q_amt > 0 {
+            mlxcel_core::slice(&out, &[0, 0, 0, 0], &[b, self.num_heads, q_len, self.head_dim])
         } else {
             out
         };
         let out = mlxcel_core::transpose_axes(&out, &[0, 2, 1, 3]);
-        let out = mlxcel_core::reshape(&out, &[b, l, self.num_heads * self.head_dim]);
+        let out = mlxcel_core::reshape(&out, &[b, q_len, self.num_heads * self.head_dim]);
         self.o_proj.forward(&out)
     }
 
@@ -905,6 +982,18 @@ impl SparseAttention {
 /// deltas without correctness regressions. Verify correctness via the unit
 /// tests and a dense-differential, not via diffing tokens against the previous
 /// commit's output.
+///
+/// # Dead-code retention (cycle 79, 2026-06-26)
+///
+/// As of cycle 79's asymmetric refactor, `build_msa_unified_mask_asymmetric`
+/// subsumes this function (cache_offset=0 + num_query_blocks==num_key_blocks
+/// gives identical output). The symmetric form and its 7 unit tests are
+/// retained for regression value — they pin a smaller, hand-computable
+/// surface that anyone modifying the asymmetric form can sanity-check
+/// against. Slated for deletion after the proper-fix sequence (#78-#83)
+/// merges and the asymmetric form has lived in main for a cycle without
+/// regressions.
+#[allow(dead_code)]
 fn build_msa_unified_mask(
     selected: &MlxArray,
     b: i32,
