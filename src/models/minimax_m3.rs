@@ -958,6 +958,121 @@ fn build_msa_unified_mask(
     mlxcel_core::where_cond(&invalid_per_head, &neg_inf, &zero)
 }
 
+/// Asymmetric variant of `build_msa_unified_mask` — supports chunked prefill
+/// and prompt-cache, where the current chunk's query length differs from the
+/// total key length (cache_offset > 0).
+///
+/// # Coordinate system
+///
+/// All positions are ABSOLUTE in the full sequence (not relative to the
+/// current chunk):
+///
+///   p_q[q_block, q_pos] = cache_offset + q_block * block_size + q_pos
+///   p_k[kv_head, q_block, top_k_idx, k_pos]
+///     = selected[kv_head, q_block, top_k_idx] * block_size + k_pos
+///
+/// `selected[..] ∈ [0, num_key_blocks)` indexes into the FULL cached K's
+/// block partition; `k_pos ∈ [0, block_size)` is the position within the
+/// selected block. Both produce absolute positions in `[0, num_key_blocks *
+/// block_size)`.
+///
+/// The validity rule `p_k > p_q ⇒ invalid` from the symmetric version still
+/// holds — both sides are in the same absolute coordinate system. This rule
+/// subsumes within-block causality, future-block leakage, divisibility
+/// padding, AND cached-prefix causality (a current-chunk query can attend to
+/// any cached key whose absolute position is ≤ the query's absolute
+/// position, regardless of which chunk that key came from).
+///
+/// # Why this isn't a special case of the symmetric mask
+///
+/// The symmetric `build_msa_unified_mask` builds `p_q = arange(0, padded_l)`
+/// where padded_l = num_blocks * block_size. That implicitly assumes q_len
+/// == k_len and cache_offset == 0. In a chunked-prefill call with
+/// cache_offset > 0:
+///   - p_q must start at cache_offset, not 0, so the new chunk's queries
+///     have the right absolute coords for the causal comparison against
+///     cached keys
+///   - num_query_blocks and num_key_blocks differ; the mask shape gains a
+///     num_query_blocks axis (outer) while the gather size stays
+///     top_k * block_size (per query block)
+///   - `selected` has shape [b, num_kv_heads, num_query_blocks, top_k] —
+///     one selection per query block, indexing into num_key_blocks
+///
+/// # Parameters
+///
+/// `num_key_blocks` doesn't appear in the mask math directly — it's bounded
+/// by `selected`'s value range — but it's accepted as a parameter for
+/// trace logging and as a contract assertion at the call site.
+fn build_msa_unified_mask_asymmetric(
+    selected: &MlxArray,
+    b: i32,
+    num_kv_heads: i32,
+    num_heads: i32,
+    n_rep: i32,
+    num_query_blocks: i32,
+    _num_key_blocks: i32,
+    top_k: i32,
+    block_size: i32,
+    cache_offset: i32,
+    scores_dtype: i32,
+) -> UniquePtr<MlxArray> {
+    let padded_q_len = num_query_blocks * block_size;
+    let kv_per_q_block = top_k * block_size;
+
+    // Query positions: absolute coords starting at cache_offset.
+    let p_q =
+        mlxcel_core::arange_i32(cache_offset, cache_offset + padded_q_len, 1);
+    let p_q = mlxcel_core::reshape(&p_q, &[num_query_blocks, block_size]);
+
+    // Key positions: selected_block_idx * block_size + pos_within_block,
+    // computed from the per-query-block selected indices. `selected` indexes
+    // into num_key_blocks (the full cached K's block partition), so the
+    // resulting p_k values are absolute positions in [0, num_key_blocks *
+    // block_size), spanning both cached prefix and current chunk.
+    let selected_5 = mlxcel_core::reshape(
+        selected,
+        &[b, num_kv_heads, num_query_blocks, top_k, 1],
+    );
+    let block_size_scalar = mlxcel_core::from_slice_i32(&[block_size], &[1]);
+    let selected_x_bs = mlxcel_core::multiply(&selected_5, &block_size_scalar);
+    let k_pos_axis = mlxcel_core::arange_i32(0, block_size, 1);
+    let k_pos_axis_5 = mlxcel_core::reshape(&k_pos_axis, &[1, 1, 1, 1, block_size]);
+    let p_k = mlxcel_core::add(&selected_x_bs, &k_pos_axis_5);
+    let p_k = mlxcel_core::reshape(
+        &p_k,
+        &[b, num_kv_heads, num_query_blocks, kv_per_q_block],
+    );
+
+    let mask_shape =
+        [b, num_kv_heads, num_query_blocks, block_size, kv_per_q_block];
+    let p_q_5 = mlxcel_core::reshape(&p_q, &[1, 1, num_query_blocks, block_size, 1]);
+    let p_k_5 = mlxcel_core::reshape(
+        &p_k,
+        &[b, num_kv_heads, num_query_blocks, 1, kv_per_q_block],
+    );
+    let p_q_full = mlxcel_core::broadcast_to(&p_q_5, &mask_shape);
+    let p_k_full = mlxcel_core::broadcast_to(&p_k_5, &mask_shape);
+    let invalid_kv = mlxcel_core::greater(&p_k_full, &p_q_full);
+
+    // GQA expansion: replicate each kv_head's mask n_rep times into num_heads.
+    let invalid_with_rep_dim = mlxcel_core::reshape(
+        &invalid_kv,
+        &[b, num_kv_heads, 1, num_query_blocks, block_size, kv_per_q_block],
+    );
+    let invalid_repeated = mlxcel_core::broadcast_to(
+        &invalid_with_rep_dim,
+        &[b, num_kv_heads, n_rep, num_query_blocks, block_size, kv_per_q_block],
+    );
+    let invalid_per_head = mlxcel_core::reshape(
+        &invalid_repeated,
+        &[b, num_heads, num_query_blocks, block_size, kv_per_q_block],
+    );
+
+    let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, scores_dtype);
+    let zero = mlxcel_core::full_f32(&[1], 0.0, scores_dtype);
+    mlxcel_core::where_cond(&invalid_per_head, &neg_inf, &zero)
+}
+
 // ============================================================================
 // Custom SwiGLU activation - verified from Transformers code
 // gate = clamp(gate, max=limit)
@@ -2088,5 +2203,264 @@ mod tests {
         let result = m3_swiglu_activation(&up, &gate, 1.702, 7.0);
         mlxcel_core::eval(&result);
         assert_eq!(mlxcel_core::array_shape(&result), vec![2, 3, 2]);
+    }
+
+    // ========================================================================
+    // Asymmetric MSA mask tests (chunked-prefill / cached case)
+    // ========================================================================
+    //
+    // Layout:
+    //   b=1, num_kv_heads=2, num_heads=4, n_rep=2
+    //   block_size=2, top_k=2
+    //   cache_offset=4  → cached prefix has 2 blocks (positions 0-3)
+    //   num_query_blocks=2  → current chunk has 2 blocks (positions 4-7)
+    //   num_key_blocks=4    → full sequence has 4 blocks (positions 0-7)
+    //
+    // Mask shape: [b=1, num_heads=4, num_query_blocks=2, block_size=2,
+    //              kv_per_q_block=4]
+    //
+    // selected[kv_head, q_block, k_idx] (one selection per query block,
+    // indexing into num_key_blocks=4):
+    //   kv_head 0:
+    //     q_block 0 (p_q=[4,5]): [0, 2] — cached block 0 + current block 0
+    //     q_block 1 (p_q=[6,7]): [1, 3] — cached block 1 + current block 1
+    //   kv_head 1:
+    //     q_block 0 (p_q=[4,5]): [0, 3] — cached block 0 + FUTURE current block
+    //     q_block 1 (p_q=[6,7]): [2, 3] — both current blocks
+    //
+    // p_q[q_block, q_pos] = cache_offset + q_block * block_size + q_pos
+    // p_k[kv_head, q_block, k_idx, block_pos]
+    //   = selected[kv_head, q_block, k_idx] * block_size + block_pos
+    // invalid = (p_k > p_q)
+    //
+    // GQA: head 0,1 use kv_head 0; head 2,3 use kv_head 1.
+
+    fn msa_asym_mask_fixture() -> UniquePtr<MlxArray> {
+        let selected_data: &[i32] = &[
+            // kv_head 0:
+            // q_block 0: [0, 2]   q_block 1: [1, 3]
+            0, 2, 1, 3,
+            // kv_head 1:
+            // q_block 0: [0, 3]   q_block 1: [2, 3]
+            0, 3, 2, 3,
+        ];
+        let selected = mlxcel_core::from_slice_i32(selected_data, &[1, 2, 2, 2]);
+        build_msa_unified_mask_asymmetric(
+            &selected,
+            /* b */ 1,
+            /* num_kv_heads */ 2,
+            /* num_heads */ 4,
+            /* n_rep */ 2,
+            /* num_query_blocks */ 2,
+            /* num_key_blocks */ 4,
+            /* top_k */ 2,
+            /* block_size */ 2,
+            /* cache_offset */ 4,
+            /* scores_dtype */ mlxcel_core::dtype::FLOAT32,
+        )
+    }
+
+    #[test]
+    fn test_msa_asym_mask_cached_prefix_attendable() {
+        // THE NEW PROPERTY this asymmetric mask exists to enable.
+        // head 0, q_block 0 (p_q=[4,5]), k_idx 0 = selected block 0 pos 0
+        // (p_k=0). The query is in the current chunk, the key is in the
+        // cached prefix. Past p_q → must be valid.
+        let mask = msa_asym_mask_fixture();
+        assert_eq!(
+            mask_at(&mask, 0, 0, 0, 0),
+            0.0,
+            "current-chunk query must be able to attend to cached prefix"
+        );
+        assert_eq!(
+            mask_at(&mask, 0, 0, 0, 1),
+            0.0,
+            "cached prefix position 1 also attendable from p_q=4"
+        );
+    }
+
+    #[test]
+    fn test_msa_asym_mask_within_block_causality_in_current_chunk() {
+        // head 0, q_block 0, q_pos 0 (p_q=4), selected block 2 (current
+        // chunk first block, positions 4,5).
+        // k_idx 2 = selected_idx=1 block_pos=0 (p_k=4): equal → valid.
+        // k_idx 3 = selected_idx=1 block_pos=1 (p_k=5): future → invalid.
+        let mask = msa_asym_mask_fixture();
+        assert_eq!(
+            mask_at(&mask, 0, 0, 0, 2),
+            0.0,
+            "p_k == p_q (self) must be valid"
+        );
+        let v = mask_at(&mask, 0, 0, 0, 3);
+        assert!(
+            v.is_infinite() && v < 0.0,
+            "within-block causality must mask p_k > p_q in current chunk: got {} expected -inf",
+            v
+        );
+    }
+
+    #[test]
+    fn test_msa_asym_mask_future_block_in_current_chunk_masked() {
+        // head 2 (kv_head 1), q_block 0 (p_q=[4,5]) selects k_block 3
+        // (current chunk's SECOND block, positions 6,7). All p_k > p_q.
+        // k_idx 2 = block_pos=0 (p_k=6) > 4 → invalid for q_pos 0.
+        // k_idx 3 = block_pos=1 (p_k=7) > 5 → invalid for q_pos 1.
+        let mask = msa_asym_mask_fixture();
+        for q_pos in 0..2 {
+            for k_idx in 2..4 {
+                let v = mask_at(&mask, 2, 0, q_pos, k_idx);
+                assert!(
+                    v.is_infinite() && v < 0.0,
+                    "future-block must mask: q_pos={} k_idx={} got {} expected -inf",
+                    q_pos,
+                    k_idx,
+                    v
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_msa_asym_mask_cache_offset_shifts_p_q() {
+        // Cached selections from q_block 0 (p_q=[4,5]): selected k_block 0
+        // covers positions [0,1]. All p_k < p_q → all valid.
+        // This proves p_q starts at cache_offset=4, not 0. If p_q started at
+        // 0, p_q[0]=0 and p_k=0 would still be valid by coincidence, but
+        // p_q[1]=1 < p_k=1=0 ... actually that ALSO would pass equality.
+        // The disambiguating check is q_block 1 attending k_block 1: with
+        // correct cache_offset, p_q=[6,7], p_k=[2,3] → all valid. Without
+        // cache_offset, p_q=[2,3], p_k=[2,3]: q_pos 0 p_k 1 (p_k=3 > p_q=2)
+        // would mask. Run that one.
+        let mask = msa_asym_mask_fixture();
+        // head 0, q_block 1 (p_q=[6,7]), k_idx 0..1 = selected block 1
+        // (cached positions [2,3]). All p_k < p_q → all valid.
+        for q_pos in 0..2 {
+            for k_idx in 0..2 {
+                assert_eq!(
+                    mask_at(&mask, 0, 1, q_pos, k_idx),
+                    0.0,
+                    "second q_block attending cached block 1 must be valid \
+                     (proves p_q uses cache_offset): q_pos={} k_idx={}",
+                    q_pos,
+                    k_idx
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_msa_asym_mask_cross_block_within_chunk_valid() {
+        // head 0, q_block 1 (p_q=[6,7]), k_idx 0..1 = selected block 1
+        // (cached, p_k=[2,3]); k_idx 2..3 = selected block 3 (current chunk
+        // second block, p_k=[6,7]).
+        // k_idx 2 (p_k=6): valid for q_pos 0 (p_q=6, equal), valid for
+        // q_pos 1 (p_q=7, p_k < p_q).
+        // k_idx 3 (p_k=7): invalid for q_pos 0 (p_k=7 > p_q=6), valid for
+        // q_pos 1 (equal).
+        let mask = msa_asym_mask_fixture();
+        assert_eq!(mask_at(&mask, 0, 1, 0, 2), 0.0, "p_k=6, p_q=6 valid");
+        assert_eq!(mask_at(&mask, 0, 1, 1, 2), 0.0, "p_k=6, p_q=7 valid");
+        let v = mask_at(&mask, 0, 1, 0, 3);
+        assert!(
+            v.is_infinite() && v < 0.0,
+            "p_k=7, p_q=6 must mask: got {} expected -inf",
+            v
+        );
+        assert_eq!(mask_at(&mask, 0, 1, 1, 3), 0.0, "p_k=7, p_q=7 valid");
+    }
+
+    #[test]
+    fn test_msa_asym_mask_gqa_replication_within_kv_group() {
+        // head 0,1 share kv_head 0; head 2,3 share kv_head 1.
+        // The mask must be identical inside each GQA group at every
+        // (q_block, q_pos, k_idx).
+        let mask = msa_asym_mask_fixture();
+        for q_block in 0..2 {
+            for q_pos in 0..2 {
+                for k_idx in 0..4 {
+                    let h0 = mask_at(&mask, 0, q_block, q_pos, k_idx);
+                    let h1 = mask_at(&mask, 1, q_block, q_pos, k_idx);
+                    let h2 = mask_at(&mask, 2, q_block, q_pos, k_idx);
+                    let h3 = mask_at(&mask, 3, q_block, q_pos, k_idx);
+                    assert_eq!(
+                        h0.to_bits(),
+                        h1.to_bits(),
+                        "kv_head 0 group (heads 0,1) mismatch at q_block={} q_pos={} k_idx={}",
+                        q_block,
+                        q_pos,
+                        k_idx,
+                    );
+                    assert_eq!(
+                        h2.to_bits(),
+                        h3.to_bits(),
+                        "kv_head 1 group (heads 2,3) mismatch at q_block={} q_pos={} k_idx={}",
+                        q_block,
+                        q_pos,
+                        k_idx,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_msa_asym_mask_exhaustive_against_reference() {
+        // Brute-force check every (head, q_block, q_pos, k_idx) of the
+        // fixture against a hand-computed reference using the same rule
+        // the mask documents: p_k > p_q ⇒ invalid.
+        // GQA: head h uses kv_head = h / n_rep = h / 2.
+        const N_REP: i32 = 2;
+        const BLOCK_SIZE: i32 = 2;
+        const TOP_K: i32 = 2;
+        const CACHE_OFFSET: i32 = 4;
+        let selected = [
+            // [kv_head][q_block][k_select_idx]
+            [[0, 2], [1, 3]],
+            [[0, 3], [2, 3]],
+        ];
+        let mask = msa_asym_mask_fixture();
+        let mut checked = 0;
+        for head in 0..4i32 {
+            let kv_head = (head / N_REP) as usize;
+            for q_block in 0..2i32 {
+                let p_q_base = CACHE_OFFSET + q_block * BLOCK_SIZE;
+                for q_pos in 0..BLOCK_SIZE {
+                    let p_q = p_q_base + q_pos;
+                    for k_idx in 0..(TOP_K * BLOCK_SIZE) {
+                        let select_idx = (k_idx / BLOCK_SIZE) as usize;
+                        let block_pos = k_idx % BLOCK_SIZE;
+                        let selected_block =
+                            selected[kv_head][q_block as usize][select_idx];
+                        let p_k = selected_block * BLOCK_SIZE + block_pos;
+                        let expected_invalid = p_k > p_q;
+                        let v = mask_at(&mask, head, q_block, q_pos, k_idx);
+                        if expected_invalid {
+                            assert!(
+                                v.is_infinite() && v < 0.0,
+                                "exhaustive: head={} q_block={} q_pos={} k_idx={} \
+                                 p_q={} p_k={} expected -inf got {}",
+                                head,
+                                q_block,
+                                q_pos,
+                                k_idx,
+                                p_q,
+                                p_k,
+                                v
+                            );
+                        } else {
+                            assert_eq!(
+                                v, 0.0,
+                                "exhaustive: head={} q_block={} q_pos={} k_idx={} \
+                                 p_q={} p_k={} expected 0.0 got {}",
+                                head, q_block, q_pos, k_idx, p_q, p_k, v
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        // 4 heads × 2 q_blocks × 2 q_pos × 4 k_idx = 64 positions exhaustively.
+        assert_eq!(checked, 64, "expected 64 mask positions checked");
     }
 }
