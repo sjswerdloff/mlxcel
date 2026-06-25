@@ -57,7 +57,9 @@ chat() {
 
 # Build a long prompt (>= 3000 tokens estimated) that triggers MSA on
 # the FIRST request — current chunk l > 2048 → num_query_blocks > top_k.
-LONG_PROMPT="$(yes 'The cathedral construction in northern France was undertaken by generations of craftsmen who handed work to apprentices who would die before towers reached final height. ' | head -50 | tr -d '\n')"
+CATHEDRAL_LINE='The cathedral construction in northern France was undertaken by generations of craftsmen who handed work to apprentices who would die before towers reached final height. '
+LONG_PROMPT=""
+for _ in $(seq 1 50); do LONG_PROMPT+="$CATHEDRAL_LINE"; done
 
 echo
 echo "=== Request 1: long single-shot prompt (triggers MSA, cache_offset=0) ==="
