@@ -2631,6 +2631,275 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // Integration test: four-chunk chunked-prefill vs single-shot forward
+    // ========================================================================
+    //
+    // Target: prove that SparseAttention::forward produces the same output
+    // when called as four chunks with a growing KVCache as when called once
+    // on the full input. Same input + same weights + same seed of behavior
+    // → outputs match within fp tolerance.
+    //
+    // Stuart's framing (cycle 79, 2026-06-26): "four chunks, not two."
+    // Four exercises accumulated-error across multiple cache extensions, not
+    // just the single boundary that two chunks would catch.
+    //
+    // The integration test is the gate that distinguishes "no crash"
+    // (necessary but not sufficient) from "correct attention pattern across
+    // cached prefill" (the multi-turn opencode goal).
+
+    fn make_linear(out_features: i32, in_features: i32, scale: f32) -> mlxcel_core::layers::UnifiedLinear {
+        // Deterministic small weights. Pattern is sin-based so values
+        // distribute across positive and negative without random.
+        let n = (out_features * in_features) as usize;
+        let mut data = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = (i as f32 * 0.137).sin() * scale;
+            data.push(v);
+        }
+        let weight = mlxcel_core::from_slice_f32(&data, &[out_features, in_features]);
+        mlxcel_core::layers::UnifiedLinear::Regular(
+            mlxcel_core::layers::Linear::new(weight, None),
+        )
+    }
+
+    fn make_gemma_rms_norm(dim: i32) -> GemmaRMSNorm {
+        // weight=0 → GemmaRMSNorm effective multiplier = (1 + 0) = 1, so
+        // this norm just normalises (no scaling). Eps=1e-6 standard.
+        let zeros: Vec<f32> = vec![0.0; dim as usize];
+        let weight = mlxcel_core::from_slice_f32(&zeros, &[dim]);
+        GemmaRMSNorm::new(weight, 1e-6)
+    }
+
+    fn make_test_sparse_attention() -> SparseAttention {
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 4;
+        let hidden = num_heads * head_dim; // 16
+        let index_dim = 4;
+        let block_size = 2;
+        let top_k = 2;
+        let sparse_local_block = 1;
+        let rope_dims = 2;
+        let rope_base = 10000.0;
+
+        SparseAttention {
+            q_proj: make_linear(num_heads * head_dim, hidden, 0.1),
+            k_proj: make_linear(num_kv_heads * head_dim, hidden, 0.1),
+            v_proj: make_linear(num_kv_heads * head_dim, hidden, 0.1),
+            o_proj: make_linear(hidden, num_heads * head_dim, 0.1),
+            q_norm: Some(make_gemma_rms_norm(head_dim)),
+            k_norm: Some(make_gemma_rms_norm(head_dim)),
+            index_q_proj: Some(make_linear(num_kv_heads * index_dim, hidden, 0.1)),
+            index_k_proj: Some(make_linear(index_dim, hidden, 0.1)),
+            index_q_norm: Some(make_gemma_rms_norm(index_dim)),
+            index_k_norm: Some(make_gemma_rms_norm(index_dim)),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            rope_dims,
+            rope_base,
+            block_size,
+            top_k,
+            index_dim,
+            sparse_local_block,
+            layer_idx: 0,
+        }
+    }
+
+    fn make_test_input(b: i32, l: i32, hidden: i32) -> UniquePtr<MlxArray> {
+        // Deterministic input via cos(i * 0.073) for reproducibility.
+        let n = (b * l * hidden) as usize;
+        let mut data = Vec::with_capacity(n);
+        for i in 0..n {
+            data.push((i as f32 * 0.073).cos() * 0.5);
+        }
+        mlxcel_core::from_slice_f32(&data, &[b, l, hidden])
+    }
+
+    fn output_l2_diff(a: &MlxArray, b: &MlxArray) -> f32 {
+        let diff = mlxcel_core::subtract(a, b);
+        let sq = mlxcel_core::multiply(&diff, &diff);
+        // sum over all axes by reducing repeatedly
+        let s = mlxcel_core::array_shape(&sq);
+        let mut acc = mlxcel_core::copy(&sq);
+        for axis in (0..s.len()).rev() {
+            acc = mlxcel_core::sum_axis(&acc, axis as i32, false);
+        }
+        mlxcel_core::eval(&acc);
+        mlxcel_core::item_f32(&acc).sqrt()
+    }
+
+    #[test]
+    fn test_msa_four_chunk_chunked_vs_single_shot_no_crash() {
+        // The minimum gate: four-chunk forward through the cached MSA path
+        // completes without crashing, with correct output shapes per chunk.
+        // This is the cycle-65 latent comment turned into a live test.
+        let layer = make_test_sparse_attention();
+        let hidden = layer.num_heads * layer.head_dim;
+        let l_chunk = 6; // 3 blocks of 2 per chunk
+        let n_chunks = 4;
+        let l_total = l_chunk * n_chunks; // 24
+
+        let input = make_test_input(1, l_total, hidden);
+        let mut cache = KVCache::new();
+        for i in 0..n_chunks {
+            let chunk = mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            );
+            let out = layer.forward(&chunk, &mut cache, None);
+            mlxcel_core::eval(&out);
+            let shape = mlxcel_core::array_shape(&out);
+            assert_eq!(
+                shape,
+                vec![1, l_chunk, hidden],
+                "chunk {} output shape mismatch: got {:?} expected {:?}",
+                i,
+                shape,
+                vec![1, l_chunk, hidden]
+            );
+        }
+        // Final state assertions: cache has full sequence length.
+        assert_eq!(cache.offset, l_total, "main K/V offset must equal total tokens");
+        assert_eq!(
+            cache.m3_idx_offset(),
+            l_total,
+            "indexer K offset must equal total tokens (lockstep with main K)"
+        );
+    }
+
+    #[test]
+    fn test_msa_four_chunk_matches_single_shot_within_tolerance() {
+        // The correctness gate: chunked forward (with growing cache) must
+        // produce the same output as single-shot forward (no cache) for
+        // positions where both paths take the MSA branch.
+        //
+        // Note on dispatch: chunk 1 with l_chunk=6 has num_key_blocks=3,
+        // top_k=2 → MSA. So all four chunks take MSA, and single-shot also
+        // takes MSA. The two paths should match within fp tolerance for ALL
+        // positions.
+        let layer = make_test_sparse_attention();
+        let hidden = layer.num_heads * layer.head_dim;
+        let l_chunk = 6;
+        let n_chunks = 4;
+        let l_total = l_chunk * n_chunks;
+
+        let input = make_test_input(1, l_total, hidden);
+
+        // Chunked path
+        let mut cache = KVCache::new();
+        let mut chunked_outs: Vec<UniquePtr<MlxArray>> = Vec::new();
+        for i in 0..n_chunks {
+            let chunk = mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            );
+            chunked_outs.push(layer.forward(&chunk, &mut cache, None));
+        }
+        let chunked_concat = {
+            let mut acc = mlxcel_core::copy(&chunked_outs[0]);
+            for out in &chunked_outs[1..] {
+                acc = mlxcel_core::concatenate(&acc, out, 1);
+            }
+            acc
+        };
+        mlxcel_core::eval(&chunked_concat);
+
+        // Single-shot path
+        let mut cache_single = KVCache::new();
+        let single_out = layer.forward(&input, &mut cache_single, None);
+        mlxcel_core::eval(&single_out);
+
+        let single_shape = mlxcel_core::array_shape(&single_out);
+        let chunked_shape = mlxcel_core::array_shape(&chunked_concat);
+        assert_eq!(
+            single_shape, chunked_shape,
+            "single and chunked output shapes must match"
+        );
+
+        // L2 norm of difference. Tolerance is loose because chunked path
+        // does smaller matmuls (different fp accumulation order); the
+        // selection of top-k blocks should be deterministic across paths
+        // for matching query positions, so the residual is fp-numerical only.
+        let diff = output_l2_diff(&chunked_concat, &single_out);
+        // Compute the L2 norm of single_out for relative comparison.
+        let single_norm = {
+            let sq = mlxcel_core::multiply(&single_out, &single_out);
+            let s = mlxcel_core::array_shape(&sq);
+            let mut acc = mlxcel_core::copy(&sq);
+            for axis in (0..s.len()).rev() {
+                acc = mlxcel_core::sum_axis(&acc, axis as i32, false);
+            }
+            mlxcel_core::eval(&acc);
+            mlxcel_core::item_f32(&acc).sqrt()
+        };
+        let relative = if single_norm > 1e-6 {
+            diff / single_norm
+        } else {
+            diff
+        };
+        // Tolerance: 5% relative L2. fp differences from kernel/op-order
+        // changes typically land < 1%; 5% is generous against subtle
+        // selection-determinism issues that would still indicate
+        // correctness in spirit.
+        assert!(
+            relative < 0.05,
+            "chunked vs single-shot relative L2 diff = {} (absolute {}, norm {}). \
+             Tolerance 0.05. Larger diff indicates the asymmetric path is \
+             selecting different blocks than single-shot — a correctness \
+             regression.",
+            relative,
+            diff,
+            single_norm
+        );
+    }
+
+    #[test]
+    fn test_msa_four_chunk_determinism_bit_exact() {
+        // Cycle 64 lesson: rule out MLX nondeterminism before declaring an
+        // fp-numerical issue real. Run the chunked path twice. If outputs
+        // differ bit-exactly, MLX is nondeterministic (not the asymmetric
+        // path's fault).
+        let layer = make_test_sparse_attention();
+        let hidden = layer.num_heads * layer.head_dim;
+        let l_chunk = 6;
+        let n_chunks = 4;
+
+        let input = make_test_input(1, l_chunk * n_chunks, hidden);
+
+        let run = || -> UniquePtr<MlxArray> {
+            let mut cache = KVCache::new();
+            let mut chunked_outs: Vec<UniquePtr<MlxArray>> = Vec::new();
+            for i in 0..n_chunks {
+                let chunk = mlxcel_core::slice(
+                    &input,
+                    &[0, i * l_chunk, 0],
+                    &[1, (i + 1) * l_chunk, hidden],
+                );
+                chunked_outs.push(layer.forward(&chunk, &mut cache, None));
+            }
+            let mut acc = mlxcel_core::copy(&chunked_outs[0]);
+            for out in &chunked_outs[1..] {
+                acc = mlxcel_core::concatenate(&acc, out, 1);
+            }
+            mlxcel_core::eval(&acc);
+            acc
+        };
+
+        let run1 = run();
+        let run2 = run();
+        let diff = output_l2_diff(&run1, &run2);
+        assert!(
+            diff < 1e-6,
+            "chunked path is nondeterministic: L2 diff between two runs = {}",
+            diff
+        );
+    }
+
     #[test]
     fn test_msa_asym_mask_exhaustive_against_reference() {
         // Brute-force check every (head, q_block, q_pos, k_idx) of the
