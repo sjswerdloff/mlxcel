@@ -260,23 +260,38 @@ impl SparseAttention {
             return self.dense_attention(&q, &cache_k, &cache_v, mask);
         }
 
+        // Asymmetric q/k for chunked-prefill / cached case. cache_offset is
+        // the absolute position where the current chunk's queries START
+        // (captured BEFORE update_and_fetch advanced cache.offset). kv_len
+        // is the total cached length AFTER the current chunk is written.
+        let cache_offset_at_chunk_start = offset;
+        let kv_len = offset + l;
+
         // Ceil-div: the trailing partial block is a real block. Floor-div would silently
         // drop the tail tokens (l - floor(l/bs)*bs of them), so any prompt whose length
         // isn't a multiple of block_size would crash on the downstream reshape from
         // `[..., l, d]` to `[..., num_blocks, block_size, d]`. Matches HF reference
         // modeling_minimax_m3_vl.py:572 (`num_key_blocks = -(-k_len // block_size)`).
-        let num_blocks = (l + self.block_size - 1) / self.block_size;
-        let padded_l = num_blocks * self.block_size;
-        let pad = padded_l - l;
-        if num_blocks <= self.top_k {
+        let num_query_blocks = (l + self.block_size - 1) / self.block_size;
+        let num_key_blocks = (kv_len + self.block_size - 1) / self.block_size;
+        let padded_q_len = num_query_blocks * self.block_size;
+        let padded_k_len = num_key_blocks * self.block_size;
+        let pad_q_amt = padded_q_len - l;
+        let pad_k_amt = padded_k_len - kv_len;
+        // Dispatch dense when the KEY dimension's block count saturates top-k.
+        // Sparse selection of all blocks reduces to dense; the per-token
+        // attention math is identical, so skip the indexer machinery.
+        if num_key_blocks <= self.top_k {
             debug!(
                 layer = self.layer_idx,
                 b = b,
                 l = l,
-                num_blocks = num_blocks,
+                kv_len = kv_len,
+                num_query_blocks = num_query_blocks,
+                num_key_blocks = num_key_blocks,
                 top_k = self.top_k,
                 branch = "dense",
-                reason = "num_blocks_le_top_k",
+                reason = "num_key_blocks_le_top_k",
                 "attn.dispatch"
             );
             return self.dense_attention(&q, &cache_k, &cache_v, mask);
@@ -286,7 +301,10 @@ impl SparseAttention {
             layer = self.layer_idx,
             b = b,
             l = l,
-            num_blocks = num_blocks,
+            kv_len = kv_len,
+            cache_offset = cache_offset_at_chunk_start,
+            num_query_blocks = num_query_blocks,
+            num_key_blocks = num_key_blocks,
             top_k = self.top_k,
             block_size = self.block_size,
             branch = "msa",
@@ -328,35 +346,55 @@ impl SparseAttention {
         let idx_k =
             mlxcel_core::fast_rope(&idx_k, self.rope_dims, false, self.rope_base, 1.0, offset);
 
-        // Pad idx_q/idx_k along the sequence axis with -inf so the upcoming block reshape
-        // and max-pool can never let padded positions win. The real positions in the
-        // partial last block dominate the per-block max (any finite value beats -inf),
-        // so block scores stay real-valued. -inf appears in idx_q/idx_k only at padded
-        // tokens that are subsequently summarized away by max_axis; it never reaches a
-        // matmul.
-        let (idx_q, idx_k) = if pad > 0 {
-            let idx_dtype = mlxcel_core::array_dtype(&idx_q);
+        // Swap the current-chunk-only idx_k for the FULL cached idx_k via the
+        // indexer K cache (#80). After this call, idx_k has shape
+        // `[b, 1, kv_len, index_dim]` regardless of whether this is the first
+        // forward (cache empty) or a subsequent one (cache contains prior
+        // chunks' idx_k post-RoPE). The post-RoPE state is the correct one
+        // to cache — RoPE is position-dependent, and each position was
+        // rotated at its absolute position at the time it was written, so
+        // accumulated idx_k is internally consistent across forwards.
+        //
+        // This is THE architectural piece that fixes the indexer's blindness
+        // to cached positions. Pre-#80 the top-k selection scored only the
+        // current chunk's blocks; now it scores all num_key_blocks blocks.
+        let idx_k = cache.m3_idx_k_update_and_fetch(&idx_k);
+
+        // Pad idx_q (to padded_q_len) and idx_k (to padded_k_len) with -inf
+        // so the upcoming block reshape and max-pool can never let padded
+        // positions win. Real positions in the partial last block dominate
+        // the per-block max (any finite value beats -inf), so block scores
+        // stay real-valued. -inf appears only at padded positions that are
+        // summarized away by max_axis; it never reaches a matmul.
+        let idx_dtype = mlxcel_core::array_dtype(&idx_q);
+        let idx_q = if pad_q_amt > 0 {
             let pad_q = mlxcel_core::full_f32(
-                &[b, self.num_kv_heads, pad, self.index_dim],
+                &[b, self.num_kv_heads, pad_q_amt, self.index_dim],
                 f32::NEG_INFINITY,
                 idx_dtype,
             );
-            let pad_k = mlxcel_core::full_f32(
-                &[b, 1, pad, self.index_dim],
-                f32::NEG_INFINITY,
-                idx_dtype,
-            );
-            (
-                mlxcel_core::concatenate(&idx_q, &pad_q, 2),
-                mlxcel_core::concatenate(&idx_k, &pad_k, 2),
-            )
+            mlxcel_core::concatenate(&idx_q, &pad_q, 2)
         } else {
-            (idx_q, idx_k)
+            idx_q
+        };
+        let idx_k = if pad_k_amt > 0 {
+            let pad_k = mlxcel_core::full_f32(
+                &[b, 1, pad_k_amt, self.index_dim],
+                f32::NEG_INFINITY,
+                idx_dtype,
+            );
+            mlxcel_core::concatenate(&idx_k, &pad_k, 2)
+        } else {
+            idx_k
         };
 
-        // Block max-pool scoring
-        let k_blocked =
-            mlxcel_core::reshape(&idx_k, &[b, 1, num_blocks, self.block_size, self.index_dim]);
+        // Block max-pool scoring.
+        // K side uses num_key_blocks (full cached). Q side uses
+        // num_query_blocks (current chunk only).
+        let k_blocked = mlxcel_core::reshape(
+            &idx_k,
+            &[b, 1, num_key_blocks, self.block_size, self.index_dim],
+        );
         let k_pool = mlxcel_core::max_axis(&k_blocked, 3, false);
 
         let q_blocked = mlxcel_core::reshape(
@@ -364,7 +402,7 @@ impl SparseAttention {
             &[
                 b,
                 self.num_kv_heads,
-                num_blocks,
+                num_query_blocks,
                 self.block_size,
                 self.index_dim,
             ],
@@ -375,42 +413,35 @@ impl SparseAttention {
         let k_pool_t = mlxcel_core::transpose_axes(&k_pool, &[0, 1, 3, 2]);
         let block_scores = mlxcel_core::matmul(&q_pool, &k_pool_t);
         let block_scores = mlxcel_core::multiply_scalar(&block_scores, scale_idx);
+        // block_scores shape: [b, num_kv_heads, num_query_blocks, num_key_blocks]
 
-        let block_scores = self.apply_causal_block_mask(&block_scores, num_blocks);
+        let block_scores = self.apply_causal_block_mask_asymmetric(
+            &block_scores,
+            num_query_blocks,
+            num_key_blocks,
+            cache_offset_at_chunk_start,
+        );
 
         // Local block always included (set to inf) - verified from Transformers code
-        let block_scores = self.ensure_local_block_score(&block_scores, num_blocks);
+        let block_scores = self.ensure_local_block_score_asymmetric(
+            &block_scores,
+            num_query_blocks,
+            num_key_blocks,
+            cache_offset_at_chunk_start,
+        );
 
-        // Top-K selection
+        // Top-K selection: produces ABSOLUTE key block indices in
+        // [0, num_key_blocks). selected shape: [b, num_kv_heads,
+        // num_query_blocks, top_k].
         let neg_scores = mlxcel_core::negative(&block_scores);
         let k_minus_1 = self.top_k - 1;
         let partitioned = mlxcel_core::argpartition(&neg_scores, k_minus_1, -1);
         let selected = mlxcel_core::slice(
             &partitioned,
             &[0, 0, 0, 0],
-            &[b, self.num_kv_heads, num_blocks, self.top_k],
+            &[b, self.num_kv_heads, num_query_blocks, self.top_k],
         );
 
-        // Asymmetric q/k for chunked-prefill / cached case.
-        // - q has shape [..., l, ...] (current chunk only).
-        // - cache_k/v have shape [..., kv_len, ...] (cache_offset + l in seq dim).
-        //   kv_len read from cache_k's actual shape (most robust).
-        // - cache_offset = kv_len - l (where the current chunk starts in absolute coords).
-        //
-        // KNOWN GAP (closed by task #80, the indexer K cache): the `selected`
-        // indices above were computed from idx_q/idx_k of the CURRENT CHUNK
-        // only, so values are in [0, num_query_blocks) — chunk-relative.
-        // sparse_sdpa interprets them as absolute indices into num_key_blocks
-        // = ceil(kv_len / block_size). In the no-cache case (cache_offset=0)
-        // num_query_blocks == num_key_blocks and the two coordinate systems
-        // coincide. In the cached case they diverge; sparse_sdpa won't crash
-        // (chunk-relative indices are still valid into num_key_blocks because
-        // num_query_blocks ≤ num_key_blocks), but attention attends to the
-        // wrong blocks. End-to-end correctness gated on task #80 wiring the
-        // indexer K cache so selected becomes absolute-coord by construction.
-        let cache_k_shape = mlxcel_core::array_shape(&cache_k);
-        let kv_len = cache_k_shape[2];
-        let cache_offset_at_chunk_start = kv_len - l;
         self.sparse_sdpa(
             &q,
             &cache_k,
@@ -423,6 +454,7 @@ impl SparseAttention {
         )
     }
 
+    #[allow(dead_code)] // Symmetric form retained for regression; #81 wires asymmetric.
     fn apply_causal_block_mask(&self, scores: &MlxArray, num_blocks: i32) -> UniquePtr<MlxArray> {
         let key_pos = mlxcel_core::arange_f32(0.0, num_blocks as f32, 1.0);
         let key_pos = mlxcel_core::reshape(&key_pos, &[1, 1, 1, num_blocks]);
@@ -468,6 +500,7 @@ impl SparseAttention {
     ///   diff      = query_pos - key_pos   shape [1, 1, num_blocks, num_blocks]
     ///   is_local  = (diff >= 0) AND (diff < sparse_local_block)
     ///   scores    = where(is_local, +inf, scores)
+    #[allow(dead_code)] // Symmetric form retained for regression; #81 wires asymmetric.
     fn ensure_local_block_score(&self, scores: &MlxArray, num_blocks: i32) -> UniquePtr<MlxArray> {
         if self.sparse_local_block <= 0 {
             return mlxcel_core::copy(scores);
@@ -491,6 +524,112 @@ impl SparseAttention {
         );
         let key_plus_window = mlxcel_core::add(&key_pos, &window);
         let within_window = mlxcel_core::less(&query_pos, &key_plus_window);
+        let is_local = mlxcel_core::logical_and(&causal, &within_window);
+
+        let dtype = mlxcel_core::array_dtype(scores);
+        let pos_inf = mlxcel_core::full_f32(&[1], f32::INFINITY, dtype);
+        let s = mlxcel_core::array_shape(scores);
+        let pos_inf = mlxcel_core::broadcast_to(&pos_inf, &[s[0], s[1], s[2], s[3]]);
+
+        mlxcel_core::where_cond(&is_local, &pos_inf, scores)
+    }
+
+    /// Asymmetric variant of `apply_causal_block_mask` for chunked-prefill /
+    /// cached case. Query blocks are chunk-relative ([0, num_query_blocks));
+    /// key blocks are absolute ([0, num_key_blocks)).
+    ///
+    /// For each query block i, the maximum attendable absolute key block is
+    /// the block containing the query block's LAST absolute position:
+    ///
+    ///   max_attendable_kblock[i] = (cache_offset + (i+1)*block_size - 1) / block_size
+    ///                              (integer division, floor)
+    ///
+    /// This is over-permissive when a query block straddles a key block
+    /// boundary (cache_offset is not a multiple of block_size): we include
+    /// the boundary key block even though some of its positions may be
+    /// future from the query's first position's perspective. That's
+    /// correct: the asymmetric mask in `sparse_sdpa` later masks per-
+    /// position with the `p_k > p_q ⇒ invalid` rule, which prunes any
+    /// within-block future positions. Over-permission at top-k selection
+    /// time means a top-k slot may go to a partially-attendable block; the
+    /// per-position mask catches the residual.
+    fn apply_causal_block_mask_asymmetric(
+        &self,
+        scores: &MlxArray,
+        num_query_blocks: i32,
+        num_key_blocks: i32,
+        cache_offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        // CPU-side precompute the per-query-block max attendable absolute
+        // key block. Cheap (num_query_blocks ≤ ~64 in practice).
+        let max_kblocks: Vec<f32> = (0..num_query_blocks)
+            .map(|i| {
+                let last_abs = cache_offset + (i + 1) * self.block_size - 1;
+                (last_abs / self.block_size) as f32
+            })
+            .collect();
+        let max_kblocks_arr = mlxcel_core::from_slice_f32(
+            &max_kblocks,
+            &[1, 1, num_query_blocks, 1],
+        );
+        let key_pos = mlxcel_core::arange_f32(0.0, num_key_blocks as f32, 1.0);
+        let key_pos = mlxcel_core::reshape(&key_pos, &[1, 1, 1, num_key_blocks]);
+        let causal = mlxcel_core::less_equal(&key_pos, &max_kblocks_arr);
+        let neg_inf =
+            mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, mlxcel_core::array_dtype(scores));
+        let s = mlxcel_core::array_shape(scores);
+        let neg_inf = mlxcel_core::broadcast_to(&neg_inf, &[s[0], s[1], s[2], s[3]]);
+        mlxcel_core::where_cond(&causal, scores, &neg_inf)
+    }
+
+    /// Asymmetric variant of `ensure_local_block_score`. For each query
+    /// block i, force the absolute key blocks
+    /// `[max_attendable_kblock[i] - sparse_local_block + 1, max_attendable_kblock[i]]`
+    /// (clipped to ≥ 0) to +inf so top-k always includes the local
+    /// neighbourhood.
+    ///
+    /// In the cache_offset=0 case this reduces to the symmetric form (the
+    /// local block IS the query's block IS the diagonal of the score
+    /// matrix). With cache_offset > 0, the local block sits in the cached
+    /// prefix's last absolute block(s), which is the correct
+    /// neighbourhood for the current chunk's queries.
+    fn ensure_local_block_score_asymmetric(
+        &self,
+        scores: &MlxArray,
+        num_query_blocks: i32,
+        num_key_blocks: i32,
+        cache_offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        if self.sparse_local_block <= 0 {
+            return mlxcel_core::copy(scores);
+        }
+
+        // For each query block i: max attendable absolute key block (same
+        // formula as the asymmetric causal mask above).
+        let max_kblocks: Vec<f32> = (0..num_query_blocks)
+            .map(|i| {
+                let last_abs = cache_offset + (i + 1) * self.block_size - 1;
+                (last_abs / self.block_size) as f32
+            })
+            .collect();
+        let max_kblocks_arr = mlxcel_core::from_slice_f32(
+            &max_kblocks,
+            &[1, 1, num_query_blocks, 1],
+        );
+
+        // key_pos[k] = k (absolute)
+        let key_pos = mlxcel_core::arange_f32(0.0, num_key_blocks as f32, 1.0);
+        let key_pos = mlxcel_core::reshape(&key_pos, &[1, 1, 1, num_key_blocks]);
+
+        // is_local[q, k] = (k ≤ max_kblock[q]) AND (k > max_kblock[q] - sparse_local_block)
+        let causal = mlxcel_core::less_equal(&key_pos, &max_kblocks_arr);
+        let window = mlxcel_core::full_f32(
+            &[1],
+            self.sparse_local_block as f32,
+            mlxcel_core::dtype::FLOAT32,
+        );
+        let lower_bound = mlxcel_core::subtract(&max_kblocks_arr, &window);
+        let within_window = mlxcel_core::greater(&key_pos, &lower_bound);
         let is_local = mlxcel_core::logical_and(&causal, &within_window);
 
         let dtype = mlxcel_core::array_dtype(scores);
