@@ -242,19 +242,38 @@ impl SparseAttention {
 
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
 
-        if self.index_q_proj.is_none() || l <= self.block_size {
+        // Lockstep check on the indexer K cache: m3_idx_offset must equal the
+        // PRE-update main K offset. The scheduler's prompt-cache adoption
+        // restores main K/V from a CacheEntry that knows nothing about the
+        // M3-specific indexer state — adopting bumps cache.offset to the
+        // matched length while m3_idx_offset stays at 0. After that, the MSA
+        // path's reshape blows up because idx_k is shorter than padded_k_len
+        // would imply. Detect this up front, before computing any of the
+        // MSA-specific shapes, and dispatch dense for the rest of this
+        // session (proper fix: store m3_idx_k alongside main K/V in
+        // CacheEntry so adoption preserves it — separate task).
+        let idx_k_lockstep = cache.m3_idx_offset() == offset;
+        if self.index_q_proj.is_none()
+            || l <= self.block_size
+            || !idx_k_lockstep
+        {
+            let reason = if self.index_q_proj.is_none() {
+                "no_index_proj"
+            } else if l <= self.block_size {
+                "l_le_block_size"
+            } else {
+                "idx_k_cache_out_of_sync_after_adoption"
+            };
             debug!(
                 layer = self.layer_idx,
                 b = b,
                 l = l,
                 block_size = self.block_size,
                 has_index_proj = self.index_q_proj.is_some(),
+                main_offset = offset,
+                indexer_offset = cache.m3_idx_offset(),
                 branch = "dense",
-                reason = if self.index_q_proj.is_none() {
-                    "no_index_proj"
-                } else {
-                    "l_le_block_size"
-                },
+                reason = reason,
                 "attn.dispatch"
             );
             return self.dense_attention(&q, &cache_k, &cache_v, mask);
@@ -278,32 +297,6 @@ impl SparseAttention {
         let padded_k_len = num_key_blocks * self.block_size;
         let pad_q_amt = padded_q_len - l;
         let pad_k_amt = padded_k_len - kv_len;
-        // Detect prompt-cache adoption mismatch: when the scheduler adopts a
-        // cached entry, the main K/V buffer is restored to length cache.offset,
-        // but the m3_idx_k cache I added in #80 is NOT preserved across the
-        // adopt boundary (the CacheEntry stores main KV only). After adoption
-        // we have cache.offset > 0 (e.g. 23248) but m3_idx_offset == 0. The
-        // current chunk's idx_k projection produces only `l` positions, the
-        // padding fills to padded_k_len but no cached idx_k positions exist,
-        // and the reshape blows up — the same family as the cycle 79 root
-        // bug but in the indexer path. Fall back to dense for these requests
-        // until the cache machinery preserves idx_k state alongside main KV
-        // (proper fix: store m3_idx_k inside CacheEntry; track in #84).
-        let idx_k_lockstep = cache.m3_idx_offset() == cache.offset - l;
-        if !idx_k_lockstep {
-            debug!(
-                layer = self.layer_idx,
-                b = b,
-                l = l,
-                kv_len = kv_len,
-                main_offset = cache.offset,
-                indexer_offset = cache.m3_idx_offset(),
-                branch = "dense",
-                reason = "idx_k_cache_out_of_sync (prompt-cache adoption skipped indexer state)",
-                "attn.dispatch"
-            );
-            return self.dense_attention(&q, &cache_k, &cache_v, mask);
-        }
         // Dispatch dense when the KEY dimension's block count saturates top-k.
         // Sparse selection of all blocks reduces to dense; the per-token
         // attention math is identical, so skip the indexer machinery.
