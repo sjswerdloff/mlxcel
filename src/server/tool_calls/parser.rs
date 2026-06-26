@@ -766,6 +766,155 @@ mod tests {
         );
     }
 
+    // -- MiniMax-M3 nested-arg end-to-end tests --
+    //
+    // Real Claude Code / MCP tools take nested object and array arguments.
+    // Without recursive `to_xml` decoding these would silently lose their
+    // structure — a TaskUpdate's metadata object becomes a raw XML string,
+    // an AskUserQuestion's questions array becomes a string, and schema
+    // validation downstream rejects them. These end-to-end tests cover
+    // the realistic invoke shapes.
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_nested_object_param_taskupdate_metadata() {
+        // TaskUpdate({"taskId": "42", "metadata": {"foo": "bar", "count": 3}})
+        // chat-template rendered (post-strip):
+        //   <invoke name="TaskUpdate">
+        //     <taskId>42</taskId>
+        //     <metadata><foo>bar</foo><count>3</count></metadata>
+        //   </invoke>
+        let raw = "]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"TaskUpdate\">\
+                   ]<]minimax[>[<taskId>42]<]minimax[>[</taskId>\
+                   ]<]minimax[>[<metadata>]<]minimax[>[<foo>bar]<]minimax[>[</foo>]<]minimax[>[<count>3]<]minimax[>[</count>]<]minimax[>[</metadata>\
+                   ]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("TaskUpdate")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls(), "must extract TaskUpdate call");
+        assert_eq!(result.tool_calls[0].name, "TaskUpdate");
+        let args = arg_obj(&result.tool_calls[0]);
+        // taskId is the numeric-looking string "42"; coercion turns it into
+        // a JSON number — schema would accept either if the spec is "string |
+        // number". For this test we assert the integer outcome.
+        assert_eq!(args["taskId"], 42);
+        // The metadata MUST be a nested JSON object, not a string-literal of
+        // the XML.
+        let meta = args["metadata"].as_object().expect(
+            "metadata must decode as a JSON object; without recursive M3 \
+             support it would be a raw XML string literal",
+        );
+        assert_eq!(meta["foo"], "bar");
+        assert_eq!(meta["count"], 3);
+    }
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_array_param_taskupdate_blockedby() {
+        // TaskUpdate({"taskId": "5", "addBlockedBy": ["1", "2", "3"]})
+        // chat-template rendered (post-strip):
+        //   <invoke name="TaskUpdate">
+        //     <taskId>5</taskId>
+        //     <addBlockedBy><item>1</item><item>2</item><item>3</item></addBlockedBy>
+        //   </invoke>
+        let raw = "]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"TaskUpdate\">\
+                   ]<]minimax[>[<taskId>5]<]minimax[>[</taskId>\
+                   ]<]minimax[>[<addBlockedBy>]<]minimax[>[<item>1]<]minimax[>[</item>]<]minimax[>[<item>2]<]minimax[>[</item>]<]minimax[>[<item>3]<]minimax[>[</item>]<]minimax[>[</addBlockedBy>\
+                   ]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("TaskUpdate")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls());
+        let args = arg_obj(&result.tool_calls[0]);
+        let arr = args["addBlockedBy"]
+            .as_array()
+            .expect("addBlockedBy must decode as JSON array");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0], 1);
+        assert_eq!(arr[1], 2);
+        assert_eq!(arr[2], 3);
+    }
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_array_of_objects_askuserquestion() {
+        // AskUserQuestion({
+        //   "questions": [
+        //     {"question": "Auth method?", "header": "Auth",
+        //      "options": [{"label": "OAuth", "description": "..."},
+        //                  {"label": "API key", "description": "..."}]}
+        //   ]
+        // })
+        //
+        // This is the realistic complex case: array → object → array → object,
+        // four levels deep. Each level must decode correctly.
+        let raw = "]<]minimax[>[<tool_call>\
+                   ]<]minimax[>[<invoke name=\"AskUserQuestion\">\
+                   ]<]minimax[>[<questions>\
+                   ]<]minimax[>[<item>\
+                   ]<]minimax[>[<question>Auth method?]<]minimax[>[</question>\
+                   ]<]minimax[>[<header>Auth]<]minimax[>[</header>\
+                   ]<]minimax[>[<options>\
+                   ]<]minimax[>[<item>]<]minimax[>[<label>OAuth]<]minimax[>[</label>]<]minimax[>[<description>delegated]<]minimax[>[</description>]<]minimax[>[</item>\
+                   ]<]minimax[>[<item>]<]minimax[>[<label>API key]<]minimax[>[</label>]<]minimax[>[<description>simple]<]minimax[>[</description>]<]minimax[>[</item>\
+                   ]<]minimax[>[</options>\
+                   ]<]minimax[>[</item>\
+                   ]<]minimax[>[</questions>\
+                   ]<]minimax[>[</invoke>\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("AskUserQuestion")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls());
+        let args = arg_obj(&result.tool_calls[0]);
+        let questions = args["questions"]
+            .as_array()
+            .expect("questions must decode as JSON array");
+        assert_eq!(questions.len(), 1);
+        let q0 = questions[0]
+            .as_object()
+            .expect("question[0] must decode as JSON object");
+        assert_eq!(q0["question"], "Auth method?");
+        assert_eq!(q0["header"], "Auth");
+        let options = q0["options"]
+            .as_array()
+            .expect("options must decode as JSON array");
+        assert_eq!(options.len(), 2);
+        let opt0 = options[0]
+            .as_object()
+            .expect("option[0] must decode as JSON object");
+        assert_eq!(opt0["label"], "OAuth");
+        assert_eq!(opt0["description"], "delegated");
+        let opt1 = options[1].as_object().unwrap();
+        assert_eq!(opt1["label"], "API key");
+    }
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_mixed_scalar_object_array_params() {
+        // A single call with all three param shapes side-by-side. Mirrors
+        // a realistic MCP tool with heterogeneous args.
+        let raw = "]<]minimax[>[<tool_call>\
+                   ]<]minimax[>[<invoke name=\"mixed_call\">\
+                   ]<]minimax[>[<name>example]<]minimax[>[</name>\
+                   ]<]minimax[>[<config>]<]minimax[>[<retries>3]<]minimax[>[</retries>]<]minimax[>[<timeout>30.5]<]minimax[>[</timeout>]<]minimax[>[</config>\
+                   ]<]minimax[>[<tags>]<]minimax[>[<item>alpha]<]minimax[>[</item>]<]minimax[>[<item>beta]<]minimax[>[</item>]<]minimax[>[</tags>\
+                   ]<]minimax[>[</invoke>\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("mixed_call")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls());
+        let args = arg_obj(&result.tool_calls[0]);
+        // Scalar
+        assert_eq!(args["name"], "example");
+        // Object
+        let config = args["config"].as_object().unwrap();
+        assert_eq!(config["retries"], 3);
+        assert!((config["timeout"].as_f64().unwrap() - 30.5).abs() < 1e-9);
+        // Array of strings
+        let tags = args["tags"].as_array().unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0], "alpha");
+        assert_eq!(tags[1], "beta");
+    }
+
     // -- Prompt-primed Gemma 4 (enable_thinking=true) --
     //
     // When the chat template ends the generation prompt with an OPEN

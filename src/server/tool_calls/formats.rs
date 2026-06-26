@@ -884,25 +884,65 @@ fn extract_m2_attr_parameters(body: &str) -> String {
     serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Defensive bound on recursive descent into M3 nested values. The `to_xml`
+/// macro recurses for mapping and iterable values; an adversarial model
+/// output could pin a stack frame per level. Real schemas rarely exceed 5–6
+/// levels (top-level arg → object → array → object → field), so 32 is a
+/// large safety margin while still preventing unbounded stack growth.
+const M3_MAX_RECURSION_DEPTH: usize = 32;
+
 /// Extract parameters in M3 form: `<param_name>value</param_name>` where the
 /// parameter name IS the XML tag name.
 ///
-/// Matches the post-strip output of the M3 chat template's `to_xml` macro for
-/// flat scalar parameters. Nested object/list parameters (mapping or iterable
-/// values that recurse into nested tags) are **not** fully decoded — the
-/// extractor captures only the outer tag's raw text. This covers the common
-/// case (Read.file_path, Bash.command, Skill.skill) but leaves nested-object
-/// argument shapes as a follow-up (see HANDOFF when the need arises).
+/// Mirrors the M3 chat template's `to_xml` macro (chat_template.jinja:20-36):
+/// - **Mapping**: `<k1>v1</k1><k2>v2</k2>` (named child tags)
+/// - **Iterable**: `<item>v1</item><item>v2</item>` (repeated `<item>` tags)
+/// - **Scalar**: bare text content (numbers/strings/booleans-as-tojson)
 ///
-/// Scans only top-level tags in `body`. A tag is "top level" if it appears
-/// at the current `remaining` position and is not contained inside a prior
-/// tag's value range (the scanner advances past each matched `</close>`).
+/// Each parameter's value is parsed recursively via [`parse_m3_value`], so
+/// nested objects and arrays decode correctly into JSON.
+///
+/// **Top-level extraction is lenient**: any non-tag content between tag
+/// pairs at the invoke-body level (whitespace, newlines, unmatched-open
+/// fragments) is skipped — already-extracted parameters are preserved.
+/// This preserves the parser's resilience against partial/garbled output.
+///
+/// **Recursive value decoding is strict** (see [`parse_m3_value`]): a
+/// value body is treated as structured (mapping/array) only when it is
+/// *entirely* tag pairs. Any mixed scalar+tag content falls through to
+/// the scalar path. This prevents a literal `<` inside a string value
+/// from being mis-decoded as a nested structure.
+///
+/// Same-name nested tag-pairs (e.g. a key `<config>` containing another
+/// `<config>` field) are handled via bracket-balanced matching in
+/// [`find_matching_m3_close_offset`] — a naive `.find()` on `</tag>` would
+/// match the inner close at the wrong boundary.
 fn extract_m3_tag_parameters(body: &str) -> String {
-    let mut pairs: Vec<(String, serde_json::Value)> = Vec::new();
+    let pairs = extract_m3_top_level_lenient(body);
+    if pairs.is_empty() {
+        return "{}".to_string();
+    }
+    let mut map = serde_json::Map::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        map.insert(k, parse_m3_value(&v, 0));
+    }
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Lenient top-level extractor for M3 invoke bodies.
+///
+/// Scans `body` for `<tag>value</tag>` pairs, skipping non-tag content
+/// between them. Uses [`find_matching_m3_close_offset`] for bracket-balanced
+/// matching so same-name nested tags close at the right place. Stops at
+/// the first unmatched open (preserves prior pairs).
+///
+/// Use this at the top level only. Within a parameter value, use the
+/// strict [`decode_m3_top_level_tags`] via [`parse_m3_value`].
+fn extract_m3_top_level_lenient(body: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
     let mut remaining = body;
 
     loop {
-        // Find the next '<' that opens a tag (not a closing tag, comment, or PI).
         let Some(lt_pos) = remaining.find('<') else {
             break;
         };
@@ -912,55 +952,151 @@ fn extract_m3_tag_parameters(body: &str) -> String {
         }
         let next_byte = remaining.as_bytes()[after_lt];
         if next_byte == b'/' || next_byte == b'!' || next_byte == b'?' {
-            // Closing tag, comment, or processing instruction — skip past '<'
-            // and keep scanning. Advancing by one guarantees forward progress;
-            // remaining shrinks each iteration so the loop terminates.
+            // Closing tag, comment, or processing instruction — skip past
+            // '<' and keep scanning.
             remaining = &remaining[after_lt..];
             continue;
         }
 
-        // Find the end of the opening tag: '>'.
         let Some(gt_offset) = remaining[after_lt..].find('>') else {
             break;
         };
         let tag_name_raw = &remaining[after_lt..after_lt + gt_offset];
 
-        // Reject attributed tags (contain whitespace or '='). M3's `to_xml`
-        // emits bare tags with no attributes; an attributed tag here means
-        // we're not at an M3 parameter boundary and should skip past '<'.
         if tag_name_raw.is_empty()
             || tag_name_raw.contains(char::is_whitespace)
             || tag_name_raw.contains('=')
         {
+            // Attributed tag or empty name — not an M3 boundary; skip.
             remaining = &remaining[after_lt..];
             continue;
         }
         let tag_name = tag_name_raw.to_string();
 
         let value_start = after_lt + gt_offset + 1;
-        let close_tag = format!("</{}>", tag_name);
-        let Some(close_offset) = remaining[value_start..].find(&close_tag) else {
-            // Unmatched open: stop scanning (don't strand work on malformed
-            // input — see the M2 path's analogous `break`).
+        let Some(close_offset) =
+            find_matching_m3_close_offset(&remaining[value_start..], &tag_name)
+        else {
+            // Unmatched open: stop scanning, preserve already-extracted
+            // pairs (parity with the M2 path's break-on-malformed behaviour).
             break;
         };
-        let raw_value = &remaining[value_start..value_start + close_offset];
+        let value = remaining[value_start..value_start + close_offset].to_string();
+        let close_tag_len = tag_name.len() + 3; // "</" + name + ">"
+        pairs.push((tag_name, value));
+        remaining = &remaining[value_start + close_offset + close_tag_len..];
 
-        // Trim leading/trailing newlines + whitespace (same as M2 path).
-        let mut raw_value = raw_value;
-        if raw_value.starts_with('\n') {
-            raw_value = &raw_value[1..];
+        if pairs.len() >= MINIMAX_M2_MAX_PARAMS_PER_CALL {
+            break;
         }
-        if raw_value.ends_with('\n') {
-            raw_value = &raw_value[..raw_value.len() - 1];
+    }
+
+    pairs
+}
+
+/// Recursively decode an M3 `to_xml`-rendered value into JSON.
+///
+/// Decision order:
+/// 1. Empty (after trim) → empty string.
+/// 2. Depth-cap hit → coerce as scalar (graceful degradation under
+///    adversarial nesting).
+/// 3. Body is structured (entirely tag pairs with only whitespace between)
+///    AND all keys are `"item"` → JSON array.
+/// 4. Body is structured AND has any named key → JSON object (mapping).
+/// 5. Otherwise → scalar via [`coerce_minimax_param`].
+///
+/// The strict structured-detection in [`decode_m3_top_level_tags`] prevents
+/// a scalar string that happens to contain a `<` from being mis-decoded as
+/// a mapping. Mixed text+tag bodies fall through to scalar.
+fn parse_m3_value(body: &str, depth: usize) -> serde_json::Value {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return serde_json::Value::String(String::new());
+    }
+    if depth >= M3_MAX_RECURSION_DEPTH {
+        return coerce_minimax_param(trimmed);
+    }
+
+    if let Some(pairs) = decode_m3_top_level_tags(trimmed)
+        && !pairs.is_empty()
+    {
+        // All keys "item" → array. Mixed key + "item" tags would be a
+        // chat-template impossibility; default to mapping in that case.
+        if pairs.iter().all(|(k, _)| k == "item") {
+            let items: Vec<serde_json::Value> = pairs
+                .into_iter()
+                .map(|(_, v)| parse_m3_value(&v, depth + 1))
+                .collect();
+            return serde_json::Value::Array(items);
         }
-        let value = raw_value.trim();
+        let mut map = serde_json::Map::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            map.insert(k, parse_m3_value(&v, depth + 1));
+        }
+        return serde_json::Value::Object(map);
+    }
 
-        let json_value = coerce_minimax_param(value);
-        pairs.push((tag_name, json_value));
+    coerce_minimax_param(trimmed)
+}
 
-        // Advance past the closing tag.
-        remaining = &remaining[value_start + close_offset + close_tag.len()..];
+/// Decode a body as a sequence of top-level `<tag>value</tag>` pairs.
+///
+/// Returns `Some(pairs)` only when the body consists *entirely* of well-formed
+/// tag pairs (possibly separated by whitespace). Any non-whitespace text
+/// between tag pairs, an unmatched open, or an attributed tag (contains `=`
+/// or whitespace in the name) causes `None` — signalling to [`parse_m3_value`]
+/// that this is a scalar, not a structure. An empty body returns
+/// `Some(vec![])`.
+///
+/// Values inside each pair are extracted with bracket-balanced matching so
+/// nested same-name tags close at the correct boundary.
+fn decode_m3_top_level_tags(body: &str) -> Option<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    let mut remaining = body.trim();
+
+    while !remaining.is_empty() {
+        // Strict: must start with '<' after trim. Any leading non-whitespace
+        // text means this body isn't pure structured content → bail to
+        // scalar via `None`.
+        if !remaining.starts_with('<') {
+            return None;
+        }
+        let after_lt = 1;
+        if after_lt >= remaining.len() {
+            return None;
+        }
+        let next_byte = remaining.as_bytes()[after_lt];
+        // Closing tag, comment, or PI as the first thing — malformed for
+        // structured content; bail.
+        if next_byte == b'/' || next_byte == b'!' || next_byte == b'?' {
+            return None;
+        }
+
+        let Some(gt_offset) = remaining[after_lt..].find('>') else {
+            return None;
+        };
+        let tag_name_raw = &remaining[after_lt..after_lt + gt_offset];
+
+        // Attributed tags (whitespace or `=` in the name) are not M3 form.
+        // The `to_xml` macro emits bare tags exclusively.
+        if tag_name_raw.is_empty()
+            || tag_name_raw.contains(char::is_whitespace)
+            || tag_name_raw.contains('=')
+        {
+            return None;
+        }
+        let tag_name = tag_name_raw.to_string();
+
+        let value_start = after_lt + gt_offset + 1;
+        let Some(close_offset) =
+            find_matching_m3_close_offset(&remaining[value_start..], &tag_name)
+        else {
+            return None;
+        };
+        let value = remaining[value_start..value_start + close_offset].to_string();
+        let close_tag_len = tag_name.len() + 3; // "</" + name + ">"
+        pairs.push((tag_name, value));
+        remaining = remaining[value_start + close_offset + close_tag_len..].trim();
 
         // Defensive cap: bound per-call parameter memory (same as M2 path).
         if pairs.len() >= MINIMAX_M2_MAX_PARAMS_PER_CALL {
@@ -968,11 +1104,35 @@ fn extract_m3_tag_parameters(body: &str) -> String {
         }
     }
 
-    let mut map = serde_json::Map::with_capacity(pairs.len());
-    for (k, v) in pairs {
-        map.insert(k, v);
+    Some(pairs)
+}
+
+/// Find the byte offset of the `</tag_name>` that closes an `<tag_name>` whose
+/// opening was just consumed by the caller (so depth starts at 1).
+///
+/// Bracket-balanced: every nested `<tag_name>` increments depth, every
+/// `</tag_name>` decrements; the first decrement to zero is the match.
+/// Returns `None` if no matching close appears before EOF.
+fn find_matching_m3_close_offset(body: &str, tag_name: &str) -> Option<usize> {
+    let open = format!("<{}>", tag_name);
+    let close = format!("</{}>", tag_name);
+    let mut depth: usize = 1;
+    let mut pos = 0;
+    while pos < body.len() {
+        if body[pos..].starts_with(&open) {
+            depth += 1;
+            pos += open.len();
+        } else if body[pos..].starts_with(&close) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(pos);
+            }
+            pos += close.len();
+        } else {
+            pos += 1;
+        }
     }
-    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
+    None
 }
 
 /// Convert a raw string parameter value to the most specific JSON type.
@@ -1988,5 +2148,195 @@ mod tests {
         assert_eq!(result.tool_calls[0].name, "Read");
         let o = obj(&result.tool_calls[0].arguments);
         assert_eq!(o["file_path"], "/tmp/test.md");
+    }
+
+    // -- M3 recursive nested-arg decoding --
+    //
+    // The `to_xml` macro recurses for mapping and iterable values; tools
+    // with nested object/list arguments (TaskUpdate.metadata, AskUserQuestion
+    // .questions, Workflow.args, MCP structured args) must decode correctly
+    // or they hit the same silent-empty-args symptom Stuart caught for
+    // flat-scalar params, just one level deeper.
+
+    #[test]
+    fn m3_value_decodes_nested_mapping_object() {
+        // Simulated TaskUpdate.metadata = {"foo": "bar", "count": 3}
+        let body = "<metadata><foo>bar</foo><count>3</count></metadata>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        let meta = o["metadata"].as_object().unwrap();
+        assert_eq!(meta["foo"], "bar");
+        assert_eq!(meta["count"], 3);
+    }
+
+    #[test]
+    fn m3_value_decodes_iterable_array_of_strings() {
+        // Simulated TaskUpdate.addBlockedBy = ["1", "2"]
+        let body = "<addBlockedBy><item>1</item><item>2</item></addBlockedBy>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        let arr = o["addBlockedBy"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // Items "1" and "2" coerce to integers (coerce_minimax_param order).
+        assert_eq!(arr[0], 1);
+        assert_eq!(arr[1], 2);
+    }
+
+    #[test]
+    fn m3_value_decodes_mixed_scalar_types_in_array() {
+        let body =
+            "<items><item>42</item><item>3.14</item><item>hello</item><item>true</item></items>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        let arr = o["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr[0], 42);
+        assert!((arr[1].as_f64().unwrap() - 3.14).abs() < 1e-9);
+        assert_eq!(arr[2], "hello");
+        assert_eq!(arr[3], true);
+    }
+
+    #[test]
+    fn m3_value_decodes_array_of_objects_like_questions_param() {
+        // Simulated AskUserQuestion.questions = [{question, header}, ...]
+        let body = "<questions>\
+            <item><question>Q1?</question><header>H1</header></item>\
+            <item><question>Q2?</question><header>H2</header></item>\
+            </questions>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        let arr = o["questions"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let q0 = arr[0].as_object().unwrap();
+        assert_eq!(q0["question"], "Q1?");
+        assert_eq!(q0["header"], "H1");
+        let q1 = arr[1].as_object().unwrap();
+        assert_eq!(q1["question"], "Q2?");
+        assert_eq!(q1["header"], "H2");
+    }
+
+    #[test]
+    fn m3_value_decodes_deeply_nested_array_of_objects_with_array_field() {
+        // AskUserQuestion.questions[0].options = [{label, description}, ...]
+        // Three levels: array → object → array → object.
+        let body = "<questions>\
+            <item>\
+              <question>Pick one</question>\
+              <options>\
+                <item><label>A</label><description>first</description></item>\
+                <item><label>B</label><description>second</description></item>\
+              </options>\
+            </item>\
+            </questions>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        let q = o["questions"].as_array().unwrap()[0].as_object().unwrap();
+        assert_eq!(q["question"], "Pick one");
+        let opts = q["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].as_object().unwrap()["label"], "A");
+        assert_eq!(opts[1].as_object().unwrap()["description"], "second");
+    }
+
+    #[test]
+    fn m3_value_handles_same_name_nested_tags_bracket_balanced() {
+        // A field named `config` whose value is an object that also has a
+        // field named `config`. Naive `.find("</config>")` would match the
+        // INNER close; bracket-balanced matching must match the outer.
+        let body = "<config><config><x>1</x></config></config>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        let outer = o["config"].as_object().unwrap();
+        let inner = outer["config"].as_object().unwrap();
+        assert_eq!(inner["x"], 1);
+    }
+
+    #[test]
+    fn m3_value_decodes_single_item_array() {
+        let body = "<list><item>only</item></list>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        let arr = o["list"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0], "only");
+    }
+
+    #[test]
+    fn m3_value_decodes_empty_value_as_empty_string_not_null() {
+        // A tag with empty content (template's None-handling SHOULD elide
+        // this, but defensively the decoder gives back an empty string).
+        let body = "<args></args>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        assert_eq!(o["args"], "");
+    }
+
+    #[test]
+    fn m3_value_scalar_string_with_lt_not_misdecoded_as_structure() {
+        // The decode-mapping path is STRICT: a value like
+        // "I love <foo>bar</foo> things" must NOT be misread as a mapping
+        // with key "foo". Because there's leading non-whitespace text
+        // before the inner tag, strict mode bails and falls through to
+        // scalar.
+        let body = "<message>I love <foo>bar</foo> things</message>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        // Whatever shape the scalar takes, the key 'foo' must not appear
+        // at the top of message's value.
+        assert!(
+            !o["message"].is_object(),
+            "scalar with embedded <tag> must NOT decode as object; got {:?}",
+            o["message"]
+        );
+        // The scalar string preserves the value (modulo the inner balanced
+        // close — coerce_minimax_param won't drop characters).
+        assert!(o["message"].is_string());
+        assert!(o["message"].as_str().unwrap().contains("I love"));
+    }
+
+    #[test]
+    fn m3_value_recursion_depth_cap_degrades_to_scalar() {
+        // Construct a body nested 35 levels deep (beyond M3_MAX_RECURSION_DEPTH
+        // of 32). At the cap, parse_m3_value must stop recursing and treat
+        // the remaining content as a scalar string — not stack-overflow.
+        let depth = M3_MAX_RECURSION_DEPTH + 3;
+        let mut body = String::new();
+        for _ in 0..depth {
+            body.push_str("<l>");
+        }
+        body.push_str("inner");
+        for _ in 0..depth {
+            body.push_str("</l>");
+        }
+        // Wrap so the top-level extractor sees one tag.
+        let body = format!("<deep>{}</deep>", body);
+        let o = obj(&extract_m3_tag_parameters(&body));
+        // The decode walks down until depth cap, then turns the remaining
+        // body into a string. The exact form of the scalar isn't asserted —
+        // the contract is "no panic, produce SOMETHING for the key".
+        assert!(
+            o.contains_key("deep"),
+            "deep-nested input must still produce the top-level key"
+        );
+    }
+
+    // -- find_matching_m3_close_offset unit tests --
+
+    #[test]
+    fn find_matching_close_handles_simple_pair() {
+        assert_eq!(find_matching_m3_close_offset("x</a>", "a"), Some(1));
+    }
+
+    #[test]
+    fn find_matching_close_handles_same_name_nesting() {
+        // Body is what comes AFTER the outer <a>. The matching </a> is the
+        // SECOND </a>, not the first.
+        let body = "<a>inner</a></a>";
+        // After "<a>inner</a>" the next "</a>" closes the outer.
+        // Outer </a> is at offset 12.
+        assert_eq!(find_matching_m3_close_offset(body, "a"), Some(12));
+    }
+
+    #[test]
+    fn find_matching_close_returns_none_on_unmatched_open() {
+        assert_eq!(find_matching_m3_close_offset("x<a>y", "a"), None);
+    }
+
+    #[test]
+    fn find_matching_close_ignores_other_tag_names() {
+        // <b>...</b> inside an <a> body doesn't affect the depth count for "a".
+        let body = "<b>stuff</b></a>";
+        assert_eq!(find_matching_m3_close_offset(body, "a"), Some(12));
     }
 }
