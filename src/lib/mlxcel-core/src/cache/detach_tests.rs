@@ -265,6 +265,147 @@ fn clone_handle_round_trip_preserves_int8_scales() {
 }
 
 // ---------------------------------------------------------------------------
+// MiniMax-M3 indexer K cache: detach/adopt round-trip + lockstep trim
+// ---------------------------------------------------------------------------
+
+/// Build a tiny `[1, 1, len, dim]` FP32 idx_k chunk for round-trip tests.
+fn m3_idx_k_chunk(values: &[f32], len: i32, dim: i32) -> UniquePtr<MlxArray> {
+    assert_eq!(values.len() as i32, len * dim);
+    crate::ffi::from_slice_f32(values, &[1, 1, len, dim])
+}
+
+#[test]
+fn clone_handle_round_trip_preserves_m3_idx_k_state() {
+    // Write main K/V and an M3 indexer chunk so the donate path carries both.
+    let mut cache = KVCache::new();
+    cache.update(fp32_tokens(&[1.0, 2.0, 3.0]), fp32_tokens(&[4.0, 5.0, 6.0]));
+
+    let idx_k = m3_idx_k_chunk(&[10.0, 11.0, 20.0, 21.0, 30.0, 31.0], 3, 2);
+    let _ = cache.m3_idx_k_update_and_fetch(&idx_k);
+    assert_eq!(cache.m3_idx_offset(), 3);
+
+    let handle = cache.clone_handle();
+    // Source must be drained of both main and aux state.
+    assert!(cache.is_empty());
+    assert_eq!(cache.m3_idx_offset(), 0);
+    assert!(!cache.has_m3_idx_k_state());
+
+    // Restore into a fresh cache and verify the indexer state survives.
+    let mut restored = KVCache::new();
+    restored.install_detached(handle).unwrap();
+    assert_eq!(restored.seq_len(), 3);
+    assert_eq!(restored.m3_idx_offset(), 3);
+    assert!(restored.has_m3_idx_k_state());
+
+    let idx_k_restored = restored.m3_idx_k.as_ref().unwrap();
+    let vals = flatten_fp32(idx_k_restored);
+    assert_eq!(vals, vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0]);
+}
+
+#[test]
+fn clone_handle_round_trip_with_no_m3_idx_k_state_stays_none() {
+    // Non-M3 caches must not pick up phantom indexer state.
+    let mut cache = KVCache::new();
+    cache.update(fp32_tokens(&[1.0, 2.0]), fp32_tokens(&[3.0, 4.0]));
+    let handle = cache.clone_handle();
+
+    let mut restored = KVCache::new();
+    restored.install_detached(handle).unwrap();
+    assert_eq!(restored.m3_idx_offset(), 0);
+    assert!(!restored.has_m3_idx_k_state());
+}
+
+#[test]
+fn trim_to_mid_buffer_slices_m3_idx_k_in_lockstep() {
+    // The detached-side trim is what the scheduler uses for partial APC
+    // adoption (`DetachedCacheSet::truncate_to`). Verify the indexer cache
+    // is sliced alongside main K so MSA dispatch sees lockstep offsets.
+    let mut cache = KVCache::new();
+    cache.update(
+        fp32_tokens(&[1.0, 2.0, 3.0, 4.0]),
+        fp32_tokens(&[5.0, 6.0, 7.0, 8.0]),
+    );
+    let idx_k = m3_idx_k_chunk(
+        &[100.0, 101.0, 200.0, 201.0, 300.0, 301.0, 400.0, 401.0],
+        4,
+        2,
+    );
+    let _ = cache.m3_idx_k_update_and_fetch(&idx_k);
+
+    let mut handle = cache.clone_handle();
+    assert_eq!(handle.seq_len(), 4);
+    assert_eq!(handle.m3_idx_offset, 4);
+
+    handle.trim_to(2).expect("trim_to 2 must succeed");
+    assert_eq!(handle.offset, 2);
+    assert_eq!(handle.m3_idx_offset, 2, "indexer cache must trim in lockstep");
+
+    // Verify the surviving idx_k contents are the first two positions
+    // (axis 2 prefix slice), not the latter two.
+    let idx_k_sliced = handle.m3_idx_k.as_ref().unwrap();
+    assert_eq!(
+        crate::ffi::array_shape(idx_k_sliced),
+        vec![1, 1, 2, 2],
+        "post-trim shape must be [b, 1, new_len, index_dim]"
+    );
+    let vals = flatten_fp32(idx_k_sliced);
+    assert_eq!(vals, vec![100.0, 101.0, 200.0, 201.0]);
+}
+
+#[test]
+fn trim_to_zero_drops_m3_idx_k_state() {
+    let mut cache = KVCache::new();
+    cache.update(fp32_tokens(&[1.0, 2.0]), fp32_tokens(&[3.0, 4.0]));
+    let idx_k = m3_idx_k_chunk(&[7.0, 8.0, 9.0, 10.0], 2, 2);
+    let _ = cache.m3_idx_k_update_and_fetch(&idx_k);
+    let mut handle = cache.clone_handle();
+    assert!(handle.m3_idx_k.is_some());
+
+    handle.trim_to(0).expect("trim_to 0 must succeed");
+    assert!(handle.m3_idx_k.is_none(), "trim to zero drops the aux tensor");
+    assert_eq!(handle.m3_idx_offset, 0);
+}
+
+#[test]
+fn cache_pool_detach_adopt_preserves_m3_idx_k_state_end_to_end() {
+    // The cycle-79 proper fix: an adopt path that restores the indexer K
+    // state alongside main K/V so the MSA dispatch on a cached session no
+    // longer falls back to dense. This exercises the whole detach -> adopt
+    // path through CachePool, which is what the scheduler calls.
+    let model = RecordingModel::new(1);
+    let mut pool = CachePool::new(4);
+
+    let seq_a = pool.allocate(&model).unwrap();
+    {
+        let caches = pool.get_caches_mut(seq_a).unwrap();
+        caches[0].update(
+            fp32_tokens(&[1.0, 2.0, 3.0]),
+            fp32_tokens(&[10.0, 20.0, 30.0]),
+        );
+        let idx_k = m3_idx_k_chunk(&[0.5, 0.25, 0.125, 0.0625, 1.5, 1.25], 3, 2);
+        let _ = caches[0].m3_idx_k_update_and_fetch(&idx_k);
+        assert_eq!(caches[0].m3_idx_offset(), 3);
+    }
+
+    let detached = pool.detach(seq_a).expect("dense detach must succeed");
+    let seq_b = pool.adopt(&model, detached).expect("adopt must succeed");
+
+    let caches = pool.get_caches_mut(seq_b).unwrap();
+    assert_eq!(caches[0].seq_len(), 3);
+    assert_eq!(
+        caches[0].m3_idx_offset(),
+        3,
+        "indexer offset must round-trip through CachePool::detach/adopt"
+    );
+    assert!(
+        caches[0].has_m3_idx_k_state(),
+        "indexer K tensor must round-trip through CachePool::detach/adopt"
+    );
+    let idx_vals = flatten_fp32(caches[0].m3_idx_k.as_ref().unwrap());
+    assert_eq!(idx_vals, vec![0.5, 0.25, 0.125, 0.0625, 1.5, 1.25]);
+}
+
+// ---------------------------------------------------------------------------
 // CachePool::detach / adopt
 // ---------------------------------------------------------------------------
 

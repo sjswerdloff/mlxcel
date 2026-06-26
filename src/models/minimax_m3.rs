@@ -35,7 +35,7 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 /// Load a UnifiedLinear. Auto-detects quantization mode from weight shapes.
 fn load_linear(
@@ -243,39 +243,50 @@ impl SparseAttention {
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
 
         // Lockstep check on the indexer K cache: m3_idx_offset must equal the
-        // PRE-update main K offset. The scheduler's prompt-cache adoption
-        // restores main K/V from a CacheEntry that knows nothing about the
-        // M3-specific indexer state — adopting bumps cache.offset to the
-        // matched length while m3_idx_offset stays at 0. After that, the MSA
-        // path's reshape blows up because idx_k is shorter than padded_k_len
-        // would imply. Detect this up front, before computing any of the
-        // MSA-specific shapes, and dispatch dense for the rest of this
-        // session (proper fix: store m3_idx_k alongside main K/V in
-        // CacheEntry so adoption preserves it — separate task).
+        // PRE-update main K offset. As of the cycle-79 proper fix, m3_idx_k
+        // and m3_idx_offset round-trip through `DetachedKVCache::clone_handle`
+        // / `install_detached`, so prompt-cache adoption restores both halves
+        // in lockstep and this branch should be unreachable in healthy flows.
+        // Kept as defense-in-depth: if a future code path (new paged adopt,
+        // new model wiring, etc.) ever forgets to preserve the aux state,
+        // falling back to dense here prevents a process-killing reshape crash
+        // in `sparse_sdpa`. The warn-level log makes any regression loud.
         let idx_k_lockstep = cache.m3_idx_offset() == offset;
         if self.index_q_proj.is_none()
             || l <= self.block_size
             || !idx_k_lockstep
         {
-            let reason = if self.index_q_proj.is_none() {
-                "no_index_proj"
-            } else if l <= self.block_size {
-                "l_le_block_size"
+            if !idx_k_lockstep && self.index_q_proj.is_some() && l > self.block_size {
+                warn!(
+                    layer = self.layer_idx,
+                    b = b,
+                    l = l,
+                    main_offset = offset,
+                    indexer_offset = cache.m3_idx_offset(),
+                    branch = "dense",
+                    reason = "idx_k_cache_out_of_sync_after_adoption",
+                    "attn.dispatch: indexer K cache desync — proper fix should prevent this; \
+                     falling back to dense to avoid a reshape crash"
+                );
             } else {
-                "idx_k_cache_out_of_sync_after_adoption"
-            };
-            debug!(
-                layer = self.layer_idx,
-                b = b,
-                l = l,
-                block_size = self.block_size,
-                has_index_proj = self.index_q_proj.is_some(),
-                main_offset = offset,
-                indexer_offset = cache.m3_idx_offset(),
-                branch = "dense",
-                reason = reason,
-                "attn.dispatch"
-            );
+                let reason = if self.index_q_proj.is_none() {
+                    "no_index_proj"
+                } else {
+                    "l_le_block_size"
+                };
+                debug!(
+                    layer = self.layer_idx,
+                    b = b,
+                    l = l,
+                    block_size = self.block_size,
+                    has_index_proj = self.index_q_proj.is_some(),
+                    main_offset = offset,
+                    indexer_offset = cache.m3_idx_offset(),
+                    branch = "dense",
+                    reason = reason,
+                    "attn.dispatch"
+                );
+            }
             return self.dense_attention(&q, &cache_k, &cache_v, mask);
         }
 
@@ -2874,6 +2885,133 @@ mod tests {
             relative,
             diff,
             single_norm
+        );
+    }
+
+    #[test]
+    fn test_msa_four_chunk_with_cache_detach_adopt_midway_matches_continuous() {
+        // Cycle-79 proper-fix gate: exercise the detach/adopt round-trip in
+        // the MIDDLE of a chunked-prefill session. Without `m3_idx_k`
+        // preservation through `clone_handle`/`install_detached`, the MSA
+        // dispatch on chunks 3-4 would either crash (pre-band-aid) or fall
+        // back to dense via the lockstep guard (post-band-aid). With the
+        // proper fix, MSA fires normally and the output matches a
+        // continuous-cache reference within fp tolerance.
+        let layer = make_test_sparse_attention();
+        let hidden = layer.num_heads * layer.head_dim;
+        let l_chunk = 6;
+        let n_chunks = 4;
+        let l_total = l_chunk * n_chunks;
+
+        let input = make_test_input(1, l_total, hidden);
+
+        // Reference path: forward all four chunks against a single growing
+        // cache (no adoption interruption).
+        let mut cache_ref = KVCache::new();
+        let mut outs_ref: Vec<UniquePtr<MlxArray>> = Vec::new();
+        for i in 0..n_chunks {
+            let chunk = mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            );
+            outs_ref.push(layer.forward(&chunk, &mut cache_ref, None));
+        }
+
+        // Adoption path: forward chunks 1-2, simulate prompt-cache donate +
+        // adopt by round-tripping the cache through `clone_handle` /
+        // `install_detached` (the same primitives `CachePool::detach`/`adopt`
+        // call into), then continue with chunks 3-4 against the restored
+        // cache.
+        let mut cache_src = KVCache::new();
+        let mut outs_adopt: Vec<UniquePtr<MlxArray>> = Vec::new();
+        for i in 0..2 {
+            let chunk = mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            );
+            outs_adopt.push(layer.forward(&chunk, &mut cache_src, None));
+        }
+        assert_eq!(cache_src.offset, (2 * l_chunk) as i32);
+        assert_eq!(cache_src.m3_idx_offset(), (2 * l_chunk) as i32);
+
+        // Donate.
+        let handle = cache_src.clone_handle();
+        assert!(cache_src.is_empty(), "source cache must drain after donate");
+        assert_eq!(cache_src.m3_idx_offset(), 0);
+
+        // Adopt.
+        let mut cache_adopted = KVCache::new();
+        cache_adopted
+            .install_detached(handle)
+            .expect("install_detached must succeed");
+        assert_eq!(
+            cache_adopted.offset,
+            (2 * l_chunk) as i32,
+            "main K offset must round-trip"
+        );
+        assert_eq!(
+            cache_adopted.m3_idx_offset(),
+            (2 * l_chunk) as i32,
+            "indexer K offset must round-trip — the cycle-79 proper fix. A \
+             zero here means `m3_idx_k` was dropped on detach/adopt and chunk \
+             3's MSA dispatch will fall back to dense via the lockstep guard."
+        );
+        assert!(
+            cache_adopted.has_m3_idx_k_state(),
+            "indexer K tensor must round-trip alongside main K/V"
+        );
+
+        for i in 2..n_chunks {
+            let chunk = mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            );
+            outs_adopt.push(layer.forward(&chunk, &mut cache_adopted, None));
+        }
+        assert_eq!(cache_adopted.offset, l_total);
+        assert_eq!(cache_adopted.m3_idx_offset(), l_total);
+
+        // Compare both paths' concatenated outputs.
+        let concat = |outs: &[UniquePtr<MlxArray>]| -> UniquePtr<MlxArray> {
+            let mut acc = mlxcel_core::copy(&outs[0]);
+            for out in &outs[1..] {
+                acc = mlxcel_core::concatenate(&acc, out, 1);
+            }
+            mlxcel_core::eval(&acc);
+            acc
+        };
+        let ref_concat = concat(&outs_ref);
+        let adopt_concat = concat(&outs_adopt);
+
+        let diff = output_l2_diff(&ref_concat, &adopt_concat);
+        let ref_norm = {
+            let sq = mlxcel_core::multiply(&ref_concat, &ref_concat);
+            let s = mlxcel_core::array_shape(&sq);
+            let mut acc = mlxcel_core::copy(&sq);
+            for axis in (0..s.len()).rev() {
+                acc = mlxcel_core::sum_axis(&acc, axis as i32, false);
+            }
+            mlxcel_core::eval(&acc);
+            mlxcel_core::item_f32(&acc).sqrt()
+        };
+        let relative = if ref_norm > 1e-6 { diff / ref_norm } else { diff };
+        // Same input, same model, same dispatch path through MSA on both
+        // sides. Any non-trivial diff means the adoption disturbed the
+        // computation. A regression in m3_idx_k preservation would push
+        // chunks 3-4 to the dense fallback while the reference path stays
+        // on MSA, producing a much larger relative diff.
+        assert!(
+            relative < 0.05,
+            "detach-adopt-midway vs continuous-cache relative L2 = {} \
+             (abs {}, norm {}). Tolerance 0.05. A larger diff indicates the \
+             adoption side fell back to dense for chunks 3-4 — i.e. the \
+             `m3_idx_k` preservation through detach/adopt regressed.",
+            relative,
+            diff,
+            ref_norm
         );
     }
 

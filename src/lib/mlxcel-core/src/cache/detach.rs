@@ -123,6 +123,17 @@ pub struct DetachedKVCache {
     pub(super) hot_threshold: i32,
     pub(super) delegated_fp16_fast_path: bool,
     pub(super) delegated_fp16_sidecar_policy: super::turbo::DelegatedFp16SidecarPolicy,
+    /// MiniMax-M3 indexer K cache. `None` for non-M3 models (and for M3's
+    /// dense layers 0-2). Shape when `Some`: `[b, 1, m3_idx_offset, index_dim]`.
+    /// Round-trips through detach/adopt so prompt-cache reuse preserves the
+    /// indexer state alongside main K/V; otherwise an adopted MSA path would
+    /// see `m3_idx_offset == 0` while `offset == matched_len > 0` and crash on
+    /// the asymmetric reshape (the cycle-79 desync).
+    pub(super) m3_idx_k: Option<UniquePtr<MlxArray>>,
+    /// Logical length of `m3_idx_k`. Lockstep with `offset` under normal
+    /// operation. Preserved through detach/adopt and trimmed by `trim_to`
+    /// in parallel with the main K seq axis.
+    pub(super) m3_idx_offset: i32,
 }
 
 impl DetachedKVCache {
@@ -150,6 +161,7 @@ impl DetachedKVCache {
             || self.v_rescale.is_some()
             || self.k_packed.is_some()
             || self.k_norms.is_some()
+            || self.m3_idx_k.is_some()
         {
             return None;
         }
@@ -171,6 +183,8 @@ impl DetachedKVCache {
             hot_threshold: self.hot_threshold,
             delegated_fp16_fast_path: self.delegated_fp16_fast_path,
             delegated_fp16_sidecar_policy: self.delegated_fp16_sidecar_policy,
+            m3_idx_k: None,
+            m3_idx_offset: 0,
         })
     }
 
@@ -194,7 +208,8 @@ impl DetachedKVCache {
         let vr = self.v_rescale.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let kp = self.k_packed.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let kn = self.k_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
-        k + v + ks + vs + vp + vn + vr + kp + kn
+        let im3 = self.m3_idx_k.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        k + v + ks + vs + vp + vn + vr + kp + kn + im3
     }
 
     /// Whether the detached handle carries no data (all tensors were `None`).
@@ -276,6 +291,9 @@ impl DetachedKVCache {
             self.k_norms = None;
             self.cold_offset = 0;
             self.offset = 0;
+            // MiniMax-M3 indexer K cache trims in lockstep with main K.
+            self.m3_idx_k = None;
+            self.m3_idx_offset = 0;
             return Ok(());
         }
 
@@ -396,6 +414,21 @@ impl DetachedKVCache {
             self.offset = new_len;
         }
 
+        // MiniMax-M3 indexer K cache. Mode-agnostic: M3 layers 3-59 populate
+        // it regardless of which KV mode is in play, dense layers leave it
+        // None. Shape: `[b, 1, m3_idx_offset, index_dim]`. Slice axis 2 in
+        // lockstep with main K so partial APC adoption preserves the
+        // (cache_offset == m3_idx_offset) invariant the MSA dispatch relies on.
+        if let Some(ref idx_k) = self.m3_idx_k {
+            let shape = ffi::array_shape(idx_k);
+            self.m3_idx_k = Some(ffi::slice(
+                idx_k,
+                &[0, 0, 0, 0],
+                &[shape[0], shape[1], new_len, shape[3]],
+            ));
+            self.m3_idx_offset = new_len;
+        }
+
         debug_assert!(
             self.offset == new_len,
             "DetachedKVCache::trim_to: post-condition failed: offset {} != new_len {} (was {prev_offset})",
@@ -429,6 +462,8 @@ impl std::fmt::Debug for DetachedKVCache {
                 "delegated_fp16_sidecar_policy",
                 &self.delegated_fp16_sidecar_policy,
             )
+            .field("has_m3_idx_k", &self.m3_idx_k.is_some())
+            .field("m3_idx_offset", &self.m3_idx_offset)
             .finish()
     }
 }
@@ -515,6 +550,8 @@ impl KVCache {
             hot_threshold: self.hot_threshold,
             delegated_fp16_fast_path: self.delegated_fp16_fast_path,
             delegated_fp16_sidecar_policy: self.delegated_fp16_sidecar_policy,
+            m3_idx_k: self.m3_idx_k.take(),
+            m3_idx_offset: std::mem::replace(&mut self.m3_idx_offset, 0),
         };
         // Clear turbo_params on the source so the next quantize call rebuilds
         // it from scratch (required if the slot is reused with a different
@@ -559,6 +596,13 @@ impl KVCache {
         self.hot_threshold = detached.hot_threshold;
         self.delegated_fp16_fast_path = detached.delegated_fp16_fast_path;
         self.delegated_fp16_sidecar_policy = detached.delegated_fp16_sidecar_policy;
+        // MiniMax-M3 indexer K cache + offset. Restored alongside main K/V so
+        // the asymmetric MSA dispatch (`sparse_sdpa` with `cache_offset > 0`)
+        // sees idx_k spanning the same logical length as the main K cache.
+        // Without this restoration the dense-fallback band-aid in
+        // `models/minimax_m3.rs` would fire permanently on adopted sessions.
+        self.m3_idx_k = detached.m3_idx_k;
+        self.m3_idx_offset = detached.m3_idx_offset;
         // turbo_params is rebuilt lazily on the next quantize call, but if we
         // can already see the V head_dim from v_packed we may as well prebuild
         // so dequantize-only consumers (which don't go through update_*) still
