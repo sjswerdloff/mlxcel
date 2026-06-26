@@ -1293,15 +1293,23 @@ impl BatchScheduler {
 
         let store = self.prompt_cache.as_ref()?.clone();
         let key = Self::compose_prompt_cache_key(ctx, tokens);
-        // Diagnostic logging for cache lookup. Logs the first 16 token IDs of
-        // the lookup attempt so an operator can diff prefixes across requests
-        // when investigating cache misses (cycle 79: M3 thinking tags may be
-        // re-tokenized differently on round-trip, breaking prefix stability).
+        // Diagnostic logging for cache lookup. Logs the first 16 token IDs and
+        // the key components (model_id, lora_id, template_sig, session_key,
+        // mm_digest_hex) so an operator can diff EVERY namespace input across
+        // requests. The cycle-79 trace showed lookups missing despite a
+        // matching token prefix and a populated store, which means the KEY
+        // itself differed — usually because template_sig changes (tools list
+        // shifts across turns, kwargs differ) or session_key churns.
         let preview_n = tokens.len().min(16);
         let token_preview: Vec<i32> = tokens[..preview_n].to_vec();
+        let template_sig_short: String = ctx.template_sig.chars().take(16).collect();
         tracing::info!(
             total_tokens = tokens.len(),
             store_entries = store.len(),
+            model_id = %ctx.model_id,
+            lora_id = ?ctx.lora_id,
+            template_sig_short = %template_sig_short,
+            session_key = %ctx.session_key,
             token_preview = ?token_preview,
             "prompt-cache: lookup attempt"
         );
@@ -1754,6 +1762,12 @@ impl BatchScheduler {
                 // immediately release. The dense path needs no such screen — a
                 // rejected dense entry just drops its buffers.
                 if tokens.len() < store.min_prefix_tokens() {
+                    tracing::info!(
+                        seq_id = %seq_id,
+                        token_len = tokens.len(),
+                        min_prefix_tokens = store.min_prefix_tokens(),
+                        "prompt-cache donate skipped: tokens below min_prefix_tokens threshold (paged backend)"
+                    );
                     return;
                 }
                 match self.cache_pool.detach_paged(seq_id) {
@@ -1779,8 +1793,20 @@ impl BatchScheduler {
         let entry = CacheEntry::new(tokens, kv_set);
         let key_tokens = entry.tokens.clone();
         let key = Self::compose_prompt_cache_key(&ctx, &key_tokens);
+        // Diagnostic: log key components on insert so they can be diffed
+        // against the lookup log to find namespace drift.
+        let template_sig_short: String = ctx.template_sig.chars().take(16).collect();
         match store.insert(&key, entry) {
             Ok(()) => {
+                tracing::info!(
+                    seq_id = %seq_id,
+                    token_len = key_tokens.len(),
+                    model_id = %ctx.model_id,
+                    lora_id = ?ctx.lora_id,
+                    template_sig_short = %template_sig_short,
+                    session_key = %ctx.session_key,
+                    "prompt-cache: insert SUCCESS (entry now in store)"
+                );
                 self.batch_observability.record_prompt_cache_insert();
                 // refresh byte/entry gauges after a successful insert.
                 self.batch_metrics
@@ -1793,9 +1819,13 @@ impl BatchScheduler {
                 // (it has no `CachePool` handle), which the
                 // `drain_store_paged_releases()` below returns to the pool
                 // (#122 sub-step a).
-                tracing::debug!(
+                tracing::info!(
                     seq_id = %seq_id,
-                    "prompt-cache donate-back skipped: {err:?}"
+                    token_len = key_tokens.len(),
+                    min_prefix_tokens = store.min_prefix_tokens(),
+                    template_sig_short = %template_sig_short,
+                    session_key = %ctx.session_key,
+                    "prompt-cache: insert REJECTED ({err:?})"
                 );
                 self.batch_observability.record_prompt_cache_insert_reject();
             }
