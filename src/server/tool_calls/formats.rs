@@ -1113,23 +1113,34 @@ fn decode_m3_top_level_tags(body: &str) -> Option<Vec<(String, String)>> {
 /// Bracket-balanced: every nested `<tag_name>` increments depth, every
 /// `</tag_name>` decrements; the first decrement to zero is the match.
 /// Returns `None` if no matching close appears before EOF.
+///
+/// **UTF-8 safety**: when no tag matches at `pos`, advance by ONE CHARACTER
+/// (the next char's UTF-8 byte length) — not one byte. A naive `pos += 1`
+/// lands inside a multi-byte char and the next `&body[pos..]` slice panics
+/// with "start byte index is not a char boundary". Stuart caught this live
+/// 2026-06-26 when the model emitted an em dash inside a parameter value.
 fn find_matching_m3_close_offset(body: &str, tag_name: &str) -> Option<usize> {
     let open = format!("<{}>", tag_name);
     let close = format!("</{}>", tag_name);
     let mut depth: usize = 1;
     let mut pos = 0;
     while pos < body.len() {
-        if body[pos..].starts_with(&open) {
+        let rest = &body[pos..];
+        if rest.starts_with(&open) {
             depth += 1;
             pos += open.len();
-        } else if body[pos..].starts_with(&close) {
+        } else if rest.starts_with(&close) {
             depth -= 1;
             if depth == 0 {
                 return Some(pos);
             }
             pos += close.len();
         } else {
-            pos += 1;
+            // Advance to the next char boundary, not the next byte.
+            // `unwrap_or(1)` is a safety net the loop condition makes
+            // unreachable: `pos < body.len()` guarantees at least one
+            // remaining character, so `chars().next()` is always Some.
+            pos += rest.chars().next().map_or(1, |c| c.len_utf8());
         }
     }
     None
@@ -2338,5 +2349,92 @@ mod tests {
         // <b>...</b> inside an <a> body doesn't affect the depth count for "a".
         let body = "<b>stuff</b></a>";
         assert_eq!(find_matching_m3_close_offset(body, "a"), Some(12));
+    }
+
+    // -- UTF-8 char-boundary safety --
+    //
+    // Stuart caught a live panic on 2026-06-26: the model emitted an
+    // em dash `—` (3 bytes in UTF-8) inside a parameter value, and
+    // find_matching_m3_close_offset's `pos += 1` landed in the middle
+    // of the multi-byte character. The next `body[pos..]` slice
+    // panicked with "start byte index is not a char boundary".
+    //
+    // Every advance MUST move to the next char boundary, not the next
+    // byte. These tests cover em dash, multi-byte CJK, accented chars,
+    // and emoji — all common in real assistant output.
+
+    #[test]
+    fn find_matching_close_handles_em_dash_in_value() {
+        // The exact pattern from Stuart's crash: an em dash in the
+        // text between the (already-consumed) open tag and the close.
+        let body = "Hello — world</a>";
+        let expected = "Hello — world".len();
+        assert_eq!(find_matching_m3_close_offset(body, "a"), Some(expected));
+    }
+
+    #[test]
+    fn find_matching_close_handles_cjk_characters() {
+        // CJK characters are 3 bytes each in UTF-8.
+        let body = "日本語のテキスト</a>";
+        let expected = "日本語のテキスト".len();
+        assert_eq!(find_matching_m3_close_offset(body, "a"), Some(expected));
+    }
+
+    #[test]
+    fn find_matching_close_handles_emoji() {
+        // Emoji are 4 bytes (and some compose into longer sequences).
+        let body = "say 👋 hi</a>";
+        let expected = "say 👋 hi".len();
+        assert_eq!(find_matching_m3_close_offset(body, "a"), Some(expected));
+    }
+
+    #[test]
+    fn find_matching_close_handles_accented_latin() {
+        // Accented Latin chars are 2 bytes each.
+        let body = "café crème brûlée</a>";
+        let expected = "café crème brûlée".len();
+        assert_eq!(find_matching_m3_close_offset(body, "a"), Some(expected));
+    }
+
+    #[test]
+    fn extract_m3_tag_parameters_round_trips_em_dash_in_value() {
+        // Top-level extract: an em dash in a scalar value must
+        // round-trip through extract → parse → JSON without panic
+        // and the value preserved.
+        let body = "<msg>Hello — world</msg>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        assert_eq!(o["msg"], "Hello — world");
+    }
+
+    #[test]
+    fn extract_m3_tag_parameters_round_trips_emoji_in_value() {
+        let body = "<msg>say 👋 hi</msg>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        assert_eq!(o["msg"], "say 👋 hi");
+    }
+
+    #[test]
+    fn extract_m3_tag_parameters_round_trips_cjk_in_value() {
+        let body = "<msg>日本語のテキスト</msg>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        assert_eq!(o["msg"], "日本語のテキスト");
+    }
+
+    #[test]
+    fn extract_m3_tag_parameters_handles_multibyte_at_start_of_value() {
+        // Multi-byte char immediately after the opening tag — the first
+        // advance from pos 0 in find_matching_close hits it.
+        let body = "<msg>—em dash first</msg>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        assert_eq!(o["msg"], "—em dash first");
+    }
+
+    #[test]
+    fn extract_m3_tag_parameters_handles_multibyte_in_nested_object_value() {
+        // Multi-byte inside a nested object's leaf value.
+        let body = "<obj><field>résumé</field></obj>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        let inner = o["obj"].as_object().unwrap();
+        assert_eq!(inner["field"], "résumé");
     }
 }
