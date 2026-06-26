@@ -242,54 +242,6 @@ impl SparseAttention {
 
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
 
-        // Lockstep check on the indexer K cache: m3_idx_offset must equal the
-        // PRE-update main K offset. As of the cycle-79 proper fix, m3_idx_k
-        // and m3_idx_offset round-trip through `DetachedKVCache::clone_handle`
-        // / `install_detached`, so prompt-cache adoption restores both halves
-        // in lockstep and this branch should be unreachable in healthy flows.
-        // Kept as defense-in-depth: if a future code path (new paged adopt,
-        // new model wiring, etc.) ever forgets to preserve the aux state,
-        // falling back to dense here prevents a process-killing reshape crash
-        // in `sparse_sdpa`. The warn-level log makes any regression loud.
-        let idx_k_lockstep = cache.m3_idx_offset() == offset;
-        if self.index_q_proj.is_none()
-            || l <= self.block_size
-            || !idx_k_lockstep
-        {
-            if !idx_k_lockstep && self.index_q_proj.is_some() && l > self.block_size {
-                warn!(
-                    layer = self.layer_idx,
-                    b = b,
-                    l = l,
-                    main_offset = offset,
-                    indexer_offset = cache.m3_idx_offset(),
-                    branch = "dense",
-                    reason = "idx_k_cache_out_of_sync_after_adoption",
-                    "attn.dispatch: indexer K cache desync — proper fix should prevent this; \
-                     falling back to dense to avoid a reshape crash"
-                );
-            } else {
-                let reason = if self.index_q_proj.is_none() {
-                    "no_index_proj"
-                } else {
-                    "l_le_block_size"
-                };
-                debug!(
-                    layer = self.layer_idx,
-                    b = b,
-                    l = l,
-                    block_size = self.block_size,
-                    has_index_proj = self.index_q_proj.is_some(),
-                    main_offset = offset,
-                    indexer_offset = cache.m3_idx_offset(),
-                    branch = "dense",
-                    reason = reason,
-                    "attn.dispatch"
-                );
-            }
-            return self.dense_attention(&q, &cache_k, &cache_v, mask);
-        }
-
         // Asymmetric q/k for chunked-prefill / cached case. cache_offset is
         // the absolute position where the current chunk's queries START
         // (captured BEFORE update_and_fetch advanced cache.offset). kv_len
@@ -308,20 +260,116 @@ impl SparseAttention {
         let padded_k_len = num_key_blocks * self.block_size;
         let pad_q_amt = padded_q_len - l;
         let pad_k_amt = padded_k_len - kv_len;
-        // Dispatch dense when the KEY dimension's block count saturates top-k.
-        // Sparse selection of all blocks reduces to dense; the per-token
-        // attention math is identical, so skip the indexer machinery.
-        if num_key_blocks <= self.top_k {
+
+        let is_msa_eligible_layer = self.index_q_proj.is_some();
+
+        // MSA-eligible layers MUST keep m3_idx_k in lockstep with main K
+        // *regardless* of which attention dispatch this forward picks. The
+        // indexer K cache is a per-token artifact (field comment on
+        // `KVCache::m3_idx_k` in cache.rs documents this contract): each MSA
+        // forward selects top-k blocks over the FULL cached prefix, so the
+        // cache must contain idx_k for every position in main K — including
+        // positions written by chunks that dispatched dense (e.g. early
+        // chunks where `num_key_blocks <= top_k` saturates the selector).
+        //
+        // Pre-cycle-79.5 the update only happened in the MSA branch, which
+        // silently broke lockstep on any session whose first chunk dispatched
+        // dense and later chunks reached MSA — including the common pattern
+        // of `prefill_chunk_size=512` where chunk 1's kv_len is small enough
+        // to dense-saturate.
+        //
+        // Defense-in-depth: a PRE-update lockstep mismatch (`m3_idx_offset
+        // != offset`) means the prior prefix's idx_k is missing. After the
+        // cycle-79 proper fix (clone_handle/install_detached round-trip),
+        // adoption restores both halves together so this should never fire
+        // in healthy flows. If it does fire, we cannot retroactively
+        // reconstruct the missing prefix's idx_k without re-projecting from
+        // tokens we no longer have, so the only safe move is to dense-
+        // fallback for THIS forward AND skip the update so subsequent
+        // forwards in this session continue to dense-fallback (any partial
+        // update would produce a gappy idx_k that scores wrong blocks).
+        let pre_update_indexer_offset = cache.m3_idx_offset();
+        let lockstep_healthy = pre_update_indexer_offset == offset;
+        let cached_idx_k = if is_msa_eligible_layer && lockstep_healthy {
+            // Always compute idx_k projection and update the cache. Cost is
+            // one Linear(hidden, num_kv_heads*index_dim) + norm + transpose
+            // + RoPE per MSA-eligible layer per forward — negligible vs the
+            // main attention math.
+            //
+            // Order: RESHAPE → NORM → TRANSPOSE → RoPE matches the HF
+            // reference (MiniMaxM3VLIndexer). The post-RoPE values are what
+            // gets cached because RoPE is position-dependent and each
+            // position was rotated at its absolute position when written.
+            let idx_k_raw = self.index_k_proj.as_ref().unwrap().forward(x);
+            let idx_k = mlxcel_core::reshape(&idx_k_raw, &[b, l, 1, self.index_dim]);
+            let idx_k = if let Some(ref n) = self.index_k_norm {
+                n.forward(&idx_k)
+            } else {
+                idx_k
+            };
+            let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+            let idx_k = mlxcel_core::fast_rope(
+                &idx_k,
+                self.rope_dims,
+                false,
+                self.rope_base,
+                1.0,
+                offset,
+            );
+            Some(cache.m3_idx_k_update_and_fetch(&idx_k))
+        } else {
+            if is_msa_eligible_layer && !lockstep_healthy {
+                warn!(
+                    layer = self.layer_idx,
+                    b = b,
+                    l = l,
+                    main_offset = offset,
+                    indexer_offset = pre_update_indexer_offset,
+                    reason = "idx_k_cache_desync_pre_update",
+                    "m3_idx_k lockstep broken before update — likely adoption \
+                     regression (cycle-79 proper fix should prevent this). \
+                     Falling back to dense for the rest of this session; \
+                     reset the session to recover sparse dispatch."
+                );
+            }
+            None
+        };
+
+        // Dispatch decision — shape-based, with the broken-lockstep fall-
+        // through baked into `cached_idx_k.is_none()`:
+        //   * non-MSA-eligible layer: dense (dense layers 0-2 in M3)
+        //   * MSA layer with `l <= block_size`: dense (single-block decode)
+        //   * MSA layer with `num_key_blocks <= top_k`: dense (saturation —
+        //     sparse-selecting all blocks reduces to dense)
+        //   * broken lockstep (cached_idx_k is None): dense
+        //   * else: MSA
+        if !is_msa_eligible_layer
+            || l <= self.block_size
+            || num_key_blocks <= self.top_k
+            || cached_idx_k.is_none()
+        {
+            let reason = if !is_msa_eligible_layer {
+                "no_index_proj"
+            } else if l <= self.block_size {
+                "l_le_block_size"
+            } else if num_key_blocks <= self.top_k {
+                "num_key_blocks_le_top_k"
+            } else {
+                "idx_k_cache_desync"
+            };
             debug!(
                 layer = self.layer_idx,
                 b = b,
                 l = l,
                 kv_len = kv_len,
-                num_query_blocks = num_query_blocks,
+                block_size = self.block_size,
                 num_key_blocks = num_key_blocks,
                 top_k = self.top_k,
+                has_index_proj = is_msa_eligible_layer,
+                main_offset = offset,
+                indexer_offset = cache.m3_idx_offset(),
                 branch = "dense",
-                reason = "num_key_blocks_le_top_k",
+                reason = reason,
                 "attn.dispatch"
             );
             return self.dense_attention(&q, &cache_k, &cache_v, mask);
@@ -341,54 +389,26 @@ impl SparseAttention {
             "attn.dispatch"
         );
 
-        // Index Branch - verified from Transformers MiniMaxM3VLIndexer.
-        //
-        // Order must be RESHAPE → NORM (matching the regular Q/K norm path above and
-        // the HF reference). GemmaRMSNorm's `weight` is shape [index_dim] = [128];
-        // applying it to the raw projection output (last dim = num_kv_heads * index_dim
-        // = 512) throws "[rms_norm] (*weight) must have the same size as the last
-        // dimension of x but has 128 elements." Reshape into per-head shape first so the
-        // 128-element norm weight aligns with the head-dim axis.
+        // MSA path. cached_idx_k is Some by construction (passed the dispatch
+        // check above which guards `cached_idx_k.is_none()`). The cached
+        // tensor has shape `[b, 1, kv_len, index_dim]` — the full prefix
+        // including the current chunk's freshly-RoPE'd idx_k that was
+        // appended during the unconditional pre-dispatch update above.
+        let idx_k = cached_idx_k.unwrap();
+
+        // Compute idx_q for the current chunk. idx_q is per-forward (no
+        // caching) because the selector only operates on the current query
+        // positions.
         let idx_q_raw = self.index_q_proj.as_ref().unwrap().forward(x);
-        let idx_k_raw = self.index_k_proj.as_ref().unwrap().forward(x);
-
         let idx_q = mlxcel_core::reshape(&idx_q_raw, &[b, l, self.num_kv_heads, self.index_dim]);
-        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[b, l, 1, self.index_dim]);
-
         let idx_q = if let Some(ref n) = self.index_q_norm {
             n.forward(&idx_q)
         } else {
             idx_q
         };
-        let idx_k = if let Some(ref n) = self.index_k_norm {
-            n.forward(&idx_k)
-        } else {
-            idx_k
-        };
-
         let idx_q = mlxcel_core::transpose_axes(&idx_q, &[0, 2, 1, 3]);
-        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
-
-        // Index Branch also gets RoPE - verified from Transformers code:
-        // apply_rotary_pos_emb(idx_q, idx_k, cos[..., :head_dim], sin[..., :head_dim])
         let idx_q =
             mlxcel_core::fast_rope(&idx_q, self.rope_dims, false, self.rope_base, 1.0, offset);
-        let idx_k =
-            mlxcel_core::fast_rope(&idx_k, self.rope_dims, false, self.rope_base, 1.0, offset);
-
-        // Swap the current-chunk-only idx_k for the FULL cached idx_k via the
-        // indexer K cache (#80). After this call, idx_k has shape
-        // `[b, 1, kv_len, index_dim]` regardless of whether this is the first
-        // forward (cache empty) or a subsequent one (cache contains prior
-        // chunks' idx_k post-RoPE). The post-RoPE state is the correct one
-        // to cache — RoPE is position-dependent, and each position was
-        // rotated at its absolute position at the time it was written, so
-        // accumulated idx_k is internally consistent across forwards.
-        //
-        // This is THE architectural piece that fixes the indexer's blindness
-        // to cached positions. Pre-#80 the top-k selection scored only the
-        // current chunk's blocks; now it scores all num_key_blocks blocks.
-        let idx_k = cache.m3_idx_k_update_and_fetch(&idx_k);
 
         // Pad idx_q (to padded_q_len) and idx_k (to padded_k_len) with -inf
         // so the upcoming block reshape and max-pool can never let padded
@@ -2885,6 +2905,157 @@ mod tests {
             relative,
             diff,
             single_norm
+        );
+    }
+
+    #[test]
+    fn test_msa_dense_saturation_then_msa_transition_matches_single_shot() {
+        // Cycle-79.5 fix gate: a session that starts with dense-saturated
+        // chunks (`num_key_blocks <= top_k`) and later transitions to MSA
+        // (because kv_len grew past the saturation threshold) MUST produce
+        // the same output as a single-shot MSA-throughout reference. This
+        // requires m3_idx_k to accumulate on EVERY MSA-eligible forward —
+        // including dense-saturated chunks — so the post-saturation MSA
+        // chunk's selector sees the full prefix.
+        //
+        // Pre-cycle-79.5 the m3_idx_k_update_and_fetch call lived only in
+        // the MSA branch, so the dense-saturated chunks left m3_idx_k empty.
+        // The next chunk's lockstep check failed and forced a dense
+        // fallback for the remainder of the session — wrong dispatch, but
+        // the output still came out plausible because dense is a valid
+        // attention mechanism. A correctness test (output match) wouldn't
+        // have caught it; only a live multi-turn smoke test exposed the
+        // permanent dense fallback. This test now traps the regression at
+        // unit level.
+        //
+        // Config: block_size=2, top_k=2. Chunk 1 l=2 → num_key_blocks=1
+        // ≤ top_k, dense-saturated AND l <= block_size (both dense
+        // triggers). Chunk 2 l=4 → kv_len=6, num_key_blocks=3 > top_k=2 and
+        // l > block_size → MSA dispatches. Single-shot reference l=6,
+        // num_key_blocks=3 → MSA.
+        let layer = make_test_sparse_attention();
+        let hidden = layer.num_heads * layer.head_dim;
+        let l_dense = 2;
+        let l_msa = 4;
+        let l_total = l_dense + l_msa; // 6
+        let input = make_test_input(1, l_total, hidden);
+
+        // Reference: single-shot MSA over the full 6 tokens.
+        let mut cache_ref = KVCache::new();
+        let ref_out = layer.forward(&input, &mut cache_ref, None);
+        mlxcel_core::eval(&ref_out);
+        // Sanity: single-shot took MSA path — m3_idx_offset advanced to
+        // l_total only if MSA fired. Always-update would also advance it,
+        // but for this single-shot case both paths agree.
+        assert_eq!(cache_ref.m3_idx_offset(), l_total);
+
+        // Chunked: dense-saturated chunk 1 followed by MSA chunk 2.
+        let mut cache_chunked = KVCache::new();
+        let chunk1 = mlxcel_core::slice(&input, &[0, 0, 0], &[1, l_dense, hidden]);
+        let out1 = layer.forward(&chunk1, &mut cache_chunked, None);
+        mlxcel_core::eval(&out1);
+        // After chunk 1 the always-update keeps lockstep even though
+        // dispatch was dense. THIS is the cycle-79.5 invariant.
+        assert_eq!(
+            cache_chunked.offset, l_dense,
+            "main K offset must advance after chunk 1"
+        );
+        assert_eq!(
+            cache_chunked.m3_idx_offset(),
+            l_dense,
+            "m3_idx_offset must advance to {l_dense} after dense-saturated \
+             chunk 1 — the always-update path must populate it regardless \
+             of dispatch. If this fails, the indexer K cache is gappy and \
+             the next MSA chunk will see an incomplete prefix."
+        );
+
+        let chunk2 = mlxcel_core::slice(&input, &[0, l_dense, 0], &[1, l_total, hidden]);
+        let out2 = layer.forward(&chunk2, &mut cache_chunked, None);
+        mlxcel_core::eval(&out2);
+        assert_eq!(cache_chunked.offset, l_total);
+        assert_eq!(
+            cache_chunked.m3_idx_offset(),
+            l_total,
+            "m3_idx_offset must equal l_total after chunk 2's MSA forward — \
+             this proves MSA actually dispatched (dense_attention never \
+             advances m3_idx_offset)"
+        );
+
+        // Compare outputs. Chunked path concatenates out1 (dense, l_dense
+        // tokens) and out2 (MSA, l_msa tokens). Single-shot ref is MSA over
+        // all l_total tokens.
+        let chunked_concat = mlxcel_core::concatenate(&out1, &out2, 1);
+        mlxcel_core::eval(&chunked_concat);
+
+        let ref_shape = mlxcel_core::array_shape(&ref_out);
+        let chunked_shape = mlxcel_core::array_shape(&chunked_concat);
+        assert_eq!(
+            ref_shape, chunked_shape,
+            "single-shot and chunked output shapes must match"
+        );
+
+        let diff = output_l2_diff(&chunked_concat, &ref_out);
+        let ref_norm = {
+            let sq = mlxcel_core::multiply(&ref_out, &ref_out);
+            let s = mlxcel_core::array_shape(&sq);
+            let mut acc = mlxcel_core::copy(&sq);
+            for axis in (0..s.len()).rev() {
+                acc = mlxcel_core::sum_axis(&acc, axis as i32, false);
+            }
+            mlxcel_core::eval(&acc);
+            mlxcel_core::item_f32(&acc).sqrt()
+        };
+        let relative = if ref_norm > 1e-6 { diff / ref_norm } else { diff };
+        // The chunked path's chunk 1 is dense (l_dense tokens) but the
+        // reference's first l_dense tokens come from MSA's output at those
+        // positions. For positions where MSA selected all key blocks, dense
+        // and MSA produce identical math. For chunk 1 (kv_len=2 at chunk 1
+        // boundary in chunked, kv_len=2..6 in ref) the two paths diverge by
+        // construction: ref's chunk-1-positions saw the full 6-token K, the
+        // chunked's chunk 1 only saw its own 2-token K. They are NOT
+        // expected to match for those positions.
+        //
+        // What IS expected to match: chunked chunk 2's MSA output (positions
+        // 2..6) vs ref's MSA output for positions 2..6. Slice both and
+        // compare just those positions.
+        let chunked_msa_slice =
+            mlxcel_core::slice(&chunked_concat, &[0, l_dense, 0], &[1, l_total, hidden]);
+        let ref_msa_slice =
+            mlxcel_core::slice(&ref_out, &[0, l_dense, 0], &[1, l_total, hidden]);
+        mlxcel_core::eval(&chunked_msa_slice);
+        mlxcel_core::eval(&ref_msa_slice);
+        let msa_diff = output_l2_diff(&chunked_msa_slice, &ref_msa_slice);
+        let ref_msa_norm = {
+            let sq = mlxcel_core::multiply(&ref_msa_slice, &ref_msa_slice);
+            let s = mlxcel_core::array_shape(&sq);
+            let mut acc = mlxcel_core::copy(&sq);
+            for axis in (0..s.len()).rev() {
+                acc = mlxcel_core::sum_axis(&acc, axis as i32, false);
+            }
+            mlxcel_core::eval(&acc);
+            mlxcel_core::item_f32(&acc).sqrt()
+        };
+        let msa_relative = if ref_msa_norm > 1e-6 {
+            msa_diff / ref_msa_norm
+        } else {
+            msa_diff
+        };
+        assert!(
+            msa_relative < 0.05,
+            "chunked MSA-after-dense vs single-shot MSA relative L2 = {} \
+             (absolute {}, norm {}). Tolerance 0.05. A larger diff indicates \
+             chunk 2's MSA dispatch was scoring with a gappy idx_k (missing \
+             chunk 1's positions), which would happen if the m3_idx_k cache \
+             update only fired in the MSA branch. relative is the position- \
+             [{}..{}) slice where both paths take MSA. The aggregate \
+             chunked-vs-ref diff (which includes chunk 1's dense-vs-MSA \
+             divergence) is {:.4} relative; that is expected to be larger.",
+            msa_relative,
+            msa_diff,
+            ref_msa_norm,
+            l_dense,
+            l_total,
+            relative
         );
     }
 

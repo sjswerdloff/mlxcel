@@ -28,9 +28,13 @@ SERVER_PID_FILE="/tmp/mlxcel_msa_smoke.pid"
 # HANDOFF_cycle79_msa_chunked_prefill.md).
 PROMPT_CACHE_CAP_BYTES="${MLXCEL_PROMPT_CACHE_CAPACITY_BYTES:-34359738368}"
 
-# Start server.
+# Start server. RUST_LOG enables debug-level logs from the M3 module so
+# Gate 4 (positive MSA dispatch confirmation) can read `branch="msa"`
+# lines. Everything else stays at INFO so the log isn't drowned in
+# noise.
 echo "Starting server (logs: $LOG) ..."
 MLXCEL_PROMPT_CACHE_CAPACITY_BYTES="$PROMPT_CACHE_CAP_BYTES" \
+RUST_LOG="${RUST_LOG:-info,mlxcel::models::minimax_m3=debug}" \
 nohup ./target/release/mlxcel-server \
   --model "$MODEL_PATH" \
   --host "$HOST" \
@@ -70,11 +74,17 @@ chat() {
       '{model: $m, messages: [{role: "user", content: $c}], max_tokens: 32, stream: false}')"
 }
 
-# Build a long prompt (>= 3000 tokens estimated) that triggers MSA on
-# the FIRST request — current chunk l > 2048 → num_query_blocks > top_k.
+# Build a long prompt that ACTUALLY exercises MSA. MSA fires when
+# `num_key_blocks > top_k`, i.e. `kv_len > top_k * block_size`. M3
+# production config: top_k=16, block_size=128 → MSA threshold is
+# kv_len > 2048. Cathedral line is ~25 tokens. 120 repetitions ≈ 3000
+# tokens, well past the MSA threshold. The cycle-79.5 fix gate requires
+# that BOTH (a) early chunks dispatch dense-saturated AND (b) later
+# chunks dispatch MSA — so the lockstep-on-every-MSA-eligible-layer
+# invariant gets exercised on a real workload.
 CATHEDRAL_LINE='The cathedral construction in northern France was undertaken by generations of craftsmen who handed work to apprentices who would die before towers reached final height. '
 LONG_PROMPT=""
-for _ in $(seq 1 50); do LONG_PROMPT+="$CATHEDRAL_LINE"; done
+for _ in $(seq 1 120); do LONG_PROMPT+="$CATHEDRAL_LINE"; done
 
 echo
 echo "=== Request 1: long single-shot prompt (triggers MSA, cache_offset=0) ==="
@@ -147,6 +157,28 @@ echo "  positive cached-count lines: $POSITIVE_CACHED (expect >= 1)"
 if [[ "$POSITIVE_CACHED" -eq 0 ]]; then
   echo "FAIL: no forward saw cached>0 tokens. The cache MATCH'd but"
   echo "  the adopt path returned zero usable tokens."
+  exit 1
+fi
+
+# Gate 4: at least one MSA dispatch. The whole point of the cycle-79
+# work is that MSA fires correctly on cached + multi-chunk sessions.
+# If the prompt is too short, MSA never fires and gates 1-3 are moot.
+#
+# We grep for `sparse_sdpa.entry` (the message string the MSA branch
+# emits via tracing's `debug!` macro) rather than `branch="msa"` because
+# tracing wraps structured field names (`branch=`) in ANSI italic codes
+# that split the literal `branch="msa"` across escape sequences in the
+# raw log file — `grep` looking for a continuous match would silently
+# return zero even when MSA is firing happily. `sparse_sdpa.entry` lives
+# in the message body (no field-wrapping) so it survives the ANSI codes
+# intact.
+MSA_DISPATCH=$(grep -c 'sparse_sdpa.entry' "$LOG" || true)
+echo "  MSA dispatch log count: $MSA_DISPATCH (expect >= 1)"
+if [[ "$MSA_DISPATCH" -eq 0 ]]; then
+  echo "FAIL: no forward dispatched MSA. The prompt is too short to push"
+  echo "  kv_len past top_k*block_size = 2048. Increase the cathedral_line"
+  echo "  repetition count in this script. Cycle-79 properties are not"
+  echo "  exercised by a prompt where every chunk dense-saturates."
   exit 1
 fi
 
