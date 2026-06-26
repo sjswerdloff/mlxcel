@@ -211,6 +211,14 @@ const CHAT_DELIMITERS: &[(&str, DelimiterAction)] = &[
     // both route the block to `reasoning_content`.
     ("</mm:think>", DelimiterAction::ExitThinking),
     ("<mm:think>", DelimiterAction::EnterThinking),
+    // MiniMax-M3 namespace prefix — token 200058, used by the M3 chat
+    // template to wrap every tool-call boundary tag (e.g.
+    // `]<]minimax[>[<tool_call>...]<]minimax[>[</tool_call>` or
+    // `]<]minimax[>[<invoke name="...">...</invoke>`). The model has
+    // learned to emit this prefix during generation; without stripping
+    // it bleeds into user-visible streamed content. Mirrors the
+    // non-streaming strip in `clean_content_markers` (parser.rs).
+    ("]<]minimax[>[", DelimiterAction::Strip),
     // Gemma 4 tool-call delimiters — must precede Hermes `<tool_call>` to avoid
     // a spurious Hermes hit on the Gemma 4 open tag.
     ("<|tool_call>", DelimiterAction::EnterToolCall),
@@ -671,6 +679,18 @@ mod tests {
         let mut f = StreamFilter::new();
         assert_eq!(
             f.feed("Before<|think|>After").content,
+            Some("BeforeAfter".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_minimax_m3_namespace_marker() {
+        // M3's `]<]minimax[>[` (token 200058) wraps tool-call boundary
+        // tags in the chat template and leaks into streamed output if not
+        // stripped. Stuart caught a live instance, 2026-06-26.
+        let mut f = StreamFilter::new();
+        assert_eq!(
+            f.feed("Before]<]minimax[>[After").content,
             Some("BeforeAfter".to_string())
         );
     }

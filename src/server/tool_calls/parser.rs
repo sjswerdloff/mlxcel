@@ -98,6 +98,17 @@ fn clean_content_markers(text: &str) -> String {
         .replace("<|channel>", "")
         .replace("<|tool_call>", "")
         .replace("<tool_call|>", "")
+        // MiniMax-M3 namespace prefix (token 200058). The M3 chat template
+        // wraps every tool-call boundary tag with this marker — e.g.
+        // `]<]minimax[>[<tool_call>...]<]minimax[>[</tool_call>` or
+        // `]<]minimax[>[<invoke name="...">...</invoke>`. Without stripping,
+        // (a) bare instances of the marker leak into user-visible content
+        // when the model emits one without a following tool call, and
+        // (b) the Hermes parser sees `{json}]<]minimax[>[` as the body
+        // between `<tool_call>` and `</tool_call>`, which fails JSON parse
+        // and produces no tool call. Strip globally — the literal is a
+        // chat-template control marker, never legitimate user content.
+        .replace("]<]minimax[>[", "")
         .trim()
         .to_string()
 }
@@ -127,6 +138,15 @@ pub fn clean_structural_tokens(raw: &str) -> String {
 pub fn parse_tool_calls(raw_output: &str, tools: Option<&[Tool]>) -> ToolCallParseResult {
     // Strip thinking blocks first
     let cleaned = strip_thinking(raw_output);
+    // Strip the MiniMax-M3 namespace prefix BEFORE parser dispatch. M3
+    // emits `]<]minimax[>[<tool_call>{json}]<]minimax[>[</tool_call>` (and
+    // similarly around `<invoke name=`); without this strip the Hermes
+    // parser sees `{json}]<]minimax[>[` as the body and JSON-parse fails,
+    // producing zero tool calls when the model meant one. Stripping at
+    // dispatch time keeps the per-format parsers innocent of the M3-
+    // specific wrapping. Non-M3 outputs are unaffected (the literal is
+    // not used by any other family).
+    let cleaned = cleaned.replace("]<]minimax[>[", "");
     let text = cleaned.trim();
 
     if text.is_empty() {
@@ -501,6 +521,47 @@ mod tests {
         let input = "<|turn>content<turn|><|think|>";
         let result = clean_content_markers(input);
         assert_eq!(result, "content");
+    }
+
+    #[test]
+    fn clean_content_markers_strips_minimax_m3_namespace_prefix() {
+        // M3 emits ]<]minimax[>[ as a namespace marker. The bare marker
+        // must not leak into content (Stuart caught a live instance,
+        // 2026-06-26).
+        let input = "Here is the answer]<]minimax[>[ that I produced.";
+        let result = clean_content_markers(input);
+        assert_eq!(result, "Here is the answer that I produced.");
+    }
+
+    #[test]
+    fn parse_tool_calls_strips_m3_namespace_around_hermes_tool_call() {
+        // M3 wraps tool-call boundaries with the namespace prefix. Without
+        // the dispatch-time strip, the Hermes parser would see
+        // `{"name":"fn","arguments":{}}]<]minimax[>[` as the tool_call
+        // body, fail JSON parse, and produce zero tool calls — silently
+        // breaking tool calling on M3.
+        let raw = "]<]minimax[>[<tool_call>{\"name\":\"fn\",\"arguments\":{}}]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("fn")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(
+            result.has_tool_calls(),
+            "M3-wrapped Hermes tool call must parse cleanly after namespace strip"
+        );
+        assert_eq!(result.tool_calls[0].name, "fn");
+    }
+
+    #[test]
+    fn parse_tool_calls_strips_m3_namespace_around_invoke_format() {
+        // M3 also emits the namespace prefix around <invoke name=> for
+        // the MiniMax M2-style parser. Without the strip, the namespace
+        // would land in the parsed content prefix.
+        let raw = "]<]minimax[>[<invoke name=\"fn\"><parameter name=\"k\">v</parameter></invoke>";
+        let tools = vec![make_tool("fn")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls[0].name, "fn");
+        // The namespace prefix must not appear in content either.
+        assert!(!result.content.contains("]<]minimax[>["));
     }
 
     // -- Prompt-primed Gemma 4 (enable_thinking=true) --
