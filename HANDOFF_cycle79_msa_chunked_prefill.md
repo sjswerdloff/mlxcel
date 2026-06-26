@@ -4,6 +4,12 @@
 **Status:** Tasks #78–#83 complete. Three follow-up server-side fixes
 (`<mm:think>` extraction, cache lookup diagnostics, indexer-cache desync
 fallback) landed in commits `8b3ea00`, `316a997`, `c755e45`.
+**Proper fix (Option 1 below) implemented in `8afc5f0`** — DetachedKVCache
+now carries `m3_idx_k` + `m3_idx_offset` and round-trips through the
+existing per-layer `clone_handle` / `install_detached` / `trim_to` flow.
+The lockstep band-aid in `minimax_m3.rs` is retained as defense-in-depth
+with a warn-level log if a future regression ever puts adoption out of
+lockstep again.
 
 ## What was broken (the cycle-79 root)
 
@@ -93,7 +99,67 @@ Behavior:
 Cache hit still saves the prefill cost on the adopted portion. MSA
 performance benefit lost for adopted sessions.
 
-## Proper fix (deferred — discuss before implementing)
+## Proper fix — implemented (`8afc5f0`)
+
+After reading `entry.rs` more carefully, the natural insertion point
+turned out to be one layer lower than the original handoff suggested:
+`DetachedKVCache` (per-layer detached snapshot), not `CacheEntry`
+(sequence-level prompt-cache wrapper). The existing flow already moves
+all per-layer state through `clone_handle` / `install_detached` — adding
+two more fields to that move means the scheduler's `try_adopt_cached_prefix`
+and `donate_finished_sequence_cache` need no changes at all.
+
+**What changed (3 files, +352/-29):**
+- `mlxcel-core/src/cache/detach.rs`:
+  - New fields on `DetachedKVCache`: `m3_idx_k: Option<UniquePtr<MlxArray>>`
+    and `m3_idx_offset: i32`.
+  - `clone_handle()` takes both alongside main K/V.
+  - `install_detached()` restores both.
+  - `trim_to()` slices `m3_idx_k` on axis 2 in lockstep with main K
+    (used by `DetachedCacheSet::truncate_to` for partial APC adoption).
+  - `nbytes()` counts the aux tensor; `Debug` shows it; `pool_backed_handle_clone`
+    rejects handles carrying aux state.
+- `mlxcel-core/src/cache/detach_tests.rs`: 5 new tests (round-trip with
+  state, round-trip without state, mid-buffer trim lockstep, trim-to-zero
+  drop, full CachePool detach→adopt end-to-end).
+- `models/minimax_m3.rs`:
+  - Lockstep dispatch guard retained as defense-in-depth; desync branch
+    upgraded from `debug!` to `warn!` so a regression is loud.
+  - New integration test `test_msa_four_chunk_with_cache_detach_adopt_midway_matches_continuous`:
+    forwards chunks 1–2, round-trips the cache through `clone_handle`/`install_detached`,
+    continues with chunks 3–4, asserts MSA fires and output matches a
+    continuous-cache reference within 5% relative L2.
+
+**Why per-layer not entry-level:** the original handoff suggested
+attaching `AuxiliaryCacheState` to `CacheEntry`, parallel to its
+`detached: Mutex<DetachedKvSetHolder>`. That works but duplicates
+machinery — the entry-level wrapper would have to be Send/Sync, mutex-guarded,
+and explicitly wired into both `try_adopt_cached_prefix` and
+`donate_finished_sequence_cache`. The per-layer approach piggybacks on
+the round-trip already happening for keys/values/scales/turbo/etc, so
+no scheduler-level code changes were needed and the partial-trim
+contract is automatically lockstep-correct (main K and aux are sliced
+by the same `truncate_to` walk over `caches.iter_mut()`).
+
+**Paged path:** untouched. M3 currently only runs in the dense backend.
+If a paged M3 deployment is ever wanted, parallel changes would need to
+go in `DetachedPagedKVCache` + `cache/paged_detach.rs`.
+
+**Smoke-test verification (Stuart, when ready):**
+1. Rebuild and restart the server.
+2. Send turn 1 with a long prompt (≥3000 tokens). Expect `prompt-cache: insert SUCCESS`.
+3. Send turn 2 reusing the prefix. Expect:
+   - `prompt-cache: longest-prefix MATCH` with positive `matched_len`
+   - **No `warn!` log of `idx_k_cache_out_of_sync_after_adoption`** — that's the regression detector
+   - `attn.dispatch ... branch=sparse` on the post-adoption forward (not dense)
+   - `cached=N/total` with N > 0 on the chunked-prefill report
+4. Send turn 3 extending further. Same pattern. No crashes.
+
+If turn 2 logs the warn-level desync line, the proper fix regressed and
+the band-aid is keeping the server alive — investigate `clone_handle` /
+`install_detached` integrity.
+
+## Proper fix discussion (preserved for reference)
 
 The band-aid permanently degrades MSA-on-cached-sessions to dense.
 Acceptable short term; bad long term because real workloads (long
