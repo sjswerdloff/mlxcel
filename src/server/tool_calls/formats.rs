@@ -779,11 +779,42 @@ fn extract_quoted_name(s: &str) -> String {
     }
 }
 
-/// Parse all `<parameter name="k">v</parameter>` tags inside an `<invoke>` body.
+/// Parse parameters from an `<invoke>` body, handling both MiniMax-M2 and
+/// MiniMax-M3 chat-template forms.
+///
+/// **M2 / Anthropic form** (used by MiniMax-M2 and Claude/Anthropic):
+/// ```text
+/// <parameter name="file_path">/tmp/test.md</parameter>
+/// ```
+///
+/// **M3 form** (chat_template.jinja `to_xml` macro, post-namespace-strip):
+/// ```text
+/// <file_path>/tmp/test.md</file_path>
+/// ```
+/// where the parameter name IS the tag name itself.
+///
+/// The dispatcher tries M2 first (preserves all existing M2 behavior); if it
+/// extracts at least one parameter, that result wins. Otherwise the M3 fallback
+/// runs, which scans for bare `<tag>value</tag>` pairs at the top level of the
+/// body. The two forms are mutually exclusive per chat template — a given
+/// model family emits one form, not a mix — so the precedence is unambiguous.
 ///
 /// Returns a JSON object string mapping parameter names to their typed values.
 /// Type coercion order: null → integer → float → boolean → JSON object/array → string.
 fn extract_minimax_parameters(body: &str) -> String {
+    let m2 = extract_m2_attr_parameters(body);
+    if m2 != "{}" {
+        return m2;
+    }
+    extract_m3_tag_parameters(body)
+}
+
+/// Extract parameters in M2/Anthropic form: `<parameter name="k">v</parameter>`.
+///
+/// Used by MiniMax-M2 and any client emitting Anthropic-style invoke XML.
+/// Returns `"{}"` when no `<parameter name=` openings are found, so the
+/// M3 fallback in [`extract_minimax_parameters`] can take over.
+fn extract_m2_attr_parameters(body: &str) -> String {
     let param_open = "<parameter name=";
     let param_close = "</parameter>";
 
@@ -846,6 +877,97 @@ fn extract_minimax_parameters(body: &str) -> String {
     }
 
     // Build a JSON object from the collected pairs
+    let mut map = serde_json::Map::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        map.insert(k, v);
+    }
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Extract parameters in M3 form: `<param_name>value</param_name>` where the
+/// parameter name IS the XML tag name.
+///
+/// Matches the post-strip output of the M3 chat template's `to_xml` macro for
+/// flat scalar parameters. Nested object/list parameters (mapping or iterable
+/// values that recurse into nested tags) are **not** fully decoded — the
+/// extractor captures only the outer tag's raw text. This covers the common
+/// case (Read.file_path, Bash.command, Skill.skill) but leaves nested-object
+/// argument shapes as a follow-up (see HANDOFF when the need arises).
+///
+/// Scans only top-level tags in `body`. A tag is "top level" if it appears
+/// at the current `remaining` position and is not contained inside a prior
+/// tag's value range (the scanner advances past each matched `</close>`).
+fn extract_m3_tag_parameters(body: &str) -> String {
+    let mut pairs: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut remaining = body;
+
+    loop {
+        // Find the next '<' that opens a tag (not a closing tag, comment, or PI).
+        let Some(lt_pos) = remaining.find('<') else {
+            break;
+        };
+        let after_lt = lt_pos + 1;
+        if after_lt >= remaining.len() {
+            break;
+        }
+        let next_byte = remaining.as_bytes()[after_lt];
+        if next_byte == b'/' || next_byte == b'!' || next_byte == b'?' {
+            // Closing tag, comment, or processing instruction — skip past '<'
+            // and keep scanning. Advancing by one guarantees forward progress;
+            // remaining shrinks each iteration so the loop terminates.
+            remaining = &remaining[after_lt..];
+            continue;
+        }
+
+        // Find the end of the opening tag: '>'.
+        let Some(gt_offset) = remaining[after_lt..].find('>') else {
+            break;
+        };
+        let tag_name_raw = &remaining[after_lt..after_lt + gt_offset];
+
+        // Reject attributed tags (contain whitespace or '='). M3's `to_xml`
+        // emits bare tags with no attributes; an attributed tag here means
+        // we're not at an M3 parameter boundary and should skip past '<'.
+        if tag_name_raw.is_empty()
+            || tag_name_raw.contains(char::is_whitespace)
+            || tag_name_raw.contains('=')
+        {
+            remaining = &remaining[after_lt..];
+            continue;
+        }
+        let tag_name = tag_name_raw.to_string();
+
+        let value_start = after_lt + gt_offset + 1;
+        let close_tag = format!("</{}>", tag_name);
+        let Some(close_offset) = remaining[value_start..].find(&close_tag) else {
+            // Unmatched open: stop scanning (don't strand work on malformed
+            // input — see the M2 path's analogous `break`).
+            break;
+        };
+        let raw_value = &remaining[value_start..value_start + close_offset];
+
+        // Trim leading/trailing newlines + whitespace (same as M2 path).
+        let mut raw_value = raw_value;
+        if raw_value.starts_with('\n') {
+            raw_value = &raw_value[1..];
+        }
+        if raw_value.ends_with('\n') {
+            raw_value = &raw_value[..raw_value.len() - 1];
+        }
+        let value = raw_value.trim();
+
+        let json_value = coerce_minimax_param(value);
+        pairs.push((tag_name, json_value));
+
+        // Advance past the closing tag.
+        remaining = &remaining[value_start + close_offset + close_tag.len()..];
+
+        // Defensive cap: bound per-call parameter memory (same as M2 path).
+        if pairs.len() >= MINIMAX_M2_MAX_PARAMS_PER_CALL {
+            break;
+        }
+    }
+
     let mut map = serde_json::Map::with_capacity(pairs.len());
     for (k, v) in pairs {
         map.insert(k, v);
@@ -1701,5 +1823,170 @@ mod tests {
             obj.len()
         );
         assert_eq!(obj.len(), MINIMAX_M2_MAX_PARAMS_PER_CALL);
+    }
+
+    // -- MiniMax-M3 tag-name parameter form --
+    //
+    // Direct unit tests of `extract_m3_tag_parameters` and the M2/M3
+    // precedence inside `extract_minimax_parameters`. These complement the
+    // end-to-end M3 invoke tests in `parser.rs` by isolating the extractor
+    // and exercising type coercion through the M3 form.
+
+    fn obj(s: &str) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(s)
+            .unwrap()
+            .as_object()
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn m3_tag_extracts_single_string() {
+        let result = extract_m3_tag_parameters("<file_path>/tmp/test.md</file_path>");
+        let o = obj(&result);
+        assert_eq!(o["file_path"], "/tmp/test.md");
+    }
+
+    #[test]
+    fn m3_tag_extracts_multiple_strings() {
+        let body = "<command>ls -la</command><description>List files</description>";
+        let o = obj(&extract_m3_tag_parameters(body));
+        assert_eq!(o["command"], "ls -la");
+        assert_eq!(o["description"], "List files");
+    }
+
+    #[test]
+    fn m3_tag_extracts_empty_string_value() {
+        let o = obj(&extract_m3_tag_parameters("<skill>essential</skill><args></args>"));
+        assert_eq!(o["skill"], "essential");
+        assert_eq!(o["args"], "");
+    }
+
+    #[test]
+    fn m3_tag_coerces_integer() {
+        let o = obj(&extract_m3_tag_parameters("<limit>42</limit>"));
+        assert_eq!(o["limit"], 42);
+    }
+
+    #[test]
+    fn m3_tag_coerces_float() {
+        let o = obj(&extract_m3_tag_parameters("<rate>0.75</rate>"));
+        assert!(o["rate"].as_f64().unwrap() - 0.75 < 1e-9);
+    }
+
+    #[test]
+    fn m3_tag_coerces_boolean_from_tojson() {
+        // M3 chat-template renders booleans via `tojson` → "true" / "false".
+        let o = obj(&extract_m3_tag_parameters(
+            "<enabled>true</enabled><verbose>false</verbose>",
+        ));
+        assert_eq!(o["enabled"], true);
+        assert_eq!(o["verbose"], false);
+    }
+
+    #[test]
+    fn m3_tag_returns_empty_for_no_params() {
+        // An <invoke> body with no parameters at all — neither M2 nor M3
+        // form present. Must return "{}", not None or a panic.
+        assert_eq!(extract_m3_tag_parameters(""), "{}");
+        assert_eq!(extract_m3_tag_parameters("  \n  "), "{}");
+    }
+
+    #[test]
+    fn m3_tag_ignores_attributed_tags() {
+        // A tag with an attribute (`<foo bar="baz">v</foo>`) is NOT M3
+        // form (M3 emits bare tags). The extractor must skip it rather
+        // than mis-extracting the attribute as part of the tag name.
+        // Currently we advance past '<' and continue scanning — this means
+        // we may capture nothing useful but must not panic or corrupt.
+        let result = extract_m3_tag_parameters("<foo bar=\"baz\">v</foo>");
+        assert_eq!(
+            result, "{}",
+            "attributed tag must not be misinterpreted as M3 param"
+        );
+    }
+
+    #[test]
+    fn m3_tag_handles_path_value_with_slashes() {
+        let o = obj(&extract_m3_tag_parameters(
+            "<file_path>/Users/foo/bar/baz.md</file_path>",
+        ));
+        assert_eq!(o["file_path"], "/Users/foo/bar/baz.md");
+    }
+
+    #[test]
+    fn m3_tag_handles_hyphenated_param_names() {
+        // The chat-template example uses hyphenated names (param-1, param-2).
+        let o = obj(&extract_m3_tag_parameters("<param-1>value-1</param-1>"));
+        assert_eq!(o["param-1"], "value-1");
+    }
+
+    #[test]
+    fn m3_tag_stops_at_unmatched_open() {
+        // An open tag with no matching close — extractor should break, not
+        // hang. Already-extracted pairs are preserved.
+        let o = obj(&extract_m3_tag_parameters(
+            "<a>1</a><b>unclosed and never closed",
+        ));
+        assert_eq!(o["a"], 1);
+        assert!(!o.contains_key("b"));
+    }
+
+    #[test]
+    fn extract_minimax_parameters_prefers_m2_when_present() {
+        // Mixed body (unrealistic, but the precedence must be unambiguous):
+        // M2 form present + extra bare tags. M2 wins.
+        let body = r#"<parameter name="a">m2_value</parameter><b>m3_value</b>"#;
+        let o = obj(&extract_minimax_parameters(body));
+        assert_eq!(o["a"], "m2_value");
+        // M3 fallback not invoked → bare tag NOT extracted.
+        assert!(!o.contains_key("b"));
+    }
+
+    #[test]
+    fn extract_minimax_parameters_falls_back_to_m3_when_no_m2() {
+        let body = "<file_path>/tmp/x.md</file_path>";
+        let o = obj(&extract_minimax_parameters(body));
+        assert_eq!(o["file_path"], "/tmp/x.md");
+    }
+
+    #[test]
+    fn extract_minimax_parameters_empty_when_neither_form_present() {
+        // No <parameter name=> and no recognized M3 tags — empty.
+        assert_eq!(extract_minimax_parameters("just text no tags"), "{}");
+    }
+
+    #[test]
+    fn m3_tag_extractor_caps_excessive_parameters_per_call() {
+        // Defensive cap parity with M2 path. Construct a body with more
+        // parameters than MINIMAX_M2_MAX_PARAMS_PER_CALL; verify the
+        // extractor stops at the cap.
+        let mut body = String::new();
+        for i in 0..(MINIMAX_M2_MAX_PARAMS_PER_CALL + 10) {
+            body.push_str(&format!("<k{}>v{}</k{}>", i, i, i));
+        }
+        let result = extract_m3_tag_parameters(&body);
+        let o = obj(&result);
+        assert_eq!(
+            o.len(),
+            MINIMAX_M2_MAX_PARAMS_PER_CALL,
+            "M3 extractor must cap at MINIMAX_M2_MAX_PARAMS_PER_CALL"
+        );
+    }
+
+    // -- try_minimax_m2 end-to-end through M3 fallback --
+
+    #[test]
+    fn try_minimax_m2_extracts_m3_form_via_extractor_fallback() {
+        // The whole point of integration: try_minimax_m2 finds <invoke name=>,
+        // calls extract_minimax_parameters which now falls back to M3 form
+        // when M2 yields nothing. End-to-end the call must produce a tool
+        // call with arguments populated from M3-style XML.
+        let text = "<invoke name=\"Read\"><file_path>/tmp/test.md</file_path></invoke>";
+        let result = try_minimax_m2(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "Read");
+        let o = obj(&result.tool_calls[0].arguments);
+        assert_eq!(o["file_path"], "/tmp/test.md");
     }
 }

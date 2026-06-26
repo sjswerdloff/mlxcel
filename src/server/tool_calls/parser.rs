@@ -564,6 +564,208 @@ mod tests {
         assert!(!result.content.contains("]<]minimax[>["));
     }
 
+    // -- MiniMax-M3 invoke format (param-name-as-tag-name) --
+    //
+    // The M3 chat template (chat_template.jinja, lines 127-141 and 180-190)
+    // renders parameters with the parameter name AS the XML tag name, not
+    // as a `name=` attribute. After the dispatch-time namespace strip, the
+    // body inside `<invoke>` looks like:
+    //
+    //   <file_path>/tmp/test.md</file_path>
+    //
+    // not the M2/Anthropic form `<parameter name="file_path">/tmp/test.md</parameter>`.
+    //
+    // BUG (Stuart caught live 2026-06-26): `extract_minimax_parameters`
+    // only matched the M2 form, so the M3 invoke parser extracted the
+    // function name correctly but returned `arguments = "{}"` for every
+    // call — silently dropping every argument. Downstream tool schemas
+    // (e.g. Read requires `file_path`) rejected the call as missing
+    // required parameters. Tool calling appeared to "almost work" — name
+    // recognized, args gone.
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_extracts_single_string_param() {
+        // Smoking-gun shape: the exact post-strip output of a Read({"file_path": "/tmp/test.md"})
+        // call rendered by the M3 chat template. Pre-strip, every tag is
+        // prefixed by `]<]minimax[>[`. The strip flattens it to plain XML.
+        let raw = "]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"Read\">]<]minimax[>[<file_path>/tmp/test.md]<]minimax[>[</file_path>\n\
+                   ]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("Read")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(
+            result.has_tool_calls(),
+            "M3 invoke must produce a tool call; got content={:?}",
+            result.content
+        );
+        assert_eq!(result.tool_calls[0].name, "Read");
+        let args = arg_obj(&result.tool_calls[0]);
+        assert_eq!(
+            args["file_path"], "/tmp/test.md",
+            "file_path must be extracted from <file_path>...</file_path>; \
+             got args = {}",
+            result.tool_calls[0].arguments
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_extracts_multiple_string_params() {
+        // Bash({"command": "ls -la", "description": "List files"})
+        let raw = "]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"Bash\">]<]minimax[>[<command>ls -la]<]minimax[>[</command>]<]minimax[>[<description>List files]<]minimax[>[</description>\n\
+                   ]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("Bash")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls[0].name, "Bash");
+        let args = arg_obj(&result.tool_calls[0]);
+        assert_eq!(args["command"], "ls -la");
+        assert_eq!(args["description"], "List files");
+    }
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_handles_empty_string_value() {
+        // Skill({"skill": "essential-infrastructure", "args": ""}) — empty
+        // string is a real call shape; chat-template renders <args></args>.
+        let raw = "]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"Skill\">]<]minimax[>[<skill>essential-infrastructure]<]minimax[>[</skill>]<]minimax[>[<args>]<]minimax[>[</args>\n\
+                   ]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("Skill")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls[0].name, "Skill");
+        let args = arg_obj(&result.tool_calls[0]);
+        assert_eq!(args["skill"], "essential-infrastructure");
+        // Empty-string args must round-trip as "" (not null, not missing).
+        assert_eq!(
+            args["args"], "",
+            "empty-string parameter must round-trip as empty string; got args = {}",
+            result.tool_calls[0].arguments
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_string_value_with_path_separator() {
+        // A value containing '/' must not be confused with closing-tag detection.
+        let raw = "]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"Read\">]<]minimax[>[<file_path>/Users/foo/bar/baz.md]<]minimax[>[</file_path>\n\
+                   ]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("Read")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls());
+        let args = arg_obj(&result.tool_calls[0]);
+        assert_eq!(args["file_path"], "/Users/foo/bar/baz.md");
+    }
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_parallel_calls() {
+        // Two invoke blocks inside one tool_call container — both must
+        // produce their own ParsedToolCall with arguments preserved.
+        let raw = "]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"Read\">]<]minimax[>[<file_path>a.md]<]minimax[>[</file_path>]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[<invoke name=\"Read\">]<]minimax[>[<file_path>b.md]<]minimax[>[</file_path>]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("Read")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls.len(), 2);
+        let args_a = arg_obj(&result.tool_calls[0]);
+        let args_b = arg_obj(&result.tool_calls[1]);
+        assert_eq!(args_a["file_path"], "a.md");
+        assert_eq!(args_b["file_path"], "b.md");
+    }
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_typed_numeric_param() {
+        // M3 numeric value — `extract_m3_tag_parameters` must coerce
+        // via `coerce_minimax_param` (same as M2).
+        let raw = "]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"limit_results\">]<]minimax[>[<count>10]<]minimax[>[</count>]<]minimax[>[<ratio>0.5]<]minimax[>[</ratio>\n\
+                   ]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("limit_results")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls());
+        let args = arg_obj(&result.tool_calls[0]);
+        assert_eq!(args["count"], 10);
+        // Float comparison — assert as f64 with epsilon since serde_json
+        // can store as Number with either int or float representation.
+        let ratio = args["ratio"].as_f64().unwrap();
+        assert!((ratio - 0.5).abs() < 1e-9, "ratio should be 0.5; got {}", ratio);
+    }
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_typed_boolean_param() {
+        // M3 chat-template renders booleans via `tojson` → "true" / "false".
+        let raw = "]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"toggle\">]<]minimax[>[<enabled>true]<]minimax[>[</enabled>]<]minimax[>[<verbose>false]<]minimax[>[</verbose>\n\
+                   ]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("toggle")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls());
+        let args = arg_obj(&result.tool_calls[0]);
+        assert_eq!(args["enabled"], true);
+        assert_eq!(args["verbose"], false);
+    }
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_with_zero_params_produces_empty_args() {
+        // <invoke name="get_status"></invoke> — a parameterless call.
+        // Must produce a tool call with arguments == "{}", not None.
+        let raw = "]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"get_status\">]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>";
+        let tools = vec![make_tool("get_status")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(
+            result.has_tool_calls(),
+            "parameterless call must still produce a tool call; content={:?}",
+            result.content
+        );
+        assert_eq!(result.tool_calls[0].name, "get_status");
+        assert_eq!(result.tool_calls[0].arguments, "{}");
+    }
+
+    #[test]
+    fn parse_tool_calls_m3_invoke_in_mid_conversation_preamble_postamble() {
+        // Realistic shape: assistant says something, then calls a tool, then
+        // says something more. Mirrors what comes from accumulated_raw in the
+        // streaming path. Asserts the M3-specific extraction works end-to-end
+        // when wrapped in conversational text.
+        //
+        // NOTE: `try_minimax_m2` returns empty content (it does not preserve
+        // preamble/postamble — pre-existing behaviour, not specific to this
+        // fix). The test only asserts what IS the M3 contract: tool call +
+        // arguments extracted, and zero leakage of tool-call internals.
+        let raw = "Let me check that.]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"Read\">]<]minimax[>[<file_path>/etc/hosts]<]minimax[>[</file_path>\n\
+                   ]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>One moment.";
+        let tools = vec![make_tool("Read")];
+        let result = parse_tool_calls(raw, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls[0].name, "Read");
+        let args = arg_obj(&result.tool_calls[0]);
+        assert_eq!(args["file_path"], "/etc/hosts");
+        // Tool-call internals must NOT leak into content (regardless of
+        // whether preamble survives).
+        assert!(
+            !result.content.contains("]<]minimax[>["),
+            "namespace marker must not leak; got content={:?}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("<invoke") && !result.content.contains("<file_path>"),
+            "tool-call body must not leak; got content={:?}",
+            result.content
+        );
+    }
+
     // -- Prompt-primed Gemma 4 (enable_thinking=true) --
     //
     // When the chat template ends the generation prompt with an OPEN

@@ -695,6 +695,238 @@ mod tests {
         );
     }
 
+    #[test]
+    fn m3_namespace_marker_split_across_two_feeds() {
+        // The model emits ]<]minimax[>[ as a single token (200058), so in
+        // practice we'd see it in one feed(). But token decoding can fragment
+        // any text; the filter must handle the marker arriving split across
+        // calls. Buffer must hold the partial match until the rest arrives.
+        let mut f = StreamFilter::new();
+        // First feed ends mid-marker — partial match buffered, no emit.
+        assert_eq!(f.feed("Before]<]minim").content, Some("Before".to_string()));
+        // Second feed completes the marker and continues.
+        assert_eq!(f.feed("ax[>[After").content, Some("After".to_string()));
+    }
+
+    #[test]
+    fn m3_namespace_marker_split_across_many_feeds_one_byte_each() {
+        // Pathological case: each byte arrives in its own feed. Filter must
+        // accumulate until the full 15-byte marker resolves, then strip it.
+        let mut f = StreamFilter::new();
+        // Preamble — emits as content.
+        let pre = f.feed("A");
+        assert_eq!(pre.content, Some("A".to_string()));
+        // The 15 bytes of "]<]minimax[>[" arrive one at a time.
+        // None of these individual feeds should emit content (each byte
+        // could be the start of the delimiter, so all get buffered).
+        let marker = "]<]minimax[>[";
+        for ch in marker.chars() {
+            let out = f.feed(&ch.to_string());
+            assert_eq!(
+                out.content, None,
+                "byte {:?} of partial marker must NOT emit content",
+                ch
+            );
+        }
+        // Trailing content after the marker resolves — emits content.
+        assert_eq!(f.feed("B").content, Some("B".to_string()));
+    }
+
+    #[test]
+    fn m3_namespace_marker_split_at_every_byte_boundary_strips_cleanly() {
+        // Exhaustive: for every possible split point inside the 15-byte
+        // marker, the two-feed sequence must produce "BeforeAfter" with no
+        // leakage. Catches off-by-one bugs in the partial-match buffering
+        // logic.
+        let marker = "]<]minimax[>[";
+        for split in 1..marker.len() {
+            let mut f = StreamFilter::new();
+            let first = format!("Before{}", &marker[..split]);
+            let second = format!("{}After", &marker[split..]);
+            let out1 = f.feed(&first).content.unwrap_or_default();
+            let out2 = f.feed(&second).content.unwrap_or_default();
+            assert_eq!(
+                format!("{}{}", out1, out2),
+                "BeforeAfter",
+                "split at byte {} must strip cleanly; got first={:?} second={:?}",
+                split,
+                out1,
+                out2
+            );
+        }
+    }
+
+    #[test]
+    fn m3_full_toolcall_in_one_feed_yields_only_preamble_and_postamble_content() {
+        // End-to-end shape: preamble, then M3 chat-template tool-call block,
+        // then postamble. Client-facing SSE content must contain ONLY the
+        // preamble + postamble — no tool-call body, no namespace markers,
+        // no boundary tags.
+        let mut f = StreamFilter::new();
+        let raw = "Reading the file.]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"Read\">]<]minimax[>[<file_path>/tmp/test.md]<]minimax[>[</file_path>\n\
+                   ]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>Done.";
+        let mut content = String::new();
+        if let Some(c) = f.feed(raw).content {
+            content.push_str(&c);
+        }
+        if let Some(c) = f.flush().content {
+            content.push_str(&c);
+        }
+        assert!(
+            !content.contains("]<]minimax[>["),
+            "namespace marker must not leak to SSE; got content={:?}",
+            content
+        );
+        assert!(
+            !content.contains("<tool_call>") && !content.contains("</tool_call>"),
+            "tool-call boundary tags must not leak; got content={:?}",
+            content
+        );
+        assert!(
+            !content.contains("<invoke") && !content.contains("<file_path>"),
+            "tool-call body must not leak; got content={:?}",
+            content
+        );
+        // Must contain BOTH preamble and postamble (proves we don't accidentally
+        // suppress everything).
+        assert!(
+            content.contains("Reading the file."),
+            "preamble must reach client; got content={:?}",
+            content
+        );
+        assert!(
+            content.contains("Done."),
+            "postamble must reach client; got content={:?}",
+            content
+        );
+    }
+
+    #[test]
+    fn m3_full_toolcall_streamed_char_by_char_no_leakage() {
+        // Same scenario but stream one byte at a time. This is the closest
+        // simulation of real token-by-token generation, exercising both the
+        // partial-delimiter buffer and the state machine under maximum
+        // fragmentation pressure.
+        let mut f = StreamFilter::new();
+        let raw = "Hi.]<]minimax[>[<tool_call>]<]minimax[>[<invoke name=\"Read\">]<]minimax[>[<file_path>/x</file_path>]<]minimax[>[</invoke>]<]minimax[>[</tool_call>Done.";
+        let mut content = String::new();
+        for ch in raw.chars() {
+            if let Some(c) = f.feed(&ch.to_string()).content {
+                content.push_str(&c);
+            }
+        }
+        if let Some(c) = f.flush().content {
+            content.push_str(&c);
+        }
+        assert!(
+            !content.contains("]<]minimax[>["),
+            "no namespace marker leakage under char-by-char streaming; got content={:?}",
+            content
+        );
+        assert!(
+            !content.contains("<tool_call>") && !content.contains("</tool_call>"),
+            "no boundary tag leakage; got content={:?}",
+            content
+        );
+        assert!(
+            !content.contains("<invoke") && !content.contains("file_path"),
+            "no tool-call body leakage; got content={:?}",
+            content
+        );
+        assert!(content.contains("Hi.") && content.contains("Done."),
+            "preamble and postamble must survive; got content={:?}", content);
+    }
+
+    #[test]
+    fn m3_namespace_marker_immediately_followed_by_tool_call_open() {
+        // The chat template emits these back-to-back: `]<]minimax[>[<tool_call>`.
+        // The strip-then-enter sequence must execute in order: first strip the
+        // marker, then recognize `<tool_call>` and enter ToolCall state.
+        let mut f = StreamFilter::new();
+        let out = f.feed("X]<]minimax[>[<tool_call>BODY");
+        // 'X' emits as content; the marker strips; <tool_call> consumes
+        // BODY into the suppressed-tool-call state.
+        assert_eq!(out.content, Some("X".to_string()));
+        // The body should still be in buffer/state; flush discards it.
+        let flushed = f.flush();
+        assert_eq!(
+            flushed.content, None,
+            "tool-call body must NOT surface as content via flush"
+        );
+    }
+
+    #[test]
+    fn m3_round_trip_streamed_then_parsed_extracts_arguments() {
+        // The streaming filter discards tool-call body, but the route handler
+        // also keeps an `accumulated_raw` buffer of every fragment. End-of-stream,
+        // parse_tool_calls runs on that buffer. Verify the combination works:
+        // feed every fragment through BOTH the filter (for SSE) and a separate
+        // accumulator (for parsing), then run parse_tool_calls on the accumulator.
+        use super::super::parse_tool_calls;
+        use crate::server::types::request::{FunctionDefinition, Tool};
+
+        fn make_tool(name: &str) -> Tool {
+            Tool {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: name.to_string(),
+                    description: None,
+                    parameters: None,
+                },
+            }
+        }
+
+        let mut f = StreamFilter::new();
+        let raw = "Reading.]<]minimax[>[<tool_call>\n\
+                   ]<]minimax[>[<invoke name=\"Read\">]<]minimax[>[<file_path>/tmp/x.md]<]minimax[>[</file_path>\n\
+                   ]<]minimax[>[</invoke>\n\
+                   ]<]minimax[>[</tool_call>";
+        let mut accumulated = String::new();
+        let mut sse_content = String::new();
+        // Simulate token-by-token streaming.
+        for ch in raw.chars() {
+            let s = ch.to_string();
+            accumulated.push_str(&s);
+            if let Some(c) = f.feed(&s).content {
+                sse_content.push_str(&c);
+            }
+        }
+        if let Some(c) = f.flush().content {
+            sse_content.push_str(&c);
+        }
+        // SSE should be just the preamble (no tool-call body, no markers).
+        assert!(
+            !sse_content.contains("]<]minimax[>[")
+                && !sse_content.contains("<tool_call>")
+                && !sse_content.contains("file_path"),
+            "no tool-call internals in SSE; got sse_content={:?}",
+            sse_content
+        );
+        assert!(
+            sse_content.contains("Reading."),
+            "preamble must survive; got sse_content={:?}",
+            sse_content
+        );
+        // End-of-stream: parse the accumulated raw and verify the M3 tool call
+        // came through with arguments intact.
+        let tools = vec![make_tool("Read")];
+        let parsed = parse_tool_calls(&accumulated, Some(&tools));
+        assert!(
+            parsed.has_tool_calls(),
+            "parser must extract the tool call from accumulated raw"
+        );
+        assert_eq!(parsed.tool_calls[0].name, "Read");
+        let args: serde_json::Value =
+            serde_json::from_str(&parsed.tool_calls[0].arguments).unwrap();
+        assert_eq!(
+            args["file_path"], "/tmp/x.md",
+            "file_path must survive streaming + parsing round-trip; got args={}",
+            parsed.tool_calls[0].arguments
+        );
+    }
+
     // -- Partial delimiter buffering --
 
     #[test]
