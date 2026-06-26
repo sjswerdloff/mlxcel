@@ -1293,6 +1293,18 @@ impl BatchScheduler {
 
         let store = self.prompt_cache.as_ref()?.clone();
         let key = Self::compose_prompt_cache_key(ctx, tokens);
+        // Diagnostic logging for cache lookup. Logs the first 16 token IDs of
+        // the lookup attempt so an operator can diff prefixes across requests
+        // when investigating cache misses (cycle 79: M3 thinking tags may be
+        // re-tokenized differently on round-trip, breaking prefix stability).
+        let preview_n = tokens.len().min(16);
+        let token_preview: Vec<i32> = tokens[..preview_n].to_vec();
+        tracing::info!(
+            total_tokens = tokens.len(),
+            store_entries = store.len(),
+            token_preview = ?token_preview,
+            "prompt-cache: lookup attempt"
+        );
         if self.model.supports_snapshot_reuse()
             && let Some((snapshot_entry, matched_len)) = store.lookup_snapshot_prefix(&key, tokens)
         {
@@ -1334,7 +1346,24 @@ impl BatchScheduler {
                 }
             }
         }
-        let (entry, matched_len) = store.lookup_longest_prefix(&key, tokens)?;
+        let (entry, matched_len) = match store.lookup_longest_prefix(&key, tokens) {
+            Some(found) => {
+                tracing::info!(
+                    matched_len = found.1,
+                    total = tokens.len(),
+                    "prompt-cache: longest-prefix MATCH (raw, before adoption)"
+                );
+                found
+            }
+            None => {
+                tracing::info!(
+                    total = tokens.len(),
+                    store_entries = store.len(),
+                    "prompt-cache: longest-prefix MISS (no entry shares any prefix under this key)"
+                );
+                return None;
+            }
+        };
         // #124 step c: multimodal sharing requires the matched prefix to cover
         // the ENTIRE stored entry. A partial (e.g. APC block-clamped) match
         // could leave image/audio placeholder tokens in the suffix, which the

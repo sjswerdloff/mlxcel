@@ -429,12 +429,32 @@ fn is_tool_response_pseudo_user(content: &str) -> bool {
 /// Messages that don't contain a block pass through unchanged (zero allocation
 /// in the common case — we only allocate when a block is actually removed).
 pub fn strip_think_block(content: &str) -> Cow<'_, str> {
-    const OPEN: &str = "<think>";
-    const CLOSE: &str = "</think>";
+    // Try each (open, close) tag family. First family whose OPEN is found
+    // wins. Listing widest-format first (M3 `<mm:think>`) avoids a partial
+    // match where a prefix overlaps another family — but `<think>` and
+    // `<mm:think>` share no prefix, so this is informational only.
+    const TAG_FAMILIES: &[(&str, &str)] = &[
+        ("<think>", "</think>"),
+        ("<mm:think>", "</mm:think>"),
+    ];
 
-    let Some(open_idx) = content.find(OPEN) else {
+    let mut chosen: Option<(&str, &str, usize)> = None;
+    for &(open, close) in TAG_FAMILIES {
+        if let Some(idx) = content.find(open) {
+            match chosen {
+                None => chosen = Some((open, close, idx)),
+                Some((_, _, prev_idx)) if idx < prev_idx => {
+                    chosen = Some((open, close, idx))
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some((open_tag, close_tag, open_idx)) = chosen else {
         return Cow::Borrowed(content);
     };
+    let OPEN = open_tag;
+    let CLOSE = close_tag;
     // Search for the matching close *after* the open. If the tag is malformed
     // (no closing), leave the content alone — we don't want to silently drop
     // everything to end-of-string.

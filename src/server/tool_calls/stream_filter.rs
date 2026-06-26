@@ -204,6 +204,13 @@ const CHAT_DELIMITERS: &[(&str, DelimiterAction)] = &[
     // Probe these first to mirror resolve_thinking_token_ids ordering.
     ("</think>", DelimiterAction::ExitThinking),
     ("<think>", DelimiterAction::EnterThinking),
+    // MiniMax-M3 reasoning markers (`<mm:think>` / `</mm:think>`). Selection
+    // is by byte position then longest, so listing order is informational
+    // only. M3 emits these as added/special tokens at generation; they need
+    // explicit entries here so streaming + non-streaming response assembly
+    // both route the block to `reasoning_content`.
+    ("</mm:think>", DelimiterAction::ExitThinking),
+    ("<mm:think>", DelimiterAction::EnterThinking),
     // Gemma 4 tool-call delimiters — must precede Hermes `<tool_call>` to avoid
     // a spurious Hermes hit on the Gemma 4 open tag.
     ("<|tool_call>", DelimiterAction::EnterToolCall),
