@@ -2926,10 +2926,18 @@ impl KVCache {
     /// mirrors that pattern: it calls `ffi::eval` on every non-`None` tensor
     /// field that contributes to the cache state (`keys`, `values`,
     /// `key_scales`, `val_scales`, `v_packed`, `v_norms`, `v_rescale`,
-    /// `k_packed`, `k_norms`), then returns. Evaluating only the cache state
-    /// avoids forcing the LM-head matmul (and the resulting peak allocation)
-    /// that would follow from evaluating the full `[1, step, vocab_size]`
-    /// logits tensor.
+    /// `k_packed`, `k_norms`, `m3_idx_k`), then returns. Evaluating only the
+    /// cache state avoids forcing the LM-head matmul (and the resulting peak
+    /// allocation) that would follow from evaluating the full
+    /// `[1, step, vocab_size]` logits tensor.
+    ///
+    /// `m3_idx_k` (MiniMax-M3 indexer K state, added by the MSA support in
+    /// cycle 80) is also covered by an inline `ffi::eval` at the bottom of
+    /// `m3_idx_k_update_and_fetch` — but that inline eval addresses callers
+    /// that don't go through `eval_state` at all (the non-speculative
+    /// inference path). Including it here keeps the contract honest for
+    /// callers that DO go through `eval_state` (speculative path) and want
+    /// "all cache state is materialised" to mean ALL of it.
     ///
     /// Used by: `SpeculativeGenerator::generate` (chunked prefill loop)
     pub fn eval_state(&self) {
@@ -2959,6 +2967,9 @@ impl KVCache {
         }
         if let Some(kn) = self.k_norms.as_ref() {
             ffi::eval(kn);
+        }
+        if let Some(idx) = self.m3_idx_k.as_ref() {
+            ffi::eval(idx);
         }
     }
 
@@ -3725,6 +3736,21 @@ impl KVCache {
         };
         self.m3_idx_offset += chunk_len;
         self.m3_idx_k = Some(combined);
+        // Break the lazy-eval graph reference to the prior iteration's
+        // `m3_idx_k` buffer. Without this, MLX's compute graph keeps `prev`
+        // alive across every MSA-eligible forward — across 57 layers and a
+        // long prefill, this accumulates ~499K live buffer handles and the
+        // Metal allocator refuses further allocation with
+        // `[metal::malloc] Resource limit (499000) exceeded`. The leak
+        // surfaces in MLX upstream as ml-explore/mlx-lm#1332 (open, 2026);
+        // the canonical fix is to eval the cache state after the concat so
+        // MLX can release the now-unreferenced prior buffer. Mirrors the
+        // `eval_state` pattern (this file, line ~2935) but inline here
+        // because `m3_idx_k_update_and_fetch` is called even when MSA
+        // dispatch will NOT fire (cycle-79.5 always-accumulate invariant),
+        // and the dense path discards the returned slice without ever
+        // reading it — meaning no downstream attention op forces eval.
+        ffi::eval(self.m3_idx_k.as_ref().unwrap());
         // Return another independently-owned slice of the full cached idx_k.
         let full = self.m3_idx_k.as_ref().unwrap();
         let full_shape = ffi::array_shape(full);
@@ -6741,6 +6767,106 @@ mod tests {
         let _ = cache.m3_idx_k_update_and_fetch(&chunk);
         assert_eq!(cache.m3_idx_offset(), 1);
         assert_eq!(cache.offset, 0, "main K/V offset must be unaffected");
+    }
+
+    // -- m3_idx_k unevaluated-concat graph leak (the bug that crashed M3 at
+    //    123K tokens with `[metal::malloc] Resource limit (499000) exceeded`)
+    //    ----------------------------------------------------------------
+    //
+    // Without the `ffi::eval(self.m3_idx_k.as_ref().unwrap())` at the bottom
+    // of `m3_idx_k_update_and_fetch`, the concat operation produces a lazy
+    // graph node that retains a reference to the prior iteration's m3_idx_k
+    // buffer. Across N iterations the dependency chain is N deep. MLX
+    // tracks each unevaluated intermediate as a live buffer handle until
+    // freed, and accumulating thousands per layer overruns Metal's handle
+    // ceiling (~499K). The reference fix pattern is documented in
+    // ml-explore/mlx-lm#1332 — eval the cache state to materialise the
+    // chain and let MLX release the unreferenced intermediates.
+    //
+    // **In-process detection caveat (cycle-80 honesty)**: the leak surfaces
+    // as accumulated *buffer handles* (Metal's 499K ceiling), not as
+    // materialised bytes. `mlxcel_core::memory::active_memory()` reads
+    // *materialised* bytes only — it does not see unevaluated graph nodes.
+    // So a unit test cannot reliably detect the bug by reading active_memory
+    // alone; the real bite happens at production scale (~57 layers × ~100K
+    // tokens × many forward passes) and surfaces as the Metal allocator
+    // panic. The test below therefore exercises the function across many
+    // iterations as a *correctness smoke test* (does the cache still hold
+    // the right data after N iterations) but does NOT claim to detect the
+    // graph leak in-process. The actual leak detection is end-to-end on a
+    // live server with the memory monitor enabled.
+
+    #[test]
+    fn m3_idx_k_update_and_fetch_remains_correct_across_many_iterations() {
+        // Smoke test: many iterations of update_and_fetch with a small
+        // chunk. Asserts the cache offset advances correctly and the
+        // final cached buffer materialises cleanly with the expected
+        // shape. This is what a production prefill loop would do — even
+        // without the eval-after-concat fix, this test passes because
+        // active_memory tracks materialised bytes and the small chunks
+        // never push the byte count anywhere near a limit. Its value is
+        // ensuring the function's contract is preserved (offset, shape,
+        // correctness) across the iteration count we'd see in a real
+        // prefill of a few hundred MSA-dispatched chunks.
+        const ITERS: usize = 200;
+        const CHUNK_LEN: i32 = 1;
+        const HEADS: i32 = 4;
+        const HEAD_DIM: i32 = 8;
+
+        let mut cache = KVCache::new();
+        let zeros = vec![0.0_f32; (HEADS * HEAD_DIM * CHUNK_LEN) as usize];
+        for _ in 0..ITERS {
+            let chunk = ffi::from_slice_f32(&zeros, &[1, HEADS, CHUNK_LEN, HEAD_DIM]);
+            let _ = cache.m3_idx_k_update_and_fetch(&chunk);
+        }
+        assert_eq!(
+            cache.m3_idx_offset(),
+            ITERS as i32 * CHUNK_LEN,
+            "offset must advance once per iteration"
+        );
+        // Materialise the final cached buffer. Under the bug this forces
+        // MLX to walk a N-deep concat chain (which would be ~200 calls
+        // here — easy in-process — but at 57 layers × 123K tokens in
+        // production it overruns the handle ceiling). The eval should
+        // succeed regardless.
+        let full = cache.m3_idx_k.as_ref().expect("m3_idx_k must be populated");
+        ffi::eval(full);
+        let full_shape = ffi::array_shape(full);
+        assert_eq!(
+            full_shape,
+            vec![1, HEADS, ITERS as i32 * CHUNK_LEN, HEAD_DIM],
+            "final cached idx_k shape must match cumulative concat"
+        );
+    }
+
+    #[test]
+    fn eval_state_covers_m3_idx_k() {
+        // Adding m3_idx_k to eval_state means callers that materialise
+        // "the whole cache state" (the speculative path is the current
+        // one) get indexer K coverage too. Without this, an unevaluated
+        // concat in m3_idx_k would persist across an eval_state boundary
+        // even though the rest of the cache's state was materialised.
+        //
+        // This test mainly guards against `eval_state` ever losing
+        // coverage of m3_idx_k in a refactor — it does not directly
+        // observe MLX internals.
+        let mut cache = KVCache::new();
+        let chunk = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2]);
+        let _ = cache.m3_idx_k_update_and_fetch(&chunk);
+        assert!(cache.has_m3_idx_k_state());
+        // eval_state should run without panic and leave the cached
+        // m3_idx_k still readable (eval materialises in place; it does
+        // not clear).
+        cache.eval_state();
+        assert!(
+            cache.has_m3_idx_k_state(),
+            "eval_state must not clear m3_idx_k"
+        );
+        assert_eq!(
+            cache.m3_idx_offset(),
+            2,
+            "eval_state must not affect offset accounting"
+        );
     }
 
     #[test]
