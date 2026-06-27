@@ -19,6 +19,7 @@
 //! consistent regardless of how inference is entered.
 
 use std::fmt;
+use std::time::Duration;
 
 const RUNTIME_DEVICE_ENV: &str = "MLXCEL_DEVICE";
 const WIRED_LIMIT_ENV: &str = "MLXCEL_WIRED_LIMIT";
@@ -30,6 +31,22 @@ const WIRED_LIMIT_ENV: &str = "MLXCEL_WIRED_LIMIT";
 /// as `MLXCEL_WIRED_LIMIT`: plain bytes, `NGB`, or `NMB`. Unset means
 /// "do not override MLX's default limit".
 const MEMORY_LIMIT_ENV: &str = "MLXCEL_MEMORY_LIMIT";
+/// Cap on MLX's free-buffer cache (the allocator's free list). Without
+/// a cap, the free list grows toward Metal's 1.5x recommended working
+/// set ceiling over long-running sessions, eventually starving fresh
+/// allocations on a Mac that has many tens of GB of unified memory in
+/// circulation. Calls `mlxcel_core::memory::set_cache_limit(...)` at
+/// startup. Same syntax as `MLXCEL_MEMORY_LIMIT` (plain bytes, `NGB`,
+/// `NMB`). Unset / `0` / `none` means "do not override MLX's default
+/// behaviour" (the unbounded growth). Set this low (e.g. 4–8 GB) and
+/// rely on the monitor below to confirm the cap is sized correctly.
+const METAL_CACHE_LIMIT_ENV: &str = "MLXCEL_METAL_CACHE_LIMIT";
+/// Seconds between MLX memory-snapshot tracing emissions. When set, the
+/// server spawns a tokio task that periodically reads
+/// `(active, cache, peak, limit)` and emits a structured INFO line so
+/// operators can tune `MLXCEL_METAL_CACHE_LIMIT` empirically. `0` / unset
+/// disables the monitor. Recommended initial value: `60`.
+const MEMORY_MONITOR_INTERVAL_ENV: &str = "MLXCEL_MEMORY_MONITOR_INTERVAL_SECS";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeDevice {
@@ -67,6 +84,15 @@ pub struct RuntimeSetup {
     /// (issue #55). `None` when the env var was unset or invalid and
     /// MLX's default limit is in effect.
     pub memory_limit_bytes: Option<usize>,
+    /// Cap on MLX's free-buffer cache applied via `MLXCEL_METAL_CACHE_LIMIT`.
+    /// `None` when the env var was unset and the free list grows
+    /// unbounded (MLX default).
+    pub metal_cache_limit_bytes: Option<usize>,
+    /// Memory-snapshot monitor interval applied via
+    /// `MLXCEL_MEMORY_MONITOR_INTERVAL_SECS`. `None` disables the
+    /// monitor; otherwise the server spawns a periodic tokio task at
+    /// this interval.
+    pub memory_monitor_interval: Option<Duration>,
     pub invalid_device_override: Option<String>,
 }
 
@@ -109,10 +135,18 @@ pub fn initialize_runtime() -> RuntimeSetup {
     // Silicon.
     let memory_limit_bytes = resolve_memory_limit();
 
+    // Cap MLX's free-buffer cache. Unset → MLX default (unbounded
+    // growth, the long-session OOM cause). The monitor lets operators
+    // tune this with real data instead of guessing.
+    let metal_cache_limit_bytes = resolve_metal_cache_limit();
+    let memory_monitor_interval = resolve_memory_monitor_interval();
+
     RuntimeSetup {
         device,
         wired_limit_bytes,
         memory_limit_bytes,
+        metal_cache_limit_bytes,
+        memory_monitor_interval,
         invalid_device_override,
     }
 }
@@ -168,6 +202,110 @@ fn resolve_memory_limit() -> Option<usize> {
     }
     mlxcel_core::memory::set_memory_limit(bytes as u64);
     Some(bytes)
+}
+
+/// Pure parser for MLXCEL_METAL_CACHE_LIMIT raw value. Returns the byte
+/// count to apply, or `None` for the disabled-by-design inputs (`0`,
+/// `none`/`NONE`, empty, unset).
+///
+/// Split out from [`resolve_metal_cache_limit`] so unit tests can verify
+/// the parsing logic without invoking `set_cache_limit`. The FFI is
+/// process-global and polluting it inside the test runner has broken
+/// sibling model tests in this crate.
+fn parse_metal_cache_limit_value(raw: Option<&str>) -> Option<usize> {
+    let bytes = match raw {
+        Some("0") | Some("none") | Some("NONE") | None | Some("") => return None,
+        Some(s) => parse_memory_size(s)?,
+    };
+    if bytes == 0 {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Resolve the MLX free-buffer cache cap from MLXCEL_METAL_CACHE_LIMIT.
+///
+/// Without a cap, MLX's allocator keeps freed buffers in an internal
+/// free list to amortise the next allocation of the same shape. Over a
+/// long-running session with varied shapes the free list grows toward
+/// Metal's 1.5x recommended-working-set ceiling — eventually a fresh
+/// allocation is refused with `[metal::malloc] Resource limit exceeded`
+/// and the request panics.
+///
+/// Setting a cap returns excess freed buffers to the OS immediately.
+/// The trade-off: slightly slower first allocation of an unfamiliar
+/// shape (must round-trip to the OS) for predictable peak memory.
+/// In practice the hot working set is small (the few activation /
+/// scratch shapes that recur during prefill and decode), so a cap on
+/// the order of `4–8 GB` typically has no observable perf impact.
+///
+/// Returns the cap actually applied, or `None` when the env var was
+/// unset / explicitly disabled (`0`, `none`). The `set_cache_limit`
+/// FFI is process-global; this function is the only intended caller.
+fn resolve_metal_cache_limit() -> Option<usize> {
+    let raw = std::env::var(METAL_CACHE_LIMIT_ENV).ok();
+    let bytes = parse_metal_cache_limit_value(raw.as_deref())?;
+    mlxcel_core::memory::set_cache_limit(bytes as u64);
+    Some(bytes)
+}
+
+/// Resolve the memory-snapshot monitor cadence from
+/// MLXCEL_MEMORY_MONITOR_INTERVAL_SECS.
+///
+/// `0` / unset disables the monitor entirely. Any positive integer N
+/// means "spawn a tokio task that wakes every N seconds and emits a
+/// structured tracing line with active / cache / peak / limit bytes."
+/// Lets an operator empirically observe the MLX allocator's behaviour
+/// and tune `MLXCEL_METAL_CACHE_LIMIT` with real data rather than
+/// guesswork.
+fn resolve_memory_monitor_interval() -> Option<Duration> {
+    let raw = std::env::var(MEMORY_MONITOR_INTERVAL_ENV).ok();
+    let secs = match raw.as_deref() {
+        Some("0") | Some("none") | Some("NONE") | None | Some("") => return None,
+        Some(s) => s.trim().parse::<u64>().ok()?,
+    };
+    if secs == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(secs))
+}
+
+/// Spawn the periodic MLX memory-snapshot tracing task.
+///
+/// Reads `(active, cache, peak, limit)` from
+/// [`mlxcel_core::memory::snapshot`] at the configured interval and
+/// emits a structured INFO tracing line. Designed to run for the
+/// server's lifetime; cancelling the returned `JoinHandle` stops the
+/// monitor. Logging is the only side effect — no shared mutable state.
+///
+/// The interval should be measured in tens of seconds. The snapshot
+/// reads are cheap (just counter loads from the MLX allocator) but
+/// emitting at sub-second cadence would clutter the log without
+/// telling the operator anything new about steady-state behaviour.
+///
+/// Used by: server startup after [`initialize_runtime`] when
+/// `RuntimeSetup::memory_monitor_interval` is `Some`.
+pub fn spawn_memory_monitor(interval: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // Skip the immediate first-tick fire — we just started; let
+        // one interval elapse so the operator sees a real measurement
+        // rather than the post-startup zero-state.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let snap = mlxcel_core::memory::snapshot();
+            tracing::info!(
+                target: "mlxcel::memory_monitor",
+                active_bytes = snap.active_bytes,
+                cache_bytes = snap.cache_bytes,
+                peak_bytes = snap.peak_bytes,
+                limit_bytes = snap.limit_bytes,
+                "MLX memory snapshot"
+            );
+        }
+    })
 }
 
 /// Parse a memory size string: plain bytes, "NGB", or "NMB".

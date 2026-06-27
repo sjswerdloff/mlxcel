@@ -1542,6 +1542,27 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
             max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
         );
     }
+    if let Some(cap) = runtime.metal_cache_limit_bytes {
+        tracing::info!(
+            "MLX free-buffer cache cap: {:.1} GB (from MLXCEL_METAL_CACHE_LIMIT)",
+            cap as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    } else {
+        tracing::info!(
+            "MLX free-buffer cache cap: unset (free list grows toward Metal default ceiling; \
+             set MLXCEL_METAL_CACHE_LIMIT to bound)"
+        );
+    }
+    if let Some(interval) = runtime.memory_monitor_interval {
+        tracing::info!(
+            "MLX memory monitor: emitting every {}s",
+            interval.as_secs()
+        );
+        // Spawn for the lifetime of the server. The JoinHandle is dropped;
+        // the task aborts only when the tokio runtime shuts down. Logging
+        // is the only side effect, so a leaked handle is harmless.
+        let _ = crate::execution::runtime::spawn_memory_monitor(interval);
+    }
 
     // -- Distributed mode initialization --
     let distributed = resolve_distributed_startup(&startup).await?;
