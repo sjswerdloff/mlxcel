@@ -79,6 +79,11 @@ pub fn new_thread_local_generation_stream() -> Option<UniquePtr<MlxThreadLocalSt
 /// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler, AudioWorker
 pub fn install_thread_local_default_stream(tls: Option<&UniquePtr<MlxThreadLocalStream>>) {
     if let Some(tls) = tls {
+        // Arm the per-thread MLX teardown finalizer before doing anything
+        // that touches MLX's per-thread stream registry, so this thread's
+        // registry entries will be released on thread exit rather than
+        // during the C++ static-destructor phase at process exit.
+        init_thread();
         let stream = ffi::stream_from_thread_local_stream(tls);
         ffi::set_default_stream(&stream);
     }
@@ -181,6 +186,82 @@ pub fn install_default_stream(stream: Option<&UniquePtr<MlxStream>>) {
     if let Some(stream) = stream {
         ffi::set_default_stream(stream);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-thread MLX teardown finalizer
+// ---------------------------------------------------------------------------
+//
+// MLX maintains a per-thread stream registry that is populated on every
+// `default_stream()`, `new_stream_on_device()`, and thread-local stream
+// resolve. Absent an explicit release call, MLX's own C++ static
+// destructors free the registry during process-exit static-destructor
+// phase — which races with `MlxArray` destructors still running in other
+// unwinding threads and manifests as intermittent SIGSEGV / SIGTRAP at
+// teardown when multiple threads have used MLX. See MLX `mlx/stream.h`
+// `clear_streams()` for the canonical hook.
+//
+// `MlxThreadFinalizer` is a zero-cost RAII guard registered as a
+// `thread_local!`. When the storing thread exits, the guard's `Drop`
+// calls `mlx::core::clear_streams()` — freeing that thread's registry
+// entries BEFORE static destructors run. Arming is idempotent (Rust
+// thread_local storage is allocated on first access), and cheap: one
+// TLS lookup.
+
+struct MlxThreadFinalizer;
+
+impl Drop for MlxThreadFinalizer {
+    fn drop(&mut self) {
+        // Safety net for a very narrow window: if the process is already
+        // in static-destructor phase when this thread exits (e.g. main
+        // returned while this thread was mid-join), `ffi::clear_streams`
+        // would touch a destroyed MLX static. In practice `thread_local!`
+        // Drops run before static destructors on all supported platforms,
+        // so this call is safe. Catching a panic here would only be
+        // relevant if MLX ever grew a panic-on-teardown path — worth
+        // revisiting then.
+        ffi::clear_streams();
+    }
+}
+
+thread_local! {
+    static MLX_THREAD_FINALIZER: MlxThreadFinalizer = const { MlxThreadFinalizer };
+}
+
+/// Arm the calling thread's MLX teardown finalizer.
+///
+/// Idempotent and cheap. Call at least once from any thread that will
+/// touch MLX FFI — factory functions, dispatch, evaluation, or simply
+/// holding an `MlxArray` local. The finalizer's `Drop` runs on thread
+/// exit, releasing this thread's entries from MLX's per-thread stream
+/// registry before process-exit static destructors interleave with
+/// concurrent `MlxArray` destructors on other unwinding threads.
+///
+/// Auto-armed by [`install_thread_local_default_stream`], so production
+/// generation threads (`CxxGenerator`, `SpeculativeGenerator`,
+/// `BatchScheduler`, `AudioWorker`) get the finalizer for free. Test
+/// threads and other consumers that use MLX without installing a
+/// stream should call this explicitly.
+pub fn init_thread() {
+    MLX_THREAD_FINALIZER.with(|_| ());
+}
+
+/// Explicit main-thread shutdown for graceful process exit.
+///
+/// Call from a `SIGTERM` handler or immediately before returning from
+/// `main()`. Synchronizes the default stream, releases the main
+/// thread's stream registry entries, and clears MLX's global memory
+/// cache — leaving the runtime in a state where the subsequent C++
+/// static-destructor phase has nothing racing against it on this
+/// thread.
+///
+/// Idempotent, but only meaningful once per process. Does NOT
+/// finalize other threads' streams — each thread runs its own
+/// [`MlxThreadFinalizer`] via [`init_thread`].
+pub fn shutdown() {
+    ffi::synchronize_default();
+    ffi::clear_streams();
+    ffi::clear_memory_cache();
 }
 
 #[cfg(test)]

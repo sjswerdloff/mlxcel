@@ -46,6 +46,10 @@ void synchronize_thread_local_stream(const MlxThreadLocalStream& tls) {
     mlx::core::synchronize(tls.inner);
 }
 
+void clear_streams() {
+    mlx::core::clear_streams();
+}
+
 // Array factory functions.
 std::unique_ptr<MlxArray> zeros(rust::Slice<const int32_t> shape, int32_t dtype) {
     return std::make_unique<MlxArray>(mlx::core::zeros(to_shape(shape), to_dtype(dtype)));

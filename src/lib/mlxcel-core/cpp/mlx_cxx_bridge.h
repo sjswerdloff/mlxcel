@@ -72,6 +72,20 @@ std::unique_ptr<MlxStream> stream_from_thread_local_stream(const MlxThreadLocalS
 // dispatched the work.
 void synchronize_thread_local_stream(const MlxThreadLocalStream& tls);
 
+// Destroy all `mlx::core::Stream`s created in the calling thread.
+//
+// MLX maintains a per-thread stream registry that is populated on every
+// `default_stream()` / `new_stream_on_device()` / thread-local resolve.
+// Its entries are otherwise cleaned up during C++ static-destructor phase
+// at process exit — which races with `MlxArray` destructors running in
+// other still-unwinding threads and manifests as intermittent
+// SIGSEGV/SIGTRAP at test-suite teardown.
+//
+// Calling `clear_streams()` on a thread before it exits (or on the main
+// thread before returning from `main()`) makes the drop order explicit
+// and eliminates the race. Wraps `mlx::core::clear_streams()`.
+void clear_streams();
+
 // Array factory functions.
 // Create array filled with zeros
 std::unique_ptr<MlxArray> zeros(rust::Slice<const int32_t> shape, int32_t dtype);

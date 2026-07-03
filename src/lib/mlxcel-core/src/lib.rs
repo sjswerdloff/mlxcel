@@ -59,6 +59,16 @@ mod ffi {
         /// Synchronize the calling thread's stream for this TLS handle.
         fn synchronize_thread_local_stream(tls: &MlxThreadLocalStream);
 
+        /// Destroy all `mlx::core::Stream`s created in the calling thread.
+        ///
+        /// Wraps `mlx::core::clear_streams()`. Call on a thread before it
+        /// exits (or on the main thread before returning from `main()`)
+        /// to make MLX per-thread state release order explicit and avoid
+        /// the C++ static-destructor-order fiasco that manifests as
+        /// intermittent SIGSEGV/SIGTRAP at process teardown when multiple
+        /// threads have used MLX. See `streams::MlxThreadFinalizer`.
+        fn clear_streams();
+
         // Array factory functions.
         /// Create array filled with zeros
         fn zeros(shape: &[i32], dtype: i32) -> UniquePtr<MlxArray>;
