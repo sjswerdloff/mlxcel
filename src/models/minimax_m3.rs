@@ -54,10 +54,95 @@ pub struct ModelArgs {
     pub quantization: Option<M3Quantization>,
 }
 
+/// Quantization descriptor for MiniMax-M3 checkpoints.
+///
+/// Accepts two on-disk schemas so the same struct deserializes both
+/// canonical MiniMax-M3 quantized exports:
+///
+/// * **mlx-community schema** — produced by `mlx_lm.convert`
+///   (e.g. `mlx-community/MiniMax-M3-*-mlx`):
+///
+///   ```json
+///   "quantization": { "group_size": 32, "bits": 8 }
+///   ```
+///
+/// * **HF `quantization_config` schema** — used by MiniMax's own
+///   MXFP8 upload (`MiniMaxAI/MiniMax-M3-MXFP8`) and by NVIDIA-style
+///   MXFP4 / NVFP4 exports:
+///
+///   ```json
+///   "quantization_config": {
+///     "quant_method": "mxfp8",
+///     "activation_scheme": "dynamic",
+///     "weight_block_size": [1, 32],
+///     "ignored_layers": ["lm_head", "model.embed_tokens", ...]
+///   }
+///   ```
+///
+/// `group_size` / `bits` are canonical for the loader — they drive
+/// `UnifiedLinear::from_weights`'s mode auto-detect (bits == 8 →
+/// `mxfp8`, group_size == 16 → `nvfp4`, else → `mxfp4`, unless
+/// `.biases` are present, which forces `affine`). When only the HF
+/// schema is present [`M3Quantization::group_size_effective`] derives
+/// `group_size` from `weight_block_size[1]` and
+/// [`M3Quantization::bits_effective`] derives `bits` from
+/// `quant_method`.
+///
+/// `ignored_layers` is descriptive only. The loader's `.scales`-key
+/// auto-detect already falls back to unquantized `Linear` for layers
+/// whose safetensors export lacks a scales tensor, which is exactly
+/// the set the checkpoint author enumerates here (lm_head, embed
+/// tokens, vision heads, MoE gates).
 #[derive(Debug, Clone, Deserialize)]
 pub struct M3Quantization {
-    pub group_size: i32,
-    pub bits: i32,
+    #[serde(default)]
+    pub group_size: Option<i32>,
+    #[serde(default)]
+    pub bits: Option<i32>,
+
+    // HF `quantization_config` fields.
+    #[serde(default)]
+    pub quant_method: Option<String>,
+    #[serde(default)]
+    pub weight_block_size: Option<Vec<i32>>,
+    #[serde(default)]
+    pub activation_scheme: Option<String>,
+    #[serde(default)]
+    pub ignored_layers: Option<Vec<String>>,
+}
+
+impl M3Quantization {
+    /// Group size to feed `UnifiedLinear::from_weights`.
+    ///
+    /// Prefers the explicit `group_size` field (mlx-community schema).
+    /// Falls back to `weight_block_size[1]` for HF exports — the outer
+    /// `[1, N]` layout gives one scale per `N`-element run along the
+    /// last axis, and `N` is what the loader wants. Returns `None`
+    /// when neither is present.
+    pub fn group_size_effective(&self) -> Option<i32> {
+        if let Some(gs) = self.group_size {
+            return Some(gs);
+        }
+        self.weight_block_size
+            .as_ref()
+            .and_then(|v| v.get(1).copied())
+    }
+
+    /// Bit width to feed `UnifiedLinear::from_weights`.
+    ///
+    /// Prefers the explicit `bits` field. Falls back to `quant_method`
+    /// for HF exports: `mxfp8` → 8, `mxfp4` / `nvfp4` → 4. Returns
+    /// `None` when neither is present.
+    pub fn bits_effective(&self) -> Option<i32> {
+        if let Some(b) = self.bits {
+            return Some(b);
+        }
+        match self.quant_method.as_deref() {
+            Some("mxfp8") => Some(8),
+            Some("mxfp4") | Some("nvfp4") => Some(4),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,12 +218,19 @@ fn default_local_block() -> usize {
 
 impl ModelArgs {
     pub fn group_size(&self) -> i32 {
-        let gs = self.quantization.as_ref().map(|q| q.group_size).unwrap_or(64);
+        let gs = self
+            .quantization
+            .as_ref()
+            .and_then(|q| q.group_size_effective())
+            .unwrap_or(64);
         eprintln!("[M3 ModelArgs] group_size={} (quantization={:?})", gs, self.quantization);
         gs
     }
     pub fn bits(&self) -> i32 {
-        self.quantization.as_ref().map(|q| q.bits).unwrap_or(4)
+        self.quantization
+            .as_ref()
+            .and_then(|q| q.bits_effective())
+            .unwrap_or(4)
     }
     pub fn gate_bits(&self) -> i32 {
         8
@@ -1860,9 +1952,21 @@ impl MiniMaxM3Model {
         let text_config = full_config
             .get("text_config")
             .ok_or("Missing text_config")?;
+        // Accept both canonical MiniMax-M3 quantized export schemas:
+        //   * mlx-community's `mlx_lm.convert` output uses top-level
+        //     `quantization` with `group_size` / `bits`.
+        //   * MiniMax's own MXFP8 upload and NVIDIA-style MXFP4/NVFP4
+        //     exports use HF's top-level `quantization_config` with
+        //     `quant_method` / `weight_block_size` / `ignored_layers`.
+        // `M3Quantization` deserializes both; here we just have to feed
+        // it whichever key is present. Preferring `quantization` first
+        // keeps behavior unchanged for existing mlx-community loads.
+        let quant_value = full_config
+            .get("quantization")
+            .or_else(|| full_config.get("quantization_config"));
         let args: ModelArgs = serde_json::from_value(serde_json::json!({
             "text_config": text_config,
-            "quantization": full_config.get("quantization"),
+            "quantization": quant_value,
         }))
         .map_err(|e| format!("Failed to parse ModelArgs: {}", e))?;
         let weights = crate::models::load_text_weights(model_dir, None)?;
@@ -2020,6 +2124,101 @@ mod tests {
         assert!(!args.use_msa_for_layer(2));
         assert!(args.use_msa_for_layer(3));
         assert!(args.use_msa_for_layer(59));
+    }
+
+    /// mlx-community MiniMax-M3 exports (produced by `mlx_lm.convert`)
+    /// carry the historical top-level `quantization` key with
+    /// `group_size` / `bits`. Pre-existing behaviour: `group_size()` and
+    /// `bits()` return those values verbatim; loader auto-detect maps
+    /// `bits == 8` → mxfp8 quantized load.
+    #[test]
+    fn m3_quantization_mlx_community_schema_deserializes() {
+        let q: M3Quantization = serde_json::from_str(
+            r#"{ "group_size": 32, "bits": 8 }"#,
+        )
+        .expect("mlx-community quantization schema must deserialize");
+
+        assert_eq!(q.group_size_effective(), Some(32));
+        assert_eq!(q.bits_effective(), Some(8));
+        assert!(q.quant_method.is_none());
+        assert!(q.weight_block_size.is_none());
+        assert!(q.ignored_layers.is_none());
+    }
+
+    /// MiniMaxAI's own MXFP8 upload
+    /// (`MiniMaxAI/MiniMax-M3-MXFP8`) uses the HF `quantization_config`
+    /// schema: `quant_method`, `weight_block_size`, `activation_scheme`,
+    /// `ignored_layers`. `group_size_effective` derives from
+    /// `weight_block_size[1]` and `bits_effective` derives from
+    /// `quant_method`, so the loader's mode auto-detect sees
+    /// `bits == 8` / `group_size == 32` and correctly selects mxfp8.
+    #[test]
+    fn m3_quantization_hf_mxfp8_schema_deserializes() {
+        let q: M3Quantization = serde_json::from_str(
+            r#"{
+                "quant_method": "mxfp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [1, 32],
+                "ignored_layers": [
+                    "lm_head",
+                    "model.embed_tokens",
+                    "vision_tower",
+                    "language_model.model.layers.10.block_sparse_moe.gate"
+                ]
+            }"#,
+        )
+        .expect("HF MXFP8 quantization_config schema must deserialize");
+
+        assert_eq!(q.quant_method.as_deref(), Some("mxfp8"));
+        assert_eq!(q.weight_block_size.as_deref(), Some(&[1, 32][..]));
+        assert_eq!(q.activation_scheme.as_deref(), Some("dynamic"));
+        assert_eq!(q.group_size_effective(), Some(32));
+        assert_eq!(q.bits_effective(), Some(8));
+        assert!(q.group_size.is_none());
+        assert!(q.bits.is_none());
+        let ignored = q.ignored_layers.expect("ignored_layers must be present");
+        assert!(ignored.iter().any(|s| s == "lm_head"));
+        assert!(ignored.iter().any(|s| s == "model.embed_tokens"));
+        assert_eq!(ignored.len(), 4);
+    }
+
+    /// `quant_method` may also carry `mxfp4` or `nvfp4`; both round to
+    /// `bits == 4` so the loader's auto-detect selects the block-float
+    /// mode from `group_size` (16 → nvfp4, else → mxfp4).
+    #[test]
+    fn m3_quantization_hf_mxfp4_and_nvfp4_derive_bits_4() {
+        let q4: M3Quantization = serde_json::from_str(
+            r#"{ "quant_method": "mxfp4", "weight_block_size": [1, 32] }"#,
+        )
+        .unwrap();
+        assert_eq!(q4.bits_effective(), Some(4));
+        assert_eq!(q4.group_size_effective(), Some(32));
+
+        let qnv: M3Quantization = serde_json::from_str(
+            r#"{ "quant_method": "nvfp4", "weight_block_size": [1, 16] }"#,
+        )
+        .unwrap();
+        assert_eq!(qnv.bits_effective(), Some(4));
+        assert_eq!(qnv.group_size_effective(), Some(16));
+    }
+
+    /// Explicit `bits` and `group_size` win over `quant_method`
+    /// derivations. Guards against a future mixed export that carries
+    /// both keys and against silent divergence between the two paths.
+    #[test]
+    fn m3_quantization_explicit_fields_override_quant_method() {
+        let q: M3Quantization = serde_json::from_str(
+            r#"{
+                "quant_method": "mxfp4",
+                "weight_block_size": [1, 32],
+                "bits": 8,
+                "group_size": 64
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(q.bits_effective(), Some(8));
+        assert_eq!(q.group_size_effective(), Some(64));
     }
 
     #[test]
