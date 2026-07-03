@@ -256,9 +256,21 @@ fn quantize_per_token(x: &MlxArray) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>
     // scale = absmax / 127.0  (FP16 to match cache dtype)
     let scale = divide_scalar(&absmax, 127.0); // [B, H, T, 1]
 
-    // Avoid divide-by-zero: replace zero scales with 1.0
+    // Avoid divide-by-zero **only** for the exact-zero case. Using
+    // `maximum(scale, 1.0)` here is mathematically wrong: it clamps any
+    // scale below 1.0 *up* to 1.0, destroying precision for every
+    // small-magnitude token — which, since `scale = absmax / 127`, is
+    // every realistic RMSNorm'd attention key (values in `[-1, 1]`,
+    // scale in `~0.008–0.08`). Use a `where` op so non-zero scales pass
+    // through unchanged. Mirrors the same fix already applied in
+    // `cache/turbo/quant.rs::quantize_v_turbo4` for the L2-norm safe
+    // divide. See regression test
+    // `int8_kv_cache_round_trip_preserves_small_fractional_values`
+    // in `cache/detach_tests.rs`.
+    let zero = ffi::full_f32(&[1], 0.0, dtype::FLOAT16);
     let one = ffi::full_f32(&[1], 1.0, dtype::FLOAT16);
-    let safe_scale = ffi::maximum(&scale, &one);
+    let positive_mask = ffi::greater(&scale, &zero);
+    let safe_scale = ffi::where_cond(&positive_mask, &scale, &one);
 
     // x_int8 = round(x / safe_scale).clamp(-128, 127)
     let x_div = ffi::divide(x, &safe_scale);

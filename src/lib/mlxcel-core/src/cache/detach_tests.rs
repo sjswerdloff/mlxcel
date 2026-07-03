@@ -1187,3 +1187,110 @@ fn detached_cache_set_truncate_to_int8_preserves_dequantization() {
         "INT8 truncate_to+adopt+decode values diverge from fresh prefill"
     );
 }
+
+// ---------------------------------------------------------------------------
+// INT8 quantization fidelity — regression for the safe_scale bug
+// ---------------------------------------------------------------------------
+
+/// Regression test for the safe_scale floor bug at cache.rs `quantize_per_token`.
+///
+/// The pre-fix code used `safe_scale = maximum(scale, 1.0)` intending to guard
+/// against divide-by-zero when absmax = 0. Because `scale = absmax / 127`, this
+/// actually floored every scale at 1.0 whenever `absmax < 127`, which for any
+/// realistic RMSNorm'd attention key (values in `[-1, 1]`) is always. That
+/// mapped every small value to 0 or ±1 (three representable INT8 states out of
+/// 256), destroying precision and producing incoherent generation on M3 and
+/// every other modern model that uses `--kv-bits 8`.
+///
+/// Existing INT8 tests were self-consistency checks (INT8-path A vs INT8-path B)
+/// which passed because both paths were wrong the same way. This test compares
+/// the INT8 round-trip against the original FP32 values, which is the fidelity
+/// check that was missing.
+///
+/// Under the buggy code, all four values quantize to 0 and the assertion
+/// exceeds the tolerance by orders of magnitude. Under the fix
+/// (`safe_scale = maximum(scale, 1e-4)`), each value round-trips within
+/// per-token absmax / 127 relative error (~0.8% worst-case).
+#[test]
+fn int8_kv_cache_round_trip_preserves_small_fractional_values() {
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Int8);
+
+    // Four tokens with progressively smaller magnitudes, all well below 1.0
+    // so the pre-fix safe_scale floor fires on every one and produces zero.
+    // Post-fix, each token uses its real scale (absmax/127) and round-trips
+    // within 1 LSB.
+    let original: Vec<f32> = vec![0.4, 0.2, 0.1, 0.05];
+
+    let (k_out, v_out) = cache.update_and_fetch(fp32_tokens(&original), fp32_tokens(&original));
+    eval(&k_out);
+    eval(&v_out);
+
+    let k_read = flatten_fp32(&k_out);
+    let v_read = flatten_fp32(&v_out);
+
+    // Tolerance well below the smallest test value (0.05) so the pre-fix
+    // "quantized to zero" behaviour fails loudly, and well above the largest
+    // per-token 1-LSB quantization error (0.4 / 127 ≈ 0.003) so the post-fix
+    // behaviour passes comfortably.
+    let tolerance = 0.01f32;
+
+    for (i, (exp, got)) in original.iter().zip(k_read.iter()).enumerate() {
+        let err = (exp - got).abs();
+        assert!(
+            err <= tolerance,
+            "INT8 key round-trip destroyed precision at token {}: expected {}, got {}, err {} (tolerance {}).\n\
+             This regresses the safe_scale floor bug at cache.rs quantize_per_token \
+             (safe_scale = maximum(scale, 1.0) clamped every realistic key scale to 1.0, \
+              mapping small values to zero). Fix: floor safe_scale at 1e-4 instead of 1.0.",
+            i, exp, got, err, tolerance
+        );
+    }
+    for (i, (exp, got)) in original.iter().zip(v_read.iter()).enumerate() {
+        let err = (exp - got).abs();
+        assert!(
+            err <= tolerance,
+            "INT8 value round-trip destroyed precision at token {}: expected {}, got {}, err {} (tolerance {}).",
+            i, exp, got, err, tolerance
+        );
+    }
+}
+
+/// Regression test that INT8 KV mode does NOT affect the M3 indexer cache.
+///
+/// `m3_idx_k_update_and_fetch` (cache.rs:3717) writes the post-RoPE indexer
+/// key as raw FP16 with no reference to `self.mode`. This is intentional —
+/// the indexer key comes from a separate projection and never gets
+/// quantized. Sparse block selection consumes it directly.
+///
+/// Documents current correct behaviour and guards against a future
+/// refactor that might accidentally route `m3_idx_k` through the
+/// `quantize_per_token` path when `mode == Int8`.
+#[test]
+fn m3_idx_k_round_trip_unaffected_by_int8_kv_mode() {
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Int8);
+
+    // Prime the main K/V so the cache is in a valid state, then push
+    // indexer keys through the m3 path.
+    let _ = cache.update_and_fetch(fp32_tokens(&[0.4, 0.2]), fp32_tokens(&[0.4, 0.2]));
+
+    // Indexer key values that would suffer from the safe_scale bug if they
+    // were incorrectly routed through quantize_per_token.
+    let idx_original: Vec<f32> = vec![0.35, 0.175];
+    let idx_out = cache.m3_idx_k_update_and_fetch(&fp32_tokens(&idx_original));
+    eval(&idx_out);
+
+    let idx_read = flatten_fp32(&idx_out);
+    let tolerance = 1e-3f32; // FP16 rounding only; no quantization expected.
+
+    for (i, (exp, got)) in idx_original.iter().zip(idx_read.iter()).enumerate() {
+        let err = (exp - got).abs();
+        assert!(
+            err <= tolerance,
+            "m3_idx_k should round-trip in FP16 regardless of KV cache mode. \
+             Token {}: expected {}, got {}, err {} (tolerance {}). \
+             If this fails, m3_idx_k may have been accidentally routed through \
+             quantize_per_token — check cache.rs::m3_idx_k_update_and_fetch.",
+            i, exp, got, err, tolerance
+        );
+    }
+}
