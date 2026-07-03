@@ -1062,11 +1062,29 @@ impl CachePool {
             retained.retain(|id| !dropped.contains(id));
         }
         for handle in set.caches.iter_mut() {
-            // The adopted prefix is exactly `target_tokens` long; a freshly
-            // detached pool-backed handle always satisfies
-            // `offset == seq_len > target_tokens` here, so this is a clamp in
-            // practice and an explicit statement of intent either way.
-            debug_assert!(handle.offset >= target_tokens as i32);
+            // Re-anchor the dense-side metadata offset to `target_tokens` so a
+            // later adopt resumes RoPE at the trimmed prefix boundary. This
+            // mirrors what `clone_detached_paged_prefix` achieves via
+            // `pool_backed_handle_clone(target_tokens as i32)`.
+            //
+            // Two valid input states reach this point:
+            //   * Pool-backed handle: `offset == 0` at rest. Dense K/V lives in
+            //     the pool, so the dense-side handle is a metadata placeholder
+            //     and its offset was never advanced.
+            //   * Dense-backed handle (Int8 dense-compat, etc.): `offset ==
+            //     seq_len` at rest. K/V live in the handle's tensors, so the
+            //     offset tracks the written length.
+            //
+            // A mid-range value (0 < offset < target_tokens) would indicate a
+            // partially-advanced handle — real corruption worth catching, so
+            // the assertion allows both endpoint states and only that.
+            debug_assert!(
+                handle.offset == 0 || handle.offset >= target_tokens as i32,
+                "handle.offset={} is neither a pool-backed placeholder (0) \
+                 nor a dense-backed length (>= target_tokens={})",
+                handle.offset,
+                target_tokens
+            );
             handle.offset = target_tokens as i32;
         }
         set.current_offset = set.current_offset.min(target_tokens as i32);
