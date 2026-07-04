@@ -440,14 +440,15 @@ async fn non_stream_chat_completion(
 
     let cached_tokens = result.cached_tokens;
 
-    // Surface the thinking scratchpad as `reasoning_content`. This is additive:
-    // the `content` computation below (strip_unclosed_primed_thinking /
-    // clean_structural_tokens / tool-call parsing) is unchanged. Reusing the
-    // streaming `StreamFilter` here means streaming and non-streaming responses
-    // split reasoning from content identically. `None` for non-thinking models
-    // leaves the field absent, closing the dropped-reasoning gap for every
-    // thinking family at once (Qwen `<think>`, Gemma 4 `<|channel>`).
-    let reasoning = extract_reasoning_content(&result.text, primed_open_thinking);
+    // Split the thinking scratchpad (`reasoning_content`) from user-facing
+    // content with the streaming filter, so streaming and non-streaming
+    // responses agree. The tool-parsing paths below keep the parser's own
+    // cleaned content (it also strips tool-call blocks); the plain-chat path
+    // uses the filter's content half so closed thinking blocks never leak
+    // into `content` (they used to appear in BOTH fields). `None` for
+    // non-thinking models leaves the field absent.
+    let (reasoning, filtered_content) =
+        split_reasoning_and_content(&result.text, primed_open_thinking);
 
     // Try to parse tool calls from the output
     if tool_calls::should_parse_tool_calls(&request) {
@@ -498,14 +499,12 @@ async fn non_stream_chat_completion(
         ));
     }
 
-    // Even without tool-call parsing, strip structural tokens so Gemma 4
-    // (and similar) markers like `<channel|>` / `<turn|>` never leak into
-    // plain chat responses.
-    let cleaned_text = strip_unclosed_primed_thinking(
-        tool_calls::clean_structural_tokens(&result.text),
-        &result.text,
-        primed_open_thinking,
-    );
+    // Plain-chat path: start from the filter's content half (closed thinking
+    // blocks already routed to `reasoning_content`, tool-call markers
+    // suppressed, primed-open thinking handled by the filter's start state),
+    // then strip residual structural tokens so Gemma 4 (and similar) markers
+    // like `<channel|>` / `<turn|>` never leak into plain chat responses.
+    let cleaned_text = tool_calls::clean_structural_tokens(&filtered_content);
 
     Ok(Json(
         ChatCompletionResponse::new_with_logprobs(
@@ -997,23 +996,53 @@ fn strip_unclosed_primed_thinking(content: String, raw_output: &str, primed: boo
 /// models). Tool-call blocks are suppressed by the filter and never leak into
 /// reasoning; they are materialized by the parser path instead.
 fn extract_reasoning_content(raw_text: &str, primed_open_thinking: bool) -> Option<String> {
+    split_reasoning_and_content(raw_text, primed_open_thinking).0
+}
+
+/// Split raw generation output into `(reasoning, content)` with the same
+/// `StreamFilter` the streaming path uses, so both endpoints agree on where
+/// a thinking block ends and user-facing content begins.
+///
+/// The content half exists because the plain-chat (no tool parsing) response
+/// previously assembled `content` from the raw text with only structural-token
+/// cleaning: a closed thinking block (`<mm:think>…</mm:think>` on MiniMax-M3,
+/// `<think>…</think>` on Qwen-style models) was captured into
+/// `reasoning_content` AND left verbatim inside `content`. Clients rendering
+/// `content` displayed raw think markup, and clients that resend assistant
+/// turns fed ever-growing thinking blocks back into the conversation. The
+/// tool-parsing path never had this problem because the parser strips
+/// thinking; this brings the plain path into line with it and with streaming.
+fn split_reasoning_and_content(
+    raw_text: &str,
+    primed_open_thinking: bool,
+) -> (Option<String>, String) {
     let mut filter = if primed_open_thinking {
         StreamFilter::new_primed_open_thinking()
     } else {
         StreamFilter::new()
     };
     let mut reasoning = String::new();
-    if let Some(r) = filter.feed(raw_text).reasoning {
+    let mut content = String::new();
+    let out = filter.feed(raw_text);
+    if let Some(r) = out.reasoning {
         reasoning.push_str(&r);
     }
-    if let Some(r) = filter.flush().reasoning {
+    if let Some(c) = out.content {
+        content.push_str(&c);
+    }
+    let out = filter.flush();
+    if let Some(r) = out.reasoning {
         reasoning.push_str(&r);
     }
-    if reasoning.is_empty() {
+    if let Some(c) = out.content {
+        content.push_str(&c);
+    }
+    let reasoning = if reasoning.is_empty() {
         None
     } else {
         Some(reasoning)
-    }
+    };
+    (reasoning, content)
 }
 
 /// Build ServerGenerateOptions using request params with server config as defaults
@@ -1195,6 +1224,45 @@ mod tests {
             extract_reasoning_content(raw, false),
             Some("thought\ndeliberating".to_string())
         );
+    }
+
+    // -- split_reasoning_and_content: the content half must exclude the
+    //    thinking block (2026-07-04: closed <mm:think> blocks appeared in
+    //    BOTH content and reasoning_content on the plain-chat path) --
+
+    #[test]
+    fn split_mm_think_block_strips_content_and_captures_reasoning() {
+        // MiniMax-M3 adaptive thinking: the model emits its own opening
+        // marker mid-stream (no priming). The mutation this catches:
+        // assembling plain-chat content from raw text again.
+        let raw = "<mm:think>The user is asking for the capital of France.</mm:think>Paris";
+        let (reasoning, content) = split_reasoning_and_content(raw, false);
+        assert_eq!(
+            reasoning,
+            Some("The user is asking for the capital of France.".to_string())
+        );
+        assert_eq!(
+            content, "Paris",
+            "closed thinking block must not leak into user-facing content"
+        );
+    }
+
+    #[test]
+    fn split_without_thinking_passes_content_through() {
+        let raw = "just a plain answer";
+        let (reasoning, content) = split_reasoning_and_content(raw, false);
+        assert_eq!(reasoning, None);
+        assert_eq!(content, "just a plain answer");
+    }
+
+    #[test]
+    fn split_primed_unclosed_thinking_yields_empty_content() {
+        // Primed-open thinking that never closes: everything is reasoning,
+        // content is empty (mirrors strip_unclosed_primed_thinking).
+        let raw = "unclosed thinking forever";
+        let (reasoning, content) = split_reasoning_and_content(raw, true);
+        assert_eq!(reasoning, Some("unclosed thinking forever".to_string()));
+        assert_eq!(content, "");
     }
 
     #[test]
