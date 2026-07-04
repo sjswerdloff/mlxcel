@@ -635,6 +635,34 @@ fn configure_environment(env: &mut Environment<'_>) {
         chrono::Utc::now().format("%d %b %Y").to_string()
     });
 
+    // Python-Jinja `tojson` compatibility. HF templates written for Python
+    // pass `json.dumps` kwargs to the filter — MiniMax-M3's tool rendering
+    // uses `tojson(ensure_ascii=False)` — and minijinja's builtin rejects
+    // unknown kwargs, aborting the whole render and silently dropping every
+    // request onto the fallback formatter (2026-07-04). Override with a
+    // permissive filter: UTF-8 output already gives `ensure_ascii=False`
+    // semantics, `indent` maps to pretty-printing, and any other kwarg is
+    // ignored the way presentation hints should be. Unlike minijinja's
+    // builtin this does not HTML-escape, matching Python `json.dumps`
+    // (chat templates embed JSON in prompts, not in HTML).
+    env.add_filter(
+        "tojson",
+        |value: Value, kwargs: minijinja::value::Kwargs| -> Result<String, minijinja::Error> {
+            let indent = kwargs.get::<Option<usize>>("indent").ok().flatten();
+            let rendered = if indent.is_some() {
+                serde_json::to_string_pretty(&value)
+            } else {
+                serde_json::to_string(&value)
+            };
+            rendered.map_err(|e| {
+                minijinja::Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("tojson serialization failed: {e}"),
+                )
+            })
+        },
+    );
+
     // Handle Python methods not natively supported by minijinja.
     //
     // Many HuggingFace chat templates use Python-style string and dict
@@ -948,6 +976,28 @@ impl std::fmt::Debug for ChatTemplateProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MiniMax-M3's tool rendering uses `tojson(ensure_ascii=False)` —
+    /// Python `json.dumps` kwargs that minijinja's builtin rejected,
+    /// aborting the whole render and dropping requests onto the fallback
+    /// formatter. The permissive override must render, emit UTF-8 (which IS
+    /// `ensure_ascii=False` semantics), and not HTML-escape.
+    #[test]
+    fn tojson_accepts_python_json_dumps_kwargs() {
+        let tpl = r#"{{ {"a": "ü", "b": "<tag>"} | tojson(ensure_ascii=False) }}"#.to_string();
+        let processor = ChatTemplateProcessor::with_template(tpl);
+        let out = processor
+            .apply(&[], None)
+            .expect("tojson with json.dumps kwargs must not abort the render");
+        assert!(
+            out.contains("ü"),
+            "UTF-8 must pass through unescaped: {out}"
+        );
+        assert!(
+            out.contains("<tag>"),
+            "JSON for prompts must not be HTML-escaped: {out}"
+        );
+    }
 
     #[test]
     fn test_default_template() {
