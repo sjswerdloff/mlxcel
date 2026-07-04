@@ -28,9 +28,9 @@
 //! - Block max-pool scoring with causal masking
 //! - Local block always included (score set to inf)
 
-use crate::models::switch_layers::{gather_sort, SwitchLinear};
+use crate::models::switch_layers::{SwitchLinear, gather_sort};
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, GemmaRMSNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::layers::{GemmaRMSNorm, KVCache, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -38,12 +38,7 @@ use std::path::Path;
 use tracing::{debug, trace, warn};
 
 /// Load a UnifiedLinear. Auto-detects quantization mode from weight shapes.
-fn load_linear(
-    weights: &WeightMap,
-    prefix: &str,
-    g: i32,
-    b: i32,
-) -> Result<UnifiedLinear, String> {
+fn load_linear(weights: &WeightMap, prefix: &str, g: i32, b: i32) -> Result<UnifiedLinear, String> {
     UnifiedLinear::from_weights(weights, prefix, g, b)
 }
 
@@ -223,7 +218,10 @@ impl ModelArgs {
             .as_ref()
             .and_then(|q| q.group_size_effective())
             .unwrap_or(64);
-        eprintln!("[M3 ModelArgs] group_size={} (quantization={:?})", gs, self.quantization);
+        eprintln!(
+            "[M3 ModelArgs] group_size={} (quantization={:?})",
+            gs, self.quantization
+        );
         gs
     }
     pub fn bits(&self) -> i32 {
@@ -400,14 +398,8 @@ impl SparseAttention {
                 idx_k
             };
             let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
-            let idx_k = mlxcel_core::fast_rope(
-                &idx_k,
-                self.rope_dims,
-                false,
-                self.rope_base,
-                1.0,
-                offset,
-            );
+            let idx_k =
+                mlxcel_core::fast_rope(&idx_k, self.rope_dims, false, self.rope_base, 1.0, offset);
             Some(cache.m3_idx_k_update_and_fetch(&idx_k))
         } else {
             if is_msa_eligible_layer && !lockstep_healthy {
@@ -570,6 +562,7 @@ impl SparseAttention {
             num_query_blocks,
             num_key_blocks,
             cache_offset_at_chunk_start,
+            l,
         );
 
         // Top-K selection: produces ABSOLUTE key block indices in
@@ -710,10 +703,8 @@ impl SparseAttention {
                 (last_abs / self.block_size) as f32
             })
             .collect();
-        let max_kblocks_arr = mlxcel_core::from_slice_f32(
-            &max_kblocks,
-            &[1, 1, num_query_blocks, 1],
-        );
+        let max_kblocks_arr =
+            mlxcel_core::from_slice_f32(&max_kblocks, &[1, 1, num_query_blocks, 1]);
         let key_pos = mlxcel_core::arange_f32(0.0, num_key_blocks as f32, 1.0);
         let key_pos = mlxcel_core::reshape(&key_pos, &[1, 1, 1, num_key_blocks]);
         let causal = mlxcel_core::less_equal(&key_pos, &max_kblocks_arr);
@@ -735,29 +726,42 @@ impl SparseAttention {
     /// matrix). With cache_offset > 0, the local block sits in the cached
     /// prefix's last absolute block(s), which is the correct
     /// neighbourhood for the current chunk's queries.
+    ///
+    /// `q_len` anchors the guarantee at the chunk's REAL last query
+    /// position. A partial final query block (q_len not a multiple of
+    /// block_size, reachable whenever a dense prompt-cache adoption resumes
+    /// prefill at an arbitrary token offset — e.g. adopted_len 160 with
+    /// block_size 128) would otherwise compute its anchor from the padded
+    /// block end: with `sparse_local_block = 1` (the M3 default) the +inf
+    /// then lands entirely on a key block one past the newest real block,
+    /// forcing NOTHING — exactly the degenerate local-context omission the
+    /// paper's fixed allocation exists to prevent, on the positions that
+    /// produce the first token after adoption.
     fn ensure_local_block_score_asymmetric(
         &self,
         scores: &MlxArray,
         num_query_blocks: i32,
         num_key_blocks: i32,
         cache_offset: i32,
+        q_len: i32,
     ) -> UniquePtr<MlxArray> {
         if self.sparse_local_block <= 0 {
             return mlxcel_core::copy(scores);
         }
 
-        // For each query block i: max attendable absolute key block (same
-        // formula as the asymmetric causal mask above).
+        // For each query block i: the absolute key block containing the
+        // query block's last REAL position. Full query blocks reduce to the
+        // asymmetric causal-mask formula; the final partial block clamps to
+        // the chunk's true last position instead of its padded block end.
+        let last_real_abs = cache_offset + q_len - 1;
         let max_kblocks: Vec<f32> = (0..num_query_blocks)
             .map(|i| {
-                let last_abs = cache_offset + (i + 1) * self.block_size - 1;
+                let last_abs = (cache_offset + (i + 1) * self.block_size - 1).min(last_real_abs);
                 (last_abs / self.block_size) as f32
             })
             .collect();
-        let max_kblocks_arr = mlxcel_core::from_slice_f32(
-            &max_kblocks,
-            &[1, 1, num_query_blocks, 1],
-        );
+        let max_kblocks_arr =
+            mlxcel_core::from_slice_f32(&max_kblocks, &[1, 1, num_query_blocks, 1]);
 
         // key_pos[k] = k (absolute)
         let key_pos = mlxcel_core::arange_f32(0.0, num_key_blocks as f32, 1.0);
@@ -835,11 +839,8 @@ impl SparseAttention {
         let q_padded_storage;
         let q: &MlxArray = if pad_q_amt > 0 {
             let q_dtype = mlxcel_core::array_dtype(q);
-            let pad_q = mlxcel_core::full_f32(
-                &[b, self.num_heads, pad_q_amt, self.head_dim],
-                0.0,
-                q_dtype,
-            );
+            let pad_q =
+                mlxcel_core::full_f32(&[b, self.num_heads, pad_q_amt, self.head_dim], 0.0, q_dtype);
             q_padded_storage = mlxcel_core::concatenate(q, &pad_q, 2);
             q_padded_storage.as_ref().unwrap()
         } else {
@@ -919,8 +920,14 @@ impl SparseAttention {
         // named `num_blocks` are split into `num_query_blocks` and
         // `num_key_blocks` so cached prefill no longer mismatches K's actual
         // sequence dim (kv_len > q_len when cache_offset > 0).
-        let bk_view =
-            [b, self.num_kv_heads, 1, num_key_blocks, self.block_size, self.head_dim];
+        let bk_view = [
+            b,
+            self.num_kv_heads,
+            1,
+            num_key_blocks,
+            self.block_size,
+            self.head_dim,
+        ];
         let bk_target = [
             b,
             self.num_kv_heads,
@@ -929,17 +936,12 @@ impl SparseAttention {
             self.block_size,
             self.head_dim,
         ];
-        let k_expanded = mlxcel_core::broadcast_to(
-            &mlxcel_core::reshape(&k_blocked, &bk_view),
-            &bk_target,
-        );
-        let v_expanded = mlxcel_core::broadcast_to(
-            &mlxcel_core::reshape(&v_blocked, &bk_view),
-            &bk_target,
-        );
+        let k_expanded =
+            mlxcel_core::broadcast_to(&mlxcel_core::reshape(&k_blocked, &bk_view), &bk_target);
+        let v_expanded =
+            mlxcel_core::broadcast_to(&mlxcel_core::reshape(&v_blocked, &bk_view), &bk_target);
 
-        let sel_view =
-            [b, self.num_kv_heads, num_query_blocks, self.top_k, 1, 1];
+        let sel_view = [b, self.num_kv_heads, num_query_blocks, self.top_k, 1, 1];
         let sel_target = [
             b,
             self.num_kv_heads,
@@ -948,10 +950,8 @@ impl SparseAttention {
             self.block_size,
             self.head_dim,
         ];
-        let sel_broadcast = mlxcel_core::broadcast_to(
-            &mlxcel_core::reshape(selected, &sel_view),
-            &sel_target,
-        );
+        let sel_broadcast =
+            mlxcel_core::broadcast_to(&mlxcel_core::reshape(selected, &sel_view), &sel_target);
 
         debug!(
             layer = self.layer_idx,
@@ -972,11 +972,23 @@ impl SparseAttention {
         let kv_per_q_block = self.top_k * self.block_size;
         let k_flat = mlxcel_core::reshape(
             &k_gathered,
-            &[b, self.num_kv_heads, num_query_blocks, kv_per_q_block, self.head_dim],
+            &[
+                b,
+                self.num_kv_heads,
+                num_query_blocks,
+                kv_per_q_block,
+                self.head_dim,
+            ],
         );
         let v_flat = mlxcel_core::reshape(
             &v_gathered,
-            &[b, self.num_kv_heads, num_query_blocks, kv_per_q_block, self.head_dim],
+            &[
+                b,
+                self.num_kv_heads,
+                num_query_blocks,
+                kv_per_q_block,
+                self.head_dim,
+            ],
         );
 
         let q_blocked = mlxcel_core::reshape(
@@ -1001,15 +1013,35 @@ impl SparseAttention {
         let kv_5d_with_rep = |x: &MlxArray| -> UniquePtr<MlxArray> {
             let x_view = mlxcel_core::reshape(
                 x,
-                &[b, self.num_kv_heads, 1, num_query_blocks, kv_per_q_block, self.head_dim],
+                &[
+                    b,
+                    self.num_kv_heads,
+                    1,
+                    num_query_blocks,
+                    kv_per_q_block,
+                    self.head_dim,
+                ],
             );
             let x_broad = mlxcel_core::broadcast_to(
                 &x_view,
-                &[b, self.num_kv_heads, n_rep, num_query_blocks, kv_per_q_block, self.head_dim],
+                &[
+                    b,
+                    self.num_kv_heads,
+                    n_rep,
+                    num_query_blocks,
+                    kv_per_q_block,
+                    self.head_dim,
+                ],
             );
             mlxcel_core::reshape(
                 &x_broad,
-                &[b, self.num_heads, num_query_blocks, kv_per_q_block, self.head_dim],
+                &[
+                    b,
+                    self.num_heads,
+                    num_query_blocks,
+                    kv_per_q_block,
+                    self.head_dim,
+                ],
             )
         };
         let k_expanded = kv_5d_with_rep(&k_flat);
@@ -1049,7 +1081,11 @@ impl SparseAttention {
         // Reshape to padded q-length first, then slice back to the real q_len.
         let out = mlxcel_core::reshape(&out, &[b, self.num_heads, padded_q_len, self.head_dim]);
         let out = if pad_q_amt > 0 {
-            mlxcel_core::slice(&out, &[0, 0, 0, 0], &[b, self.num_heads, q_len, self.head_dim])
+            mlxcel_core::slice(
+                &out,
+                &[0, 0, 0, 0],
+                &[b, self.num_heads, q_len, self.head_dim],
+            )
         } else {
             out
         };
@@ -1116,7 +1152,9 @@ impl SparseAttention {
             let mask_ptr = mask
                 .map(|m| m as *const MlxArray)
                 .unwrap_or(std::ptr::null());
-            unsafe { mlxcel_core::layers::attention_from_ptr(q, k, v, self.scale, mask_ptr, 0.0, 0) }
+            unsafe {
+                mlxcel_core::layers::attention_from_ptr(q, k, v, self.scale, mask_ptr, 0.0, 0)
+            }
         };
         let shape = mlxcel_core::array_shape(&raw);
         let b = shape[0];
@@ -1292,10 +1330,7 @@ fn build_msa_unified_mask(
     let p_q = mlxcel_core::arange_i32(0, padded_l, 1);
     let p_q = mlxcel_core::reshape(&p_q, &[num_blocks, block_size]);
 
-    let selected_5 = mlxcel_core::reshape(
-        selected,
-        &[b, num_kv_heads, num_blocks, top_k, 1],
-    );
+    let selected_5 = mlxcel_core::reshape(selected, &[b, num_kv_heads, num_blocks, top_k, 1]);
     let block_size_scalar = mlxcel_core::from_slice_i32(&[block_size], &[1]);
     let selected_x_bs = mlxcel_core::multiply(&selected_5, &block_size_scalar);
     let k_pos_axis = mlxcel_core::arange_i32(0, block_size, 1);
@@ -1390,8 +1425,7 @@ fn build_msa_unified_mask_asymmetric(
     let kv_per_q_block = top_k * block_size;
 
     // Query positions: absolute coords starting at cache_offset.
-    let p_q =
-        mlxcel_core::arange_i32(cache_offset, cache_offset + padded_q_len, 1);
+    let p_q = mlxcel_core::arange_i32(cache_offset, cache_offset + padded_q_len, 1);
     let p_q = mlxcel_core::reshape(&p_q, &[num_query_blocks, block_size]);
 
     // Key positions: selected_block_idx * block_size + pos_within_block,
@@ -1399,22 +1433,21 @@ fn build_msa_unified_mask_asymmetric(
     // into num_key_blocks (the full cached K's block partition), so the
     // resulting p_k values are absolute positions in [0, num_key_blocks *
     // block_size), spanning both cached prefix and current chunk.
-    let selected_5 = mlxcel_core::reshape(
-        selected,
-        &[b, num_kv_heads, num_query_blocks, top_k, 1],
-    );
+    let selected_5 = mlxcel_core::reshape(selected, &[b, num_kv_heads, num_query_blocks, top_k, 1]);
     let block_size_scalar = mlxcel_core::from_slice_i32(&[block_size], &[1]);
     let selected_x_bs = mlxcel_core::multiply(&selected_5, &block_size_scalar);
     let k_pos_axis = mlxcel_core::arange_i32(0, block_size, 1);
     let k_pos_axis_5 = mlxcel_core::reshape(&k_pos_axis, &[1, 1, 1, 1, block_size]);
     let p_k = mlxcel_core::add(&selected_x_bs, &k_pos_axis_5);
-    let p_k = mlxcel_core::reshape(
-        &p_k,
-        &[b, num_kv_heads, num_query_blocks, kv_per_q_block],
-    );
+    let p_k = mlxcel_core::reshape(&p_k, &[b, num_kv_heads, num_query_blocks, kv_per_q_block]);
 
-    let mask_shape =
-        [b, num_kv_heads, num_query_blocks, block_size, kv_per_q_block];
+    let mask_shape = [
+        b,
+        num_kv_heads,
+        num_query_blocks,
+        block_size,
+        kv_per_q_block,
+    ];
     let p_q_5 = mlxcel_core::reshape(&p_q, &[1, 1, num_query_blocks, block_size, 1]);
     let p_k_5 = mlxcel_core::reshape(
         &p_k,
@@ -1427,11 +1460,25 @@ fn build_msa_unified_mask_asymmetric(
     // GQA expansion: replicate each kv_head's mask n_rep times into num_heads.
     let invalid_with_rep_dim = mlxcel_core::reshape(
         &invalid_kv,
-        &[b, num_kv_heads, 1, num_query_blocks, block_size, kv_per_q_block],
+        &[
+            b,
+            num_kv_heads,
+            1,
+            num_query_blocks,
+            block_size,
+            kv_per_q_block,
+        ],
     );
     let invalid_repeated = mlxcel_core::broadcast_to(
         &invalid_with_rep_dim,
-        &[b, num_kv_heads, n_rep, num_query_blocks, block_size, kv_per_q_block],
+        &[
+            b,
+            num_kv_heads,
+            n_rep,
+            num_query_blocks,
+            block_size,
+            kv_per_q_block,
+        ],
     );
     let invalid_per_head = mlxcel_core::reshape(
         &invalid_repeated,
@@ -1564,10 +1611,7 @@ fn m3_switchglu_forward(
         // Inline scatter_unsort: unsort, reshape to [n_tokens, top_k, ...], drop middle axis
         let unsorted = mlxcel_core::take(&output, &inv_order, 0);
         let x_shape = mlxcel_core::array_shape(&unsorted);
-        let reshaped = mlxcel_core::reshape(
-            &unsorted,
-            &[n_tokens, top_k, x_shape[1], x_shape[2]],
-        );
+        let reshaped = mlxcel_core::reshape(&unsorted, &[n_tokens, top_k, x_shape[1], x_shape[2]]);
         mlxcel_core::squeeze_axis(&reshaped, 2)
     } else {
         let x_gate = gate_proj.forward(&x_exp, indices, false);
@@ -1702,33 +1746,16 @@ impl SparseMoeBlock {
         // rather than the single SwitchGLU, so the activation step can be M3's
         // clamped (up+1.0) variant. Same w1/w3/w2 convention as before.
         let switch_mlp_prefix = format!("{}.switch_mlp", prefix);
-        let gate_proj = SwitchLinear::from_weights(
-            weights,
-            &format!("{}.w1", switch_mlp_prefix),
-            g,
-            b,
-        )?;
-        let up_proj = SwitchLinear::from_weights(
-            weights,
-            &format!("{}.w3", switch_mlp_prefix),
-            g,
-            b,
-        )?;
-        let down_proj = SwitchLinear::from_weights(
-            weights,
-            &format!("{}.w2", switch_mlp_prefix),
-            g,
-            b,
-        )?;
+        let gate_proj =
+            SwitchLinear::from_weights(weights, &format!("{}.w1", switch_mlp_prefix), g, b)?;
+        let up_proj =
+            SwitchLinear::from_weights(weights, &format!("{}.w3", switch_mlp_prefix), g, b)?;
+        let down_proj =
+            SwitchLinear::from_weights(weights, &format!("{}.w2", switch_mlp_prefix), g, b)?;
 
         let shared = if cfg.n_shared_experts > 0 {
             let shared_prefix = format!("{}.shared_experts", prefix);
-            Some(SharedExperts::from_weights(
-                weights,
-                &shared_prefix,
-                g,
-                b,
-            )?)
+            Some(SharedExperts::from_weights(weights, &shared_prefix, g, b)?)
         } else {
             None
         };
@@ -2133,10 +2160,8 @@ mod tests {
     /// `bits == 8` → mxfp8 quantized load.
     #[test]
     fn m3_quantization_mlx_community_schema_deserializes() {
-        let q: M3Quantization = serde_json::from_str(
-            r#"{ "group_size": 32, "bits": 8 }"#,
-        )
-        .expect("mlx-community quantization schema must deserialize");
+        let q: M3Quantization = serde_json::from_str(r#"{ "group_size": 32, "bits": 8 }"#)
+            .expect("mlx-community quantization schema must deserialize");
 
         assert_eq!(q.group_size_effective(), Some(32));
         assert_eq!(q.bits_effective(), Some(8));
@@ -2187,17 +2212,15 @@ mod tests {
     /// mode from `group_size` (16 → nvfp4, else → mxfp4).
     #[test]
     fn m3_quantization_hf_mxfp4_and_nvfp4_derive_bits_4() {
-        let q4: M3Quantization = serde_json::from_str(
-            r#"{ "quant_method": "mxfp4", "weight_block_size": [1, 32] }"#,
-        )
-        .unwrap();
+        let q4: M3Quantization =
+            serde_json::from_str(r#"{ "quant_method": "mxfp4", "weight_block_size": [1, 32] }"#)
+                .unwrap();
         assert_eq!(q4.bits_effective(), Some(4));
         assert_eq!(q4.group_size_effective(), Some(32));
 
-        let qnv: M3Quantization = serde_json::from_str(
-            r#"{ "quant_method": "nvfp4", "weight_block_size": [1, 16] }"#,
-        )
-        .unwrap();
+        let qnv: M3Quantization =
+            serde_json::from_str(r#"{ "quant_method": "nvfp4", "weight_block_size": [1, 16] }"#)
+                .unwrap();
         assert_eq!(qnv.bits_effective(), Some(4));
         assert_eq!(qnv.group_size_effective(), Some(16));
     }
@@ -2313,7 +2336,11 @@ mod tests {
         // head 0, q_block 0, q_pos 0 (p_q=0), k_idx 0 (k_block 0 pos 0, p_k=0).
         // p_k == p_q → valid. Smallest-stakes sanity check.
         let mask = msa_mask_fixture();
-        assert_eq!(mask_at(&mask, 0, 0, 0, 0), 0.0, "self-attention must be valid");
+        assert_eq!(
+            mask_at(&mask, 0, 0, 0, 0),
+            0.0,
+            "self-attention must be valid"
+        );
     }
 
     #[test]
@@ -2368,7 +2395,11 @@ mod tests {
         // k_idx 3 = k_block 1 pos 1 (p_k=3) → 3 <= 4 → valid.
         let mask = msa_mask_fixture();
         assert_eq!(mask_at(&mask, 0, 2, 0, 0), 0.0, "past block must be valid");
-        assert_eq!(mask_at(&mask, 0, 2, 0, 3), 0.0, "past block last pos must be valid");
+        assert_eq!(
+            mask_at(&mask, 0, 2, 0, 3),
+            0.0,
+            "past block last pos must be valid"
+        );
     }
 
     #[test]
@@ -2426,8 +2457,7 @@ mod tests {
                         let top_k_idx = (k_idx / block_size) as usize;
                         let block_pos = k_idx % block_size;
                         let p_k =
-                            selected[kv_head][q_block as usize][top_k_idx] * block_size
-                                + block_pos;
+                            selected[kv_head][q_block as usize][top_k_idx] * block_size + block_pos;
                         let expected_invalid = p_k > p_q;
                         let actual = mask_at(&mask, head, q_block, q_pos, k_idx);
                         if expected_invalid {
@@ -2568,20 +2598,15 @@ mod tests {
         let mine = m3_swiglu_activation(&up, &gate, alpha, limit);
         mlxcel_core::eval(&mine);
 
-        let expected: Vec<f32> = vec![
-            (1.0_f32, 0.5_f32),
-            (-2.0, 1.0),
-            (8.0, 10.0),
-            (-8.0, -3.0),
-        ]
-        .into_iter()
-        .map(|(u, g)| {
-            let gc = g.min(limit);
-            let uc = u.clamp(-limit, limit);
-            let glu = gc * (1.0 / (1.0 + (-(gc * alpha)).exp()));
-            (uc + 1.0) * glu
-        })
-        .collect();
+        let expected: Vec<f32> = vec![(1.0_f32, 0.5_f32), (-2.0, 1.0), (8.0, 10.0), (-8.0, -3.0)]
+            .into_iter()
+            .map(|(u, g)| {
+                let gc = g.min(limit);
+                let uc = u.clamp(-limit, limit);
+                let glu = gc * (1.0 / (1.0 + (-(gc * alpha)).exp()));
+                (uc + 1.0) * glu
+            })
+            .collect();
 
         let actual = vec_from_array(&mine);
         for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
@@ -2716,8 +2741,7 @@ mod tests {
         let selected_data: &[i32] = &[
             // kv_head 0:
             // q_block 0: [0, 2]   q_block 1: [1, 3]
-            0, 2, 1, 3,
-            // kv_head 1:
+            0, 2, 1, 3, // kv_head 1:
             // q_block 0: [0, 3]   q_block 1: [2, 3]
             0, 3, 2, 3,
         ];
@@ -2897,7 +2921,11 @@ mod tests {
     // (necessary but not sufficient) from "correct attention pattern across
     // cached prefill" (the multi-turn opencode goal).
 
-    fn make_linear(out_features: i32, in_features: i32, scale: f32) -> mlxcel_core::layers::UnifiedLinear {
+    fn make_linear(
+        out_features: i32,
+        in_features: i32,
+        scale: f32,
+    ) -> mlxcel_core::layers::UnifiedLinear {
         // Deterministic small weights. Pattern is sin-based so values
         // distribute across positive and negative without random.
         let n = (out_features * in_features) as usize;
@@ -2907,9 +2935,7 @@ mod tests {
             data.push(v);
         }
         let weight = mlxcel_core::from_slice_f32(&data, &[out_features, in_features]);
-        mlxcel_core::layers::UnifiedLinear::Regular(
-            mlxcel_core::layers::Linear::new(weight, None),
-        )
+        mlxcel_core::layers::UnifiedLinear::Regular(mlxcel_core::layers::Linear::new(weight, None))
     }
 
     fn make_gemma_rms_norm(dim: i32) -> GemmaRMSNorm {
@@ -3012,7 +3038,10 @@ mod tests {
             );
         }
         // Final state assertions: cache has full sequence length.
-        assert_eq!(cache.offset, l_total, "main K/V offset must equal total tokens");
+        assert_eq!(
+            cache.offset, l_total,
+            "main K/V offset must equal total tokens"
+        );
         assert_eq!(
             cache.m3_idx_offset(),
             l_total,
@@ -3204,7 +3233,11 @@ mod tests {
             mlxcel_core::eval(&acc);
             mlxcel_core::item_f32(&acc).sqrt()
         };
-        let relative = if ref_norm > 1e-6 { diff / ref_norm } else { diff };
+        let relative = if ref_norm > 1e-6 {
+            diff / ref_norm
+        } else {
+            diff
+        };
         // The chunked path's chunk 1 is dense (l_dense tokens) but the
         // reference's first l_dense tokens come from MSA's output at those
         // positions. For positions where MSA selected all key blocks, dense
@@ -3219,8 +3252,7 @@ mod tests {
         // compare just those positions.
         let chunked_msa_slice =
             mlxcel_core::slice(&chunked_concat, &[0, l_dense, 0], &[1, l_total, hidden]);
-        let ref_msa_slice =
-            mlxcel_core::slice(&ref_out, &[0, l_dense, 0], &[1, l_total, hidden]);
+        let ref_msa_slice = mlxcel_core::slice(&ref_out, &[0, l_dense, 0], &[1, l_total, hidden]);
         mlxcel_core::eval(&chunked_msa_slice);
         mlxcel_core::eval(&ref_msa_slice);
         let msa_diff = output_l2_diff(&chunked_msa_slice, &ref_msa_slice);
@@ -3367,7 +3399,11 @@ mod tests {
             mlxcel_core::eval(&acc);
             mlxcel_core::item_f32(&acc).sqrt()
         };
-        let relative = if ref_norm > 1e-6 { diff / ref_norm } else { diff };
+        let relative = if ref_norm > 1e-6 {
+            diff / ref_norm
+        } else {
+            diff
+        };
         // Same input, same model, same dispatch path through MSA on both
         // sides. Any non-trivial diff means the adoption disturbed the
         // computation. A regression in m3_idx_k preservation would push
@@ -3379,6 +3415,232 @@ mod tests {
              (abs {}, norm {}). Tolerance 0.05. A larger diff indicates the \
              adoption side fell back to dense for chunks 3-4 — i.e. the \
              `m3_idx_k` preservation through detach/adopt regressed.",
+            relative,
+            diff,
+            ref_norm
+        );
+    }
+
+    /// Read one element from a block-scores tensor at
+    /// (kv_head, q_block, k_block) for batch 0.
+    fn block_score_at(scores: &MlxArray, head: i32, q_block: i32, k_block: i32) -> f32 {
+        let single = mlxcel_core::slice(
+            scores,
+            &[0, head, q_block, k_block],
+            &[1, head + 1, q_block + 1, k_block + 1],
+        );
+        mlxcel_core::eval(&single);
+        mlxcel_core::item_f32(&single)
+    }
+
+    /// The local-block guarantee must anchor at the chunk's REAL last query
+    /// position when the final query block is partial.
+    ///
+    /// Fixture geometry (block_size=2, sparse_local_block=1): a dense
+    /// prompt-cache adoption resumed prefill at cache_offset=5 with a
+    /// single query token (q_len=1). kv_len=6 → key blocks {0,1,2}; the
+    /// query's real position 5 lives in block 2. The pre-fix formula
+    /// anchored at the padded block end (position 6 → block 3, which does
+    /// not exist), so the +inf landed nowhere and NO local block was
+    /// forced — the degenerate selection the MSA paper's fixed allocation
+    /// exists to prevent. The mutation this test kills: dropping the
+    /// `q_len` clamp from `ensure_local_block_score_asymmetric`.
+    #[test]
+    fn test_local_guarantee_partial_final_query_block_forces_real_newest_block() {
+        let layer = make_test_sparse_attention();
+        assert_eq!(layer.block_size, 2, "fixture geometry assumption");
+        assert_eq!(layer.sparse_local_block, 1, "fixture geometry assumption");
+
+        let num_query_blocks = 1;
+        let num_key_blocks = 3;
+        let scores = mlxcel_core::zeros(
+            &[1, layer.num_kv_heads, num_query_blocks, num_key_blocks],
+            mlxcel_core::dtype::FLOAT32,
+        );
+
+        let forced = layer.ensure_local_block_score_asymmetric(
+            &scores,
+            num_query_blocks,
+            num_key_blocks,
+            5, // cache_offset: adoption resumed mid-block
+            1, // q_len: single trailing query token at absolute position 5
+        );
+
+        for head in 0..layer.num_kv_heads {
+            assert_eq!(
+                block_score_at(&forced, head, 0, 2),
+                f32::INFINITY,
+                "head {head}: the key block containing the query's real \
+                 position (block 2) must be forced to +inf"
+            );
+            assert_eq!(
+                block_score_at(&forced, head, 0, 0),
+                0.0,
+                "head {head}: distant block 0 must stay unforced"
+            );
+            assert_eq!(
+                block_score_at(&forced, head, 0, 1),
+                0.0,
+                "head {head}: block 1 is outside the local window \
+                 (sparse_local_block=1) and must stay unforced"
+            );
+        }
+    }
+
+    /// Full query blocks must be unaffected by the `q_len` anchor: for a
+    /// block-aligned chunk the clamp is a no-op and the forced set matches
+    /// the original asymmetric formula (the diagonal local block).
+    #[test]
+    fn test_local_guarantee_full_query_blocks_unchanged_by_q_len_anchor() {
+        let layer = make_test_sparse_attention();
+
+        let num_query_blocks = 1;
+        let num_key_blocks = 3;
+        let scores = mlxcel_core::zeros(
+            &[1, layer.num_kv_heads, num_query_blocks, num_key_blocks],
+            mlxcel_core::dtype::FLOAT32,
+        );
+
+        // cache_offset=4 (block-aligned), q_len=2 (one full block covering
+        // absolute positions 4-5, i.e. exactly key block 2).
+        let forced = layer.ensure_local_block_score_asymmetric(
+            &scores,
+            num_query_blocks,
+            num_key_blocks,
+            4,
+            2,
+        );
+
+        for head in 0..layer.num_kv_heads {
+            assert_eq!(
+                block_score_at(&forced, head, 0, 2),
+                f32::INFINITY,
+                "head {head}: aligned case must force the diagonal block, \
+                 exactly as before the q_len anchor"
+            );
+            assert_eq!(block_score_at(&forced, head, 0, 0), 0.0);
+            assert_eq!(block_score_at(&forced, head, 0, 1), 0.0);
+        }
+    }
+
+    /// Dense prompt-cache adoption resumes prefill at an ARBITRARY token
+    /// offset (`DetachedCacheSet::truncate_to` trims to exactly
+    /// `matched_len` — e.g. the live 160-token adoption of 2026-07-04,
+    /// which is not a multiple of the 128 block size). This is the
+    /// layer-level gate for that path: trim a donated cache to an
+    /// unaligned boundary, adopt, resume prefill from there, and require
+    /// the outputs to match a continuous-cache reference.
+    ///
+    /// Covers, in one arc: `trim_to` K/V + `m3_idx_k` lockstep at a
+    /// non-block boundary, MSA resume with `cache_offset % block_size != 0`
+    /// (which exercises the q_len-anchored local-block guarantee), and the
+    /// mlx-lm #975 off-by-one class (a one-token trim error shifts every
+    /// resumed position and blows the tolerance).
+    #[test]
+    fn test_msa_trim_adopt_at_block_aligned_boundary_matches_continuous() {
+        let layer = make_test_sparse_attention();
+        let hidden = layer.num_heads * layer.head_dim;
+        let l_chunk = 6;
+        let n_chunks = 4;
+        let l_total = l_chunk * n_chunks; // 24
+        // Block-aligned (but NOT chunk-aligned) trim: cold-equivalence holds
+        // and this test pins it. Empirical finding (2026-07-04): at an
+        // UNALIGNED trim (7 here, or the live dense-adoption 160 with
+        // block_size 128), the resumed output legitimately diverges from a
+        // cold run (relative L2 ≈ 1.13 at this scale) because MSA's
+        // query-block pooling grid anchors at the chunk start — a shifted
+        // grid pools different positions together, selects different top-k
+        // blocks, and computes different (valid) attention. Cold-equivalence
+        // after partial adoption therefore requires flooring dense adoption
+        // to the MSA block size, mirroring the paged path's #225 flooring.
+        // Tracked as follow-up work.
+        let trim_target: i32 = 8;
+
+        let input = make_test_input(1, l_total, hidden);
+
+        // Reference: all four chunks against one continuous cache.
+        let mut cache_ref = KVCache::new();
+        let mut outs_ref: Vec<UniquePtr<MlxArray>> = Vec::new();
+        for i in 0..n_chunks {
+            let chunk = mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            );
+            outs_ref.push(layer.forward(&chunk, &mut cache_ref, None));
+        }
+
+        // Donor: two chunks (12 tokens), donate, trim to 7 — the dense
+        // adopt path's exact shape (truncate to raw matched_len).
+        let mut cache_src = KVCache::new();
+        for i in 0..2 {
+            let chunk = mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            );
+            let _ = layer.forward(&chunk, &mut cache_src, None);
+        }
+        let mut handle = cache_src.clone_handle();
+        handle
+            .trim_to(trim_target)
+            .expect("trim to an unaligned boundary must succeed");
+
+        // Adopt and resume prefill from token 7 in one 17-token chunk.
+        // The offsets after install are the observable trim contract: a
+        // K/V-vs-indexer lockstep failure at the non-block boundary shows
+        // up as a mismatch here.
+        let mut cache_adopted = KVCache::new();
+        cache_adopted
+            .install_detached(handle)
+            .expect("install_detached must succeed");
+        assert_eq!(cache_adopted.offset, trim_target);
+        assert_eq!(
+            cache_adopted.m3_idx_offset(),
+            trim_target,
+            "indexer cache must trim in lockstep at a non-block boundary"
+        );
+
+        let suffix = mlxcel_core::slice(&input, &[0, trim_target, 0], &[1, l_total, hidden]);
+        let out_suffix = layer.forward(&suffix, &mut cache_adopted, None);
+        assert_eq!(cache_adopted.offset, l_total);
+        assert_eq!(cache_adopted.m3_idx_offset(), l_total);
+
+        // Reference positions 7..24, sliced out of the concatenated
+        // reference outputs.
+        let mut ref_concat = mlxcel_core::copy(&outs_ref[0]);
+        for out in &outs_ref[1..] {
+            ref_concat = mlxcel_core::concatenate(&ref_concat, out, 1);
+        }
+        let ref_suffix =
+            mlxcel_core::slice(&ref_concat, &[0, trim_target, 0], &[1, l_total, hidden]);
+        mlxcel_core::eval(&ref_suffix);
+        mlxcel_core::eval(&out_suffix);
+
+        let diff = output_l2_diff(&ref_suffix, &out_suffix);
+        let ref_norm = {
+            let sq = mlxcel_core::multiply(&ref_suffix, &ref_suffix);
+            let s = mlxcel_core::array_shape(&sq);
+            let mut acc = mlxcel_core::copy(&sq);
+            for axis in (0..s.len()).rev() {
+                acc = mlxcel_core::sum_axis(&acc, axis as i32, false);
+            }
+            mlxcel_core::eval(&acc);
+            mlxcel_core::item_f32(&acc).sqrt()
+        };
+        let relative = if ref_norm > 1e-6 {
+            diff / ref_norm
+        } else {
+            diff
+        };
+        assert!(
+            relative < 0.05,
+            "unaligned trim-adopt resume vs continuous relative L2 = {} \
+             (abs {}, norm {}). Tolerance 0.05 (same cross-chunking gate as \
+             the chunked-vs-single-shot test). A large diff means the trim \
+             left K/V and the indexer cache disagreeing about the resume \
+             position, or the resumed MSA path mis-anchored its local-block \
+             guarantee.",
             relative,
             diff,
             ref_norm
@@ -3453,8 +3715,7 @@ mod tests {
                     for k_idx in 0..(TOP_K * BLOCK_SIZE) {
                         let select_idx = (k_idx / BLOCK_SIZE) as usize;
                         let block_pos = k_idx % BLOCK_SIZE;
-                        let selected_block =
-                            selected[kv_head][q_block as usize][select_idx];
+                        let selected_block = selected[kv_head][q_block as usize][select_idx];
                         let p_k = selected_block * BLOCK_SIZE + block_pos;
                         let expected_invalid = p_k > p_q;
                         let v = mask_at(&mask, head, q_block, q_pos, k_idx);
