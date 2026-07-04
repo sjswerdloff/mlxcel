@@ -38,6 +38,13 @@ path = "src/bin/speculative_bench.rs"
 name = "mlxcel-bench-decode"
 path = "src/bin/bench_decode.rs"
 
+# Offline converter: HF/vLLM MXFP8 checkpoint → MLX-native quantized layout.
+# Pure byte-copy with header rewrites — no tensor math, no MLX, no model loading.
+# See src/bin/mxfp8_repack.rs for the byte-compatibility facts and usage.
+[[bin]]
+name = "mxfp8_repack"
+path = "src/bin/mxfp8_repack.rs"
+
 [features]
 default = ["surgery"]
 metal = ["mlxcel-core/metal"]
