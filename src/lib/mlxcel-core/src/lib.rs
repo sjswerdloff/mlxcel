@@ -1867,6 +1867,17 @@ mod ffi {
         /// Reinterpret array as given dtype (bitwise view)
         fn view(a: &MlxArray, dtype: i32) -> UniquePtr<MlxArray>;
 
+        /// FP8 (E4M3FN) encode: float array -> uint8 fp8 bytes. Inverse of
+        /// the from_fp8 conversion MLX's safetensors loader applies to
+        /// F8_E4M3 tensors, so `to_fp8(loaded_f8_tensor)` recovers the
+        /// original checkpoint bytes exactly.
+        fn to_fp8(a: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// FP8 (E4M3FN) decode: uint8 fp8 bytes -> float array of the given
+        /// dtype. Same conversion MLX's safetensors loader applies to
+        /// F8_E4M3 tensors at load time.
+        fn from_fp8(a: &MlxArray, dtype: i32) -> UniquePtr<MlxArray>;
+
         /// Kronecker product of two arrays
         fn kron(a: &MlxArray, b: &MlxArray) -> UniquePtr<MlxArray>;
 

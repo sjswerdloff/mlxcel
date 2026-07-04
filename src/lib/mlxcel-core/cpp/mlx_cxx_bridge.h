@@ -1238,6 +1238,14 @@ std::unique_ptr<MlxArray> conjugate(const MlxArray& a);
 // View/reinterpret
 std::unique_ptr<MlxArray> view(const MlxArray& a, int32_t dtype);
 
+// FP8 (E4M3FN) encode: float array -> uint8 fp8 bytes. Inverse of the
+// from_fp8 conversion MLX's safetensors loader applies to F8_E4M3 tensors.
+std::unique_ptr<MlxArray> to_fp8(const MlxArray& a);
+
+// FP8 (E4M3FN) decode: uint8 fp8 bytes -> float array of the given dtype.
+// Same conversion MLX's safetensors loader applies to F8_E4M3 tensors.
+std::unique_ptr<MlxArray> from_fp8(const MlxArray& a, int32_t dtype);
+
 // Kronecker product
 std::unique_ptr<MlxArray> kron(const MlxArray& a, const MlxArray& b);
 

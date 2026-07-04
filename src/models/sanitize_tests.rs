@@ -442,6 +442,118 @@ fn load_text_weights_with_none_transform_matches_legacy_path() {
     std::fs::remove_dir_all(&dir_b).unwrap();
 }
 
+/// End-to-end wiring guard for the HF MXFP8 repack hook: a checkpoint
+/// whose `config.json` declares `quant_method: "mxfp8"` with 1×32 blocks
+/// and whose safetensors carry F8_E4M3 weights + U8 `weight_scale_inv`
+/// scales must come out of `load_text_weights` in MLX quantized layout.
+///
+/// This exercises the real loader path (the pinned MLX loads F8_E4M3
+/// payloads as raw uint8), so it goes red if the `is_hf_mxfp8_config` gate
+/// or the `repack_hf_mxfp8_weights` call is removed from
+/// `load_text_weights` — the unit tests in `sanitize.rs` call the repack
+/// function directly and cannot catch a missing hook. It also pins the
+/// arrival dtype: if a future MLX bump starts converting F8_E4M3 at load,
+/// the repack's float branch keeps this green.
+#[test]
+fn load_text_weights_repacks_hf_mxfp8_checkpoints() {
+    #[cfg(feature = "surgery")]
+    let _env_guard = crate::test_support::env_lock::env_lock();
+
+    let dir = temp_model_dir("hf_mxfp8_repack");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&json!({
+            "model_type": "minimax_m3",
+            "tie_word_embeddings": false,
+            "quantization_config": {
+                "quant_method": "mxfp8",
+                "weight_block_size": [1, 32],
+                "activation_scheme": "dynamic"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // One 1×32 quantized weight: fp8 byte 0x38 = 1.0 in every lane, with
+    // E8M0 scale byte 128 → multiplier 2^1, so the dequantized row is all
+    // 2.0. Plus an f32 tensor with no scale companion that must pass
+    // through untouched.
+    write_safetensors(
+        &dir.join("model.safetensors"),
+        &[
+            (
+                "l.weight",
+                OwnedTensor {
+                    dtype: SafeTensorDtype::F8_E4M3,
+                    shape: vec![1, 32],
+                    data: vec![0x38; 32],
+                },
+            ),
+            (
+                "l.weight_scale_inv",
+                OwnedTensor {
+                    dtype: SafeTensorDtype::U8,
+                    shape: vec![1, 1],
+                    data: vec![128],
+                },
+            ),
+            (
+                "norm.weight",
+                OwnedTensor {
+                    dtype: SafeTensorDtype::F32,
+                    shape: vec![2],
+                    data: 1.0f32
+                        .to_le_bytes()
+                        .iter()
+                        .chain(1.0f32.to_le_bytes().iter())
+                        .copied()
+                        .collect(),
+                },
+            ),
+        ],
+    );
+
+    let weights = load_text_weights(&dir, None).unwrap();
+
+    let packed = weights
+        .get("l.weight")
+        .expect("quantized weight must survive the repack under its own key");
+    assert_eq!(
+        mlxcel_core::array_dtype(packed),
+        dtype::UINT32,
+        "repacked weight must be uint32-packed, not the loader's raw uint8"
+    );
+    assert_eq!(mlxcel_core::array_shape(packed), vec![1, 8]);
+
+    let scales = weights
+        .get("l.scales")
+        .expect("weight_scale_inv must be renamed to scales");
+    assert_eq!(mlxcel_core::array_dtype(scales), dtype::UINT8);
+    assert!(
+        !weights.contains_key("l.weight_scale_inv"),
+        "weight_scale_inv must not leak through to model constructors"
+    );
+
+    // Semantics all the way through: mxfp8 dequant must give 2.0 per lane.
+    let dequant =
+        unsafe { mlxcel_core::dequantize(packed, scales, std::ptr::null(), 32, 8, "mxfp8") };
+    let dequant_f32 = mlxcel_core::astype(&dequant, dtype::FLOAT32);
+    let expected = mlxcel_core::from_slice_f32(&[2.0f32; 32], &[1, 32]);
+    let same = mlxcel_core::array_equal(&dequant_f32, &expected, false);
+    assert!(
+        mlxcel_core::item_bool(&same),
+        "dequantized repacked weight must be e4m3 value × 2^(scale-127)"
+    );
+
+    // The scale-less tensor is untouched by the repack.
+    let norm = weights.get("norm.weight").expect("norm must survive");
+    assert_eq!(mlxcel_core::array_dtype(norm), dtype::FLOAT32);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Counter-based `WeightTransform` that records how many times
 /// `apply` ran. Used to prove the hook is actually invoked by
 /// `load_text_weights` when a non-`None` transform is supplied.

@@ -338,7 +338,10 @@ fn trim_to_mid_buffer_slices_m3_idx_k_in_lockstep() {
 
     handle.trim_to(2).expect("trim_to 2 must succeed");
     assert_eq!(handle.offset, 2);
-    assert_eq!(handle.m3_idx_offset, 2, "indexer cache must trim in lockstep");
+    assert_eq!(
+        handle.m3_idx_offset, 2,
+        "indexer cache must trim in lockstep"
+    );
 
     // Verify the surviving idx_k contents are the first two positions
     // (axis 2 prefix slice), not the latter two.
@@ -362,7 +365,10 @@ fn trim_to_zero_drops_m3_idx_k_state() {
     assert!(handle.m3_idx_k.is_some());
 
     handle.trim_to(0).expect("trim_to 0 must succeed");
-    assert!(handle.m3_idx_k.is_none(), "trim to zero drops the aux tensor");
+    assert!(
+        handle.m3_idx_k.is_none(),
+        "trim to zero drops the aux tensor"
+    );
     assert_eq!(handle.m3_idx_offset, 0);
 }
 
@@ -1290,7 +1296,11 @@ fn m3_idx_k_round_trip_unaffected_by_int8_kv_mode() {
              Token {}: expected {}, got {}, err {} (tolerance {}). \
              If this fails, m3_idx_k may have been accidentally routed through \
              quantize_per_token — check cache.rs::m3_idx_k_update_and_fetch.",
-            i, exp, got, err, tolerance
+            i,
+            exp,
+            got,
+            err,
+            tolerance
         );
     }
 }

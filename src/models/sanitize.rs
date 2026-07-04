@@ -395,6 +395,144 @@ fn dequantize_nvfp4_weights(weights: &mut mlxcel_core::weights::WeightMap) {
     }
 }
 
+/// True when `config.json` declares an HF/vLLM-style MXFP8 export:
+/// `quantization_config.quant_method == "mxfp8"` with explicit 1×32 blocks
+/// (e.g. `MiniMaxAI/MiniMax-M3-MXFP8` and its REAP-pruned derivatives).
+///
+/// Gated narrowly on both fields so per-tensor FP8 schemes (DeepSeek-style
+/// `[128, 128]` blocks, or Mistral fp8 checkpoints whose scale keys are
+/// deliberately stripped by their model loader) are never repacked.
+pub(crate) fn is_hf_mxfp8_config(config: &Value) -> bool {
+    let Some(qc) = config.get("quantization_config") else {
+        return false;
+    };
+    if qc.get("quant_method").and_then(|v| v.as_str()) != Some("mxfp8") {
+        return false;
+    }
+    match qc.get("weight_block_size").and_then(|v| v.as_array()) {
+        Some(bs) => bs.len() == 2 && bs[0].as_i64() == Some(1) && bs[1].as_i64() == Some(32),
+        None => false,
+    }
+}
+
+/// Repack HF/vLLM-format MXFP8 tensors into MLX's native quantized layout.
+///
+/// HF MXFP8 checkpoints store each quantized tensor as an F8_E4M3
+/// `{prefix}.weight` plus a U8 E8M0 `{prefix}.weight_scale_inv` holding one
+/// exponent byte per 32-element block. mlxcel's loaders key the quantized
+/// path on a `.scales` tensor that this naming never provides, so every
+/// layer silently fell through to the unquantized path and ran the raw fp8
+/// payload as if it were weight data (the cycle-82 MXFP8-64e null-token
+/// bug).
+///
+/// MLX's mxfp8 quantized representation is byte-identical to the HF layout:
+/// packed weights are the fp8 bytes viewed as uint32 (4 per word) and scales
+/// are the same U8 E8M0 exponents read as `2^(s-127)`. Repacking is
+/// therefore exact and cheap. The F8_E4M3 payload's arrival dtype depends on
+/// the MLX version:
+///
+/// * The pinned MLX (a6ec7123) loads F8_E4M3 as **raw uint8** — the fp8
+///   bytes only need the uint32 reinterpret, no conversion at all.
+/// * Newer MLX converts F8_E4M3 to a float dtype at load (`from_fp8`);
+///   `to_fp8` is its exact inverse (verified byte-identical on real
+///   checkpoint tensors, 2026-07-04), so re-encoding recovers the payload.
+///
+/// Each tensor is evaluated as it is repacked, so peak transient memory is
+/// bounded by one tensor, not a second copy of the model. Malformed groups
+/// are hard errors rather than skips: a partially repacked quantized
+/// checkpoint must never reach the silent unquantized fallback again.
+///
+/// Returns the number of weight groups repacked.
+///
+/// Used by: load_text_weights (gated on [`is_hf_mxfp8_config`])
+pub(crate) fn repack_hf_mxfp8_weights(
+    weights: &mut mlxcel_core::weights::WeightMap,
+) -> Result<usize, String> {
+    const BLOCK: i32 = 32;
+
+    // Collect first to avoid borrowing conflicts during mutation.
+    let scale_keys: Vec<String> = weights
+        .keys()
+        .filter(|k| k.ends_with(".weight_scale_inv"))
+        .cloned()
+        .collect();
+
+    if scale_keys.is_empty() {
+        return Ok(0);
+    }
+
+    eprintln!(
+        "Repacking {} HF MXFP8 weight groups to MLX quantized layout...",
+        scale_keys.len()
+    );
+
+    for scale_key in &scale_keys {
+        let prefix = scale_key
+            .strip_suffix(".weight_scale_inv")
+            .expect("keys filtered on this suffix above");
+        let weight_key = format!("{prefix}.weight");
+
+        let packed = {
+            let weight = weights.get(&weight_key).ok_or_else(|| {
+                format!("MXFP8 repack: {scale_key} has no companion {weight_key}")
+            })?;
+            let scales = weights.get(scale_key).expect("key collected above");
+
+            if mlxcel_core::array_dtype(scales) != mlxcel_core::dtype::UINT8 {
+                return Err(format!(
+                    "MXFP8 repack: {scale_key} has dtype code {}, expected U8 E8M0 \
+                     scale data",
+                    mlxcel_core::array_dtype(scales)
+                ));
+            }
+
+            let w_shape = mlxcel_core::array_shape(weight);
+            let s_shape = mlxcel_core::array_shape(scales);
+            let w_in = *w_shape.last().unwrap_or(&0);
+            let s_groups = *s_shape.last().unwrap_or(&0);
+            if w_in <= 0 || w_in % BLOCK != 0 || s_groups * BLOCK != w_in {
+                return Err(format!(
+                    "MXFP8 repack: {weight_key} shape {w_shape:?} does not match \
+                     {scale_key} shape {s_shape:?} at block size {BLOCK}"
+                ));
+            }
+
+            let w_dtype = mlxcel_core::array_dtype(weight);
+            let fp8_bytes = if w_dtype == mlxcel_core::dtype::UINT8 {
+                // Pinned-MLX arrival: the raw F8_E4M3 payload, byte-exact.
+                mlxcel_core::copy(weight)
+            } else if matches!(
+                w_dtype,
+                mlxcel_core::dtype::FLOAT16
+                    | mlxcel_core::dtype::FLOAT32
+                    | mlxcel_core::dtype::BFLOAT16
+            ) {
+                // Newer-MLX arrival: loader already ran from_fp8; re-encode.
+                mlxcel_core::to_fp8(weight)
+            } else {
+                return Err(format!(
+                    "MXFP8 repack: {weight_key} has dtype code {w_dtype}, expected \
+                     uint8 fp8 bytes or a float dtype from the safetensors loader"
+                ));
+            };
+
+            let packed = mlxcel_core::view(&fp8_bytes, mlxcel_core::dtype::UINT32);
+            // Materialize now: bounds transient memory to this one tensor
+            // and lets the loader's lazy graph drop immediately.
+            mlxcel_core::eval(&packed);
+            packed
+        };
+
+        weights.insert(weight_key, packed);
+        let scales = weights
+            .remove(scale_key)
+            .expect("key collected above and not otherwise mutated");
+        weights.insert(format!("{prefix}.scales"), scales);
+    }
+
+    Ok(scale_keys.len())
+}
+
 /// Drop k_proj / v_proj / k_norm weight entries that belong to KV-shared
 /// layers so they are never materialized into MLX arrays.
 ///
@@ -1144,6 +1282,17 @@ pub fn load_text_weights<P: AsRef<std::path::Path>>(
                 .get("text_config")
                 .and_then(|tc| tc.get("quantization"))
                 .is_some();
+        // HF/vLLM-format MXFP8 checkpoints (F8_E4M3 weights + U8 E8M0
+        // `weight_scale_inv` scales) arrive from MLX's safetensors loader as
+        // unscaled bf16 mantissas. Repack them into MLX's native quantized
+        // layout so the `.scales`-keyed quantized loaders engage instead of
+        // silently falling through to the unquantized path. `is_quantized`
+        // stays false here on purpose: the tensors *not* repacked (norms,
+        // embeddings, MoE gates, `ignored_layers`) are genuine bf16 and
+        // still want the Apple Silicon bf16 → f16 conversion below.
+        if is_hf_mxfp8_config(config) {
+            repack_hf_mxfp8_weights(&mut weights)?;
+        }
     }
 
     // Axis A weight-load surgery hook. Runs after sanitization
@@ -1664,6 +1813,260 @@ mod tests {
         normalize_nvfp4_keys(&mut weights);
         // The existing key should remain unchanged.
         assert!(weights.contains_key("language_model.model.layers.0.mlp.gate_proj.weight"));
+    }
+
+    // --- is_hf_mxfp8_config / repack_hf_mxfp8_weights tests ---
+
+    fn hf_mxfp8_config() -> Value {
+        serde_json::json!({
+            "quantization_config": {
+                "quant_method": "mxfp8",
+                "weight_block_size": [1, 32],
+                "activation_scheme": "dynamic",
+                "ignored_layers": ["lm_head"]
+            }
+        })
+    }
+
+    #[test]
+    fn is_hf_mxfp8_config_accepts_m3_style_export() {
+        assert!(is_hf_mxfp8_config(&hf_mxfp8_config()));
+    }
+
+    #[test]
+    fn is_hf_mxfp8_config_rejects_other_fp8_schemes() {
+        // DeepSeek-style per-tensor fp8: different method and block shape.
+        let deepseek = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128]
+            }
+        });
+        assert!(!is_hf_mxfp8_config(&deepseek));
+
+        // mxfp8 method but wrong block shape must not engage 1x32 repacking.
+        let wrong_block = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "mxfp8",
+                "weight_block_size": [128, 128]
+            }
+        });
+        assert!(!is_hf_mxfp8_config(&wrong_block));
+
+        // Missing weight_block_size: stay conservative, do not repack.
+        let no_block = serde_json::json!({
+            "quantization_config": { "quant_method": "mxfp8" }
+        });
+        assert!(!is_hf_mxfp8_config(&no_block));
+
+        // mlx-community exports use top-level `quantization` and are already
+        // in MLX layout — never repack those.
+        let mlx_community = serde_json::json!({
+            "quantization": { "group_size": 32, "bits": 8 }
+        });
+        assert!(!is_hf_mxfp8_config(&mlx_community));
+    }
+
+    /// Build a u8 MLX array from raw bytes.
+    fn u8_array(bytes: &[u8], shape: &[i32]) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
+        mlxcel_core::from_bytes(bytes, shape, mlxcel_core::dtype::UINT8)
+    }
+
+    /// Shared fixture bytes for the repack contract tests: two rows of one
+    /// 32-element e4m3 block each, plus the expected decoded values.
+    fn repack_fixture() -> (Vec<u8>, Vec<f32>) {
+        // Simple exact e4m3 encodings: 0x38 = 1.0, 0x40 = 2.0, 0xB8 = -1.0,
+        // 0x30 = 0.5, 0x00 = 0.0.
+        let row_bytes: [u8; 32] = [
+            0x38, 0x40, 0xB8, 0x30, 0x00, 0x38, 0x40, 0xB8, 0x30, 0x00, 0x38, 0x40, 0xB8, 0x30,
+            0x00, 0x38, 0x40, 0xB8, 0x30, 0x00, 0x38, 0x40, 0xB8, 0x30, 0x00, 0x38, 0x40, 0xB8,
+            0x30, 0x00, 0x38, 0x40,
+        ];
+        let row_values: [f32; 32] = [
+            1.0, 2.0, -1.0, 0.5, 0.0, 1.0, 2.0, -1.0, 0.5, 0.0, 1.0, 2.0, -1.0, 0.5, 0.0, 1.0, 2.0,
+            -1.0, 0.5, 0.0, 1.0, 2.0, -1.0, 0.5, 0.0, 1.0, 2.0, -1.0, 0.5, 0.0, 1.0, 2.0,
+        ];
+        let mut fp8_bytes = Vec::with_capacity(64);
+        fp8_bytes.extend_from_slice(&row_bytes);
+        fp8_bytes.extend_from_slice(&row_bytes);
+        // Row 0 scale byte 127 → ×2^0; row 1 scale byte 128 → ×2^1.
+        let mut expected = Vec::with_capacity(64);
+        expected.extend(row_values.iter().copied());
+        expected.extend(row_values.iter().map(|v| v * 2.0));
+        (fp8_bytes, expected)
+    }
+
+    /// Assert the post-repack contract shared by both arrival dtypes:
+    /// weight uint32-packed and byte-identical to the original fp8 payload,
+    /// scales renamed, and mxfp8 dequant reproducing
+    /// `e4m3_value * 2^(scale_byte - 127)`.
+    fn assert_repacked(
+        weights: &mlxcel_core::weights::WeightMap,
+        fp8_bytes: &[u8],
+        expected: &[f32],
+    ) {
+        assert!(
+            weights.contains_key("l.scales"),
+            "scales must be renamed in"
+        );
+        assert!(
+            !weights.contains_key("l.weight_scale_inv"),
+            "weight_scale_inv must be renamed away"
+        );
+
+        let packed = weights.get("l.weight").expect("weight must remain");
+        assert_eq!(
+            mlxcel_core::array_dtype(packed),
+            mlxcel_core::dtype::UINT32,
+            "repacked weight must be uint32-packed"
+        );
+        assert_eq!(mlxcel_core::array_shape(packed), vec![2, 8]);
+
+        // Byte-identity with the original checkpoint payload.
+        let expected_packed =
+            mlxcel_core::view(&u8_array(fp8_bytes, &[2, 32]), mlxcel_core::dtype::UINT32);
+        let same = mlxcel_core::array_equal(packed, &expected_packed, false);
+        assert!(
+            mlxcel_core::item_bool(&same),
+            "repacked bytes must equal original fp8 payload"
+        );
+
+        // End-to-end semantics: mxfp8 dequant of the repacked pair must be
+        // e4m3_value * 2^(scale - 127) — row 0 as-is, row 1 doubled.
+        let dequant = unsafe {
+            mlxcel_core::dequantize(
+                packed,
+                weights.get("l.scales").expect("scales renamed in"),
+                std::ptr::null(),
+                32,
+                8,
+                "mxfp8",
+            )
+        };
+        let dequant_f32 = mlxcel_core::astype(&dequant, mlxcel_core::dtype::FLOAT32);
+        let expected_arr = mlxcel_core::from_slice_f32(expected, &[2, 32]);
+        let dequant_ok = mlxcel_core::array_equal(&dequant_f32, &expected_arr, false);
+        assert!(
+            mlxcel_core::item_bool(&dequant_ok),
+            "mxfp8 dequant of repacked weights must reproduce scaled e4m3 values"
+        );
+    }
+
+    /// Pinned-MLX arrival path: F8_E4M3 payloads load as raw uint8, so the
+    /// repack must only reinterpret them as uint32 — byte-exact, no
+    /// conversion. Mutations this must catch: dropping the uint8 branch
+    /// (dtype error), wrong view dtype (shape assert), scale-semantics
+    /// drift (dequant values wrong).
+    #[test]
+    fn repack_hf_mxfp8_views_raw_uint8_payload_exactly() {
+        let (fp8_bytes, expected) = repack_fixture();
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        weights.insert("l.weight".to_string(), u8_array(&fp8_bytes, &[2, 32]));
+        weights.insert(
+            "l.weight_scale_inv".to_string(),
+            u8_array(&[127, 128], &[2, 1]),
+        );
+
+        let repacked = repack_hf_mxfp8_weights(&mut weights).expect("repack must succeed");
+        assert_eq!(repacked, 1);
+        assert_repacked(&weights, &fp8_bytes, &expected);
+    }
+
+    /// Newer-MLX arrival path: the safetensors loader already ran
+    /// `from_fp8`, so the weight arrives as a float dtype and the repack
+    /// must re-encode with `to_fp8` (its exact inverse) before packing.
+    #[test]
+    fn repack_hf_mxfp8_round_trips_float_loader_conversion() {
+        let (fp8_bytes, expected) = repack_fixture();
+        let fp8 = u8_array(&fp8_bytes, &[2, 32]);
+
+        // Simulate what a newer MLX safetensors loader hands mlxcel.
+        let loaded_bf16 = mlxcel_core::from_fp8(&fp8, mlxcel_core::dtype::BFLOAT16);
+
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        weights.insert("l.weight".to_string(), loaded_bf16);
+        weights.insert(
+            "l.weight_scale_inv".to_string(),
+            u8_array(&[127, 128], &[2, 1]),
+        );
+
+        let repacked = repack_hf_mxfp8_weights(&mut weights).expect("repack must succeed");
+        assert_eq!(repacked, 1);
+        assert_repacked(&weights, &fp8_bytes, &expected);
+    }
+
+    #[test]
+    fn repack_hf_mxfp8_errors_on_unexpected_weight_dtype() {
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        // An int32 weight is neither raw fp8 bytes nor a float conversion.
+        weights.insert(
+            "l.weight".to_string(),
+            mlxcel_core::from_bytes(&[0u8; 128], &[1, 32], mlxcel_core::dtype::INT32),
+        );
+        weights.insert("l.weight_scale_inv".to_string(), u8_array(&[127], &[1, 1]));
+        let err = repack_hf_mxfp8_weights(&mut weights)
+            .expect_err("unexpected weight dtype must be a hard error");
+        assert!(
+            err.contains("uint8 fp8 bytes or a float dtype"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repack_hf_mxfp8_errors_on_missing_companion_weight() {
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        weights.insert("l.weight_scale_inv".to_string(), u8_array(&[127], &[1, 1]));
+        let err = repack_hf_mxfp8_weights(&mut weights)
+            .expect_err("orphaned scale tensor must be a hard error, not a silent skip");
+        assert!(err.contains("no companion"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn repack_hf_mxfp8_errors_on_scale_shape_mismatch() {
+        let fp8 = u8_array(&[0x38; 32], &[1, 32]);
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        weights.insert(
+            "l.weight".to_string(),
+            mlxcel_core::from_fp8(&fp8, mlxcel_core::dtype::BFLOAT16),
+        );
+        // 2 groups claimed for a 32-wide weight: inconsistent with 1x32 blocks.
+        weights.insert(
+            "l.weight_scale_inv".to_string(),
+            u8_array(&[127, 127], &[1, 2]),
+        );
+        let err =
+            repack_hf_mxfp8_weights(&mut weights).expect_err("shape mismatch must be a hard error");
+        assert!(err.contains("does not match"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn repack_hf_mxfp8_errors_on_non_u8_scales() {
+        let fp8 = u8_array(&[0x38; 32], &[1, 32]);
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        weights.insert(
+            "l.weight".to_string(),
+            mlxcel_core::from_fp8(&fp8, mlxcel_core::dtype::BFLOAT16),
+        );
+        weights.insert(
+            "l.weight_scale_inv".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1, 1]),
+        );
+        let err =
+            repack_hf_mxfp8_weights(&mut weights).expect_err("non-U8 scales must be a hard error");
+        assert!(err.contains("U8 E8M0"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn repack_hf_mxfp8_noop_without_scale_inv_keys() {
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        weights.insert(
+            "l.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        let repacked = repack_hf_mxfp8_weights(&mut weights).expect("no-op must succeed");
+        assert_eq!(repacked, 0);
+        assert!(weights.contains_key("l.weight"));
+        assert_eq!(weights.len(), 1);
     }
 
     // --- strip_gemma4_kv_shared_weights tests ---

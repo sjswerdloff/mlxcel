@@ -4268,6 +4268,14 @@ std::unique_ptr<MlxArray> view(const MlxArray& a, int32_t dtype) {
     return std::make_unique<MlxArray>(mlx::core::view(a.inner, to_dtype(dtype)));
 }
 
+std::unique_ptr<MlxArray> to_fp8(const MlxArray& a) {
+    return std::make_unique<MlxArray>(mlx::core::to_fp8(a.inner));
+}
+
+std::unique_ptr<MlxArray> from_fp8(const MlxArray& a, int32_t dtype) {
+    return std::make_unique<MlxArray>(mlx::core::from_fp8(a.inner, to_dtype(dtype)));
+}
+
 std::unique_ptr<MlxArray> kron(const MlxArray& a, const MlxArray& b) {
     return std::make_unique<MlxArray>(mlx::core::kron(a.inner, b.inner));
 }
