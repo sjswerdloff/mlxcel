@@ -512,59 +512,22 @@ impl SparseAttention {
         // positions. Shared pipeline with the per-token decode path.
         let idx_q = self.project_index_queries(x, b, l, offset);
 
-        // Pad idx_q (to padded_q_len) and idx_k (to padded_k_len) with -inf
-        // so the upcoming block reshape and max-pool can never let padded
-        // positions win. Real positions in the partial last block dominate
-        // the per-block max (any finite value beats -inf), so block scores
-        // stay real-valued. -inf appears only at padded positions that are
-        // summarized away by max_axis; it never reaches a matmul.
-        let idx_dtype = mlxcel_core::array_dtype(&idx_q);
-        let idx_q = if pad_q_amt > 0 {
-            let pad_q = mlxcel_core::full_f32(
-                &[b, self.num_kv_heads, pad_q_amt, self.index_dim],
-                f32::NEG_INFINITY,
-                idx_dtype,
-            );
-            mlxcel_core::concatenate(&idx_q, &pad_q, 2)
-        } else {
-            idx_q
-        };
-        let idx_k = if pad_k_amt > 0 {
-            let pad_k = mlxcel_core::full_f32(
-                &[b, 1, pad_k_amt, self.index_dim],
-                f32::NEG_INFINITY,
-                idx_dtype,
-            );
-            mlxcel_core::concatenate(&idx_k, &pad_k, 2)
-        } else {
-            idx_k
-        };
-
-        // Block max-pool scoring.
-        // K side uses num_key_blocks (full cached). Q side uses
-        // num_query_blocks (current chunk only).
-        let k_blocked = mlxcel_core::reshape(
-            &idx_k,
-            &[b, 1, num_key_blocks, self.block_size, self.index_dim],
-        );
-        let k_pool = mlxcel_core::max_axis(&k_blocked, 3, false);
-
-        let q_blocked = mlxcel_core::reshape(
-            &idx_q,
-            &[
-                b,
-                self.num_kv_heads,
-                num_query_blocks,
-                self.block_size,
-                self.index_dim,
-            ],
-        );
-        let q_pool = mlxcel_core::max_axis(&q_blocked, 3, false);
-
-        let scale_idx = 1.0 / (self.index_dim as f32).sqrt();
-        let k_pool_t = mlxcel_core::transpose_axes(&k_pool, &[0, 1, 3, 2]);
-        let block_scores = mlxcel_core::matmul(&q_pool, &k_pool_t);
-        let block_scores = mlxcel_core::multiply_scalar(&block_scores, scale_idx);
+        // Reference score-pooling (2026-07-05 audit, item 3c/3b): per-pair
+        // dots first, causal-mask per POSITION, amax over key positions
+        // within each block, then max over the query positions of each
+        // q-block. The previous scorer max-pooled the raw index VECTORS
+        // coordinate-wise before a single pooled dot (dot-of-coordmaxes) —
+        // scoring blocks by a composite profile no real token has, which is
+        // NOT the trained selection signal (max-of-dots). The remaining
+        // deliberate approximation vs the per-token reference is only that
+        // each q-block SHARES one selection (required by the q-block gather
+        // in sparse_sdpa); the scores feeding that selection are now
+        // reference-exact.
+        //
+        // Looped one q-block at a time so the per-pair score tensor stays
+        // [b, H, block_size, kv_len] — bounded regardless of chunk size.
+        let _ = pad_q_amt; // q padding handled per-slice below
+        let block_scores = self.prefill_block_scores(&idx_q, &idx_k, b, l, kv_len, offset);
         // block_scores shape: [b, num_kv_heads, num_query_blocks, num_key_blocks]
 
         let block_scores = self.apply_causal_block_mask_asymmetric(
@@ -825,6 +788,93 @@ impl SparseAttention {
         };
         let idx_q = mlxcel_core::transpose_axes(&idx_q, &[0, 2, 1, 3]);
         mlxcel_core::fast_rope(&idx_q, self.rope_dims, false, self.rope_base, 1.0, offset)
+    }
+
+    /// Reference score-pooling for the q-block-granular prefill path:
+    /// per-pair dots → per-position causal mask → amax over key positions
+    /// within each key block → max over the query positions of each query
+    /// block. Returns `[b, num_kv_heads, num_query_blocks, num_key_blocks]`.
+    ///
+    /// Computed one query block at a time so the per-pair intermediate is
+    /// bounded at `[b, H, block_size, kv_len]` regardless of chunk size
+    /// (a 2048-token chunk is 16 small matmuls, not one giant one).
+    fn prefill_block_scores(
+        &self,
+        idx_q: &MlxArray,
+        idx_k: &MlxArray,
+        b: i32,
+        l: i32,
+        kv_len: i32,
+        offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        let num_query_blocks = (l + self.block_size - 1) / self.block_size;
+        let num_key_blocks = (kv_len + self.block_size - 1) / self.block_size;
+        let padded_k_len = num_key_blocks * self.block_size;
+        let pad_k_amt = padded_k_len - kv_len;
+        let scale_idx = 1.0 / (self.index_dim as f32).sqrt();
+        let dtype = mlxcel_core::array_dtype(idx_q);
+        let k_t = mlxcel_core::transpose_axes(idx_k, &[0, 1, 3, 2]);
+        let key_pos = mlxcel_core::arange_f32(0.0, kv_len as f32, 1.0);
+        let key_pos = mlxcel_core::reshape(&key_pos, &[1, 1, 1, kv_len]);
+
+        let mut pooled: Option<UniquePtr<MlxArray>> = None;
+        for qb in 0..num_query_blocks {
+            let q_start = qb * self.block_size;
+            let q_size = (l - q_start).min(self.block_size);
+            let q_slice = mlxcel_core::slice(
+                idx_q,
+                &[0, 0, q_start, 0],
+                &[b, self.num_kv_heads, q_start + q_size, self.index_dim],
+            );
+            let scores = mlxcel_core::matmul(&q_slice, &k_t);
+            let scores = mlxcel_core::multiply_scalar(&scores, scale_idx);
+
+            // Per-position causality BEFORE any pooling (reference order): a
+            // future token must not lift its block's amax for this query.
+            let q_pos = mlxcel_core::arange_f32(
+                (offset + q_start) as f32,
+                (offset + q_start + q_size) as f32,
+                1.0,
+            );
+            let q_pos = mlxcel_core::reshape(&q_pos, &[1, 1, q_size, 1]);
+            let causal = mlxcel_core::less_equal(&key_pos, &q_pos);
+            let neg_inf = mlxcel_core::broadcast_to(
+                &mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, dtype),
+                &[b, self.num_kv_heads, q_size, kv_len],
+            );
+            let scores = mlxcel_core::where_cond(&causal, &scores, &neg_inf);
+
+            // Pad the SCORE axis to the block multiple with -inf.
+            let scores = if pad_k_amt > 0 {
+                let pad = mlxcel_core::broadcast_to(
+                    &mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, dtype),
+                    &[b, self.num_kv_heads, q_size, pad_k_amt],
+                );
+                mlxcel_core::concatenate(&scores, &pad, 3)
+            } else {
+                scores
+            };
+
+            // amax over key positions within each block, then max over the
+            // q-block's query positions (keepdims → one row per q-block).
+            let blocked = mlxcel_core::reshape(
+                &scores,
+                &[
+                    b,
+                    self.num_kv_heads,
+                    q_size,
+                    num_key_blocks,
+                    self.block_size,
+                ],
+            );
+            let per_query = mlxcel_core::max_axis(&blocked, 4, false);
+            let row = mlxcel_core::max_axis(&per_query, 2, true);
+            pooled = Some(match pooled {
+                None => row,
+                Some(acc) => mlxcel_core::concatenate(&acc, &row, 2),
+            });
+        }
+        pooled.expect("num_query_blocks >= 1 on the prefill path")
     }
 
     /// Reference-semantics per-token block selection (transformers
@@ -2738,6 +2788,56 @@ mod tests {
         let mut q1: Vec<i32> = vals[2..4].iter().map(|v| *v as i32).collect();
         q1.sort_unstable();
         assert_eq!(q1, vec![0, 3]);
+    }
+
+    // Prefill scorer semantics, hand-computed on the same fixture as the
+    // per-token test. Pins BOTH audit findings at once:
+    //  - max-of-dots vs coordmax-of-vectors: block1 (single strong token,
+    //    pooled 2.5) must outrank block2 (complementary pair, pooled 1.5);
+    //    the old vector-pooling scorer ranked block2 at 4.0 > block1.
+    //  - per-POSITION causality before pooling: p7 is future for q0; if
+    //    causality were block-level, q0·k7 (= 9.0) would lift block3 from
+    //    0.5 to 9.0.
+    #[test]
+    fn prefill_block_scores_match_hand_computed_reference() {
+        let mut attn = make_test_sparse_attention();
+        attn.num_kv_heads = 1;
+
+        #[rustfmt::skip]
+        let idx_k_vals: Vec<f32> = vec![
+            0.1, 0.0, 0.0, 0.0,
+            0.2, 0.0, 7.0, 0.0,
+            5.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+            4.0, -1.0, 0.0, 0.0,
+            -1.0, 4.0, 0.0, 0.0,
+            0.5, 0.0, 0.0, 0.0,
+            9.0, 9.0, 2.0, 0.0,
+        ];
+        let idx_k = mlxcel_core::from_slice_f32(&idx_k_vals, &[1, 1, 8, 4]);
+        #[rustfmt::skip]
+        let idx_q_vals: Vec<f32> = vec![
+            1.0, 1.0, 0.0, 0.0, // q0 at abs pos 6
+            0.0, 0.0, 0.5, 0.0, // q1 at abs pos 7
+        ];
+        let idx_q = mlxcel_core::from_slice_f32(&idx_q_vals, &[1, 1, 2, 4]);
+
+        // One q-block (l=2, bs=2) over 4 key blocks; scale = 1/√4 = 0.5.
+        let scores = attn.prefill_block_scores(&idx_q, &idx_k, 1, 2, 8, 6);
+        assert_eq!(mlxcel_core::array_shape(&scores), vec![1, 1, 1, 4]);
+        mlxcel_core::eval(&scores);
+        let bytes = mlxcel_core::array_to_raw_bytes(&scores);
+        let vals: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let expected = [1.75_f32, 2.5, 1.5, 0.5];
+        for (i, (got, want)) in vals.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "block {i}: got {got}, want {want} (full row {vals:?})"
+            );
+        }
     }
 
     // Gather-attend equivalence: the sparse decode path must produce
