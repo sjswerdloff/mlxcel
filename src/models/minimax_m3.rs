@@ -2078,6 +2078,24 @@ impl LanguageModel for MiniMaxM3Model {
     fn supports_maskless_padded_prefill(&self) -> bool {
         true
     }
+
+    /// MSA pools query blocks anchored at absolute multiples of
+    /// `block_size` (see `SparseAttention::forward`), so an adopted prefix
+    /// must end on a block boundary or every resumed prefill dispatch
+    /// computes a shifted pooling grid (valid-but-divergent attention vs a
+    /// cold prefill — the cycle-83 unaligned-adoption finding).
+    ///
+    /// Reads the CONSTRUCTED layers, not parse-time config: if no layer
+    /// carries index projections (sparse attention absent or disabled at
+    /// load), every prefill dispatch is dense and no alignment constraint
+    /// exists, so the default quantum of 1 is returned.
+    fn prefill_alignment(&self) -> usize {
+        self.layers
+            .iter()
+            .find(|layer| layer.self_attn.index_q_proj.is_some())
+            .map(|layer| (layer.self_attn.block_size.max(1)) as usize)
+            .unwrap_or(1)
+    }
 }
 
 #[cfg(test)]
@@ -3004,6 +3022,105 @@ mod tests {
         }
         mlxcel_core::eval(&acc);
         mlxcel_core::item_f32(&acc).sqrt()
+    }
+
+    /// Assemble a miniature MiniMaxM3Model around the supplied decoder
+    /// layers. Dimensions match make_test_sparse_attention (hidden = 16);
+    /// vocab is a tiny 8 rows. prefill_alignment() only inspects
+    /// `layers[..].self_attn`, so embed/norm/lm_head just need to be valid
+    /// constructions — forward() is never called on this model.
+    fn make_test_m3_model(layers: Vec<DecoderLayer>) -> MiniMaxM3Model {
+        let vocab = 8;
+        let hidden = 16;
+        // Deterministic sin-based embedding table, same pattern as
+        // make_linear: values spread positive/negative without random.
+        let n = (vocab * hidden) as usize;
+        let mut data = Vec::with_capacity(n);
+        for i in 0..n {
+            data.push((i as f32 * 0.137).sin() * 0.1);
+        }
+        let weight = mlxcel_core::from_slice_f32(&data, &[vocab, hidden]);
+        MiniMaxM3Model {
+            embed_tokens: UnifiedEmbedding::Regular(mlxcel_core::layers::Embedding::new(weight)),
+            layers,
+            norm: make_gemma_rms_norm(hidden),
+            lm_head: None,
+        }
+    }
+
+    #[test]
+    fn prefill_alignment_first_msa_layer_supplies_block_quantum() {
+        // Production M3 has dense layers 0-2 before its first MSA layer, so
+        // prefill_alignment must skip leading dense layers and read
+        // block_size from the FIRST MSA-eligible layer (index_q_proj is
+        // Some). Miniature: layers[0] dense, layers[1] MSA with
+        // block_size = 2 (128 in the production config; 2 here).
+        //
+        // Red-capability: if the override were deleted (trait default),
+        // this returns 1 and the assertion fails.
+        let mut dense_attn = make_test_sparse_attention();
+        dense_attn.index_q_proj = None;
+        dense_attn.index_k_proj = None;
+        dense_attn.index_q_norm = None;
+        dense_attn.index_k_norm = None;
+        dense_attn.layer_idx = 0;
+
+        let mut msa_attn = make_test_sparse_attention();
+        msa_attn.layer_idx = 1;
+        assert_eq!(msa_attn.block_size, 2, "helper contract: block_size = 2");
+
+        let layers = vec![
+            DecoderLayer {
+                self_attn: dense_attn,
+                mlp: None,
+                moe: None,
+                input_layernorm: make_gemma_rms_norm(16),
+                post_attention_layernorm: make_gemma_rms_norm(16),
+                layer_idx: 0,
+            },
+            DecoderLayer {
+                self_attn: msa_attn,
+                mlp: None,
+                moe: None,
+                input_layernorm: make_gemma_rms_norm(16),
+                post_attention_layernorm: make_gemma_rms_norm(16),
+                layer_idx: 1,
+            },
+        ];
+        let model = make_test_m3_model(layers);
+
+        // The quantum comes from the constructed MSA layer's block_size,
+        // skipping the leading dense layer exactly as production M3 skips
+        // dense layers 0-2.
+        assert_eq!(model.prefill_alignment(), 2);
+    }
+
+    #[test]
+    fn prefill_alignment_dense_only_model_returns_one() {
+        // An M3 whose sparse attention is absent (or disabled at load) has
+        // no MSA-eligible layer: every index_q_proj is None. It imposes no
+        // adoption constraint — prefill_alignment must return 1, preserving
+        // the unconstrained prefill path.
+        let mut layers = Vec::new();
+        for layer_idx in 0..2usize {
+            let mut dense_attn = make_test_sparse_attention();
+            dense_attn.index_q_proj = None;
+            dense_attn.index_k_proj = None;
+            dense_attn.index_q_norm = None;
+            dense_attn.index_k_norm = None;
+            dense_attn.layer_idx = layer_idx;
+            layers.push(DecoderLayer {
+                self_attn: dense_attn,
+                mlp: None,
+                moe: None,
+                input_layernorm: make_gemma_rms_norm(16),
+                post_attention_layernorm: make_gemma_rms_norm(16),
+                layer_idx,
+            });
+        }
+        let model = make_test_m3_model(layers);
+
+        assert_eq!(model.prefill_alignment(), 1);
     }
 
     #[test]

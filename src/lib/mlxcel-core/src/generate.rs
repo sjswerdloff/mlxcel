@@ -414,6 +414,32 @@ pub trait LanguageModel {
         Err("model does not support exact-prefix state snapshots".to_string())
     }
 
+    /// Alignment quantum, in tokens, that an adopted/resumed prefill prefix
+    /// must respect for this model's attention to be position-consistent.
+    ///
+    /// Most models attend identically regardless of where a resumed prefill
+    /// starts, so the default of `1` imposes no constraint and keeps the
+    /// prompt-cache adoption path bit-exact with pre-existing behavior.
+    ///
+    /// Models whose attention derives structure from ABSOLUTE position
+    /// blocking must override this with their block quantum. Concretely,
+    /// MiniMax-M3's Multi-head Sparse Attention pools query blocks anchored
+    /// at multiples of `sparse_block_size` (128): a cached prefix adopted at
+    /// a non-multiple offset shifts the pooling grid for every subsequent
+    /// chunked-prefill dispatch, producing valid-but-divergent attention
+    /// relative to a cold prefill of the same tokens (observed as rel-L2
+    /// ≈ 1.13 at layer scale, and paragraph-level repetition loops at
+    /// conversation depth). DeepSeek-V4 CSA/HCA (trim quantum 128) is the
+    /// expected second user.
+    ///
+    /// Used by: the server batch scheduler's `try_adopt_cached_prefix`,
+    /// which floors the matched prefix length to this quantum before any
+    /// adoption (dense truncate, paged clone/trim, or snapshot restore),
+    /// falling back to a cold prefill of the floored remainder.
+    fn prefill_alignment(&self) -> usize {
+        1
+    }
+
     /// Describe how one sequence's runtime state should be allocated.
     ///
     /// Phase 0 keeps the default behavior aligned with today's

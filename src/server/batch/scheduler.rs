@@ -112,6 +112,40 @@ fn vlm_prefix_sharing_allowed(enabled: bool, is_multimodal: bool, has_videos: bo
     enabled && is_multimodal && !has_videos
 }
 
+/// Floor a raw longest-prefix cache match to the model's prefill-alignment
+/// quantum (see [`LanguageModel::prefill_alignment`]).
+///
+/// Returns the token length an adoption may cover, or `None` to decline to
+/// a cold prefill.
+///
+/// `alignment <= 1` is the identity: the raw match is returned untouched,
+/// preserving bit-exact pre-alignment behavior for every position-agnostic
+/// model (the store already enforced its minimum prefix at lookup time, so
+/// no re-check happens on this path). For `alignment > 1` (MSA-class
+/// models) the match floors to the quantum; a floored result below
+/// `min_prefix` (or zero) declines, because adopting a misaligned prefix
+/// would shift the model's pooling grid for every resumed prefill dispatch
+/// — degraded speed is acceptable, divergent attention is not.
+///
+/// Kept as one pure function (same pattern as
+/// [`vlm_prefix_sharing_allowed`]) so the safety condition is pinned by
+/// unit tests a future edit cannot silently weaken.
+#[inline]
+pub(crate) fn align_matched_prefix(
+    raw_matched: usize,
+    alignment: usize,
+    min_prefix: usize,
+) -> Option<usize> {
+    if alignment <= 1 {
+        return Some(raw_matched);
+    }
+    let floored = (raw_matched / alignment) * alignment;
+    if floored < min_prefix.max(1) {
+        return None;
+    }
+    Some(floored)
+}
+
 fn effective_decode_storage_backend(
     requested: DecodeStorageBackend,
     max_batch_size: usize,
@@ -1293,6 +1327,13 @@ impl BatchScheduler {
 
         let store = self.prompt_cache.as_ref()?.clone();
         let key = Self::compose_prompt_cache_key(ctx, tokens);
+        // Model-declared adoption quantum (default 1 = unconstrained; see
+        // `LanguageModel::prefill_alignment`). MSA-class models (M3) return
+        // their sparse block size: a prefix adopted off a block boundary
+        // shifts the query-pooling grid for every resumed prefill dispatch,
+        // so every adoption path below floors `matched_len` to this quantum
+        // and re-prefills the remainder instead of resuming misaligned.
+        let alignment = self.model.prefill_alignment().max(1);
         // Diagnostic logging for cache lookup. Logs the first 16 token IDs and
         // the key components (model_id, lora_id, template_sig, session_key,
         // mm_digest_hex) so an operator can diff EVERY namespace input across
@@ -1316,6 +1357,23 @@ impl BatchScheduler {
         if self.model.supports_snapshot_reuse()
             && let Some((snapshot_entry, matched_len)) = store.lookup_snapshot_prefix(&key, tokens)
         {
+            // A snapshot restores model-owned state whole — it cannot be
+            // truncated to an aligned length the way detached KV can. If a
+            // model ever declares both snapshot reuse AND an alignment
+            // quantum, an off-quantum snapshot is declined outright to a
+            // cold prefill (NOT the KV-entry path below: a snapshot-reuse
+            // model's detached-KV adoption validity is untested, and cold
+            // prefill is always correct). Defensive today: no current model
+            // sets both (M3 is KV-path; snapshot users are recurrent-state
+            // families with alignment 1).
+            if alignment > 1 && matched_len % alignment != 0 {
+                tracing::info!(
+                    matched = matched_len,
+                    alignment,
+                    "prompt-cache: snapshot match off the model's prefill alignment; skipping snapshot reuse"
+                );
+                return None;
+            }
             let seq_id = match self.allocate_sequence_state() {
                 Ok(id) => id,
                 Err(err) => {
@@ -1372,12 +1430,48 @@ impl BatchScheduler {
                 return None;
             }
         };
+        // Floor the raw match to the model's prefill alignment BEFORE any
+        // consumer sees it. This covers BOTH unaligned entry points on the
+        // dense path: a partial match (floored value flows into the existing
+        // `truncate_to` branch) and a whole-entry match on an entry whose
+        // stored length is itself unaligned (the cycle-83 `cached=160` case:
+        // pre-floor, `matched_len == seq_len` skipped truncation and adopted
+        // the misaligned prefix bit-exact). `alignment == 1` (every
+        // non-MSA model) takes the untouched value and preserves today's
+        // behavior exactly, including the bit-exact whole-entry skip. A
+        // match floored below the store's minimum prefix declines to a cold
+        // prefill — degraded speed, never a misaligned pooling grid.
+        let matched_len = match align_matched_prefix(
+            matched_len,
+            alignment,
+            store.min_prefix_tokens(),
+        ) {
+            Some(aligned) => {
+                if aligned < matched_len {
+                    tracing::info!(
+                        raw = matched_len,
+                        floored = aligned,
+                        alignment,
+                        "prompt-cache: floored matched prefix to the model's prefill alignment"
+                    );
+                }
+                aligned
+            }
+            None => {
+                tracing::info!(
+                    raw = matched_len,
+                    alignment,
+                    "prompt-cache: alignment-floored match below minimum prefix; falling back to cold prefill"
+                );
+                return None;
+            }
+        };
         // #124 step c: multimodal sharing requires the matched prefix to cover
-        // the ENTIRE stored entry. A partial (e.g. APC block-clamped) match
-        // could leave image/audio placeholder tokens in the suffix, which the
-        // token-path suffix prefill would mis-handle. Decline here (falling
-        // back to a cold prefill) before consuming anything; the entry stays
-        // available for a later exact match.
+        // the ENTIRE stored entry. A partial (e.g. APC block-clamped, or
+        // alignment-floored) match could leave image/audio placeholder tokens
+        // in the suffix, which the token-path suffix prefill would mis-handle.
+        // Decline here (falling back to a cold prefill) before consuming
+        // anything; the entry stays available for a later exact match.
         if require_whole_entry && matched_len < entry.tokens.len() {
             return None;
         }
@@ -1410,6 +1504,15 @@ impl BatchScheduler {
         let clone_attempt: Option<PagedCloneOutcome> = entry.with_detached(|set| match set {
             DetachedKvSet::Paged(paged) if backend_is_paged && paged.clone_eligible() => {
                 let block_size = paged.layout().block_size.max(1);
+                // The pool-block floor below only preserves the model's
+                // alignment floor when one quantum divides the other
+                // (128 | 128 today; V4-class models are also expected to
+                // declare 128). A model breaking this invariant needs an
+                // LCM floor here instead — catch it in debug builds.
+                debug_assert!(
+                    alignment == 1 || block_size.is_multiple_of(alignment) || alignment.is_multiple_of(block_size),
+                    "prefill_alignment {alignment} and pool block size {block_size} must divide one another"
+                );
                 // Floor BOTH the partial and the whole-entry match to the
                 // pool block boundary: a donated entry's length
                 // (prompt + generated tokens) is almost never block-aligned,
@@ -1518,6 +1621,13 @@ impl BatchScheduler {
                 // the pre-#225 path.
                 let paged_seq_len = paged.seq_len();
                 let block_size = paged.layout().block_size.max(1);
+                // Same divisibility invariant as the clone path above: the
+                // pool-block floor must not un-align a value already floored
+                // to the model's prefill alignment.
+                debug_assert!(
+                    alignment == 1 || block_size.is_multiple_of(alignment) || alignment.is_multiple_of(block_size),
+                    "prefill_alignment {alignment} and pool block size {block_size} must divide one another"
+                );
                 let adoptable = if matched_len < paged_seq_len {
                     (matched_len / block_size) * block_size
                 } else {
