@@ -2006,6 +2006,7 @@ impl MiniMaxM3Model {
         args: &ModelArgs,
         prefix: &str,
     ) -> Result<Self, String> {
+        validate_sparse_attention_config(args)?;
         let g = args.group_size();
         let b = args.bits();
         let embed_tokens =
@@ -2048,6 +2049,60 @@ fn get_weight(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, St
         .get(name)
         .map(|w| mlxcel_core::copy(w))
         .ok_or_else(|| format!("Weight not found: {}", name))
+}
+
+/// Refuse to build an M3 whose sparse-attention config declares semantics
+/// this implementation does not honor. Every existing M3 checkpoint passes
+/// (init_block 0, score_type "max", disable_index_value 1 on all
+/// MSA-eligible layers, num_index_heads == num_kv_heads == 4); a future
+/// checkpoint that changes any of these would previously have been served
+/// with silently wrong attention — the same silent-misload class as the
+/// un-repacked-MXFP8 case, refused the same way (2026-07-05 MSA audit).
+fn validate_sparse_attention_config(args: &ModelArgs) -> Result<(), String> {
+    let cfg = &args.text_config;
+    let sac = &cfg.sparse_attention_config;
+    if !sac.use_sparse_attention {
+        // Dense-only serving has no unsupported-semantics surface.
+        return Ok(());
+    }
+    if sac.sparse_init_block > 0 {
+        return Err(format!(
+            "sparse_init_block = {} declared but forced init/sink blocks are \
+             not implemented (this engine forces none, matching init_block 0); \
+             serving this checkpoint would silently drop its trained sink",
+            sac.sparse_init_block
+        ));
+    }
+    if sac.sparse_score_type != "max" {
+        return Err(format!(
+            "sparse_score_type = {:?} declared but block scoring is \
+             implemented for \"max\" only; serving would silently use the \
+             wrong pooling",
+            sac.sparse_score_type
+        ));
+    }
+    if sac.sparse_num_index_heads != cfg.num_key_value_heads {
+        return Err(format!(
+            "sparse_num_index_heads ({}) != num_key_value_heads ({}): the \
+             indexer is implemented with one index head per KV head (GQA \
+             group); a checkpoint decoupling them would be silently mis-served",
+            sac.sparse_num_index_heads, cfg.num_key_value_heads
+        ));
+    }
+    for layer_idx in 0..cfg.num_hidden_layers {
+        if args.use_msa_for_layer(layer_idx)
+            && layer_idx < sac.sparse_disable_index_value.len()
+            && !sac.sparse_disable_index_value[layer_idx]
+        {
+            return Err(format!(
+                "layer {layer_idx}: sparse_disable_index_value = 0 declares an \
+                 indexer VALUE path (index_v/index_o) that is not implemented \
+                 (all existing checkpoints are score-only); serving would \
+                 silently drop the value path"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl LanguageModel for MiniMaxM3Model {
@@ -2169,6 +2224,109 @@ mod tests {
         assert!(!args.use_msa_for_layer(2));
         assert!(args.use_msa_for_layer(3));
         assert!(args.use_msa_for_layer(59));
+    }
+
+    /// Build ModelArgs from a small config, optionally overriding
+    /// sparse_attention_config keys, for the validation-guard tests.
+    fn guard_test_args(overrides: &[(&str, serde_json::Value)]) -> ModelArgs {
+        let mut config: serde_json::Value = serde_json::json!({
+            "text_config": {
+                "hidden_size": 64,
+                "intermediate_size": 32,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "head_dim": 8,
+                "vocab_size": 128,
+                "rms_norm_eps": 1e-06,
+                "rope_theta": 5000000,
+                "rotary_dim": 4,
+                "partial_rotary_factor": 0.5,
+                "use_qk_norm": true,
+                "tie_word_embeddings": false,
+                "dense_intermediate_size": 64,
+                "shared_intermediate_size": 32,
+                "scoring_func": "sigmoid",
+                "use_routing_bias": true,
+                "qk_norm_type": "per_head",
+                "swiglu_alpha": 1.702,
+                "swiglu_limit": 7.0,
+                "routed_scaling_factor": 2.0,
+                "num_local_experts": 4,
+                "num_experts_per_tok": 2,
+                "n_shared_experts": 1,
+                "moe_layer_freq": [0, 1, 1, 1],
+                "sparse_attention_config": {
+                    "use_sparse_attention": true,
+                    "sparse_index_dim": 8,
+                    "sparse_num_index_heads": 4,
+                    "sparse_topk_blocks": 2,
+                    "sparse_block_size": 2,
+                    "sparse_score_type": "max",
+                    "sparse_init_block": 0,
+                    "sparse_local_block": 1,
+                    "sparse_disable_index_value": [0, 1, 1, 1],
+                    "sparse_attention_freq": [0, 1, 1, 1]
+                }
+            }
+        });
+        for (key, value) in overrides {
+            config["text_config"]["sparse_attention_config"][*key] = value.clone();
+        }
+        serde_json::from_value(config).expect("guard test config must parse")
+    }
+
+    // Every guard must be red-capable: the matching declared-but-unsupported
+    // semantics must REFUSE the build (silently mis-serving a checkpoint is
+    // the failure class this exists to prevent — 2026-07-05 MSA audit), and
+    // the real-checkpoint shape must pass.
+    #[test]
+    fn sparse_config_guards_refuse_unsupported_semantics() {
+        // Real shape (matches every existing M3 checkpoint): passes.
+        assert!(validate_sparse_attention_config(&guard_test_args(&[])).is_ok());
+
+        // init_block > 0: we force no sink; refusing beats silently dropping it.
+        let err = validate_sparse_attention_config(&guard_test_args(&[(
+            "sparse_init_block",
+            serde_json::json!(1),
+        )]))
+        .unwrap_err();
+        assert!(err.contains("sparse_init_block"), "got: {err}");
+
+        // score_type other than "max": pooling semantics unimplemented.
+        let err = validate_sparse_attention_config(&guard_test_args(&[(
+            "sparse_score_type",
+            serde_json::json!("mean"),
+        )]))
+        .unwrap_err();
+        assert!(err.contains("sparse_score_type"), "got: {err}");
+
+        // disable_index_value = 0 on an MSA-eligible layer: value path
+        // unimplemented. (Index 1 is MSA-eligible in the fixture; index 0 is
+        // dense and its 0 entry must NOT trip the guard — checked by the
+        // passing default above.)
+        let err = validate_sparse_attention_config(&guard_test_args(&[(
+            "sparse_disable_index_value",
+            serde_json::json!([0, 0, 1, 1]),
+        )]))
+        .unwrap_err();
+        assert!(err.contains("disable_index_value"), "got: {err}");
+
+        // index-head count decoupled from KV heads: unimplemented layout.
+        let err = validate_sparse_attention_config(&guard_test_args(&[(
+            "sparse_num_index_heads",
+            serde_json::json!(8),
+        )]))
+        .unwrap_err();
+        assert!(err.contains("sparse_num_index_heads"), "got: {err}");
+
+        // Sparse disabled entirely: no unsupported surface, always passes.
+        let mut args = guard_test_args(&[]);
+        args.text_config
+            .sparse_attention_config
+            .use_sparse_attention = false;
+        args.text_config.sparse_attention_config.sparse_init_block = 7;
+        assert!(validate_sparse_attention_config(&args).is_ok());
     }
 
     /// mlx-community MiniMax-M3 exports (produced by `mlx_lm.convert`)
