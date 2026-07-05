@@ -422,20 +422,19 @@ impl SparseAttention {
         // Dispatch decision — shape-based, with the broken-lockstep fall-
         // through baked into `cached_idx_k.is_none()`:
         //   * non-MSA-eligible layer: dense (dense layers 0-2 in M3)
-        //   * MSA layer with `l <= block_size`: dense (single-block decode)
         //   * MSA layer with `num_key_blocks <= top_k`: dense (saturation —
         //     sparse-selecting all blocks reduces to dense)
         //   * broken lockstep (cached_idx_k is None): dense
-        //   * else: MSA
-        if !is_msa_eligible_layer
-            || l <= self.block_size
-            || num_key_blocks <= self.top_k
-            || cached_idx_k.is_none()
-        {
+        //   * MSA layer with `l <= block_size` (every decode step): the
+        //     reference per-token sparse path. Pre-audit (2026-07-05) this
+        //     dispatched DENSE over the full cache — attention statistics
+        //     the model never trained on, degrading long generations; the
+        //     transformers reference has no dense fallback and runs sparse
+        //     selection identically at q_len = 1.
+        //   * else: MSA (block-pooled chunked prefill)
+        if !is_msa_eligible_layer || num_key_blocks <= self.top_k || cached_idx_k.is_none() {
             let reason = if !is_msa_eligible_layer {
                 "no_index_proj"
-            } else if l <= self.block_size {
-                "l_le_block_size"
             } else if num_key_blocks <= self.top_k {
                 "num_key_blocks_le_top_k"
             } else {
@@ -457,6 +456,34 @@ impl SparseAttention {
                 "attn.dispatch"
             );
             return self.dense_attention(&q, &cache_k, &cache_v, mask);
+        }
+
+        if l <= self.block_size {
+            debug!(
+                layer = self.layer_idx,
+                b = b,
+                l = l,
+                kv_len = kv_len,
+                block_size = self.block_size,
+                num_key_blocks = num_key_blocks,
+                top_k = self.top_k,
+                main_offset = offset,
+                indexer_offset = cache.m3_idx_offset(),
+                branch = "msa_decode",
+                "attn.dispatch"
+            );
+            let idx_k = cached_idx_k.unwrap();
+            return self.sparse_decode_attention(
+                x,
+                &q,
+                &cache_k,
+                &cache_v,
+                &idx_k,
+                b,
+                l,
+                kv_len,
+                cache_offset_at_chunk_start,
+            );
         }
 
         debug!(
@@ -482,17 +509,8 @@ impl SparseAttention {
 
         // Compute idx_q for the current chunk. idx_q is per-forward (no
         // caching) because the selector only operates on the current query
-        // positions.
-        let idx_q_raw = self.index_q_proj.as_ref().unwrap().forward(x);
-        let idx_q = mlxcel_core::reshape(&idx_q_raw, &[b, l, self.num_kv_heads, self.index_dim]);
-        let idx_q = if let Some(ref n) = self.index_q_norm {
-            n.forward(&idx_q)
-        } else {
-            idx_q
-        };
-        let idx_q = mlxcel_core::transpose_axes(&idx_q, &[0, 2, 1, 3]);
-        let idx_q =
-            mlxcel_core::fast_rope(&idx_q, self.rope_dims, false, self.rope_base, 1.0, offset);
+        // positions. Shared pipeline with the per-token decode path.
+        let idx_q = self.project_index_queries(x, b, l, offset);
 
         // Pad idx_q (to padded_q_len) and idx_k (to padded_k_len) with -inf
         // so the upcoming block reshape and max-pool can never let padded
@@ -784,6 +802,323 @@ impl SparseAttention {
         let pos_inf = mlxcel_core::broadcast_to(&pos_inf, &[s[0], s[1], s[2], s[3]]);
 
         mlxcel_core::where_cond(&is_local, &pos_inf, scores)
+    }
+
+    /// Project, normalize, and RoPE the indexer queries for the current
+    /// chunk. Shared by the block-pooled prefill selection and the
+    /// per-token decode selection so the two paths can never drift on the
+    /// idx_q pipeline (reshape → per-head Gemma norm → transpose → partial
+    /// RoPE at the chunk's absolute offset).
+    fn project_index_queries(
+        &self,
+        x: &MlxArray,
+        b: i32,
+        l: i32,
+        offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        let idx_q_raw = self.index_q_proj.as_ref().unwrap().forward(x);
+        let idx_q = mlxcel_core::reshape(&idx_q_raw, &[b, l, self.num_kv_heads, self.index_dim]);
+        let idx_q = if let Some(ref n) = self.index_q_norm {
+            n.forward(&idx_q)
+        } else {
+            idx_q
+        };
+        let idx_q = mlxcel_core::transpose_axes(&idx_q, &[0, 2, 1, 3]);
+        mlxcel_core::fast_rope(&idx_q, self.rope_dims, false, self.rope_base, 1.0, offset)
+    }
+
+    /// Reference-semantics per-token block selection (transformers
+    /// `minimax_m3_vl`): per-position score matmul idx_q·idx_k, per-position
+    /// causal mask, THEN amax over the key positions inside each 128-block,
+    /// local-block force, top-k per query token per index head.
+    ///
+    /// This is the selection the model trained with. It differs from the
+    /// prefill path's q-block-pooled selection in two deliberate ways it
+    /// avoids: no pooling over query positions (each token gets its own
+    /// top-k) and no coordinate-wise max over raw index_k VECTORS before the
+    /// dot product (max-of-dots, not dot-of-coordmaxes — the latter scores
+    /// blocks by a composite profile no real token has).
+    ///
+    /// Returns absolute key-block indices, shape
+    /// `[b, num_kv_heads, l, top_k]`, for queries at absolute positions
+    /// `offset..offset+l` against `kv_len` cached keys.
+    fn per_token_block_selection(
+        &self,
+        idx_q: &MlxArray,
+        idx_k: &MlxArray,
+        b: i32,
+        l: i32,
+        kv_len: i32,
+        offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        let num_key_blocks = (kv_len + self.block_size - 1) / self.block_size;
+        let padded_k_len = num_key_blocks * self.block_size;
+        let pad_k_amt = padded_k_len - kv_len;
+
+        // Per-position scores [b, H_idx, l, kv_len]; idx_k's single shared
+        // head broadcasts across the H_idx index heads. The 1/√index_dim
+        // scale is monotonic (selection-order-equivalent to the reference's
+        // raw dots); kept for numeric consistency with the prefill scorer.
+        let k_t = mlxcel_core::transpose_axes(idx_k, &[0, 1, 3, 2]);
+        let scores = mlxcel_core::matmul(idx_q, &k_t);
+        let scale_idx = 1.0 / (self.index_dim as f32).sqrt();
+        let scores = mlxcel_core::multiply_scalar(&scores, scale_idx);
+
+        // Per-position causality BEFORE pooling (the reference order): key
+        // position p_k > query position p_q ⇒ -inf, so a future token can
+        // never win its block's amax.
+        let dtype = mlxcel_core::array_dtype(&scores);
+        let key_pos = mlxcel_core::arange_f32(0.0, kv_len as f32, 1.0);
+        let key_pos = mlxcel_core::reshape(&key_pos, &[1, 1, 1, kv_len]);
+        let q_pos = mlxcel_core::arange_f32(offset as f32, (offset + l) as f32, 1.0);
+        let q_pos = mlxcel_core::reshape(&q_pos, &[1, 1, l, 1]);
+        let causal = mlxcel_core::less_equal(&key_pos, &q_pos);
+        let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, dtype);
+        let neg_inf_b = mlxcel_core::broadcast_to(&neg_inf, &[b, self.num_kv_heads, l, kv_len]);
+        let scores = mlxcel_core::where_cond(&causal, &scores, &neg_inf_b);
+
+        // Pad the SCORE axis (not the idx_k vectors) to the block multiple
+        // with -inf so padded positions can never win the amax.
+        let scores = if pad_k_amt > 0 {
+            let pad = mlxcel_core::broadcast_to(
+                &mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, dtype),
+                &[b, self.num_kv_heads, l, pad_k_amt],
+            );
+            mlxcel_core::concatenate(&scores, &pad, 3)
+        } else {
+            scores
+        };
+
+        // amax over key positions within each block → [b, H_idx, l, nkb].
+        let blocked = mlxcel_core::reshape(
+            &scores,
+            &[b, self.num_kv_heads, l, num_key_blocks, self.block_size],
+        );
+        let block_scores = mlxcel_core::max_axis(&blocked, 4, false);
+
+        // Local-block guarantee per TOKEN: the token's own block (and
+        // sparse_local_block-1 predecessors) forced to +inf. Own block is
+        // exact per token — no pooled-anchor approximation needed on this
+        // path.
+        let block_scores = if self.sparse_local_block > 0 {
+            let own: Vec<f32> = (0..l)
+                .map(|i| ((offset + i) / self.block_size) as f32)
+                .collect();
+            let own = mlxcel_core::from_slice_f32(&own, &[1, 1, l, 1]);
+            let kb_pos = mlxcel_core::arange_f32(0.0, num_key_blocks as f32, 1.0);
+            let kb_pos = mlxcel_core::reshape(&kb_pos, &[1, 1, 1, num_key_blocks]);
+            let causal_b = mlxcel_core::less_equal(&kb_pos, &own);
+            let window = mlxcel_core::full_f32(
+                &[1],
+                self.sparse_local_block as f32,
+                mlxcel_core::dtype::FLOAT32,
+            );
+            let lower = mlxcel_core::subtract(&own, &window);
+            let within = mlxcel_core::greater(&kb_pos, &lower);
+            let is_local = mlxcel_core::logical_and(&causal_b, &within);
+            let pos_inf = mlxcel_core::broadcast_to(
+                &mlxcel_core::full_f32(&[1], f32::INFINITY, dtype),
+                &[b, self.num_kv_heads, l, num_key_blocks],
+            );
+            mlxcel_core::where_cond(&is_local, &pos_inf, &block_scores)
+        } else {
+            block_scores
+        };
+
+        // Top-k per token per index head → [b, H_idx, l, top_k].
+        let neg_scores = mlxcel_core::negative(&block_scores);
+        let partitioned = mlxcel_core::argpartition(&neg_scores, self.top_k - 1, -1);
+        mlxcel_core::slice(
+            &partitioned,
+            &[0, 0, 0, 0],
+            &[b, self.num_kv_heads, l, self.top_k],
+        )
+    }
+
+    /// Reference-equivalent sparse attention for short chunks
+    /// (`l <= block_size`, which includes every decode step). Before the
+    /// 2026-07-05 audit these chunks dispatched DENSE over the full cache —
+    /// attention statistics the model never trained on, degrading long
+    /// generations (the transformers reference runs sparse selection
+    /// identically at q_len = 1; no dense fallback exists upstream).
+    ///
+    /// Per token: reference per-token selection, gather the selected key
+    /// blocks (+ the forced local block), attend over the ~(top_k ×
+    /// block_size) gathered positions with the `p_k > p_q ⇒ -inf` unified
+    /// rule (subsumes within-block causality and divisibility padding).
+    #[allow(clippy::too_many_arguments)]
+    fn sparse_decode_attention(
+        &self,
+        x: &MlxArray,
+        q: &MlxArray,
+        k: &MlxArray,
+        v: &MlxArray,
+        idx_k: &MlxArray,
+        b: i32,
+        l: i32,
+        kv_len: i32,
+        offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        let idx_q = self.project_index_queries(x, b, l, offset);
+        let selected = self.per_token_block_selection(&idx_q, idx_k, b, l, kv_len, offset);
+
+        let num_key_blocks = (kv_len + self.block_size - 1) / self.block_size;
+        let padded_k_len = num_key_blocks * self.block_size;
+        let pad_k_amt = padded_k_len - kv_len;
+        let kv_per_token = self.top_k * self.block_size;
+
+        // Zero-pad K/V to the block multiple (padded positions are masked
+        // out by the position rule below before softmax).
+        let (k_p, v_p);
+        let (k, v): (&MlxArray, &MlxArray) = if pad_k_amt > 0 {
+            let kv_dtype = mlxcel_core::array_dtype(k);
+            let pad = mlxcel_core::full_f32(
+                &[b, self.num_kv_heads, pad_k_amt, self.head_dim],
+                0.0,
+                kv_dtype,
+            );
+            k_p = mlxcel_core::concatenate(k, &pad, 2);
+            v_p = mlxcel_core::concatenate(v, &pad, 2);
+            (&k_p, &v_p)
+        } else {
+            (k, v)
+        };
+
+        // Per-token gather of the selected key blocks.
+        // K/V blocked [b, H, nkb, bs, hd] → broadcast a query axis →
+        // take_along_axis on the block axis with per-token indices.
+        let kb_target = [
+            b,
+            self.num_kv_heads,
+            l,
+            num_key_blocks,
+            self.block_size,
+            self.head_dim,
+        ];
+        // The query axis MUST be inserted by reshape before broadcasting:
+        // broadcast_to aligns trailing dims, so broadcasting the 5-D blocked
+        // tensor straight to the 6-D target aligns kv-heads against `l`,
+        // scrambling heads across tokens (caught by the masked-dense
+        // equivalence test; aborts outright when num_kv_heads != l).
+        let k_blocked = mlxcel_core::broadcast_to(
+            &mlxcel_core::reshape(
+                k,
+                &[
+                    b,
+                    self.num_kv_heads,
+                    1,
+                    num_key_blocks,
+                    self.block_size,
+                    self.head_dim,
+                ],
+            ),
+            &kb_target,
+        );
+        let v_blocked = mlxcel_core::broadcast_to(
+            &mlxcel_core::reshape(
+                v,
+                &[
+                    b,
+                    self.num_kv_heads,
+                    1,
+                    num_key_blocks,
+                    self.block_size,
+                    self.head_dim,
+                ],
+            ),
+            &kb_target,
+        );
+        let sel_view = [b, self.num_kv_heads, l, self.top_k, 1, 1];
+        let sel_target = [
+            b,
+            self.num_kv_heads,
+            l,
+            self.top_k,
+            self.block_size,
+            self.head_dim,
+        ];
+        let sel_b =
+            mlxcel_core::broadcast_to(&mlxcel_core::reshape(&selected, &sel_view), &sel_target);
+        let k_g = mlxcel_core::take_along_axis(&k_blocked, &sel_b, 3);
+        let v_g = mlxcel_core::take_along_axis(&v_blocked, &sel_b, 3);
+        let k_g = mlxcel_core::reshape(
+            &k_g,
+            &[b, self.num_kv_heads, l, kv_per_token, self.head_dim],
+        );
+        let v_g = mlxcel_core::reshape(
+            &v_g,
+            &[b, self.num_kv_heads, l, kv_per_token, self.head_dim],
+        );
+
+        // Absolute positions of the gathered slots, via the SAME gather as
+        // K (guaranteed consistent): arange over the padded axis, blocked,
+        // taken along the block axis with the same indices.
+        let pos_full = mlxcel_core::arange_f32(0.0, padded_k_len as f32, 1.0);
+        let pos_blocked = mlxcel_core::broadcast_to(
+            &mlxcel_core::reshape(&pos_full, &[1, 1, 1, num_key_blocks, self.block_size, 1]),
+            &[b, self.num_kv_heads, l, num_key_blocks, self.block_size, 1],
+        );
+        let sel_pos_target = [b, self.num_kv_heads, l, self.top_k, self.block_size, 1];
+        let sel_pos_b =
+            mlxcel_core::broadcast_to(&mlxcel_core::reshape(&selected, &sel_view), &sel_pos_target);
+        let pos_g = mlxcel_core::take_along_axis(&pos_blocked, &sel_pos_b, 3);
+        let pos_g = mlxcel_core::reshape(&pos_g, &[b, self.num_kv_heads, l, kv_per_token]);
+
+        // Unified validity: gathered position ≤ query position. Subsumes
+        // within-block causality (the local block contains the future half
+        // of its own block), divisibility padding (pos ≥ kv_len > p_q), and
+        // any future-block leak.
+        let q_pos = mlxcel_core::arange_f32(offset as f32, (offset + l) as f32, 1.0);
+        let q_pos = mlxcel_core::reshape(&q_pos, &[1, 1, l, 1]);
+        let valid = mlxcel_core::less_equal(&pos_g, &q_pos);
+
+        let q_dtype = mlxcel_core::array_dtype(q);
+        let zero = mlxcel_core::full_f32(&[1], 0.0, q_dtype);
+        let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, q_dtype);
+        let zero_b = mlxcel_core::broadcast_to(&zero, &[b, self.num_kv_heads, l, kv_per_token]);
+        let neg_b = mlxcel_core::broadcast_to(&neg_inf, &[b, self.num_kv_heads, l, kv_per_token]);
+        let additive = mlxcel_core::where_cond(&valid, &zero_b, &neg_b);
+
+        // GQA expansion of gathered K/V and the mask to all attention heads
+        // (contiguous grouping: head h uses kv head h / n_rep).
+        let n_rep = self.num_heads / self.num_kv_heads;
+        let expand_kv = |x: &MlxArray| -> UniquePtr<MlxArray> {
+            let x_view = mlxcel_core::reshape(
+                x,
+                &[b, self.num_kv_heads, 1, l, kv_per_token, self.head_dim],
+            );
+            let x_b = mlxcel_core::broadcast_to(
+                &x_view,
+                &[b, self.num_kv_heads, n_rep, l, kv_per_token, self.head_dim],
+            );
+            mlxcel_core::reshape(&x_b, &[b, self.num_heads, l, kv_per_token, self.head_dim])
+        };
+        let k_all = expand_kv(&k_g);
+        let v_all = expand_kv(&v_g);
+        let additive = {
+            let a_view =
+                mlxcel_core::reshape(&additive, &[b, self.num_kv_heads, 1, l, kv_per_token]);
+            let a_b =
+                mlxcel_core::broadcast_to(&a_view, &[b, self.num_kv_heads, n_rep, l, kv_per_token]);
+            let a = mlxcel_core::reshape(&a_b, &[b, self.num_heads, l, kv_per_token]);
+            mlxcel_core::reshape(&a, &[b, self.num_heads, l, 1, kv_per_token])
+        };
+
+        // Per-token attend: q [b, nh, l, 1, hd] × gathered K/V.
+        let q_tok = mlxcel_core::reshape(q, &[b, self.num_heads, l, 1, self.head_dim]);
+        let scores = mlxcel_core::matmul(
+            &q_tok,
+            &mlxcel_core::transpose_axes(&k_all, &[0, 1, 2, 4, 3]),
+        );
+        let scores = mlxcel_core::multiply_scalar(&scores, self.scale);
+        let scores = mlxcel_core::add(&scores, &additive);
+        let weights = mlxcel_core::softmax(&scores, -1);
+        let out = mlxcel_core::matmul(&weights, &v_all);
+
+        let out = mlxcel_core::reshape(&out, &[b, self.num_heads, l, self.head_dim]);
+        let out = mlxcel_core::transpose_axes(&out, &[0, 2, 1, 3]);
+        let out = mlxcel_core::reshape(&out, &[b, l, self.num_heads * self.head_dim]);
+        self.o_proj.forward(&out)
     }
 
     fn sparse_sdpa(
@@ -2327,6 +2662,212 @@ mod tests {
             .use_sparse_attention = false;
         args.text_config.sparse_attention_config.sparse_init_block = 7;
         assert!(validate_sparse_attention_config(&args).is_ok());
+    }
+
+    /// Read an integer-typed selection tensor back as f32 values by
+    /// promoting through an MLX add-with-f32-scalar, then decoding.
+    fn selection_to_f32_vec(selected: &MlxArray) -> Vec<f32> {
+        let zero = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::dtype::FLOAT32);
+        let as_f32 = mlxcel_core::add(selected, &zero);
+        mlxcel_core::eval(&as_f32);
+        let bytes = mlxcel_core::array_to_raw_bytes(&as_f32);
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    // Reference-semantics selection, hand-computed. Geometry: 1 index head,
+    // index_dim 4, block_size 2, top_k 2, local 1; kv_len 8 (4 blocks),
+    // queries at absolute positions 6 and 7 (offset 6, l 2).
+    //
+    // The fixture DISCRIMINATES amax-of-dots (reference) from the prefill
+    // path's coordmax-of-vectors: for q0 = [1,1,0,0], block1 holds one
+    // strongly matching token ([5,0,0,0] → dot 5) while block2 holds two
+    // complementary tokens ([4,-1,0,0], [-1,4,0,0] → dots 3,3 but
+    // coordinate-max [4,4,0,0] → dot 8). Reference ranks block1 > block2;
+    // vector-pooling would rank block2 > block1. If this test goes red
+    // after a scoring change, the coordmax bug is back.
+    //
+    // Causality is pinned by q0 (pos 6): key 7 carries a huge dot for q0's
+    // direction but is in the future half of block 3 — it must not lift
+    // block 3's score (block 3 wins for q0 only via the local force).
+    #[test]
+    fn per_token_selection_matches_hand_computed_reference() {
+        let mut attn = make_test_sparse_attention();
+        attn.num_kv_heads = 1;
+        // block_size 2, top_k 2, index_dim 4, sparse_local_block 1 from the helper.
+
+        #[rustfmt::skip]
+        let idx_k_vals: Vec<f32> = vec![
+            0.1, 0.0, 0.0, 0.0,  // p0  block0
+            0.2, 0.0, 7.0, 0.0,  // p1  block0 (dot 3.5 for q1's direction)
+            5.0, 0.0, 0.0, 0.0,  // p2  block1 (the single strong token)
+            0.0, 0.0, 0.0, 0.0,  // p3  block1
+            4.0, -1.0, 0.0, 0.0, // p4  block2 (complementary pair …)
+            -1.0, 4.0, 0.0, 0.0, // p5  block2 (… coordmax would inflate)
+            0.5, 0.0, 0.0, 0.0,  // p6  block3 (own block for both queries)
+            9.0, 9.0, 2.0, 0.0,  // p7  block3 (future for q0; dot 1 for q1)
+        ];
+        let idx_k = mlxcel_core::from_slice_f32(&idx_k_vals, &[1, 1, 8, 4]);
+        #[rustfmt::skip]
+        let idx_q_vals: Vec<f32> = vec![
+            1.0, 1.0, 0.0, 0.0, // q0 at abs pos 6
+            0.0, 0.0, 0.5, 0.0, // q1 at abs pos 7
+        ];
+        let idx_q = mlxcel_core::from_slice_f32(&idx_q_vals, &[1, 1, 2, 4]);
+
+        let selected = attn.per_token_block_selection(&idx_q, &idx_k, 1, 2, 8, 6);
+        assert_eq!(mlxcel_core::array_shape(&selected), vec![1, 1, 2, 2]);
+        let vals = selection_to_f32_vec(&selected);
+
+        // q0: block3 (local force) + block1 (amax 5 beats block2's amax 3
+        // and block0's 0.2-scale scores). Set comparison — argpartition
+        // order is unspecified.
+        let mut q0: Vec<i32> = vals[0..2].iter().map(|v| *v as i32).collect();
+        q0.sort_unstable();
+        assert_eq!(
+            q0,
+            vec![1, 3],
+            "q0 must pick the single-strong-token block over the \
+             coordmax-inflated pair (amax-of-dots semantics)"
+        );
+
+        // q1 (pos 7, all keys causal): block3 (local force) + block0
+        // (p1 dot 3.5 in q1's direction beats every other block).
+        let mut q1: Vec<i32> = vals[2..4].iter().map(|v| *v as i32).collect();
+        q1.sort_unstable();
+        assert_eq!(q1, vec![0, 3]);
+    }
+
+    // Gather-attend equivalence: the sparse decode path must produce
+    // EXACTLY the attention that dense attention produces when dense is
+    // given an additive mask restricting each query to that query's
+    // selected blocks (causally clipped). Same softmax support ⇒ same
+    // output; this pins the whole per-token gather / GQA-expand / unified
+    // position-mask plumbing against an independently constructed mask.
+    #[test]
+    fn sparse_decode_attention_equals_selection_masked_dense() {
+        let attn = make_test_sparse_attention(); // 4 q heads, 2 kv heads, hd 4, bs 2, top_k 2
+        let hidden = 16;
+        let kv_len_prior = 8; // 4 key blocks (> top_k) before the decode chunk
+        let l = 2; // decode-sized chunk (l <= block_size)
+        let kv_len = kv_len_prior + l; // 10 → 5 blocks
+        let offset = kv_len_prior;
+
+        // Cache A drives the REAL dispatch: prefill (l=8 > bs), then a
+        // decode-sized chunk (l=2 ≤ bs → sparse decode path; 5 key blocks
+        // > top_k 2 keeps it un-saturated).
+        let mut cache_a = KVCache::new();
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let _ = attn.forward(&x_prefill, &mut cache_a, None);
+        assert_eq!(cache_a.offset, kv_len_prior);
+        let x_decode = make_test_input(1, l, hidden);
+        let sparse_out = attn.forward(&x_decode, &mut cache_a, None);
+        mlxcel_core::eval(&sparse_out);
+        assert_eq!(cache_a.offset, kv_len, "decode chunk must be cached");
+
+        // Cache B replays the same inputs but the decode chunk is driven BY
+        // HAND, replicating forward's pre-dispatch pipeline exactly (same
+        // deterministic inputs ⇒ identical cache contents), so the test can
+        // hold the full K/V and idx_k tensors forward never exposes.
+        let mut cache_b = KVCache::new();
+        let _ = attn.forward(&x_prefill, &mut cache_b, None);
+        assert_eq!(cache_b.offset, kv_len_prior);
+
+        // k/v pipeline (forward lines: proj → reshape → per-head norm →
+        // transpose → partial RoPE at chunk offset → update_and_fetch).
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = if let Some(ref n) = attn.k_norm {
+            n.forward(&k)
+        } else {
+            k
+        };
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let (cache_k, cache_v) = cache_b.update_and_fetch(k, v);
+
+        // idx_k pipeline (proj → reshape single head → norm → transpose →
+        // partial RoPE → lockstep append-and-fetch).
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(&x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = if let Some(ref n) = attn.index_k_norm {
+            n.forward(&idx_k)
+        } else {
+            idx_k
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let idx_k_full = cache_b.m3_idx_k_update_and_fetch(&idx_k);
+
+        let idx_q = attn.project_index_queries(&x_decode, 1, l, offset);
+        let selected = attn.per_token_block_selection(&idx_q, &idx_k_full, 1, l, kv_len, offset);
+        let sel = selection_to_f32_vec(&selected); // [1, kvh=2, l=2, top_k=2]
+
+        let num_blocks = (kv_len + attn.block_size - 1) / attn.block_size;
+        let n_rep = (attn.num_heads / attn.num_kv_heads) as usize;
+        let mut mask_vals = vec![f32::NEG_INFINITY; (attn.num_heads * l * kv_len) as usize];
+        for kvh in 0..attn.num_kv_heads as usize {
+            for qi in 0..l as usize {
+                let p_q = offset as usize + qi;
+                for slot in 0..attn.top_k as usize {
+                    let blk = sel
+                        [kvh * (l as usize * attn.top_k as usize) + qi * attn.top_k as usize + slot]
+                        as usize;
+                    assert!(blk < num_blocks as usize, "selected block in range");
+                    for pos in blk * attn.block_size as usize
+                        ..((blk + 1) * attn.block_size as usize).min(kv_len as usize)
+                    {
+                        if pos <= p_q {
+                            for rep in 0..n_rep {
+                                let head = kvh * n_rep + rep;
+                                mask_vals[head * (l as usize * kv_len as usize)
+                                    + qi * kv_len as usize
+                                    + pos] = 0.0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mask = mlxcel_core::from_slice_f32(&mask_vals, &[1, attn.num_heads, l, kv_len]);
+
+        // Rebuild the roped q for the decode chunk the same way forward
+        // does, and take K/V straight from the cache.
+        let q_raw = attn.q_proj.forward(&x_decode);
+        let q = mlxcel_core::reshape(&q_raw, &[1, l, attn.num_heads, attn.head_dim]);
+        let q = if let Some(ref n) = attn.q_norm {
+            n.forward(&q)
+        } else {
+            q
+        };
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let q_probe =
+            mlxcel_core::fast_rope(&q, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let dense_out = attn.dense_attention(&q_probe, &cache_k, &cache_v, Some(&mask));
+        mlxcel_core::eval(&dense_out);
+
+        let diff = output_l2_diff(&sparse_out, &dense_out);
+        assert!(
+            diff < 1e-4,
+            "sparse decode gather-attend must equal selection-masked dense; rel diff {diff}"
+        );
+
+        // And it must NOT equal unmasked dense (blocks were really dropped;
+        // if these match, the path silently reverted to dense attention).
+        let dense_unmasked = attn.dense_attention(&q, &cache_k, &cache_v, None);
+        mlxcel_core::eval(&dense_unmasked);
+        let diff_unmasked = output_l2_diff(&sparse_out, &dense_unmasked);
+        assert!(
+            diff_unmasked > 1e-3,
+            "sparse decode output unexpectedly identical to full dense — \
+             selection dropped nothing (dispatch regression?); diff {diff_unmasked}"
+        );
     }
 
     /// mlx-community MiniMax-M3 exports (produced by `mlx_lm.convert`)
