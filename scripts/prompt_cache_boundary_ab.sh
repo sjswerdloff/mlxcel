@@ -90,7 +90,32 @@ check() {
 # walks the raw match point across a >2-block span and reports the
 # observed (prompt_tokens, cached_tokens) pairs for each request so
 # block-boundary behavior is visible in the output.
-for sentences in 12 20 33 54; do
+#
+# The MSA-discriminating regime needs DEPTH: M3 selects sparse_topk_blocks
+# (16) blocks of sparse_block_size (128) tokens, so below 16*128 = 2048
+# tokens of context every block is selected and MSA is mathematically
+# dense — a shifted pooling grid cannot change a selection that keeps
+# everything. Only the deep sweeps (160/280 sentences, ~2.5-5k tokens)
+# put the top-k selection, the query-pooling grid, and multi-chunk
+# resumed prefill (chunk 2048) in play. Override with SWEEP_SENTENCES.
+#
+# ALIGN (default 128) asserts every reported cached_tokens is a multiple
+# of the model's prefill alignment — the client-visible proof of the
+# adoption-flooring fix. Set ALIGN=0 for models without an alignment
+# quantum.
+ALIGN="${ALIGN:-128}"
+check_aligned() {
+  local label="$1" cached="$2"
+  [[ "$ALIGN" -le 1 || "$cached" -le 0 ]] && return 0
+  if ((cached % ALIGN == 0)); then
+    echo "  PASS  $label cached=$cached is ${ALIGN}-aligned"
+  else
+    echo "  FAIL  $label cached=$cached NOT a multiple of $ALIGN (misaligned adoption)"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+for sentences in ${SWEEP_SENTENCES:-12 20 33 54 160 280}; do
   PREFIX="$(build_prefix "$sentences")"
   S1="After the context, repeat exactly this sentence once and stop: The quick auditor checks block $TAG-alpha."
   S2="After the context, repeat exactly this sentence once and stop: A careful engine replays prefix $TAG-beta."
@@ -108,6 +133,9 @@ for sentences in 12 20 33 54; do
 
   check "B == C (adopted-prefix generation replays deterministically)" "$O_B" "$O_C"
   check "A == D (stored entry survives B's adoption un-poisoned)" "$O_A" "$O_D"
+  check_aligned "B" "$CT_B"
+  check_aligned "C" "$CT_C"
+  check_aligned "D" "$CT_D"
 
   if [[ "$CT_B" -le "$CT_A" && "$CT_A" -ge 0 && "$CT_B" -gt 0 ]]; then
     echo "  WARN  B's cached_tokens ($CT_B) did not exceed A's ($CT_A); prefix may not have matched as intended"
