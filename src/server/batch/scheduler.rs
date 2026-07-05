@@ -1625,7 +1625,9 @@ impl BatchScheduler {
                 // pool-block floor must not un-align a value already floored
                 // to the model's prefill alignment.
                 debug_assert!(
-                    alignment == 1 || block_size.is_multiple_of(alignment) || alignment.is_multiple_of(block_size),
+                    alignment == 1
+                        || block_size.is_multiple_of(alignment)
+                        || alignment.is_multiple_of(block_size),
                     "prefill_alignment {alignment} and pool block size {block_size} must divide one another"
                 );
                 let adoptable = if matched_len < paged_seq_len {

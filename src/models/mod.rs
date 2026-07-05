@@ -445,6 +445,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     // MoE models
     ModelType::GptOss,
     ModelType::MiniMax,
+    ModelType::MiniMaxM3,
     ModelType::Mixtral,
     ModelType::Qwen2Moe,
     ModelType::OLMoE,

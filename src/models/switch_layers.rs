@@ -124,8 +124,18 @@ impl SwitchLinear {
         group_size: i32,
         bits: i32,
     ) -> Result<Self, String> {
-        // Auto-detect mode: no .biases → block-float scheme, not affine
-        let mode = if weights.get(&format!("{}.biases", prefix)).is_some() {
+        // Auto-detect mode: affine carries `.biases`; block-float schemes
+        // (mxfp4 / nvfp4 / mxfp8) carry none. Probe BOTH layouts the loader
+        // below accepts — the stacked key AND the per-expert `experts.0` key
+        // — because per-expert affine checkpoints (Qwen2-MoE / Mixtral
+        // style) hold biases on each expert, not on a stacked tensor.
+        // Probing only the stacked key misdetected per-expert affine as
+        // block-float (regression introduced with the M3 NVFP4 loader,
+        // 8d3e475), which would run affine weights through a block-float
+        // dequant path.
+        let has_biases = weights.get(&format!("{}.biases", prefix)).is_some()
+            || expert_zero_key(prefix, "biases").is_some_and(|key| weights.contains_key(&key));
+        let mode = if has_biases {
             "affine"
         } else if bits == 8 {
             "mxfp8"
@@ -192,6 +202,13 @@ impl SwitchLinear {
             let scales = weights
                 .get(&format!("{}.scales", prefix))
                 .map(|w| mlxcel_core::copy(w));
+            if scales.is_none()
+                && weights
+                    .get(&format!("{}.weight_scale_inv", prefix))
+                    .is_some()
+            {
+                return Err(hf_mxfp8_unrepacked_error(prefix));
+            }
             // biases may not exist for mxfp4/nvfp4/mxfp8 modes
             let biases = weights
                 .get(&format!("{}.biases", prefix))
@@ -209,6 +226,12 @@ impl SwitchLinear {
         // the pre-stacked tensor is absent, so it never changes behavior for an
         // already-loadable checkpoint.
         if let Some((weight, scales, biases)) = stack_individual_experts(weights, prefix) {
+            if scales.is_none()
+                && expert_zero_key(prefix, "weight_scale_inv")
+                    .is_some_and(|key| weights.contains_key(&key))
+            {
+                return Err(hf_mxfp8_unrepacked_error(prefix));
+            }
             return Ok(Self::from_stacked_parts(
                 weight, scales, biases, group_size, bits, mode,
             ));
@@ -284,6 +307,33 @@ impl SwitchLinear {
 ///
 /// Used by: Qwen2Moe (Qwen1.5-MoE / Qwen2-MoE individual-expert checkpoints),
 ///          Mixtral (`block_sparse_moe.experts.{idx}.{w1,w2,w3}` checkpoints)
+/// Error for HF/Blackwell-form MXFP8 expert tensors (`weight_scale_inv`
+/// companions, raw F8_E4M3 payload) reaching this loader without the
+/// load-time repack. The scales rename alone would not make them loadable —
+/// the payload also needs the uint32 re-view — so a half-conversion here is
+/// structurally refused. Silently continuing loaded the raw fp8 bytes as
+/// NON-quantized weights (the cycle-83 null-token failure, at expert level).
+fn hf_mxfp8_unrepacked_error(prefix: &str) -> String {
+    format!(
+        "{prefix}: HF-form MXFP8 expert tensors (weight_scale_inv present, .scales absent) \
+         reached the expert loader un-repacked. Run the load-time repack \
+         (repack_hf_mxfp8_weights; automatic when config declares quant_method mxfp8 with \
+         weight_block_size [1,32]) or convert the checkpoint offline with mxfp8_repack. \
+         Refusing to load raw fp8 bytes as weights."
+    )
+}
+
+/// Key of expert 0's `{leaf}` tensor for a stacked-style prefix
+/// (`{root}.switch_mlp.{proj}` → `{root}.experts.0.{proj}.{leaf}`), or
+/// `None` when the prefix is not in stacked form. Shares the parsing rule
+/// with [`stack_individual_experts`] so mode auto-detection probes exactly
+/// the per-expert layout that stacker loads.
+fn expert_zero_key(prefix: &str, leaf: &str) -> Option<String> {
+    let proj = prefix.rsplit('.').next()?;
+    let root = prefix.strip_suffix(&format!(".switch_mlp.{}", proj))?;
+    Some(format!("{}.experts.0.{}.{}", root, proj, leaf))
+}
+
 fn stack_individual_experts(
     weights: &WeightMap,
     prefix: &str,
@@ -722,6 +772,119 @@ mod tests {
         );
         assert_eq!(parts.group_size, group);
         assert_eq!(parts.mode, "affine");
+    }
+
+    // Native (repacked) MXFP8 per-expert layout: fp8 payload viewed as
+    // uint32 [out, in/4], E8M0 scales [out, in/32], NO biases. The affine
+    // auto-detect probes expert-0 biases (per-expert layout support); with
+    // biases absent and bits == 8 the mode must land on "mxfp8" — pinning
+    // that the per-expert biases probe does not false-positive and that
+    // native MXFP8 experts load quantized in BOTH layouts. (Scales dtype
+    // fidelity is exercised at the loader/integration level; mode/bits
+    // routing here is shape- and key-driven.)
+    #[test]
+    fn switch_linear_per_expert_native_mxfp8_detects_mxfp8_not_affine() {
+        let out = 4i32;
+        let group = 32i32;
+        let in_dim = 64i32;
+        let packed_in = in_dim / 4; // fp8 bytes viewed as uint32: 4 per column
+        let num_groups = in_dim / group;
+        let root = "model.layers.0.mlp";
+
+        let mut weights = WeightMap::new();
+        for e in 0..3 {
+            weights.insert(
+                format!("{root}.experts.{e}.gate_proj.weight"),
+                mlxcel_core::from_slice_f32(
+                    &vec![0.0; (out * packed_in) as usize],
+                    &[out, packed_in],
+                ),
+            );
+            weights.insert(
+                format!("{root}.experts.{e}.gate_proj.scales"),
+                mlxcel_core::from_slice_f32(
+                    &vec![127.0; (out * num_groups) as usize],
+                    &[out, num_groups],
+                ),
+            );
+        }
+
+        let sl =
+            SwitchLinear::from_weights(&weights, &format!("{root}.switch_mlp.gate_proj"), group, 8)
+                .expect("native mxfp8 per-expert stacking must load");
+        match &sl {
+            SwitchLinear::Quantized { mode, bits, .. } => {
+                assert_eq!(mode, "mxfp8", "no biases + bits 8 must route to mxfp8");
+                assert_eq!(*bits, 8);
+            }
+            SwitchLinear::Regular { .. } => {
+                panic!("native mxfp8 experts must load quantized, not Regular")
+            }
+        }
+    }
+
+    // Blackwell/HF-form MXFP8 (`weight_scale_inv` companion, `.scales`
+    // absent) must be REFUSED with an error naming the repack path.
+    // Silently continuing loaded the raw fp8 payload as a NON-quantized
+    // weight — the cycle-83 null-token failure at expert level. Both
+    // layouts are pinned; red-capable by deleting either guard in
+    // `from_weights_with_mode`.
+    #[test]
+    fn switch_linear_refuses_unrepacked_hf_mxfp8_stacked() {
+        let root = "model.layers.0.mlp";
+        let mut weights = WeightMap::new();
+        weights.insert(
+            format!("{root}.switch_mlp.gate_proj.weight"),
+            mlxcel_core::from_slice_f32(&[0.0; 3 * 4 * 16], &[3, 4, 16]),
+        );
+        weights.insert(
+            format!("{root}.switch_mlp.gate_proj.weight_scale_inv"),
+            mlxcel_core::from_slice_f32(&[127.0; 3 * 4 * 2], &[3, 4, 2]),
+        );
+
+        let err = match SwitchLinear::from_weights(
+            &weights,
+            &format!("{root}.switch_mlp.gate_proj"),
+            32,
+            8,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("un-repacked HF mxfp8 must refuse, not load Regular"),
+        };
+        assert!(
+            err.contains("un-repacked") && err.contains("mxfp8_repack"),
+            "error must name the repack remedy, got: {err}"
+        );
+    }
+
+    #[test]
+    fn switch_linear_refuses_unrepacked_hf_mxfp8_per_expert() {
+        let root = "model.layers.0.mlp";
+        let mut weights = WeightMap::new();
+        for e in 0..2 {
+            weights.insert(
+                format!("{root}.experts.{e}.gate_proj.weight"),
+                mlxcel_core::from_slice_f32(&[0.0; 4 * 16], &[4, 16]),
+            );
+            weights.insert(
+                format!("{root}.experts.{e}.gate_proj.weight_scale_inv"),
+                mlxcel_core::from_slice_f32(&[127.0; 4 * 2], &[4, 2]),
+            );
+        }
+
+        let err = match SwitchLinear::from_weights(
+            &weights,
+            &format!("{root}.switch_mlp.gate_proj"),
+            32,
+            8,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("un-repacked per-expert HF mxfp8 must refuse, not load Regular"),
+        };
+        assert!(
+            err.contains("un-repacked") && err.contains("mxfp8_repack"),
+            "error must name the repack remedy, got: {err}"
+        );
     }
 
     #[test]
