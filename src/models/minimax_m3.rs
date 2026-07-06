@@ -2790,6 +2790,37 @@ mod tests {
         assert_eq!(q1, vec![0, 3]);
     }
 
+    // The seam that shipped broken on 2026-07-05: the batch scheduler
+    // consults LoadedModel (the enum), NOT the concrete model — so a
+    // defaulted trait method missing from loaded_model.rs's delegation
+    // silently returns the default in production while every direct-model
+    // test stays green (found live: cached=145600, ≡64 mod 128, floor
+    // silent). This test calls through the ENUM; it is red whenever the
+    // delegation is absent — it would have been red for the two days the
+    // floor was dead.
+    #[test]
+    fn prefill_alignment_delegates_through_loaded_model() {
+        let msa = make_test_sparse_attention(); // block_size 2, index projections Some
+        let layers = vec![DecoderLayer {
+            self_attn: msa,
+            mlp: None,
+            moe: None,
+            input_layernorm: make_gemma_rms_norm(16),
+            post_attention_layernorm: make_gemma_rms_norm(16),
+            layer_idx: 0,
+        }];
+        let model = make_test_m3_model(layers);
+        let loaded = crate::loaded_model::LoadedModel::MiniMaxM3(model);
+        let dyn_model: &dyn LanguageModel = &loaded;
+        assert_eq!(
+            dyn_model.prefill_alignment(),
+            2,
+            "LoadedModel must forward the quantum; 1 here means the \
+             delegation is missing and the adoption floor is dead in \
+             production"
+        );
+    }
+
     // Prefill scorer semantics, hand-computed on the same fixture as the
     // per-token test. Pins BOTH audit findings at once:
     //  - max-of-dots vs coordmax-of-vectors: block1 (single strong token,

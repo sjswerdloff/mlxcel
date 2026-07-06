@@ -292,6 +292,17 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, eos_token_ids())
     }
 
+    /// MUST be delegated, not defaulted: the batch scheduler consults
+    /// `self.model` (this enum) for the adoption-flooring quantum. Without
+    /// this forward, LoadedModel inherits the trait default of 1 and M3's
+    /// 128 never reaches the scheduler — the exact half-wired state found
+    /// live on 2026-07-06 (cached=145600, ≡64 mod 128, floor silent).
+    /// If you add a scheduler-consulted default method to LanguageModel,
+    /// add its delegation here in the same commit.
+    fn prefill_alignment(&self) -> usize {
+        delegate_language_model!(self, prefill_alignment())
+    }
+
     fn output_suppressed_token_ids(&self) -> Vec<i32> {
         delegate_language_model!(self, output_suppressed_token_ids())
     }
