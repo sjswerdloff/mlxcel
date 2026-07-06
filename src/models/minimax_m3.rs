@@ -35,7 +35,15 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
-use tracing::{debug, trace, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{debug, info, trace, warn};
+
+/// One-time INFO markers so an operator at default log level can VERIFY the
+/// MSA machinery is live (the per-dispatch lines are debug-level and
+/// invisible in a normal console — which meant there was no observable
+/// evidence the 2026-07-05 sparse-decode fix was active; found by Stuart).
+static MSA_PREFILL_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+static MSA_DECODE_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 /// Load a UnifiedLinear. Auto-detects quantization mode from weight shapes.
 fn load_linear(weights: &WeightMap, prefix: &str, g: i32, b: i32) -> Result<UnifiedLinear, String> {
@@ -459,6 +467,16 @@ impl SparseAttention {
         }
 
         if l <= self.block_size {
+            if !MSA_DECODE_ANNOUNCED.swap(true, Ordering::Relaxed) {
+                info!(
+                    layer = self.layer_idx,
+                    l = l,
+                    kv_len = kv_len,
+                    top_k = self.top_k,
+                    block_size = self.block_size,
+                    "MSA per-token DECODE path active (first sparse decode dispatch this process)"
+                );
+            }
             debug!(
                 layer = self.layer_idx,
                 b = b,
@@ -499,6 +517,16 @@ impl SparseAttention {
             branch = "msa",
             "attn.dispatch"
         );
+        if !MSA_PREFILL_ANNOUNCED.swap(true, Ordering::Relaxed) {
+            info!(
+                layer = self.layer_idx,
+                l = l,
+                kv_len = kv_len,
+                top_k = self.top_k,
+                block_size = self.block_size,
+                "MSA block-sparse PREFILL path active (first sparse prefill dispatch this process)"
+            );
+        }
 
         // MSA path. cached_idx_k is Some by construction (passed the dispatch
         // check above which guards `cached_idx_k.is_none()`). The cached

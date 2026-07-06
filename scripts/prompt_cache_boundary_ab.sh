@@ -44,7 +44,14 @@ command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
 
 TAG="cachetest-$RANDOM$RANDOM"
 
-# One request at temperature 0. Prints "content<TAB>prompt_tokens<TAB>cached_tokens".
+# One request at temperature 0. Prints "prompt_tokens<TAB>cached_tokens<TAB>text".
+# NUMERIC FIELDS FIRST: an empty text field at the head of a tab-separated
+# row gets its leading tab collapsed by bash IFS whitespace handling and
+# every field shifts left (live failure 2026-07-06: M3 answered entirely in
+# its thinking block, content was "", cached= printed empty and the
+# alignment checks silently skipped). Numbers are never empty (-1 fallback),
+# so leading numerics make shifting impossible. Text = reasoning + content
+# so thinking-only replies still compare deterministically.
 ask() {
   local user_content="$1"
   local body response
@@ -56,9 +63,10 @@ ask() {
       messages: [{role: "user", content: $content}]}')
   response=$(curl -sS -X POST "$BASE_URL/v1/chat/completions" \
     -H 'Content-Type: application/json' -d "$body")
-  jq -r '[(.choices[0].message.content // "NULL"),
-          (.usage.prompt_tokens // -1),
-          (.usage.prompt_tokens_details.cached_tokens // .usage.cached_tokens // -1)]
+  jq -r '[(.usage.prompt_tokens // -1),
+          (.usage.prompt_tokens_details.cached_tokens // .usage.cached_tokens // -1),
+          (((.choices[0].message.reasoning // "") + "|" +
+            (.choices[0].message.content // "")) | if . == "|" then "EMPTY" else . end)]
          | @tsv' <<<"$response"
 }
 
@@ -106,6 +114,13 @@ check() {
 ALIGN="${ALIGN:-128}"
 check_aligned() {
   local label="$1" cached="$2"
+  # FAIL CLOSED: a missing/non-numeric cached value is a harness failure,
+  # not a pass (the empty-field shift above hid every alignment check once).
+  if ! [[ "$cached" =~ ^-?[0-9]+$ ]]; then
+    echo "  FAIL  $label cached value missing/non-numeric ('$cached') — harness cannot verify alignment"
+    FAILURES=$((FAILURES + 1))
+    return 0
+  fi
   [[ "$ALIGN" -le 1 || "$cached" -le 0 ]] && return 0
   if ((cached % ALIGN == 0)); then
     echo "  PASS  $label cached=$cached is ${ALIGN}-aligned"
@@ -122,13 +137,13 @@ for sentences in ${SWEEP_SENTENCES:-12 20 33 54 160 280}; do
 
   echo "== prefix sweep: $sentences sentences (tag $TAG) =="
 
-  IFS=$'\t' read -r O_A PT_A CT_A < <(ask "$PREFIX$S1")
+  IFS=$'\t' read -r PT_A CT_A O_A < <(ask "$PREFIX$S1")
   echo "  A cold        prompt_tokens=$PT_A cached=$CT_A"
-  IFS=$'\t' read -r O_B PT_B CT_B < <(ask "$PREFIX$S2")
+  IFS=$'\t' read -r PT_B CT_B O_B < <(ask "$PREFIX$S2")
   echo "  B partial-hit prompt_tokens=$PT_B cached=$CT_B"
-  IFS=$'\t' read -r O_C PT_C CT_C < <(ask "$PREFIX$S2")
+  IFS=$'\t' read -r PT_C CT_C O_C < <(ask "$PREFIX$S2")
   echo "  C full-hit    prompt_tokens=$PT_C cached=$CT_C"
-  IFS=$'\t' read -r O_D PT_D CT_D < <(ask "$PREFIX$S1")
+  IFS=$'\t' read -r PT_D CT_D O_D < <(ask "$PREFIX$S1")
   echo "  D full-hit    prompt_tokens=$PT_D cached=$CT_D"
 
   check "B == C (adopted-prefix generation replays deterministically)" "$O_B" "$O_C"
