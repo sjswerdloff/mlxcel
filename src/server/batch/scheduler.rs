@@ -850,6 +850,16 @@ impl BatchScheduler {
         decode_storage_backend: DecodeStorageBackend,
     ) -> Self {
         let generation_stream = new_thread_local_generation_stream();
+        // Fail-loud startup artifact (2026-07-06): print the adoption
+        // quantum AS RESOLVED THROUGH LoadedModel — the value the adopt
+        // path will actually use. A missing trait delegation (the
+        // dead-floor bug) shows here as alignment=1 on an MSA model at
+        // boot, in the operator's console, instead of failing silently
+        // on every adoption.
+        tracing::info!(
+            prefill_alignment = model.prefill_alignment(),
+            "model adoption quantum as resolved by the server (1 = unconstrained; MSA-class models must show their block size, e.g. 128)"
+        );
         let max_batch_size = max_batch_size.max(1);
         let effective_decode_storage = effective_decode_storage_backend(
             decode_storage_backend,
