@@ -251,7 +251,7 @@ def _question(label: str) -> str:
 
 
 def build_prompt(value: str, label: str, depth_tokens: int, copies: int,
-                 seed: int) -> str:
+                 seed: int, chars_per_token: float = CHARS_PER_TOKEN) -> str:
     """One probe prompt: filler, plant line(s), filler, question.
 
     Deterministic given (value, label, depth_tokens, copies, seed). The
@@ -261,12 +261,12 @@ def build_prompt(value: str, label: str, depth_tokens: int, copies: int,
     """
     if depth_tokens < 1000:
         raise HarnessError(f"--depth {depth_tokens} too shallow to be meaningful")
-    total_chars = depth_tokens * CHARS_PER_TOKEN
+    total_chars = int(depth_tokens * chars_per_token)
     question = _question(label)
     plant = PLANT_LINE_FMT.format(label=label, value=value)
 
     # First plant at ~PLANT_AT_TOKENS; clamp for shallow (smoke-test) depths.
-    first = min(PLANT_AT_TOKENS * CHARS_PER_TOKEN, int(total_chars * 0.4))
+    first = min(int(PLANT_AT_TOKENS * chars_per_token), int(total_chars * 0.4))
     if copies == 1:
         positions = [first]
     else:
@@ -461,7 +461,7 @@ def run_probe(corpus: list[dict], args) -> list[dict]:
     for item in corpus:
         label, target = item["id"], item["value"]
         prompt = build_prompt(target, label, args.depth, args.copies,
-                              args.seed)
+                              args.seed, chars_per_token=args.chars_per_token)
         r = http_chat_completion(args.base_url, args.model, prompt,
                                  args.max_tokens, args.timeout)
         rec = {"id": label, "class": item["class"], "target": target,
@@ -578,6 +578,10 @@ def parse_args(argv=None):
                         "(typical: 50000 / 150000 / 300000)")
     p.add_argument("--copies", type=int, choices=[1, 4, 16], default=1)
     p.add_argument("--max-tokens", type=int, default=100)
+    p.add_argument("--chars-per-token", type=float, default=CHARS_PER_TOKEN,
+                   help="chars-per-token estimate for sizing filler to --depth "
+                        "(default 4; tune per tokenizer — the per-request "
+                        "prompt_tokens output is the ground truth)")
     p.add_argument("--timeout", type=float, default=1800.0)
     p.add_argument("--limit", type=int, default=None,
                    help="probe only the first N corpus strings (smoke runs)")
