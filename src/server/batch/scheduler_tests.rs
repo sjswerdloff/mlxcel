@@ -1411,3 +1411,52 @@ fn batch_kv_quant_per_layer_table_disabled_skip_keeps_uniform_modes() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Effective KV-cache mode resolution (`resolve_effective_kv_cache_mode`)
+//
+// The startup fail-loud artifact in `BatchScheduler::run` and the paged-layout
+// selection in `sequence_state_layout_override` both resolve the server-wide
+// mode through this one pure function. These tests pin the precedence.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn effective_kv_cache_mode_disabled_batch_quant_passes_legacy_through() {
+    // Legacy set to a NON-default mode so this test cannot pass by
+    // hardcoding Fp16: the disabled branch must return exactly what the
+    // legacy flag says.
+    let disabled = mlxcel_core::cache::BatchKvQuantConfig::default();
+    assert!(!disabled.is_enabled());
+    assert_eq!(
+        crate::server::batch::scheduler::resolve_effective_kv_cache_mode(
+            &disabled,
+            mlxcel_core::cache::KVCacheMode::Int8,
+        ),
+        mlxcel_core::cache::KVCacheMode::Int8,
+        "disabled batch_kv_quant must pass the legacy --kv-cache-mode through untouched"
+    );
+}
+
+#[test]
+fn effective_kv_cache_mode_enabled_batch_quant_takes_precedence() {
+    // Mutation that must turn this red: inverting the `is_enabled()`
+    // branch (legacy-wins-over-batch). Legacy is deliberately set to a
+    // DIFFERENT non-Fp16 mode than the batch config resolves to, so a
+    // swapped precedence returns Turbo4Asym and fails the assertion.
+    let uniform8 = mlxcel_core::cache::BatchKvQuantConfig::new(
+        mlxcel_core::cache::KvQuantScheme::Uniform,
+        8,
+        64,
+        true,
+    )
+    .unwrap();
+    assert!(uniform8.is_enabled());
+    assert_eq!(
+        crate::server::batch::scheduler::resolve_effective_kv_cache_mode(
+            &uniform8,
+            mlxcel_core::cache::KVCacheMode::Turbo4Asym,
+        ),
+        mlxcel_core::cache::KVCacheMode::Int8,
+        "enabled batch_kv_quant (uniform/8 => Int8) must win over the legacy flag"
+    );
+}

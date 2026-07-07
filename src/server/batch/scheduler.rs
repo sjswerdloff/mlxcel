@@ -112,6 +112,32 @@ fn vlm_prefix_sharing_allowed(enabled: bool, is_multimodal: bool, has_videos: bo
     enabled && is_multimodal && !has_videos
 }
 
+/// Resolve the server-wide effective KV-cache mode: `batch_kv_quant`
+/// takes precedence when enabled, otherwise the legacy `kv_cache_mode`
+/// flag.
+///
+/// This single expression decides which quantization mode every new
+/// sequence's caches get AND what the fail-loud startup artifact in
+/// [`BatchScheduler::run`] reports — one function so the boot line can
+/// never disagree with the allocation path (the dead-floor class of bug:
+/// a value that resolves differently in the report than in the code).
+///
+/// Kept as one pure function (same pattern as
+/// [`vlm_prefix_sharing_allowed`] and [`align_matched_prefix`]) so the
+/// precedence is pinned by unit tests a future edit cannot silently
+/// invert.
+#[inline]
+pub(crate) fn resolve_effective_kv_cache_mode(
+    batch_kv_quant: &BatchKvQuantConfig,
+    legacy_kv_cache_mode: KVCacheMode,
+) -> KVCacheMode {
+    if batch_kv_quant.is_enabled() {
+        batch_kv_quant.base_mode()
+    } else {
+        legacy_kv_cache_mode
+    }
+}
+
 /// Floor a raw longest-prefix cache match to the model's prefill-alignment
 /// quantum (see [`LanguageModel::prefill_alignment`]).
 ///
@@ -2081,6 +2107,26 @@ impl BatchScheduler {
     pub fn run(&mut self) {
         install_thread_local_default_stream(self.generation_stream.as_ref());
 
+        // Fail-loud startup artifact (2026-07-07): print the KV-cache
+        // quantization state AS THE SEQUENCE PATHS RESOLVE IT, at the
+        // moment the builder chain is final. The mode comes from
+        // `effective_kv_cache_mode()` — the same function
+        // `sequence_state_layout_override` uses — so this line cannot
+        // drift from reality. An operator who asked for `int8` and sees
+        // `kv_cache_mode=Fp16` here has their alarm; a mode line that
+        // shows the paged pool bypassed explains changed sharing
+        // behavior before anyone has to diff memory graphs. (Same class
+        // as the `prefill_alignment` boot line — see with_config.)
+        let effective_mode = self.effective_kv_cache_mode();
+        tracing::info!(
+            kv_cache_mode = ?effective_mode,
+            batch_kv_quant_enabled = self.batch_kv_quant.is_enabled(),
+            decode_storage_backend = ?self.decode_storage_backend,
+            paged_block_size = DEFAULT_PAGED_BLOCK_SIZE,
+            paged_pool_shared = (effective_mode == KVCacheMode::Fp16),
+            "KV cache quantization as resolved by the server (non-Fp16 modes bypass the shared paged pool: sequences get dense per-layer caches converted to the mode after make_caches)"
+        );
+
         loop {
             // 1. Non-blocking drain of all pending requests
             self.drain_incoming_requests();
@@ -2296,6 +2342,25 @@ impl BatchScheduler {
         }
     }
 
+    /// The server-wide KV cache mode as the sequence-creation paths
+    /// actually resolve it: `batch_kv_quant` takes precedence when
+    /// enabled, otherwise the legacy `kv_cache_mode` flag.
+    ///
+    /// This is THE resolution function — the startup artifact in
+    /// [`Self::run`] and the paged-layout selection in
+    /// [`Self::sequence_state_layout_override`] both call it, so the
+    /// boot line can never report a different mode than the one
+    /// sequences are built with. If you add a third resolution site,
+    /// call this instead of re-deriving the expression. The precedence
+    /// logic lives in the free function
+    /// [`resolve_effective_kv_cache_mode`] so it is unit-testable
+    /// without constructing a scheduler (no light LoadedModel stub
+    /// exists; the cohort tests that build real schedulers are
+    /// `#[ignore]`-gated on a model directory).
+    pub(crate) fn effective_kv_cache_mode(&self) -> KVCacheMode {
+        resolve_effective_kv_cache_mode(&self.batch_kv_quant, self.kv_cache_mode)
+    }
+
     fn sequence_state_layout_override(&self) -> Option<SequenceStateLayout> {
         if self.decode_storage_backend != DecodeStorageBackend::Paged {
             return None;
@@ -2305,11 +2370,7 @@ impl BatchScheduler {
         // prefer the batched KV quant config when active so
         // its `base_mode()` drives paged-layout selection (Turbo-aware
         // when scheme is TurboQuant, otherwise the legacy uniform path).
-        let effective_mode = if self.batch_kv_quant.is_enabled() {
-            self.batch_kv_quant.base_mode()
-        } else {
-            self.kv_cache_mode
-        };
+        let effective_mode = self.effective_kv_cache_mode();
         // when a Turbo4 cache mode is configured, build a
         // packed-aware paged layout so per-page
         // sidecar accounting and detach/adopt round-trip work correctly.
