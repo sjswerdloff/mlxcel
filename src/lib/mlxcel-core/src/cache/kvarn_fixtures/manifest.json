@@ -1,0 +1,108 @@
+{
+  "balanced_f32": {
+    "dtype": "float32",
+    "shape": [
+      2,
+      128,
+      128
+    ]
+  },
+  "dequant_rot4_f32": {
+    "dtype": "float32",
+    "shape": [
+      2,
+      128,
+      128
+    ]
+  },
+  "dequant_rot8_f32": {
+    "dtype": "float32",
+    "shape": [
+      2,
+      128,
+      128
+    ]
+  },
+  "input_tiles_f32": {
+    "dtype": "float32",
+    "shape": [
+      2,
+      128,
+      128
+    ]
+  },
+  "q4_u8": {
+    "dtype": "uint8",
+    "shape": [
+      2,
+      128,
+      128
+    ]
+  },
+  "q8_u8": {
+    "dtype": "uint8",
+    "shape": [
+      2,
+      128,
+      128
+    ]
+  },
+  "rotated_f32": {
+    "dtype": "float32",
+    "shape": [
+      2,
+      128,
+      128
+    ]
+  },
+  "s_col_f32": {
+    "dtype": "float32",
+    "shape": [
+      2,
+      1,
+      128
+    ]
+  },
+  "s_row_f32": {
+    "dtype": "float32",
+    "shape": [
+      2,
+      128,
+      1
+    ]
+  },
+  "scale4_f32": {
+    "dtype": "float32",
+    "shape": [
+      2,
+      128,
+      1
+    ]
+  },
+  "scale8_f32": {
+    "dtype": "float32",
+    "shape": [
+      2,
+      128,
+      1
+    ]
+  },
+  "sinkhorn_iters": 4,
+  "source": "results/kvarn_reference_vectors.npz",
+  "zp4_f32": {
+    "dtype": "float32",
+    "shape": [
+      2,
+      128,
+      1
+    ]
+  },
+  "zp8_f32": {
+    "dtype": "float32",
+    "shape": [
+      2,
+      128,
+      1
+    ]
+  }
+}

@@ -38,7 +38,13 @@ set -euo pipefail
 
 BASE_URL="${1:-http://127.0.0.1:8890}"
 MODEL="${2:-minimax-m3-nvfp4}"
-MAX_TOKENS=48
+# 2048, not 48. A thinking model needs room for a full think block PLUS the
+# answer: at 48 tokens an opened <mm:think> eats the entire budget, both
+# reasoning and content come back empty, and the probe compares truncated
+# fragments (live 2026-07-07: the 280-sweep B==C "EMPTY" divergence was
+# manufactured by starvation, not proven engine state). Third occurrence of
+# the cycle-62 lesson — don't be cheap with tokens. Env-overridable.
+MAX_TOKENS="${MAX_TOKENS:-2048}"
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
 
