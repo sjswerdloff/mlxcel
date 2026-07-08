@@ -97,8 +97,10 @@ pub struct TurboKvCacheArgs {
     /// KV cache mode shorthand (legacy; prefer --cache-type-k / --cache-type-v).
     ///
     /// Sets both K and V to the same mode. Accepted values: fp16 (default),
-    /// int8, fp16+turbo4 (alias turbo4-asym), fp16+turbo3 (alias
-    /// turbo3-asym / turbo3), turbo4 (alias turbo4-sym), turbo4-delegated.
+    /// int8, kvarn8 (alias kvarn-k8v8 — Hadamard+Sinkhorn+8-bit RTN tiles,
+    /// power-of-2 head_dim only), fp16+turbo4 (alias turbo4-asym),
+    /// fp16+turbo3 (alias turbo3-asym / turbo3), turbo4 (alias turbo4-sym),
+    /// turbo4-delegated.
     ///
     /// When --cache-type-k or --cache-type-v are also supplied, the split
     /// flags win and this flag is ignored (with a warning).
