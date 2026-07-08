@@ -472,3 +472,117 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cache_integration_tests {
+    use super::*;
+    use crate::cache::{KVCache, KVCacheMode};
+
+    /// Deterministic pseudo-random f32 in [-1, 1) — no MLX RNG plumbing
+    /// needed, and fully reproducible across runs/platforms.
+    fn lcg_data(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    /// End-to-end: a KVarN8 KVCache and an Fp16 KVCache fed IDENTICAL data
+    /// through the real update_and_fetch, compared after every chunk.
+    ///
+    /// Chunk sizes exercise every split path in update_kvarn8:
+    ///   200 → sink fills (128) + tail 72
+    ///   100 → tail 172 → one tile quantized (128) + tail 44
+    ///   1   → decode-shaped single, tail 45
+    ///   83  → tail 128 → EXACT tile boundary (tile quantized, tail empty)
+    ///   1   → first token into a fresh tail
+    ///
+    /// The k8 band from the decomposition experiment is rel_err ≈ 0.004 on
+    /// f32 tiles; fp16 in/out adds ~1e-3. Assert mean-square relative error
+    /// < 0.02 AND > 1e-6 (a bit-exact match would mean quantization never
+    /// ran — the sink-only prefix IS expected to be near-exact, so the
+    /// lower bound is asserted only once history tiles exist).
+    #[test]
+    fn kvarn8_cache_roundtrip_tracks_fp16_within_band() {
+        let (b, h, d) = (1i32, 2i32, 64i32);
+        let mut kvarn = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        let mut fp16 = KVCache::new_with_mode(KVCacheMode::Fp16);
+
+        let mut total = 0i32;
+        for (i, &chunk) in [200i32, 100, 1, 83, 1].iter().enumerate() {
+            let n = (b * h * chunk * d) as usize;
+            let k_data = lcg_data(n, 0xC1E_A0 + i as u64);
+            let v_data = lcg_data(n, 0xB0_B0 + i as u64);
+            let shape = [b, h, chunk, d];
+            let mk = || {
+                (
+                    ffi::astype(&ffi::from_slice_f32(&k_data, &shape), dtype::FLOAT16),
+                    ffi::astype(&ffi::from_slice_f32(&v_data, &shape), dtype::FLOAT16),
+                )
+            };
+            let (k1, v1) = mk();
+            let (k2, v2) = mk();
+            let (qk, qv) = kvarn.update_and_fetch(k1, v1);
+            let (rk, rv) = fp16.update_and_fetch(k2, v2);
+            total += chunk;
+
+            for (q, r, name) in [(&qk, &rk, "K"), (&qv, &rv, "V")] {
+                assert_eq!(
+                    ffi::array_shape(q),
+                    ffi::array_shape(r),
+                    "{name} shape mismatch after chunk {i}"
+                );
+                assert_eq!(ffi::array_shape(q)[2], total, "{name} window length");
+                let qf = ffi::astype(q, dtype::FLOAT32);
+                let rf = ffi::astype(r, dtype::FLOAT32);
+                let diff = ffi::subtract(&qf, &rf);
+                let num = ffi::sum_all(&ffi::multiply(&diff, &diff));
+                let den = ffi::sum_all(&ffi::multiply(&rf, &rf));
+                let rel = ffi::divide(&ffi::sqrt(&num), &ffi::sqrt(&den));
+                ffi::eval(&rel);
+                let rel = ffi::item_f32(&rel);
+                assert!(
+                    rel < 0.02,
+                    "{name} rel_err {rel} above k8 band after chunk {i} (total={total})"
+                );
+                if total > 2 * KVARN_TILE_TOKENS {
+                    // History tiles exist — quantization must be visible.
+                    assert!(
+                        rel > 1e-6,
+                        "{name} suspiciously exact after chunk {i} — is \
+                         quantization actually running?"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The trim_front guard must keep refusing KVarN8 (tile state cannot be
+    /// head-trimmed) — pin the guard's current behavior so a future edit
+    /// widening the matches! turns this red instead of corrupting silently.
+    #[test]
+    fn kvarn8_trim_front_refuses() {
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        let (b, h, d) = (1i32, 1i32, 64i32);
+        let n = (b * h * 200 * d) as usize;
+        let k = ffi::astype(
+            &ffi::from_slice_f32(&lcg_data(n, 7), &[b, h, 200, d]),
+            dtype::FLOAT16,
+        );
+        let v = ffi::astype(
+            &ffi::from_slice_f32(&lcg_data(n, 8), &[b, h, 200, d]),
+            dtype::FLOAT16,
+        );
+        let _ = cache.update_and_fetch(k, v);
+        let trimmed = cache.trim_front(64);
+        assert_eq!(
+            trimmed, 0,
+            "KVarN8 must refuse head-trimming (returned {trimmed})"
+        );
+    }
+}

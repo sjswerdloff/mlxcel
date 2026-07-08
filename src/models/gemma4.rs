@@ -843,6 +843,10 @@ fn kv_cache_mode_to_i32(mode: KVCacheMode) -> i32 {
         KVCacheMode::Turbo3Asym => 3,
         KVCacheMode::Turbo4 => 4,
         KVCacheMode::Turbo4Delegated => 5,
+        // Persisted snapshot tag — append-only, never renumber (the tag is
+        // part of the cache's identity stamp; unknown tags fail loudly in
+        // kv_cache_mode_from_i32).
+        KVCacheMode::KVarN8 => 6,
     }
 }
 
@@ -854,6 +858,7 @@ fn kv_cache_mode_from_i32(value: i32) -> Result<KVCacheMode, String> {
         3 => Ok(KVCacheMode::Turbo3Asym),
         4 => Ok(KVCacheMode::Turbo4),
         5 => Ok(KVCacheMode::Turbo4Delegated),
+        6 => Ok(KVCacheMode::KVarN8),
         other => Err(format!("unknown Gemma 4 cache snapshot mode tag {other}")),
     }
 }

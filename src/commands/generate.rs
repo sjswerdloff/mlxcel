@@ -1565,6 +1565,12 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
                  ~5.1x total KV savings)"
             );
         }
+        KVCacheMode::KVarN8 => {
+            println!(
+                "KV cache mode: kvarn8 (Hadamard+Sinkhorn+8-bit RTN in 128-token tiles, \
+                 fp16 sink/tail, ~2x KV savings; power-of-2 head_dim only)"
+            );
+        }
         KVCacheMode::Fp16 => {}
     }
 

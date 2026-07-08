@@ -77,6 +77,7 @@
 
 pub mod batch_quant;
 mod detach;
+pub mod kvarn;
 mod paged;
 mod paged_detach;
 #[cfg(test)]
@@ -88,15 +89,14 @@ mod paged_turbo_tests;
 #[cfg(test)]
 #[path = "cache/sparse_v_tests.rs"]
 mod sparse_v_tests;
-pub mod kvarn;
 pub mod turbo;
 #[cfg(test)]
 #[path = "cache/turbo_tests.rs"]
 mod turbo_tests;
 
 pub use batch_quant::{
-    BatchKvQuantConfig, BatchQuantizedKVCache, BatchTurboQuantKVCache, KvQuantScheme,
-    DEFAULT_KV_GROUP_SIZE,
+    BatchKvQuantConfig, BatchQuantizedKVCache, BatchTurboQuantKVCache, DEFAULT_KV_GROUP_SIZE,
+    KvQuantScheme,
 };
 pub use detach::{DetachedCacheSet, DetachedHandle, DetachedKVCache, DetachedRotatingKVCache};
 pub use paged::{
@@ -184,6 +184,16 @@ pub enum KVCacheMode {
     /// `MLXCEL_TURBO4_DELEGATED_FP16_FAST_PATH=1` keeps an FP16 V working set
     /// for native-SDPA decode while still maintaining packed sidecars.
     Turbo4Delegated,
+    /// KVarN 8-bit K + 8-bit V: Hadamard rotation + Sinkhorn variance
+    /// normalization + per-row asymmetric RTN in 128-token tiles, FP16
+    /// sink (first tile) and FP16 tail (partial tile). ~2× KV memory at a
+    /// measured ~4.7× lower reconstruction error than [`Self::Int8`]'s
+    /// per-token absmax, with isotropic (rotation-spread) noise. The
+    /// mlxcel-native "k8v8" configuration of the KVarN method (arXiv
+    /// 2606.03458) — upstream presets stop at 4-bit; see [`kvarn`] module
+    /// docs for why 8-bit is the Kindled-serving rung. Power-of-2 head_dim
+    /// only (Hadamard).
+    KVarN8,
 }
 
 impl std::str::FromStr for KVCacheMode {
@@ -213,9 +223,14 @@ impl std::str::FromStr for KVCacheMode {
             // V=Turbo4 contract as Turbo4Asym but uses the delegated KVCache
             // architecture for decode speed at long context.
             "turbo4-delegated" | "fp16+turbo4-delegated" => Ok(Self::Turbo4Delegated),
+            // KVarN 8-bit symmetric (k8v8). "kvarn8" is canonical; the
+            // explicit "kvarn-k8v8" spelling is an alias for scripts that
+            // benefit from the K/V symmetry being spelled out.
+            "kvarn8" | "kvarn-k8v8" => Ok(Self::KVarN8),
             other => Err(format!(
                 "unknown kv-cache-mode \"{other}\"; expected one of \
-                 \"fp16\", \"int8\", \"fp16+turbo4\" (alias \"turbo4-asym\"), \
+                 \"fp16\", \"int8\", \"kvarn8\" (alias \"kvarn-k8v8\"), \
+                 \"fp16+turbo4\" (alias \"turbo4-asym\"), \
                  \"turbo4\" (alias \"turbo4-sym\"), \
                  \"turbo4-delegated\" (alias \"fp16+turbo4-delegated\"), \
                  \"fp16+turbo3\" (aliases \"turbo3-asym\" / \"turbo3\")"
@@ -233,6 +248,7 @@ impl std::fmt::Display for KVCacheMode {
             Self::Turbo4 => f.write_str("turbo4"),
             Self::Turbo4Delegated => f.write_str("turbo4-delegated"),
             Self::Turbo3Asym => f.write_str("fp16+turbo3"),
+            Self::KVarN8 => f.write_str("kvarn8"),
         }
     }
 }
@@ -465,6 +481,39 @@ pub struct KVCache {
     // during weird in-place mutations.
     pub(crate) m3_idx_k: Option<UniquePtr<MlxArray>>,
     pub(crate) m3_idx_offset: i32,
+
+    // ------------------------------------------------------------------
+    // KVarN8 state (mode == KVCacheMode::KVarN8; all None otherwise).
+    //
+    // Every KVarN tensor lives in the ROTATED (Hadamard) frame — rotation
+    // happens once per incoming token on write, and the fetch path
+    // un-rotates the assembled [sink, history, tail] concatenation with
+    // one `wht` call before returning standard-frame FP16 to the model
+    // (transparent mode, like Int8: the model never sees KVarN internals).
+    //
+    // `kvarn_sink_*`: first KVARN_TILE_TOKENS tokens, FP16, never
+    // quantized (attention-sink protection, mirrors the reference sink
+    // pool). `kvarn_tail_*`: FP16 accumulation until a full 128-token
+    // tile exists, which is then Sinkhorn-normalized and RTN-quantized:
+    // u8 codes in `kvarn_hist_*` ([B,H,T_hist,D], T_hist a multiple of
+    // the tile size), per-token row params `*_scale`/`*_zp`/`*_s_row`
+    // ([B,H,T_hist,1]), per-tile column scales `*_s_col`
+    // ([B,H,n_tiles,D]). See [`kvarn`] module docs.
+    // ------------------------------------------------------------------
+    pub(crate) kvarn_sink_k: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_sink_v: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_tail_k: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_tail_v: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_hist_k: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_hist_v: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_k_scale: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_k_zp: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_k_s_row: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_k_s_col: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_v_scale: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_v_zp: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_v_s_row: Option<UniquePtr<MlxArray>>,
+    pub(crate) kvarn_v_s_col: Option<UniquePtr<MlxArray>>,
 }
 
 /// Shared handle that makes one [`KVCache`] write/read through a pooled paged
@@ -527,6 +576,20 @@ impl KVCache {
             paged_backing: None,
             m3_idx_k: None,
             m3_idx_offset: 0,
+            kvarn_sink_k: None,
+            kvarn_sink_v: None,
+            kvarn_tail_k: None,
+            kvarn_tail_v: None,
+            kvarn_hist_k: None,
+            kvarn_hist_v: None,
+            kvarn_k_scale: None,
+            kvarn_k_zp: None,
+            kvarn_k_s_row: None,
+            kvarn_k_s_col: None,
+            kvarn_v_scale: None,
+            kvarn_v_zp: None,
+            kvarn_v_s_row: None,
+            kvarn_v_s_col: None,
         }
     }
 
@@ -577,6 +640,20 @@ impl KVCache {
             paged_backing: None,
             m3_idx_k: None,
             m3_idx_offset: 0,
+            kvarn_sink_k: None,
+            kvarn_sink_v: None,
+            kvarn_tail_k: None,
+            kvarn_tail_v: None,
+            kvarn_hist_k: None,
+            kvarn_hist_v: None,
+            kvarn_k_scale: None,
+            kvarn_k_zp: None,
+            kvarn_k_s_row: None,
+            kvarn_k_s_col: None,
+            kvarn_v_scale: None,
+            kvarn_v_zp: None,
+            kvarn_v_s_row: None,
+            kvarn_v_s_col: None,
         }
     }
 
@@ -825,11 +902,7 @@ impl KVCache {
         match buf {
             Some(k) => {
                 let shape = ffi::array_shape(k);
-                if shape.len() >= 3 {
-                    shape[2]
-                } else {
-                    0
-                }
+                if shape.len() >= 3 { shape[2] } else { 0 }
             }
             None => 0,
         }
@@ -863,8 +936,206 @@ impl KVCache {
             KVCacheMode::Turbo4 => self.update_turbo4_sym(new_keys, new_values),
             KVCacheMode::Turbo4Delegated => self.update_turbo4_delegated(new_keys, new_values),
             KVCacheMode::Turbo3Asym => self.update_turbo3_asym(new_keys, new_values),
+            KVCacheMode::KVarN8 => self.update_kvarn8(new_keys, new_values),
             KVCacheMode::Fp16 => self.update_fp16(new_keys, new_values),
         }
+    }
+
+    /// KVarN8 update path — rotate incoming tokens into the Hadamard frame,
+    /// route them to sink / full-tile quantization / tail (see the
+    /// `kvarn_*` field docs and the [`kvarn`] module).
+    ///
+    /// v1 is correctness-first: buffers grow by concatenation (no
+    /// pre-allocation), and the whole history dequantizes on every fetch.
+    /// Both are acceptable for the gate rungs and marked for optimization
+    /// after live measurement — the transparent-mode semantics (FP16
+    /// standard frame out) will not change.
+    fn update_kvarn8(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
+        use crate::cache::kvarn::{KVARN_TILE_TOKENS, kvarn_quantize, kvarn_rotate};
+
+        let key_shape = ffi::array_shape(&new_keys);
+        let head_dim = key_shape[3];
+        assert!(
+            head_dim > 0 && (head_dim & (head_dim - 1)) == 0,
+            "KVarN8 requires power-of-2 head_dim (Hadamard); got {head_dim} — \
+             the mode guard upstream should have refused this model"
+        );
+        let new_seq_len = key_shape[2];
+
+        // Rotate once per incoming token (channel-axis Hadamard). K arrives
+        // post-RoPE; rotation composes after RoPE by design (the two do not
+        // commute, so rotation lives at the cache boundary — module docs).
+        let rot_k = kvarn_rotate(&ffi::astype(&new_keys, dtype::FLOAT16));
+        let rot_v = kvarn_rotate(&ffi::astype(&new_values, dtype::FLOAT16));
+
+        // Prepend any existing tail so the splitting below sees one
+        // contiguous rotated run.
+        let (mut pending_k, mut pending_v) =
+            match (self.kvarn_tail_k.take(), self.kvarn_tail_v.take()) {
+                (Some(tk), Some(tv)) => (
+                    crate::ops::concatenate(&tk, &rot_k, 2),
+                    crate::ops::concatenate(&tv, &rot_v, 2),
+                ),
+                _ => (rot_k, rot_v),
+            };
+
+        // Fill the FP16 sink first (first KVARN_TILE_TOKENS positions).
+        let sink_len = self
+            .kvarn_sink_k
+            .as_ref()
+            .map_or(0, |s| ffi::array_shape(s)[2]);
+        let sink_needed = (KVARN_TILE_TOKENS - sink_len).max(0);
+        if sink_needed > 0 {
+            let shape = ffi::array_shape(&pending_k);
+            let take = sink_needed.min(shape[2]);
+            let (b, h, d) = (shape[0], shape[1], shape[3]);
+            let k_part = ffi::slice(&pending_k, &[0, 0, 0, 0], &[b, h, take, d]);
+            let v_part = ffi::slice(&pending_v, &[0, 0, 0, 0], &[b, h, take, d]);
+            self.kvarn_sink_k = Some(match self.kvarn_sink_k.take() {
+                Some(s) => crate::ops::concatenate(&s, &k_part, 2),
+                None => k_part,
+            });
+            self.kvarn_sink_v = Some(match self.kvarn_sink_v.take() {
+                Some(s) => crate::ops::concatenate(&s, &v_part, 2),
+                None => v_part,
+            });
+            if shape[2] - take == 0 {
+                self.offset += new_seq_len;
+                return;
+            }
+            pending_k = ffi::slice(&pending_k, &[0, 0, take, 0], &[b, h, shape[2], d]);
+            pending_v = ffi::slice(&pending_v, &[0, 0, take, 0], &[b, h, shape[2], d]);
+        }
+
+        // Quantize as many full tiles as pending holds; remainder → tail.
+        let shape = ffi::array_shape(&pending_k);
+        let (b, h, len, d) = (shape[0], shape[1], shape[2], shape[3]);
+        let n_full = len / KVARN_TILE_TOKENS;
+        if n_full > 0 {
+            let full_len = n_full * KVARN_TILE_TOKENS;
+            let k_full = ffi::slice(&pending_k, &[0, 0, 0, 0], &[b, h, full_len, d]);
+            let v_full = ffi::slice(&pending_v, &[0, 0, 0, 0], &[b, h, full_len, d]);
+            // [B,H,full_len,D] → tile batch [B·H·n_full, TILE, D].
+            let as_tiles = |x: &MlxArray| {
+                ffi::reshape(
+                    &ffi::astype(x, dtype::FLOAT32),
+                    &[b * h * n_full, KVARN_TILE_TOKENS, d],
+                )
+            };
+            let k_q = kvarn_quantize(&as_tiles(&k_full), 8);
+            let v_q = kvarn_quantize(&as_tiles(&v_full), 8);
+
+            fn append(
+                dst: &mut Option<UniquePtr<MlxArray>>,
+                new: &MlxArray,
+                shape: &[i32],
+                axis: i32,
+            ) {
+                let new = ffi::reshape(new, shape);
+                *dst = Some(match dst.take() {
+                    Some(old) => crate::ops::concatenate(&old, &new, axis),
+                    None => new,
+                });
+            }
+            append(&mut self.kvarn_hist_k, &k_q.q, &[b, h, full_len, d], 2);
+            append(&mut self.kvarn_hist_v, &v_q.q, &[b, h, full_len, d], 2);
+            append(&mut self.kvarn_k_scale, &k_q.scale, &[b, h, full_len, 1], 2);
+            append(&mut self.kvarn_k_zp, &k_q.zp, &[b, h, full_len, 1], 2);
+            append(&mut self.kvarn_k_s_row, &k_q.s_row, &[b, h, full_len, 1], 2);
+            append(&mut self.kvarn_v_scale, &v_q.scale, &[b, h, full_len, 1], 2);
+            append(&mut self.kvarn_v_zp, &v_q.zp, &[b, h, full_len, 1], 2);
+            append(&mut self.kvarn_v_s_row, &v_q.s_row, &[b, h, full_len, 1], 2);
+            // s_col is per-tile: [B·H·n_full, 1, D] → [B, H, n_full, D],
+            // appended along the tile axis (2).
+            append(&mut self.kvarn_k_s_col, &k_q.s_col, &[b, h, n_full, d], 2);
+            append(&mut self.kvarn_v_s_col, &v_q.s_col, &[b, h, n_full, d], 2);
+
+            if len > full_len {
+                self.kvarn_tail_k = Some(ffi::slice(
+                    &pending_k,
+                    &[0, 0, full_len, 0],
+                    &[b, h, len, d],
+                ));
+                self.kvarn_tail_v = Some(ffi::slice(
+                    &pending_v,
+                    &[0, 0, full_len, 0],
+                    &[b, h, len, d],
+                ));
+            }
+        } else {
+            self.kvarn_tail_k = Some(pending_k);
+            self.kvarn_tail_v = Some(pending_v);
+        }
+        self.offset += new_seq_len;
+    }
+
+    /// Assemble the full KVarN8 K/V window in the STANDARD frame (FP16):
+    /// dequantize history tiles, concatenate [sink, history, tail] (all
+    /// rotated), un-rotate once (`wht` is self-inverse), cast. Returns
+    /// `(keys, values)`.
+    fn fetch_kvarn8(&self) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        use crate::cache::kvarn::{KVARN_TILE_TOKENS, kvarn_rotate};
+
+        #[allow(clippy::too_many_arguments)]
+        fn assemble(
+            sink: &Option<UniquePtr<MlxArray>>,
+            hist: &Option<UniquePtr<MlxArray>>,
+            scale: &Option<UniquePtr<MlxArray>>,
+            zp: &Option<UniquePtr<MlxArray>>,
+            s_row: &Option<UniquePtr<MlxArray>>,
+            s_col: &Option<UniquePtr<MlxArray>>,
+            tail: &Option<UniquePtr<MlxArray>>,
+        ) -> UniquePtr<MlxArray> {
+            let mut parts: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(3);
+            if let Some(s) = sink {
+                parts.push(ffi::astype(s, dtype::FLOAT32));
+            }
+            if let Some(q) = hist {
+                // (q·scale + zp)·s_row, then ·s_col per tile.
+                let qf = ffi::astype(q, dtype::FLOAT32);
+                let de = ffi::add(
+                    &ffi::multiply(&qf, scale.as_ref().unwrap()),
+                    zp.as_ref().unwrap(),
+                );
+                let de = ffi::multiply(&de, s_row.as_ref().unwrap());
+                let shape = ffi::array_shape(&de);
+                let (b, h, t, d) = (shape[0], shape[1], shape[2], shape[3]);
+                let n_tiles = t / KVARN_TILE_TOKENS;
+                let tiled = ffi::reshape(&de, &[b, h, n_tiles, KVARN_TILE_TOKENS, d]);
+                let sc = ffi::reshape(s_col.as_ref().unwrap(), &[b, h, n_tiles, 1, d]);
+                let scaled = ffi::multiply(&tiled, &sc);
+                parts.push(ffi::reshape(&scaled, &[b, h, t, d]));
+            }
+            if let Some(tl) = tail {
+                parts.push(ffi::astype(tl, dtype::FLOAT32));
+            }
+            assert!(!parts.is_empty(), "fetch_kvarn8 on an empty cache");
+            let mut rotated = parts.remove(0);
+            for p in parts {
+                rotated = crate::ops::concatenate(&rotated, &p, 2);
+            }
+            ffi::astype(&kvarn_rotate(&rotated), dtype::FLOAT16)
+        }
+
+        let k = assemble(
+            &self.kvarn_sink_k,
+            &self.kvarn_hist_k,
+            &self.kvarn_k_scale,
+            &self.kvarn_k_zp,
+            &self.kvarn_k_s_row,
+            &self.kvarn_k_s_col,
+            &self.kvarn_tail_k,
+        );
+        let v = assemble(
+            &self.kvarn_sink_v,
+            &self.kvarn_hist_v,
+            &self.kvarn_v_scale,
+            &self.kvarn_v_zp,
+            &self.kvarn_v_s_row,
+            &self.kvarn_v_s_col,
+            &self.kvarn_tail_v,
+        );
+        (k, v)
     }
 
     /// FP16 (standard) update path — original pre-allocated buffer logic.
@@ -1693,11 +1964,7 @@ impl KVCache {
         match self.keys.as_ref() {
             Some(k) => {
                 let s = ffi::array_shape(k);
-                if s.len() >= 3 {
-                    s[2]
-                } else {
-                    0
-                }
+                if s.len() >= 3 { s[2] } else { 0 }
             }
             None => 0,
         }
@@ -1709,11 +1976,7 @@ impl KVCache {
         match self.values.as_ref() {
             Some(v) => {
                 let s = ffi::array_shape(v);
-                if s.len() >= 3 {
-                    s[2]
-                } else {
-                    0
-                }
+                if s.len() >= 3 { s[2] } else { 0 }
             }
             None => 0,
         }
@@ -2047,11 +2310,7 @@ impl KVCache {
         let cold_cap = match &self.v_packed {
             Some(vp) => {
                 let s = ffi::array_shape(vp);
-                if s.len() >= 3 {
-                    s[2]
-                } else {
-                    0
-                }
+                if s.len() >= 3 { s[2] } else { 0 }
             }
             None => 0,
         };
@@ -2575,6 +2834,14 @@ impl KVCache {
         // `self.offset`-based slicing.
         let live_len = self.buffer_idx();
         match self.mode {
+            KVCacheMode::KVarN8 => {
+                // Transparent dequant + un-rotate; all bookkeeping (sink/
+                // tile/tail splits) already happened in update_kvarn8.
+                // NOTE: KVarN8 does not support live_start trimming (the
+                // trim_front guard excludes it), so buffer_idx == offset
+                // and fetch_kvarn8 assembles the whole window.
+                self.fetch_kvarn8()
+            }
             KVCacheMode::Int8 => {
                 // Dequantize the filled portion of the INT8 buffers
                 let k_int8 = self.keys.as_ref().unwrap();
@@ -2971,6 +3238,26 @@ impl KVCache {
         }
         if let Some(vn) = self.v_norms.as_ref() {
             ffi::eval(vn);
+        }
+        for kv in [
+            &self.kvarn_sink_k,
+            &self.kvarn_sink_v,
+            &self.kvarn_tail_k,
+            &self.kvarn_tail_v,
+            &self.kvarn_hist_k,
+            &self.kvarn_hist_v,
+            &self.kvarn_k_scale,
+            &self.kvarn_k_zp,
+            &self.kvarn_k_s_row,
+            &self.kvarn_k_s_col,
+            &self.kvarn_v_scale,
+            &self.kvarn_v_zp,
+            &self.kvarn_v_s_row,
+            &self.kvarn_v_s_col,
+        ] {
+            if let Some(a) = kv.as_ref() {
+                ffi::eval(a);
+            }
         }
         if let Some(vr) = self.v_rescale.as_ref() {
             ffi::eval(vr);
@@ -3727,10 +4014,7 @@ impl KVCache {
     /// a dense per-request tensor regardless of paging mode (paging is for
     /// the larger main K/V where memory pressure justifies the indirection
     /// cost; the idx_k tensor is small enough that dense storage is fine).
-    pub fn m3_idx_k_update_and_fetch(
-        &mut self,
-        new_idx_k: &MlxArray,
-    ) -> UniquePtr<MlxArray> {
+    pub fn m3_idx_k_update_and_fetch(&mut self, new_idx_k: &MlxArray) -> UniquePtr<MlxArray> {
         let new_shape = ffi::array_shape(new_idx_k);
         let chunk_len = new_shape[2];
         let combined = match self.m3_idx_k.as_ref() {
@@ -3968,11 +4252,7 @@ impl RotatingKVCache {
         }
         if let Some(ref keys) = self.keys {
             let shape = ffi::array_shape(keys);
-            if shape.len() >= 3 {
-                shape[2]
-            } else {
-                0
-            }
+            if shape.len() >= 3 { shape[2] } else { 0 }
         } else {
             0
         }
@@ -3995,6 +4275,13 @@ impl RotatingKVCache {
                 // INT8 support for RotatingKVCache is not part of B9 / issue
                 // Fall back to FP16 storage so the path is correct, even
                 // if mis-configured. A future sub-issue can wire INT8 in.
+                self.update_and_fetch_fp16(new_keys, new_values)
+            }
+            KVCacheMode::KVarN8 => {
+                // KVarN8 is not wired for sliding-window caches (tile
+                // bookkeeping vs. rotation eviction is future work). Fall
+                // back to FP16 so the path stays CORRECT if mis-configured
+                // — explicit arm, never a wildcard (dead-floor class).
                 self.update_and_fetch_fp16(new_keys, new_values)
             }
             KVCacheMode::Turbo4Asym => self.update_and_fetch_turbo4_asym(new_keys, new_values),
@@ -6692,10 +6979,7 @@ mod tests {
     fn m3_idx_k_cache_first_write_stores_chunk_and_advances_offset() {
         let mut cache = KVCache::new();
         // [b=1, head=1, len=3, dim=2]
-        let chunk = ffi::from_slice_f32(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            &[1, 1, 3, 2],
-        );
+        let chunk = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 1, 3, 2]);
         let full = cache.m3_idx_k_update_and_fetch(&chunk);
         assert_eq!(cache.m3_idx_offset(), 3);
         assert!(cache.has_m3_idx_k_state());
@@ -6756,11 +7040,7 @@ mod tests {
         }
         // Final state: full cache should contain values 0..12.
         let full_shape = vec![1, 1, 6, 2];
-        let full = ffi::slice(
-            cache.m3_idx_k.as_ref().unwrap(),
-            &[0, 0, 0, 0],
-            &full_shape,
-        );
+        let full = ffi::slice(cache.m3_idx_k.as_ref().unwrap(), &[0, 0, 0, 0], &full_shape);
         ffi::eval(&full);
         let bytes = ffi::array_to_raw_bytes(&full);
         let vals: Vec<f32> = bytes

@@ -170,8 +170,10 @@ pub fn boundary_mode_for(nominal: KVCacheMode) -> KVCacheMode {
         | KVCacheMode::Turbo4Delegated
         | KVCacheMode::Turbo3Asym => KVCacheMode::Fp16,
         // Non-turbo modes have no boundary upgrade path — return the
-        // nominal mode unchanged.
-        KVCacheMode::Fp16 | KVCacheMode::Int8 => nominal,
+        // nominal mode unchanged. KVarN8's FP16 sink pool already keeps
+        // the highest-sensitivity (attention-sink) tokens unquantized by
+        // construction, so a boundary-layer override adds nothing there.
+        KVCacheMode::Fp16 | KVCacheMode::Int8 | KVCacheMode::KVarN8 => nominal,
     }
 }
 

@@ -530,6 +530,18 @@ impl KVCache {
     /// Used by: prompt prefix cache detach/adopt, cross-request reuse
     /// handoff inside `CachePool::detach`.
     pub fn clone_handle(&mut self) -> DetachedKVCache {
+        // KVarN8 detach/donation lands in PR-3 (DetachedKVCache mirror
+        // fields + tile-aligned trim_to). Until then, refusing LOUDLY beats
+        // the silent alternative: the field moves below would strand the
+        // kvarn_* tile state on the source while zeroing its offset —
+        // a poisoned donation that corrupts whichever sequence adopts it.
+        // KVarN8 cannot reach a production server before PR-3 + gates, so
+        // this assert can only fire on a test port.
+        assert!(
+            self.mode != KVCacheMode::KVarN8,
+            "KVarN8 prompt-cache donation/detach is not implemented yet \
+             (PR-3); refusing rather than silently dropping tile state"
+        );
         self.compact_turbo4_delegated_fp16_sidecars();
 
         let handle = DetachedKVCache {
