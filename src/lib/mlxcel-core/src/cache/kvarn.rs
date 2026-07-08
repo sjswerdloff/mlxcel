@@ -586,3 +586,144 @@ mod cache_integration_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod detach_roundtrip_tests {
+    use super::*;
+    use crate::cache::{KVCache, KVCacheMode};
+
+    fn lcg_data(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    fn feed(cache: &mut KVCache, data_k: &[f32], data_v: &[f32], b: i32, h: i32, len: i32, d: i32) {
+        let k = ffi::astype(
+            &ffi::from_slice_f32(data_k, &[b, h, len, d]),
+            dtype::FLOAT16,
+        );
+        let v = ffi::astype(
+            &ffi::from_slice_f32(data_v, &[b, h, len, d]),
+            dtype::FLOAT16,
+        );
+        let _ = cache.update_and_fetch(k, v);
+    }
+
+    /// PR-3 proof: detach → tile-aligned trim → adopt into a fresh cache
+    /// must be BIT-IDENTICAL to a cache that simply never saw the trimmed
+    /// suffix — the surviving quantized tiles are the same bytes, the
+    /// pipeline is deterministic, so any divergence is a slicing bug.
+    ///
+    /// 320 tokens = sink 128 + one 128-token tile + tail 64.
+    /// trim_to(256) keeps sink + tile exactly (the aligned boundary).
+    /// Both caches then receive the same next token; the fetched windows
+    /// must match exactly (atol 0 via allclose with tight tolerances).
+    #[test]
+    fn kvarn8_detach_trim_adopt_is_bit_identical_to_direct_prefix() {
+        let (b, h, d) = (1i32, 2i32, 64i32);
+        let n_all = (b * h * 320 * d) as usize;
+        let k_all = lcg_data(n_all, 0xDE7AC0);
+        let v_all = lcg_data(n_all, 0xAD0B7);
+
+        // Cache A: all 320 tokens, then detach + trim to 256 + adopt.
+        let mut a = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        feed(&mut a, &k_all, &v_all, b, h, 320, d);
+        let mut detached = a.clone_handle();
+        detached
+            .trim_to(256)
+            .expect("tile-aligned trim must succeed");
+        let mut adopted = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        adopted
+            .install_detached(detached)
+            .expect("install into fresh cache");
+        assert_eq!(adopted.offset, 256, "adopted offset");
+
+        // Cache B: fed ONLY the first 256 tokens of the identical stream.
+        // Per-(head,token) layout means the first 256 tokens of each head
+        // are interleaved in the flat buffer — slice via MLX, not the Vec.
+        let mut direct = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        let k_full = ffi::from_slice_f32(&k_all, &[b, h, 320, d]);
+        let v_full = ffi::from_slice_f32(&v_all, &[b, h, 320, d]);
+        let k_256 = ffi::slice(&k_full, &[0, 0, 0, 0], &[b, h, 256, d]);
+        let v_256 = ffi::slice(&v_full, &[0, 0, 0, 0], &[b, h, 256, d]);
+        let _ = direct.update_and_fetch(
+            ffi::astype(&k_256, dtype::FLOAT16),
+            ffi::astype(&v_256, dtype::FLOAT16),
+        );
+
+        // Same next token to both; windows must match bit-for-bit.
+        let n1 = (b * h * d) as usize;
+        let k_next = lcg_data(n1, 999);
+        let v_next = lcg_data(n1, 998);
+        let mk =
+            |data: &[f32]| ffi::astype(&ffi::from_slice_f32(data, &[b, h, 1, d]), dtype::FLOAT16);
+        let (qa_k, qa_v) = adopted.update_and_fetch(mk(&k_next), mk(&v_next));
+        let (qb_k, qb_v) = direct.update_and_fetch(mk(&k_next), mk(&v_next));
+
+        for (x, y, name) in [(&qa_k, &qb_k, "K"), (&qa_v, &qb_v, "V")] {
+            assert_eq!(ffi::array_shape(x), ffi::array_shape(y), "{name} shape");
+            assert_eq!(ffi::array_shape(x)[2], 257, "{name} window len");
+            let close = ffi::allclose(x, y, 0.0, 1e-6);
+            ffi::eval(&close);
+            assert!(
+                ffi::item_bool(&close),
+                "{name}: adopted-after-trim diverges from direct prefix — \
+                 detach/trim/install corrupted tile state"
+            );
+        }
+    }
+
+    /// Misaligned history truncation must refuse loudly, not approximate.
+    #[test]
+    fn kvarn8_trim_to_refuses_misaligned_history() {
+        let (b, h, d) = (1i32, 1i32, 64i32);
+        let n = (b * h * 320 * d) as usize;
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        feed(&mut cache, &lcg_data(n, 41), &lcg_data(n, 42), b, h, 320, d);
+        let mut detached = cache.clone_handle();
+        // 200 = sink 128 + 72 tokens INTO the tile — not tile-aligned.
+        let err = detached.trim_to(200);
+        assert!(
+            err.is_err(),
+            "misaligned KVarN8 trim must fail loudly, got Ok"
+        );
+        let msg = err.unwrap_err();
+        assert!(
+            msg.contains("tile-aligned"),
+            "error must name the alignment violation: {msg}"
+        );
+    }
+
+    /// Trim INTO the sink region (below one tile) keeps a pure-FP16 prefix.
+    #[test]
+    fn kvarn8_trim_to_within_sink() {
+        let (b, h, d) = (1i32, 1i32, 64i32);
+        let n = (b * h * 320 * d) as usize;
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        feed(&mut cache, &lcg_data(n, 51), &lcg_data(n, 52), b, h, 320, d);
+        let mut detached = cache.clone_handle();
+        detached.trim_to(64).expect("sink-region trim");
+        let mut adopted = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        adopted.install_detached(detached).expect("install");
+        assert_eq!(adopted.offset, 64);
+        // Continue generating from it — window must be 65 after one token.
+        let n1 = (b * h * d) as usize;
+        let k = ffi::astype(
+            &ffi::from_slice_f32(&lcg_data(n1, 61), &[b, h, 1, d]),
+            dtype::FLOAT16,
+        );
+        let v = ffi::astype(
+            &ffi::from_slice_f32(&lcg_data(n1, 62), &[b, h, 1, d]),
+            dtype::FLOAT16,
+        );
+        let (kk, _) = adopted.update_and_fetch(k, v);
+        assert_eq!(ffi::array_shape(&kk)[2], 65, "window after sink-trim + 1");
+    }
+}

@@ -134,6 +134,24 @@ pub struct DetachedKVCache {
     /// operation. Preserved through detach/adopt and trimmed by `trim_to`
     /// in parallel with the main K seq axis.
     pub(super) m3_idx_offset: i32,
+
+    // KVarN8 tile state (all None for other modes). Same rotated-frame
+    // layout as the live cache fields — see the `kvarn_*` docs on KVCache.
+    // Round-trips through detach/adopt; trimmed tile-aligned by `trim_to`.
+    pub(super) kvarn_sink_k: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_sink_v: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_tail_k: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_tail_v: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_hist_k: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_hist_v: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_k_scale: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_k_zp: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_k_s_row: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_k_s_col: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_v_scale: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_v_zp: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_v_s_row: Option<UniquePtr<MlxArray>>,
+    pub(super) kvarn_v_s_col: Option<UniquePtr<MlxArray>>,
 }
 
 impl DetachedKVCache {
@@ -162,6 +180,9 @@ impl DetachedKVCache {
             || self.k_packed.is_some()
             || self.k_norms.is_some()
             || self.m3_idx_k.is_some()
+            || self.kvarn_sink_k.is_some()
+            || self.kvarn_tail_k.is_some()
+            || self.kvarn_hist_k.is_some()
         {
             return None;
         }
@@ -185,6 +206,20 @@ impl DetachedKVCache {
             delegated_fp16_sidecar_policy: self.delegated_fp16_sidecar_policy,
             m3_idx_k: None,
             m3_idx_offset: 0,
+            kvarn_sink_k: None,
+            kvarn_sink_v: None,
+            kvarn_tail_k: None,
+            kvarn_tail_v: None,
+            kvarn_hist_k: None,
+            kvarn_hist_v: None,
+            kvarn_k_scale: None,
+            kvarn_k_zp: None,
+            kvarn_k_s_row: None,
+            kvarn_k_s_col: None,
+            kvarn_v_scale: None,
+            kvarn_v_zp: None,
+            kvarn_v_s_row: None,
+            kvarn_v_s_col: None,
         })
     }
 
@@ -209,12 +244,33 @@ impl DetachedKVCache {
         let kp = self.k_packed.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let kn = self.k_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let im3 = self.m3_idx_k.as_ref().map_or(0, |a| ffi::array_nbytes(a));
-        k + v + ks + vs + vp + vn + vr + kp + kn + im3
+        let kvarn: usize = [
+            &self.kvarn_sink_k,
+            &self.kvarn_sink_v,
+            &self.kvarn_tail_k,
+            &self.kvarn_tail_v,
+            &self.kvarn_hist_k,
+            &self.kvarn_hist_v,
+            &self.kvarn_k_scale,
+            &self.kvarn_k_zp,
+            &self.kvarn_k_s_row,
+            &self.kvarn_k_s_col,
+            &self.kvarn_v_scale,
+            &self.kvarn_v_zp,
+            &self.kvarn_v_s_row,
+            &self.kvarn_v_s_col,
+        ]
+        .iter()
+        .map(|t| t.as_ref().map_or(0, |a| ffi::array_nbytes(a)))
+        .sum();
+        k + v + ks + vs + vp + vn + vr + kp + kn + im3 + kvarn
     }
 
     /// Whether the detached handle carries no data (all tensors were `None`).
+    /// KVarN8 caches store nothing in `keys`/`k_packed` — their earliest
+    /// state lives in the sink pool, so it must be checked too.
     pub fn is_empty(&self) -> bool {
-        self.keys.is_none() && self.k_packed.is_none()
+        self.keys.is_none() && self.k_packed.is_none() && self.kvarn_sink_k.is_none()
     }
 
     /// Read-only access to the detached keys tensor.
@@ -288,6 +344,20 @@ impl DetachedKVCache {
             self.v_norms = None;
             self.v_rescale = None;
             self.k_packed = None;
+            self.kvarn_sink_k = None;
+            self.kvarn_sink_v = None;
+            self.kvarn_tail_k = None;
+            self.kvarn_tail_v = None;
+            self.kvarn_hist_k = None;
+            self.kvarn_hist_v = None;
+            self.kvarn_k_scale = None;
+            self.kvarn_k_zp = None;
+            self.kvarn_k_s_row = None;
+            self.kvarn_k_s_col = None;
+            self.kvarn_v_scale = None;
+            self.kvarn_v_zp = None;
+            self.kvarn_v_s_row = None;
+            self.kvarn_v_s_col = None;
             self.k_norms = None;
             self.cold_offset = 0;
             self.offset = 0;
@@ -411,6 +481,80 @@ impl DetachedKVCache {
                 self.k_norms = trim_axis_seq(&self.k_norms, 1);
             }
 
+            // KVarN8: truncate across the [sink | history tiles | tail]
+            // layout. History truncation must land on a tile boundary —
+            // the adoption floor (prefill_alignment = tile size = 128)
+            // guarantees this for every real adopt, so a misaligned
+            // new_len here is a caller bug and fails loudly rather than
+            // approximating (a half-tile cannot be re-quantized without
+            // the original fp16 data).
+            if self.mode == KVCacheMode::KVarN8 {
+                let tile = crate::cache::kvarn::KVARN_TILE_TOKENS;
+                let slice_seq = |t: &Option<UniquePtr<MlxArray>>, keep: i32| {
+                    t.as_ref().map(|a| {
+                        let s = ffi::array_shape(a);
+                        ffi::slice(a, &[0, 0, 0, 0], &[s[0], s[1], keep, s[3]])
+                    })
+                };
+                let sink_len = self
+                    .kvarn_sink_k
+                    .as_ref()
+                    .map_or(0, |s| ffi::array_shape(s)[2]);
+                let hist_len = self
+                    .kvarn_hist_k
+                    .as_ref()
+                    .map_or(0, |h| ffi::array_shape(h)[2]);
+
+                if new_len <= sink_len {
+                    self.kvarn_sink_k = slice_seq(&self.kvarn_sink_k, new_len);
+                    self.kvarn_sink_v = slice_seq(&self.kvarn_sink_v, new_len);
+                    self.kvarn_hist_k = None;
+                    self.kvarn_hist_v = None;
+                    self.kvarn_k_scale = None;
+                    self.kvarn_k_zp = None;
+                    self.kvarn_k_s_row = None;
+                    self.kvarn_k_s_col = None;
+                    self.kvarn_v_scale = None;
+                    self.kvarn_v_zp = None;
+                    self.kvarn_v_s_row = None;
+                    self.kvarn_v_s_col = None;
+                    self.kvarn_tail_k = None;
+                    self.kvarn_tail_v = None;
+                } else {
+                    let hist_keep = (new_len - sink_len).min(hist_len);
+                    let tail_keep = new_len - sink_len - hist_keep;
+                    if hist_keep % tile != 0 {
+                        return Err(format!(
+                            "DetachedKVCache::trim_to: KVarN8 history \
+                             truncation to {hist_keep} tokens is not \
+                             tile-aligned (tile = {tile}); adoption floors \
+                             to the alignment quantum so this indicates a \
+                             caller bug"
+                        ));
+                    }
+                    if hist_keep < hist_len {
+                        let n_tiles_keep = hist_keep / tile;
+                        self.kvarn_hist_k = slice_seq(&self.kvarn_hist_k, hist_keep);
+                        self.kvarn_hist_v = slice_seq(&self.kvarn_hist_v, hist_keep);
+                        self.kvarn_k_scale = slice_seq(&self.kvarn_k_scale, hist_keep);
+                        self.kvarn_k_zp = slice_seq(&self.kvarn_k_zp, hist_keep);
+                        self.kvarn_k_s_row = slice_seq(&self.kvarn_k_s_row, hist_keep);
+                        self.kvarn_v_scale = slice_seq(&self.kvarn_v_scale, hist_keep);
+                        self.kvarn_v_zp = slice_seq(&self.kvarn_v_zp, hist_keep);
+                        self.kvarn_v_s_row = slice_seq(&self.kvarn_v_s_row, hist_keep);
+                        self.kvarn_k_s_col = slice_seq(&self.kvarn_k_s_col, n_tiles_keep);
+                        self.kvarn_v_s_col = slice_seq(&self.kvarn_v_s_col, n_tiles_keep);
+                    }
+                    if tail_keep > 0 {
+                        self.kvarn_tail_k = slice_seq(&self.kvarn_tail_k, tail_keep);
+                        self.kvarn_tail_v = slice_seq(&self.kvarn_tail_v, tail_keep);
+                    } else {
+                        self.kvarn_tail_k = None;
+                        self.kvarn_tail_v = None;
+                    }
+                }
+            }
+
             self.offset = new_len;
         }
 
@@ -530,18 +674,6 @@ impl KVCache {
     /// Used by: prompt prefix cache detach/adopt, cross-request reuse
     /// handoff inside `CachePool::detach`.
     pub fn clone_handle(&mut self) -> DetachedKVCache {
-        // KVarN8 detach/donation lands in PR-3 (DetachedKVCache mirror
-        // fields + tile-aligned trim_to). Until then, refusing LOUDLY beats
-        // the silent alternative: the field moves below would strand the
-        // kvarn_* tile state on the source while zeroing its offset —
-        // a poisoned donation that corrupts whichever sequence adopts it.
-        // KVarN8 cannot reach a production server before PR-3 + gates, so
-        // this assert can only fire on a test port.
-        assert!(
-            self.mode != KVCacheMode::KVarN8,
-            "KVarN8 prompt-cache donation/detach is not implemented yet \
-             (PR-3); refusing rather than silently dropping tile state"
-        );
         self.compact_turbo4_delegated_fp16_sidecars();
 
         let handle = DetachedKVCache {
@@ -564,6 +696,20 @@ impl KVCache {
             delegated_fp16_sidecar_policy: self.delegated_fp16_sidecar_policy,
             m3_idx_k: self.m3_idx_k.take(),
             m3_idx_offset: std::mem::replace(&mut self.m3_idx_offset, 0),
+            kvarn_sink_k: self.kvarn_sink_k.take(),
+            kvarn_sink_v: self.kvarn_sink_v.take(),
+            kvarn_tail_k: self.kvarn_tail_k.take(),
+            kvarn_tail_v: self.kvarn_tail_v.take(),
+            kvarn_hist_k: self.kvarn_hist_k.take(),
+            kvarn_hist_v: self.kvarn_hist_v.take(),
+            kvarn_k_scale: self.kvarn_k_scale.take(),
+            kvarn_k_zp: self.kvarn_k_zp.take(),
+            kvarn_k_s_row: self.kvarn_k_s_row.take(),
+            kvarn_k_s_col: self.kvarn_k_s_col.take(),
+            kvarn_v_scale: self.kvarn_v_scale.take(),
+            kvarn_v_zp: self.kvarn_v_zp.take(),
+            kvarn_v_s_row: self.kvarn_v_s_row.take(),
+            kvarn_v_s_col: self.kvarn_v_s_col.take(),
         };
         // Clear turbo_params on the source so the next quantize call rebuilds
         // it from scratch (required if the slot is reused with a different
@@ -615,6 +761,20 @@ impl KVCache {
         // `models/minimax_m3.rs` would fire permanently on adopted sessions.
         self.m3_idx_k = detached.m3_idx_k;
         self.m3_idx_offset = detached.m3_idx_offset;
+        self.kvarn_sink_k = detached.kvarn_sink_k;
+        self.kvarn_sink_v = detached.kvarn_sink_v;
+        self.kvarn_tail_k = detached.kvarn_tail_k;
+        self.kvarn_tail_v = detached.kvarn_tail_v;
+        self.kvarn_hist_k = detached.kvarn_hist_k;
+        self.kvarn_hist_v = detached.kvarn_hist_v;
+        self.kvarn_k_scale = detached.kvarn_k_scale;
+        self.kvarn_k_zp = detached.kvarn_k_zp;
+        self.kvarn_k_s_row = detached.kvarn_k_s_row;
+        self.kvarn_k_s_col = detached.kvarn_k_s_col;
+        self.kvarn_v_scale = detached.kvarn_v_scale;
+        self.kvarn_v_zp = detached.kvarn_v_zp;
+        self.kvarn_v_s_row = detached.kvarn_v_s_row;
+        self.kvarn_v_s_col = detached.kvarn_v_s_col;
         // turbo_params is rebuilt lazily on the next quantize call, but if we
         // can already see the V head_dim from v_packed we may as well prebuild
         // so dequantize-only consumers (which don't go through update_*) still
