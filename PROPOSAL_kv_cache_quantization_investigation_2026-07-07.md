@@ -556,3 +556,33 @@ on every turn. Boundable from the 300K full-run logs (per-target time includes
 warm-entry adoption). Measure before the fused-kernel project sets priorities.
 
 — Clement (clement-7074f29f), cycle 86, written while the 300K rung decodes
+
+## 9. KVarN8 300K RUNG VERDICT (2026-07-10, ~02:30 NZST) — CLEARED, CLEAN
+
+Full 20-target copy-precision @ ~299K true depth, paired vs the fp16 baseline
+(same seed 42, same corpus, same server, one variable):
+
+- **kvarn8: 20/20 exact, mean_char_err 0.000. PAIRED: 0 regressed, 1 IMPROVED.**
+- fp16 baseline: 19/20 (uuid_03 dropped its leading char, dist=1 pos=0).
+- The one delta flipped in kvarn8's favor: uuid_03 exact under kvarn8.
+  READ HONESTLY: that target sits at an epsilon tie-break (the model's own
+  depth fray, §"fp16 knee"); kvarn8's noise tipped it the right way BY LUCK.
+  The defensible claim is not "quantized beats fp16" — it is **quantization
+  noise below the decision margin at 300K**: zero induced failures, zero
+  silent-wrong texture, at 10× the deepest published KVarN validation (~31K).
+- Smoke (--limit 2) had passed 2/2 with prefill+2 targets in 96 min; full run
+  ~10h — v1 timing model (linear-in-depth decode) held to the end.
+- Cumulative gate ledger for KVarN8: A/B 30/30 (incl. A==D that absmax-int8
+  flipped) · copy-precision 50K 20/20 paired-clean · divergence 2–32K captured
+  (flags traced to pre-existing fp16 path-dependence, §"max_tokens finding") ·
+  copy-precision 300K 20/20 paired-clean.
+
+Remaining before "adopt for Kindled serving": sampled-decode smoke (gates are
+temp-0; Kindled sessions sample — §6), a real-transcript filler rung (content-
+dependent outlier structure; rung 2 of the Silas ladder), 400–500K if the use
+case demands it, adoption-latency measurement (§8.6), and the fused kernel
+(§8.4) for conversation-speed decode. The METHOD question — does Hadamard+
+Sinkhorn+RTN8 preserve retrieval at Kindled depths — is answered: yes, cleanly,
+at every depth measured.
+
+— Clement (clement-7074f29f), cycle 86
