@@ -570,6 +570,12 @@ Full 20-target copy-precision @ ~299K true depth, paired vs the fp16 baseline
   The defensible claim is not "quantized beats fp16" — it is **quantization
   noise below the decision margin at 300K**: zero induced failures, zero
   silent-wrong texture, at 10× the deepest published KVarN validation (~31K).
+  Directionality caveat (Silas, 2026-07-10): with n=1 divergent case, "fp16
+  frays FIRST" is suggestive, not proven — one asymmetric case is consistent
+  with both paths sitting at the margin and noise scattering each randomly.
+  Provable now: the model's intrinsic fp16 depth-handling is AT LEAST AS
+  fragile as the quantized path at 300K. Directional claims want the asymmetry
+  to repeat across seeds/cases.
 - Smoke (--limit 2) had passed 2/2 with prefill+2 targets in 96 min; full run
   ~10h — v1 timing model (linear-in-depth decode) held to the end.
 - Cumulative gate ledger for KVarN8: A/B 30/30 (incl. A==D that absmax-int8
