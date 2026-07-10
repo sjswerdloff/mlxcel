@@ -129,14 +129,56 @@ fn direct_prefill_cache_store_enabled() -> bool {
     std::env::var("MLXCEL_ENABLE_DIRECT_PREFILL_CACHE_STORE").is_ok()
 }
 
-/// MLXCEL_FP16_GATHERED=1 lets Fp16 caches report block-fetch support, so
-/// the model's gathered decode flow (selection → block fetch → compact
-/// core) runs on fp16 buffers with zero dequant. Default OFF — the rank
-/// matrix (fetch ∈ {kvarn8, fp16-gathered} × core) is a bench instrument
-/// first; production enablement goes through decode_config later.
+/// Process-wide fp16-gathered capability latch. `true` lets Fp16 caches
+/// report block-fetch support, so the model's gathered decode flow
+/// (selection → block fetch → compact core) runs on fp16 buffers with zero
+/// dequant. Construction-frozen: latched exactly once — by the server's
+/// decode_config boot init ([`init_fp16_gathered`], the
+/// `[construction] fp16_gathered` TOML key), or, for processes that never
+/// load a config (the bench path), by the MLXCEL_FP16_GATHERED=1 env seed
+/// at first read. Process-lifetime because block-fetch support shapes
+/// dispatch for every cache built after it is first consulted.
+static FP16_GATHERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The effective process value; latches the env-seeded default on first
+/// read. This is the single source of truth the fp16 dispatch consults —
+/// decode_config's echo surfaces report THIS, never a private copy.
+pub fn fp16_gathered_effective() -> bool {
+    *FP16_GATHERED.get_or_init(|| std::env::var("MLXCEL_FP16_GATHERED").is_ok_and(|v| v == "1"))
+}
+
+/// Boot-time init from the server's construction config (decode_config).
+/// First-write-wins against the lazy env seed. `Err(current)` reports an
+/// already-latched conflicting value — the caller warns loudly (restart
+/// required); the running value is never changed.
+pub fn init_fp16_gathered(enabled: bool) -> Result<(), bool> {
+    let current = *FP16_GATHERED.get_or_init(|| enabled);
+    if current == enabled { Ok(()) } else { Err(current) }
+}
+
 fn fp16_gathered_enabled() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("MLXCEL_FP16_GATHERED").is_ok_and(|v| v == "1"))
+    fp16_gathered_effective()
+}
+
+#[cfg(test)]
+mod fp16_gathered_latch_tests {
+    /// One sequential test (not several) because the latch is process-global
+    /// `OnceLock` state: first read latches the env seed, same-value init is
+    /// Ok, conflicting init reports the running value without changing it.
+    #[test]
+    fn latch_is_first_write_wins_and_conflict_reports_current() {
+        assert!(
+            std::env::var("MLXCEL_FP16_GATHERED").is_err(),
+            "this test requires MLXCEL_FP16_GATHERED unset (it pins the latch's default seed)"
+        );
+        assert!(!super::fp16_gathered_effective(), "env unset seeds false");
+        assert_eq!(super::init_fp16_gathered(false), Ok(()));
+        assert_eq!(super::init_fp16_gathered(true), Err(false));
+        assert!(
+            !super::fp16_gathered_effective(),
+            "conflicting init must not flip the latch"
+        );
+    }
 }
 
 /// Check that all `KVCache` entries in `caches` support cache trimming.
@@ -1183,14 +1225,15 @@ impl KVCache {
     /// Dense KVarN8 always qualifies; paged backing never carries
     /// KVarN8 state (non-fp16 modes bypass the shared pool at construction).
     ///
-    /// Fp16 qualifies only behind `MLXCEL_FP16_GATHERED=1` (rank-matrix
-    /// candidate, 2026-07-10): the same selection → block-fetch flow with
-    /// NO dequant anywhere, gathering selected blocks straight off the
-    /// fp16 buffer. OFF by default — zero behavior change; the fp16
+    /// Fp16 qualifies only behind the `fp16_gathered` capability latch
+    /// (decode_config `[construction]` key; MLXCEL_FP16_GATHERED=1 env
+    /// seed for bench processes): the same selection → block-fetch flow
+    /// with NO dequant anywhere, gathering selected blocks straight off
+    /// the fp16 buffer. OFF by default — zero behavior change; the fp16
     /// full-window flow is FASTER below ~250K depth (measured,
-    /// RESULTS_h0_depth_profile), so enabling it is a bench/rank decision
-    /// (later a decode_config select-among-implementations one), not a
-    /// hardcoded win. `live_start == 0` required: block coordinates are
+    /// RESULTS_h0_depth_profile), so enabling it is a per-boot
+    /// select-among-implementations decision, not a hardcoded win.
+    /// `live_start == 0` required: block coordinates are
     /// window coordinates only while nothing has been head-trimmed, and
     /// m3_idx (which selection reads) never trims.
     pub fn supports_block_fetch(&self) -> bool {

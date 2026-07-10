@@ -214,15 +214,18 @@ fn main() {
         args.rope_dims,
         args.rope_base
     );
-    // Self-labeling for the msa fetch/core axes (env-gated modes): a
-    // capture whose first lines don't carry these cannot be trusted to a
-    // rank cell. NOTE: this echoes the REQUEST — the model's first-dispatch
-    // INFO line ("C qmm-fetch fused core active") is the witness that C
-    // actually ran; the rank runner requires both.
+    // Self-labeling for the msa fetch/core axes: a capture whose first
+    // lines don't carry these cannot be trusted to a rank cell. Echoes the
+    // EFFECTIVE decode_config (env-seeded unless a TOML overrides) rather
+    // than the raw request env — garbage env values print as the default
+    // they actually select. NOTE: this still echoes INTENT — the model's
+    // first-dispatch INFO lines ("C qmm-fetch fused core active", core
+    // witnesses) remain the proof of what actually ran; the rank runner
+    // requires both.
+    let dc = mlxcel::decode_config::snapshot();
     println!(
         "msa modes: fetch={} core={}",
-        std::env::var("MLXCEL_MSA_FETCH").unwrap_or_else(|_| "default".into()),
-        std::env::var("MLXCEL_MSA_CORE").unwrap_or_else(|_| "blocked".into()),
+        dc.construction.msa_fetch, dc.msa_core,
     );
 
     // Rough state-size estimate up front (fail-loud awareness before a
