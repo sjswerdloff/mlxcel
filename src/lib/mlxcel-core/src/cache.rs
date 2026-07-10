@@ -1228,10 +1228,29 @@ impl KVCache {
             prev = b;
         }
 
-        // Per-side assembly in the ROTATED frame (f32), one part per block,
-        // then a single per-token inverse WHT + fp16 cast — the same op
-        // order as fetch_kvarn8's assemble, restricted to the requested
-        // blocks (bitwise-equal per K0 Q1+Q3).
+        // Per-side assembly in the ROTATED frame (f32), then a single
+        // per-token inverse WHT + fp16 cast — the same per-element op order
+        // as fetch_kvarn8's assemble, restricted to the requested blocks
+        // (bitwise-equal per K0 Q1+Q3).
+        //
+        // BATCHED (2026-07-10, profile-guided): the first implementation
+        // looped per block — ~|blocks| separate slice→dequant chains plus
+        // ~|blocks| concats — and the K1 serialized-ceiling profile measured
+        // it at 4.06 ms/call, 63% of decode cost, dwarfing the host sync
+        // everyone suspected (0.20 ms). Now: because `blocks` is sorted,
+        // the window splits into at most THREE segments — [sink?][interior
+        // tiles][tail?] — and the interior gathers as ONE take_along_axis
+        // over tile-blocked 5-D views + ONE dequant chain. Same values,
+        // same per-element op order (mul scale, add zp, mul s_row, mul
+        // s_col): the atol-0 block-fetch tests pin the equivalence.
+        let interior: Vec<f32> = blocks
+            .iter()
+            .filter(|&&b| b >= 1 && b <= n_tiles)
+            .map(|&b| (b - 1) as f32)
+            .collect();
+        let has_sink = blocks[0] == 0;
+        let has_tail = tail_len > 0 && *blocks.last().unwrap() == n_tiles + 1;
+
         let assemble_blocks = |sink: &Option<UniquePtr<MlxArray>>,
                                hist: &Option<UniquePtr<MlxArray>>,
                                scale: &Option<UniquePtr<MlxArray>>,
@@ -1240,48 +1259,63 @@ impl KVCache {
                                s_col: &Option<UniquePtr<MlxArray>>,
                                tail: &Option<UniquePtr<MlxArray>>|
          -> UniquePtr<MlxArray> {
-            let mut parts: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(blocks.len());
-            for &blk in blocks {
-                if blk == 0 {
-                    parts.push(ffi::astype(sink.as_ref().unwrap(), dtype::FLOAT32));
-                } else if blk <= n_tiles {
-                    let t = blk - 1;
-                    let (r0, r1) = (t * KVARN_TILE_TOKENS, (t + 1) * KVARN_TILE_TOKENS);
-                    let q = hist.as_ref().unwrap();
-                    let qs = ffi::array_shape(q);
-                    let (b_, h_, d_) = (qs[0], qs[1], qs[3]);
-                    let row = |a: &MlxArray, last: i32| {
-                        ffi::slice(a, &[0, 0, r0, 0], &[b_, h_, r1, last])
-                    };
-                    let qf = ffi::astype(&row(q, d_), dtype::FLOAT32);
-                    let de = ffi::add(
-                        &ffi::multiply(&qf, &row(scale.as_ref().unwrap(), 1)),
-                        &row(zp.as_ref().unwrap(), 1),
+            let mut parts: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(3);
+            if has_sink {
+                parts.push(ffi::astype(sink.as_ref().unwrap(), dtype::FLOAT32));
+            }
+            if !interior.is_empty() {
+                let u = interior.len() as i32;
+                let q = hist.as_ref().unwrap();
+                let qs = ffi::array_shape(q);
+                let (b_, h_, d_) = (qs[0], qs[1], qs[3]);
+                let bs = KVARN_TILE_TOKENS;
+                let idx = ffi::astype(
+                    &ffi::from_slice_f32(&interior, &[1, 1, u, 1, 1]),
+                    dtype::INT32,
+                );
+                // Gather along the TILE axis of blocked 5-D views. One
+                // gather per field; indices broadcast across (b, h, bs, d).
+                let gather5 = |a: &MlxArray, last: i32| {
+                    let a5 = ffi::reshape(a, &[b_, h_, n_tiles, bs, last]);
+                    let ib = ffi::broadcast_to(&idx, &[b_, h_, u, bs, last]);
+                    ffi::take_along_axis(&a5, &ib, 2)
+                };
+                let qf = ffi::astype(&gather5(q, d_), dtype::FLOAT32);
+                let de = ffi::add(
+                    &ffi::multiply(&qf, &gather5(scale.as_ref().unwrap(), 1)),
+                    &gather5(zp.as_ref().unwrap(), 1),
+                );
+                let de = ffi::multiply(&de, &gather5(s_row.as_ref().unwrap(), 1));
+                // s_col is per-tile [B,H,n_tiles,D]: gather its tile rows,
+                // then shape [B,H,u,1,D] to broadcast over each tile's
+                // tokens — the 5-D twin of the loop version's [B,H,1,D].
+                let sc4 = {
+                    let idx4 =
+                        ffi::astype(&ffi::from_slice_f32(&interior, &[1, 1, u, 1]), dtype::INT32);
+                    let ib = ffi::broadcast_to(&idx4, &[b_, h_, u, d_]);
+                    ffi::take_along_axis(s_col.as_ref().unwrap(), &ib, 2)
+                };
+                let sc = ffi::reshape(&sc4, &[b_, h_, u, 1, d_]);
+                let de = ffi::multiply(&de, &sc);
+                parts.push(ffi::reshape(&de, &[b_, h_, u * bs, d_]));
+            }
+            if has_tail {
+                // Tail block: fp16-rotated, zero-padded to a full block.
+                // wht(0) == 0, so padding in the rotated frame is identical
+                // to padding after un-rotation (the v1-path equivalent of
+                // zero-padding the assembled window).
+                let t = tail.as_ref().unwrap();
+                let ts = ffi::array_shape(t);
+                let mut p = ffi::astype(t, dtype::FLOAT32);
+                if tail_len < KVARN_TILE_TOKENS {
+                    let pad = ffi::full_f32(
+                        &[ts[0], ts[1], KVARN_TILE_TOKENS - tail_len, ts[3]],
+                        0.0,
+                        dtype::FLOAT32,
                     );
-                    let de = ffi::multiply(&de, &row(s_row.as_ref().unwrap(), 1));
-                    // s_col is per-tile [B,H,n_tiles,D] -> this tile's row,
-                    // shaped [B,H,1,D] to broadcast over the tile's tokens.
-                    let sc =
-                        ffi::slice(s_col.as_ref().unwrap(), &[0, 0, t, 0], &[b_, h_, t + 1, d_]);
-                    parts.push(ffi::multiply(&de, &sc));
-                } else {
-                    // Tail block: fp16-rotated, zero-padded to a full block.
-                    // wht(0) == 0, so padding in the rotated frame is
-                    // identical to padding after un-rotation (the v1-path
-                    // equivalent of zero-padding the assembled window).
-                    let t = tail.as_ref().unwrap();
-                    let ts = ffi::array_shape(t);
-                    let mut p = ffi::astype(t, dtype::FLOAT32);
-                    if tail_len < KVARN_TILE_TOKENS {
-                        let pad = ffi::full_f32(
-                            &[ts[0], ts[1], KVARN_TILE_TOKENS - tail_len, ts[3]],
-                            0.0,
-                            dtype::FLOAT32,
-                        );
-                        p = crate::ops::concatenate(&p, &pad, 2);
-                    }
-                    parts.push(p);
+                    p = crate::ops::concatenate(&p, &pad, 2);
                 }
+                parts.push(p);
             }
             let mut rotated = parts.remove(0);
             for p in parts {
