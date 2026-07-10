@@ -129,6 +129,16 @@ fn direct_prefill_cache_store_enabled() -> bool {
     std::env::var("MLXCEL_ENABLE_DIRECT_PREFILL_CACHE_STORE").is_ok()
 }
 
+/// MLXCEL_FP16_GATHERED=1 lets Fp16 caches report block-fetch support, so
+/// the model's gathered decode flow (selection → block fetch → compact
+/// core) runs on fp16 buffers with zero dequant. Default OFF — the rank
+/// matrix (fetch ∈ {kvarn8, fp16-gathered} × core) is a bench instrument
+/// first; production enablement goes through decode_config later.
+fn fp16_gathered_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("MLXCEL_FP16_GATHERED").is_ok_and(|v| v == "1"))
+}
+
 /// Check that all `KVCache` entries in `caches` support cache trimming.
 ///
 /// Mirrors the upstream mlx-lm `can_trim_prompt_cache` function
@@ -1138,12 +1148,32 @@ impl KVCache {
         (k, v)
     }
 
-    /// True iff this cache can serve [`Self::fetch_kvarn8_blocks`] — the K1
-    /// dequant-after-gather decode path (DESIGN_fused_msa_kvarn_decode_plan).
-    /// Only the dense KVarN8 mode qualifies; paged backing never carries
+    /// True iff this cache can serve [`Self::fetch_msa_blocks`] — the K1
+    /// gathered decode flow (DESIGN_fused_msa_kvarn_decode_plan).
+    /// Dense KVarN8 always qualifies; paged backing never carries
     /// KVarN8 state (non-fp16 modes bypass the shared pool at construction).
+    ///
+    /// Fp16 qualifies only behind `MLXCEL_FP16_GATHERED=1` (rank-matrix
+    /// candidate, 2026-07-10): the same selection → block-fetch flow with
+    /// NO dequant anywhere, gathering selected blocks straight off the
+    /// fp16 buffer. OFF by default — zero behavior change; the fp16
+    /// full-window flow is FASTER below ~250K depth (measured,
+    /// RESULTS_h0_depth_profile), so enabling it is a bench/rank decision
+    /// (later a decode_config select-among-implementations one), not a
+    /// hardcoded win. `live_start == 0` required: block coordinates are
+    /// window coordinates only while nothing has been head-trimmed, and
+    /// m3_idx (which selection reads) never trims.
     pub fn supports_block_fetch(&self) -> bool {
-        self.mode == KVCacheMode::KVarN8 && self.paged_backing.is_none()
+        match self.mode {
+            KVCacheMode::KVarN8 => self.paged_backing.is_none(),
+            KVCacheMode::Fp16 => {
+                fp16_gathered_enabled()
+                    && self.paged_backing.is_none()
+                    && self.keys.is_some()
+                    && self.live_start == 0
+            }
+            _ => false,
+        }
     }
 
     /// Write new K/V into the cache WITHOUT materializing the fetched
@@ -1191,8 +1221,12 @@ impl KVCache {
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         use crate::cache::kvarn::{KVARN_TILE_TOKENS, kvarn_rotate};
 
+        // Own precondition, not the generic supports_block_fetch(): with the
+        // fp16-gathered gate on, an fp16 cache supports block fetch but must
+        // route through fetch_fp16_blocks — reaching here would unwrap absent
+        // kvarn fields.
         assert!(
-            self.supports_block_fetch(),
+            self.mode == KVCacheMode::KVarN8 && self.paged_backing.is_none(),
             "fetch_kvarn8_blocks on a cache that does not support it (mode={:?})",
             self.mode
         );
@@ -1343,6 +1377,120 @@ impl KVCache {
             &self.kvarn_tail_v,
         );
         (k, v)
+    }
+
+    /// fp16-gathered fetch (rank-matrix candidate): assemble ONLY the
+    /// requested MSA key blocks straight off the fp16 buffer — a pure
+    /// block gather, no dequant, no rotation. Same return contract as
+    /// [`Self::fetch_kvarn8_blocks`]: `[B, H, blocks.len() * 128, D]`
+    /// fp16, blocks in the order given, the trailing partial block
+    /// zero-padded to a full block (padded slots carry absolute positions
+    /// >= kv_len, masked by the caller's position rule) — so the compact
+    /// core downstream is byte-for-byte the same code for both fetches.
+    ///
+    /// Block indexing is the uniform fp16 window view: block i covers
+    /// tokens `[i*128, (i+1)*128)` of the live window (no sink/tail
+    /// special cases — fp16 stores every token identically). `blocks`
+    /// must be strictly increasing, unique, in-range; refused loudly
+    /// otherwise (same contract, same reason as the kvarn8 fetch).
+    ///
+    /// O(top_k) traffic: the full blocks gather as ONE take_along_axis
+    /// over a 5-D tile-blocked VIEW of the buffer (leading slice of a
+    /// contiguous buffer → view, no copy — the same batched pattern the
+    /// kvarn8 fetch uses, whose depth-flatness the H0 bench measured).
+    pub fn fetch_fp16_blocks(&self, blocks: &[i32]) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        use crate::cache::kvarn::KVARN_TILE_TOKENS;
+
+        assert!(
+            self.mode == KVCacheMode::Fp16 && self.paged_backing.is_none(),
+            "fetch_fp16_blocks on a cache that does not support it (mode={:?})",
+            self.mode
+        );
+        assert!(
+            self.live_start == 0,
+            "fetch_fp16_blocks requires an untrimmed window (live_start == 0); got {}",
+            self.live_start
+        );
+        assert!(!blocks.is_empty(), "fetch_fp16_blocks: empty block list");
+        let keys = self
+            .keys
+            .as_ref()
+            .expect("fetch_fp16_blocks: cache holds no keys");
+        let values = self
+            .values
+            .as_ref()
+            .expect("fetch_fp16_blocks: cache holds no values");
+
+        let bs = KVARN_TILE_TOKENS;
+        let window_len = self.offset;
+        let n_full = window_len / bs;
+        let tail_len = window_len % bs;
+        let last_block = if tail_len > 0 { n_full } else { n_full - 1 };
+
+        let mut prev = -1i32;
+        for &b in blocks {
+            assert!(
+                b > prev && b >= 0 && b <= last_block,
+                "fetch_fp16_blocks: block list must be strictly increasing, unique and \
+                 in-range 0..={last_block}; got {blocks:?}"
+            );
+            prev = b;
+        }
+
+        let shape = ffi::array_shape(keys);
+        let (b_, h_, d_) = (shape[0], shape[1], shape[3]);
+        let full_req: Vec<f32> = blocks
+            .iter()
+            .filter(|&&x| x < n_full)
+            .map(|&x| x as f32)
+            .collect();
+        // Sorted + in-range means the partial block, if requested, is last.
+        let has_tail = tail_len > 0 && *blocks.last().unwrap() == n_full;
+
+        let gather_side = |buf: &MlxArray| -> UniquePtr<MlxArray> {
+            let mut parts: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(2);
+            if !full_req.is_empty() {
+                let u = full_req.len() as i32;
+                // Leading slice: the buffer may be pre-allocated past the
+                // live window; only [0, n_full*bs) participates in the
+                // blocked view.
+                let lead = ffi::slice(buf, &[0, 0, 0, 0], &[b_, h_, n_full * bs, d_]);
+                let a5 = ffi::reshape(&lead, &[b_, h_, n_full, bs, d_]);
+                let idx = ffi::astype(
+                    &ffi::from_slice_f32(&full_req, &[1, 1, u, 1, 1]),
+                    dtype::INT32,
+                );
+                let ib = ffi::broadcast_to(&idx, &[b_, h_, u, bs, d_]);
+                let g = ffi::take_along_axis(&a5, &ib, 2);
+                parts.push(ffi::reshape(&g, &[b_, h_, u * bs, d_]));
+            }
+            if has_tail {
+                let t = ffi::slice(buf, &[0, 0, n_full * bs, 0], &[b_, h_, window_len, d_]);
+                let pad = ffi::full_f32(&[b_, h_, bs - tail_len, d_], 0.0, ffi::array_dtype(buf));
+                parts.push(crate::ops::concatenate(&t, &pad, 2));
+            }
+            let mut out = parts.remove(0);
+            for p in parts {
+                out = crate::ops::concatenate(&out, &p, 2);
+            }
+            out
+        };
+        (gather_side(keys), gather_side(values))
+    }
+
+    /// Mode dispatch for the gathered decode flow's block fetch. The model
+    /// side calls THIS (never a mode-specific fetch directly), so the
+    /// gathered flow is fetch-source-agnostic: kvarn8 dequants exactly the
+    /// requested tiles; fp16 gathers them with no dequant at all. Panics
+    /// on any mode without a block-fetch implementation — dispatch keys on
+    /// [`Self::supports_block_fetch`] upstream, so reaching the panic
+    /// means the predicate and this match have drifted apart.
+    pub fn fetch_msa_blocks(&self, blocks: &[i32]) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        match self.mode {
+            KVCacheMode::KVarN8 => self.fetch_kvarn8_blocks(blocks),
+            KVCacheMode::Fp16 => self.fetch_fp16_blocks(blocks),
+            m => panic!("fetch_msa_blocks: no block-fetch implementation for mode {m:?}"),
+        }
     }
 
     /// BENCH SUPPORT — synthesize a deep KVarN8 cache state directly.

@@ -1,0 +1,18 @@
+kvarn-decode-bench BOOT: depth=100000 steps=32 warmup=4 layers=60 dense_prefix=3 dense_cache=fp16 cache_mode=fp16-gathered seed=42 profile=false
+geometry: hidden=6144 heads=64 kv_heads=4 head_dim=128 index_dim=128 top_k=32 block_size=128 rope_dims=64 rope_base=5000000
+estimated allocation: state ~13.7 GB + weights ~12.8 GB
+setup: layer 10/60
+setup: layer 20/60
+setup: layer 30/60
+setup: layer 40/60
+setup: layer 50/60
+setup: layer 60/60
+setup: 1.8s
+[2m2026-07-10T08:22:51.866046Z[0m [32m INFO[0m [2mmlxcel::models::minimax_m3[0m[2m:[0m MSA per-token DECODE path active (first sparse decode dispatch this process) [3mlayer[0m[2m=[0m3 [3ml[0m[2m=[0m1 [3mkv_len[0m[2m=[0m100001 [3mtop_k[0m[2m=[0m32 [3mblock_size[0m[2m=[0m128
+dispatch check PASSED: 3 dense (fp16) + 57 MSA (fp16-gathered) layers on the expected paths
+step    0 (warmup):    515.2 ms
+step    1 (warmup):    128.8 ms
+step    2 (warmup):    125.9 ms
+step    3 (warmup):    125.1 ms
+step    4:    121.8 ms
+RESULT depth=100000 layers=60 dense_prefix=3 dense_cache=fp16 cache_mode=fp16-gathered: mean 125.5 ms/token, p50 125.2 ms, min 119.2 ms, max 130.5 ms over 32 steps → attention-only ceiling 7.97 tok/s

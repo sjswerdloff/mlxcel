@@ -110,6 +110,49 @@ fp16 windows, zero dequant anywhere. Mean ms/token:
   while occupying half the memory. The halving is free-or-better at
   target depths, today, before B/C.
 
+## fp16-gathered — the missing matrix cell (late evening, fetch lane)
+
+`--cache-mode fp16-gathered` (`MLXCEL_FP16_GATHERED=1`): the SAME gathered
+flow (selection → `fetch_msa_blocks` → compact core) on fp16 buffers — a
+pure block gather, zero dequant. Fetch contract identical to kvarn8's
+(bitwise contract tests), so the flow is fetch-source-agnostic.
+
+Clean production-mix matrix (mean ms/token, 32 steps, D1 dense layers):
+
+| cell                    | 100K  | 300K  | 500K  | KV mem @500K |
+|-------------------------|------:|------:|------:|-------------:|
+| fp16 full-window        | 118.8 | 225.3 | 331.8 | ~2×          |
+| kvarn8 gathered (+D1)   | 171.2 | 211.6 | 211.3 | ~1×          |
+| fp16-gathered (+D1)     | 125.5 | 145.4 | 161.6 | ~2×          |
+
+- **fp16-gathered is the speed champion at depth**: 1.46× over kvarn8 at
+  300K, 1.31× at 500K, 2.05× over fp16-full at 500K; growth is mild
+  (+36 ms over 400K — selection + union growth), nothing like fp16-full's
+  linearity.
+- **kvarn8+D1 remains the capacity champion**: within 1.31–1.46× of the
+  speed champion at HALF the memory. The production shape is
+  occupancy-gated (speed-per-GB frontier), exactly as the plan framed.
+- Diagnostic for the core lane: serialized per-stage spans are nearly
+  identical between kvarn8 and fp16-gathered (fetch ~1.9 vs ~1.9–2.6,
+  core ~1.25 vs ~1.33), yet the clean walls differ by ~66 ms at 300K —
+  the dequant chain's op-count/pipeline drag is invisible to the
+  serialized ceiling. That drag is what G (op collapse) and B/C (fused
+  dequant) attack; closing it would put kvarn8 near fp16-gathered speed
+  at half the memory.
+- 300K profiled run captured separately
+  (`h0_300k_fp16gathered_profile.txt`) — serialized numbers, NOT
+  comparable to the clean matrix above.
+
+## KVarN4 stage-1 tile screen (parallel lane, same evening): KILLED
+
+Background-agent screen (synthetic tiles, k8 as anchor comparator):
+argmax-flip rate 14.5% (k4) vs 0.88% (k8) on identical query populations —
+16× worse, 3× over the 5% gate, seed-stable, present even on clean
+gaussian tiles (not an outlier artifact). Reconstruction p95 at the 0.10
+gate boundary; only V-side passes. Stages 2–4 off the board; revival, if
+ever, is a Sinkhorn/tile-param tuning loop on real-activation tiles.
+Details: `RESULTS_kvarn4_tile_screen_2026-07-10.md` (shared clone).
+
 ## Game-board implications (converged 2026-07-10 evening)
 
 - **Rank 0 (new): dense-floor fix.** Layer-selective cache mode: leave

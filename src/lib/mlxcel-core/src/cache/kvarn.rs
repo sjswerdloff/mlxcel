@@ -1083,6 +1083,89 @@ mod synth_state_tests {
         }
     }
 
+    /// fp16-gathered fetch is a PURE gather: every requested block must be
+    /// bitwise identical to the same slice of the fp16 buffer (atol 0),
+    /// and the trailing partial block's padding exactly zero — the same
+    /// contract the kvarn8 fetch pins, minus dequant.
+    #[test]
+    fn fetch_fp16_blocks_matches_full_window_bitwise() {
+        let cache = KVCache::synth_fp16_state(B, H, D, TOTAL, 0, 0x5EED7);
+        // 557 = 4 full blocks + 45-token partial block (index 4).
+        let blocks = [0i32, 2, 4];
+        let (k_blk, v_blk) = cache.fetch_fp16_blocks(&blocks);
+        for (full, compact, name) in [
+            (cache.keys.as_ref().unwrap(), &k_blk, "K"),
+            (cache.values.as_ref().unwrap(), &v_blk, "V"),
+        ] {
+            assert_eq!(
+                ffi::array_shape(compact),
+                vec![B, H, blocks.len() as i32 * KVARN_TILE_TOKENS, D]
+            );
+            for (i, &blk) in blocks.iter().enumerate() {
+                let src0 = blk * KVARN_TILE_TOKENS;
+                let src1 = (src0 + KVARN_TILE_TOKENS).min(TOTAL);
+                let blk_len = src1 - src0;
+                let dst0 = i as i32 * KVARN_TILE_TOKENS;
+                let want = ffi::slice(full, &[0, 0, src0, 0], &[B, H, src1, D]);
+                let got = ffi::slice(compact, &[0, 0, dst0, 0], &[B, H, dst0 + blk_len, D]);
+                let close = ffi::allclose(&got, &want, 0.0, 0.0);
+                ffi::eval(&close);
+                assert!(
+                    ffi::item_bool(&close),
+                    "{name} block {blk}: fp16 compact fetch diverges from the buffer"
+                );
+                if blk_len < KVARN_TILE_TOKENS {
+                    let pad = ffi::slice(
+                        compact,
+                        &[0, 0, dst0 + blk_len, 0],
+                        &[B, H, dst0 + KVARN_TILE_TOKENS, D],
+                    );
+                    let zeros =
+                        ffi::full_f32(&[B, H, KVARN_TILE_TOKENS - blk_len, D], 0.0, dtype::FLOAT16);
+                    let pz = ffi::allclose(&pad, &zeros, 0.0, 0.0);
+                    ffi::eval(&pz);
+                    assert!(ffi::item_bool(&pz), "{name} tail padding must be zero");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "strictly increasing")]
+    fn fetch_fp16_blocks_refuses_unsorted() {
+        let cache = KVCache::synth_fp16_state(B, H, D, TOTAL, 0, 0x5EED8);
+        let _ = cache.fetch_fp16_blocks(&[2, 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "in-range")]
+    fn fetch_fp16_blocks_refuses_out_of_range() {
+        let cache = KVCache::synth_fp16_state(B, H, D, TOTAL, 0, 0x5EED9);
+        let _ = cache.fetch_fp16_blocks(&[0, 5]); // last valid block is 4
+    }
+
+    /// fetch_msa_blocks must dispatch by mode and be bitwise identical to
+    /// the mode-specific fetch — the model side only ever calls the
+    /// dispatcher, so a dispatch bug would silently reroute every gathered
+    /// decode step.
+    #[test]
+    fn fetch_msa_blocks_dispatches_by_mode() {
+        let blocks = [0i32, 1, 3];
+        let kv8 = KVCache::synth_kvarn8_state(B, H, D, TOTAL, IDX, 0x5EEDA);
+        let (a, _) = kv8.fetch_msa_blocks(&blocks);
+        let (b, _) = kv8.fetch_kvarn8_blocks(&blocks);
+        let close = ffi::allclose(&a, &b, 0.0, 0.0);
+        ffi::eval(&close);
+        assert!(ffi::item_bool(&close), "kvarn8 dispatch mismatch");
+
+        let f16 = KVCache::synth_fp16_state(B, H, D, TOTAL, 0, 0x5EEDB);
+        let (a, _) = f16.fetch_msa_blocks(&blocks);
+        let (b, _) = f16.fetch_fp16_blocks(&blocks);
+        let close = ffi::allclose(&a, &b, 0.0, 0.0);
+        ffi::eval(&close);
+        assert!(ffi::item_bool(&close), "fp16 dispatch mismatch");
+    }
+
     /// fp16 synth with m3_idx (the fp16-baseline bench mode for MSA
     /// layers): index cache present, capacity-buffer layout, reader
     /// returns the exact-length window.
