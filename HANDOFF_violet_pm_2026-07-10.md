@@ -369,3 +369,32 @@ Day ledger (corrected, Clement): capacity point 500K 2.70 → 8.94 = 3.3×; 300K
   crossing). Remaining for morning (#28 leg 2): G core A/B via
   runtime msa_core on the new binary; msa_core default flip gated on
   it; production policy blessing (Stuart).
+
+## UPDATE 02:30 (Jul 11) — REAL-TILE VERDICTS (cfe29bf): k4 program RESOLVED
+
+- **K8V4 PASSES PRODUCTION GATES on real tiles at every gs** —
+  marginal +0.049/+0.043/+0.038 vs the 0.05 bar (gs128 by 0.0009, a
+  squeaker stated as such; **gs32 leads** with real headroom). The
+  synthetic kill WAS the proxy artifact the analysis-first call
+  predicted: real V statistics carried the candidate. PROVISIONAL
+  condition MET (first prospective test, passed) → status:
+  live-prospectively-confirmed-at-screen-level, earns exactly the
+  copy-precision chain, nothing more.
+- **Record-consistency requirement (Violet, pre-banking)**: the doc
+  must carry the real-tile RATIO (~8-10× vs the improved anchor)
+  alongside the passed DIFFERENCE, with the registered-form rationale
+  — we quoted 3.5× publicly on the synthetic kill; a cold auditor
+  must find both frames in one place.
+- **k4-K DEAD WITH PREJUDICE**: real flips 17-21%, WORSE than
+  synthetic — the role split was load-bearing (same session, V got
+  easier, K got harder). The 2×-via-K4V4 path CLOSES.
+- **Anchor re-baselined**: 0.0055 real-vs-real, 4.6× better than
+  synthetic — the synthetic population under-served every variant.
+- **Honest capacity map**: K8V4/gs32 +22% production-track; +idx8
+  ~+36% PENDING deferred idx Gate B (harvest captured 8-block
+  excerpts; Gate B needs full block-score vectors — one-line hook
+  addition rides the morning rebuild). Clean deferral: Gate B was
+  prospective with no retrospective history.
+- Method: 4,096 token-aligned pairs, uniform strata, gates untouched
+  throughout. Clement near Preparation; morning summary for Stuart
+  is his last act this shore or Violet carries it as PM.
