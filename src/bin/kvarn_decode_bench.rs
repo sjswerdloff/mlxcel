@@ -74,9 +74,24 @@ struct Args {
     layers: usize,
 
     /// Leading layers WITHOUT index projections (M3 production: 3). These
-    /// dispatch dense: full-window dequant every step — the O(T) floor.
+    /// dispatch dense every step.
     #[arg(long, default_value_t = 3)]
     dense_prefix: usize,
+
+    /// Cache mode synthesized for the dense-prefix layers: "fp16" (the D1
+    /// layer-selective state a live session reaches via the first-touch
+    /// downgrade) or "kvarn8" (pre-D1 behavior: the O(T) full-window
+    /// dequant floor, for A/B).
+    #[arg(long, default_value = "fp16")]
+    dense_cache: String,
+
+    /// Cache mode synthesized for the MSA layers: "kvarn8" (gathered
+    /// decode path) or "fp16" (the fp16 KV baseline: same sparse
+    /// selection, fp16 windows, no dequant anywhere — answers "what speed
+    /// does kvarn8's memory halving cost"). NOTE: fp16 at 500K is a
+    /// ~100 GB state — honor the RAM protocol before launching.
+    #[arg(long, default_value = "kvarn8")]
+    cache_mode: String,
 
     /// RNG seed for weights and cache state.
     #[arg(long, default_value_t = 42)]
@@ -144,16 +159,29 @@ fn main() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
+    let dense_fp16 = match args.dense_cache.as_str() {
+        "fp16" => true,
+        "kvarn8" => false,
+        other => panic!("--dense-cache must be 'fp16' or 'kvarn8'; got '{other}'"),
+    };
+    let msa_fp16 = match args.cache_mode.as_str() {
+        "fp16" => true,
+        "kvarn8" => false,
+        other => panic!("--cache-mode must be 'kvarn8' or 'fp16'; got '{other}'"),
+    };
+
     // Fail-loud boot artifact: every parameter that shapes the measurement,
     // so no captured number can be mis-attributed to the wrong config.
     println!(
         "kvarn-decode-bench BOOT: depth={} steps={} warmup={} layers={} dense_prefix={} \
-         seed={} profile={}",
+         dense_cache={} cache_mode={} seed={} profile={}",
         args.depth,
         args.steps,
         args.warmup,
         args.layers,
         args.dense_prefix,
+        args.dense_cache,
+        args.cache_mode,
         args.seed,
         args.profile
     );
@@ -214,14 +242,32 @@ fn main() {
             sparse_local_block: 1,
             layer_idx: i,
         });
-        caches.push(KVCache::synth_kvarn8_state(
-            1,
-            args.kv_heads,
-            args.head_dim,
-            args.depth,
-            args.index_dim,
-            args.seed.wrapping_add(i as u64 * 7919),
-        ));
+        let layer_seed = args.seed.wrapping_add(i as u64 * 7919);
+        let fp16_cache = if is_msa { msa_fp16 } else { dense_fp16 };
+        caches.push(if fp16_cache {
+            // fp16 states: dense-prefix layers carry no m3_idx (the D1 end
+            // state a live session reaches via the first-touch downgrade);
+            // MSA layers on fp16 keep m3_idx — same sparse selection, fp16
+            // windows, no dequant (the fp16-baseline comparison).
+            let index_dim = if is_msa { args.index_dim } else { 0 };
+            KVCache::synth_fp16_state(
+                1,
+                args.kv_heads,
+                args.head_dim,
+                args.depth,
+                index_dim,
+                layer_seed,
+            )
+        } else {
+            KVCache::synth_kvarn8_state(
+                1,
+                args.kv_heads,
+                args.head_dim,
+                args.depth,
+                args.index_dim,
+                layer_seed,
+            )
+        });
         if (i + 1) % 10 == 0 {
             eprintln!("setup: layer {}/{}", i + 1, args.layers);
         }
@@ -254,10 +300,13 @@ fn main() {
             // Dispatch verification, fail-loud: on an eligible MSA layer the
             // forward must have advanced the indexer cache in lockstep (the
             // gathered path's precondition and side effect); a dense-prefix
-            // layer must NOT have (no index projections → no idx update).
+            // layer must NOT have (no index projections → no idx update;
+            // fp16 dense caches carry no m3_idx state at all).
             for (i, cache) in caches.iter().enumerate() {
                 let expect = if i >= args.dense_prefix {
                     args.depth + 1
+                } else if dense_fp16 {
+                    0
                 } else {
                     args.depth
                 };
@@ -275,9 +324,11 @@ fn main() {
                 );
             }
             println!(
-                "dispatch check PASSED: {} dense + {} MSA layers on the expected paths",
+                "dispatch check PASSED: {} dense ({}) + {} MSA ({}) layers on the expected paths",
                 args.dense_prefix,
-                args.layers - args.dense_prefix
+                args.dense_cache,
+                args.layers - args.dense_prefix,
+                args.cache_mode
             );
         }
         if step >= args.warmup {
@@ -297,11 +348,14 @@ fn main() {
     let mean = times.iter().sum::<f64>() / times.len() as f64;
     let p50 = times[times.len() / 2];
     println!(
-        "RESULT depth={} layers={} dense_prefix={}: mean {:.1} ms/token, p50 {:.1} ms, \
-         min {:.1} ms, max {:.1} ms over {} steps → attention-only ceiling {:.2} tok/s",
+        "RESULT depth={} layers={} dense_prefix={} dense_cache={} cache_mode={}: \
+         mean {:.1} ms/token, p50 {:.1} ms, min {:.1} ms, max {:.1} ms over {} steps → \
+         attention-only ceiling {:.2} tok/s",
         args.depth,
         args.layers,
         args.dense_prefix,
+        args.dense_cache,
+        args.cache_mode,
         mean * 1e3,
         p50 * 1e3,
         times[0] * 1e3,

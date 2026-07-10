@@ -969,7 +969,7 @@ mod m3_idx_capacity_tests {
 #[cfg(test)]
 mod synth_state_tests {
     use super::*;
-    use crate::cache::KVCache;
+    use crate::cache::{KVCache, KVCacheMode};
 
     const B: i32 = 1;
     const H: i32 = 2;
@@ -1029,6 +1029,75 @@ mod synth_state_tests {
             ffi::eval(&finite);
             assert!(ffi::item_bool(&finite), "{name} contains NaN");
         }
+    }
+
+    /// D1 downgrade contract: fires exactly on an EMPTY KVarN8 cache —
+    /// never on a populated one (mid-session format change forbidden),
+    /// never on fp16 (already there).
+    #[test]
+    fn kvarn8_fp16_downgrade_fires_only_on_empty() {
+        let mut empty = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        assert!(empty.downgrade_kvarn8_to_fp16_if_empty());
+        assert_eq!(empty.mode, KVCacheMode::Fp16);
+        assert!(!empty.downgrade_kvarn8_to_fp16_if_empty(), "idempotent");
+
+        let mut populated = KVCache::synth_kvarn8_state(B, H, D, TOTAL, IDX, 0x5EED4);
+        assert!(
+            !populated.downgrade_kvarn8_to_fp16_if_empty(),
+            "must never change format under live state"
+        );
+        assert_eq!(populated.mode, KVCacheMode::KVarN8);
+
+        let mut fp16 = KVCache::new_with_mode(KVCacheMode::Fp16);
+        assert!(!fp16.downgrade_kvarn8_to_fp16_if_empty());
+    }
+
+    /// synth_fp16_state (D1 bench counterpart): production fp16 layout —
+    /// the next update appends through the standard growth path.
+    #[test]
+    fn synth_fp16_state_decode_step_contract() {
+        let mut cache = KVCache::synth_fp16_state(B, H, D, TOTAL, 0, 0x5EED5);
+        assert_eq!(cache.mode, KVCacheMode::Fp16);
+        assert_eq!(cache.offset, TOTAL);
+        assert!(!cache.supports_block_fetch());
+        assert!(!cache.has_m3_idx_k_state(), "index_dim=0 omits m3_idx");
+
+        let one_fp16 = |shape: &[i32]| {
+            ffi::astype(
+                &ffi::from_slice_f32(&vec![0.5f32; shape.iter().product::<i32>() as usize], shape),
+                dtype::FLOAT16,
+            )
+        };
+        let (k, v) = cache.update_and_fetch(one_fp16(&[B, H, 1, D]), one_fp16(&[B, H, 1, D]));
+        assert_eq!(cache.offset, TOTAL + 1);
+        for (a, name) in [(&k, "K"), (&v, "V")] {
+            assert_eq!(
+                ffi::array_shape(a),
+                vec![B, H, TOTAL + 1, D],
+                "{name} window"
+            );
+            assert_eq!(ffi::array_dtype(a), dtype::FLOAT16);
+            let finite = ffi::allclose(a, a, 0.0, 0.0);
+            ffi::eval(&finite);
+            assert!(ffi::item_bool(&finite), "{name} contains NaN");
+        }
+    }
+
+    /// fp16 synth with m3_idx (the fp16-baseline bench mode for MSA
+    /// layers): index cache present, capacity-buffer layout, reader
+    /// returns the exact-length window.
+    #[test]
+    fn synth_fp16_state_with_index_carries_m3_idx() {
+        let mut cache = KVCache::synth_fp16_state(B, H, D, TOTAL, IDX, 0x5EED6);
+        assert!(cache.has_m3_idx_k_state());
+        assert_eq!(cache.m3_idx_offset(), TOTAL);
+        let one = ffi::astype(
+            &ffi::from_slice_f32(&vec![0.5f32; IDX as usize], &[B, 1, 1, IDX]),
+            dtype::FLOAT16,
+        );
+        let win = cache.m3_idx_k_update_and_fetch(&one);
+        assert_eq!(ffi::array_shape(&win), vec![B, 1, TOTAL + 1, IDX]);
+        assert_eq!(cache.m3_idx_offset(), TOTAL + 1);
     }
 
     /// The per-step contract the bench decode loop relies on: update_only

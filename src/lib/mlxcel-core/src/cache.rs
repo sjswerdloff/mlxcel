@@ -1466,6 +1466,74 @@ impl KVCache {
         cache
     }
 
+    /// BENCH SUPPORT — synthesize a deep FP16 cache state directly (the
+    /// fp16 counterpart of [`Self::synth_kvarn8_state`]): random fp16 K/V
+    /// buffers filled exactly to `total`, `offset = total`. The next
+    /// `update` appends via the production growth path.
+    ///
+    /// `index_dim = 0` omits m3_idx state (layers WITHOUT index
+    /// projections — the D1 dense-prefix shape); `index_dim > 0` adds the
+    /// capacity-buffer m3_idx state exactly as [`Self::synth_kvarn8_state`]
+    /// does (MSA-eligible layers on fp16 caches — the fp16-baseline bench
+    /// mode: same sparse selection, no dequant anywhere).
+    pub fn synth_fp16_state(
+        b: i32,
+        h: i32,
+        d: i32,
+        total: i32,
+        index_dim: i32,
+        seed: u64,
+    ) -> KVCache {
+        ffi::random_seed(seed);
+        let mut cache = KVCache::new_with_mode(KVCacheMode::Fp16);
+        let k = unsafe { ffi::random_normal(&[b, h, total, d], dtype::FLOAT16, std::ptr::null()) };
+        let v = unsafe { ffi::random_normal(&[b, h, total, d], dtype::FLOAT16, std::ptr::null()) };
+        ffi::eval(&k);
+        ffi::eval(&v);
+        cache.keys = Some(k);
+        cache.values = Some(v);
+        cache.offset = total;
+        if index_dim > 0 {
+            let mut capacity = 4096i32;
+            while capacity < total {
+                capacity *= 2;
+            }
+            let idx = unsafe {
+                ffi::random_normal(
+                    &[b, 1, capacity, index_dim],
+                    dtype::FLOAT16,
+                    std::ptr::null(),
+                )
+            };
+            ffi::eval(&idx);
+            cache.m3_idx_k = Some(idx);
+            cache.m3_idx_offset = total;
+        }
+        cache
+    }
+
+    /// D1 (dense-prefix floor, RESULTS_h0_depth_profile_2026-07-10.md):
+    /// downgrade an EMPTY KVarN8 cache to Fp16. Returns whether it fired.
+    ///
+    /// Layers that never take the gathered path (M3's dense-prefix layers,
+    /// structurally identified by `index_q_proj.is_none()`) pay KVarN8's
+    /// full O(T) dequant every decode step for a memory saving that is
+    /// noise next to the 57 MSA layers' (measured: 109.7 ms/token at 300K
+    /// for 3 layers vs ~1.2 GB fp16 cost). The model-side dispatch calls
+    /// this at first touch; empty-only (`offset == 0`, no paged backing)
+    /// makes it exactly a deferred construction-time choice — never a
+    /// mid-session format change. Fp16 is also the one detach/persist-
+    /// supported mode, so downgraded layers gain snapshot support rather
+    /// than losing anything.
+    pub fn downgrade_kvarn8_to_fp16_if_empty(&mut self) -> bool {
+        if self.mode == KVCacheMode::KVarN8 && self.offset == 0 && self.paged_backing.is_none() {
+            self.mode = KVCacheMode::Fp16;
+            true
+        } else {
+            false
+        }
+    }
+
     /// FP16 (standard) update path — original pre-allocated buffer logic.
     ///
     /// Operates in **buffer-slot** coordinates: `prev = self.offset
