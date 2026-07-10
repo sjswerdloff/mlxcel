@@ -214,3 +214,41 @@ Day ledger (corrected, Clement): capacity point 500K 2.70 → 8.94 = 3.3×; 300K
   depth-stratified interior sampling, conversation-shaped source,
   anchor on identical tiles, jointly registered values. Violet
   reviews tonight before it hardens.
+
+## UPDATE 00:05 (Jul 11) — boot-night plan blessed; audit closed; hook approved
+
+- **Subagent-tier provenance: AUDIT CLOSED.** Clement self-declared
+  before my audit ran (ab52354 + 1b52565): tier POSTDATES stage-1b
+  (git timestamps verified: 23:25:26 kill / ~23:30 Stuart's subagent
+  directive / 23:37:24 tier-in-header-before-sweep); retrospective for
+  1b's K8V4 numbers, pre-registered for 1c's own data; testimony: all
+  four GATE_ constants identical across both script executions.
+  PROVISIONAL label everywhere; boot day = first prospective test.
+  Standing rule adopted: timestamps where possible, declared testimony
+  where not, and the record says which is which.
+- **Spec Amendment 1 (idx third role): co-sign conditional** on three
+  pre-data refinements (all stricter/clarifying): Gate B mass
+  renormalized WITHIN clean top-k (all-blocks denominator understates
+  lost mass); pre-registered minimum query count (≥256 proposed);
+  flips-wording clarification (score-side ⇒ composition's K-variant
+  rate). Clement amending; hardens jointly on landing.
+- **Boot-night plan: Option B BLESSED** (supervisor script Stuart
+  launches once, then sleeps) under a three-condition contract:
+  MAX_RESTARTS=1 structural; mechanical RAM check + MQTT announce
+  before boot 2 (refuse-and-log); content-verified signal file dropped
+  only after tonight-irreplaceables' artifacts are READ AND VERIFIED.
+  Rationale on record: B's failure mode degrades exactly to A (harvest
+  banked either way), so B strictly dominates at zero Stuart-margin.
+  Stuart-time: one 60-second supervisor read + one paste. Stuart's
+  one-word bless still required at launch.
+- **Harvest hook (clement/kvarn-harvest-hook @ 088f6c2): Violet seat
+  CLOSED APPROVE, no must-fixes** (3 notes: doc/code role-name drift;
+  panic claim precise-not-overstated re FFI evals; sidecar cache-field
+  overload). Boot-night condition: EARLY idx_k-present check at first
+  32K crossing (declared gap fails empty — catch it with time to
+  react). Xander's seat on top when he lands, or single-seat merge on
+  Clement's call.
+- **Violet migration branch**: build+test round 1 in flight (isolated
+  target). Runtime msa_core lands the core A/B axis reboot-free;
+  supervisor flip spends only on the fetch construction axis. Merge
+  order: migration → base BEFORE Stuart's build.
