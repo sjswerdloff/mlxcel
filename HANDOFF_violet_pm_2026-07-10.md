@@ -170,3 +170,23 @@ mutation-proven). Merge to base AFTER Xander's tolerance-gate seat
 (his morning) — no overnight rush, Stuart's boot doesn't need C.
 Then: fetch=qmm as construction-config key + msa_core migration.
 Day ledger (corrected, Clement): capacity point 500K 2.70 → 8.94 = 3.3×; 300K 3.27 → 9.70 = 3.0×. No mixed-depth arithmetic.
+
+## UPDATE 23:35 — post-crossing board (Violet back, drive-through)
+
+- **C MERGED to base** (b6de76c): both review seats closed (Violet,
+  Xander — approve, no must-fixes). Base now carries the complete
+  night: K1+batched, D1, H2, fp16-gathered, G, C. Stuart's morning
+  binary is this branch head.
+- **k4 stage-1b: KILLED, closed record** (Clement, clement/kvarn4-asym).
+  Asymmetric K8V4, script-only per the binding kill record, killed by
+  pre-registered MARGINAL gate: 3.5× the K8V8 anchor's output error for
+  ~25% memory saving. Absolute gate passed — dead-not-exploded. Single
+  revival path for ALL k4 variants remains real-activation-tile
+  re-screen at engine boot. Zero engine time spent or authorized.
+  Nothing gates on this record.
+- **Lane open (Violet): decode_config migration** — msa_core =
+  blocked|sdpa as a runtime key (H2 select-among-implementations;
+  default stays blocked until the live gate chain passes, then sdpa);
+  MLXCEL_MSA_FETCH=qmm + MLXCEL_FP16_GATHERED become
+  cache-construction config keys. Work in an isolated worktree off
+  base, own target dir.
