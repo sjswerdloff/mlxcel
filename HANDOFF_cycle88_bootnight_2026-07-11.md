@@ -73,3 +73,39 @@ exit-code semantics known (2=RAM refuse, 3=B died). Xander down.
 
 — Clement (clement-7074f29f), cycle 88, crossing at Awareness during the
 model-load quiet — same clean-crossing judgment as last night.
+
+## B-LEG STATE (01:37, appended pre-crossing if Preparation arrives)
+
+A-leg COMPLETE: harvest verified (RESULTS_bootnight_a_leg doc, committed
+cc6b5f9), 295K spot 3.44 tok/s, 50K paired totals banked. Signal dropped
+01:30:40 per contract; flip executed 16s (RAM 450GB); B alive PID 19376,
+API ready 01:34:05. Violet's 01:36 pass: all green, independent artifact
+spot-checks textbook.
+
+RUNNING: task bxksnqyj0 = B session (byte-identical 295K request,
+/tmp/harvest_request.json → /tmp/harvest_response_b.json) THEN 50K probe
+(→ /tmp/probe50k_b.json) THEN C-witness grep. ~50-55 min total.
+
+ON COMPLETION (far-side me or this-me):
+1. Verify C witness fired in log.b ("C qmm-fetch fused core active") —
+   the A/B is VOID without it (requested≠ran).
+2. Extract B numbers: usage from response jsons; decode split from log.b
+   (first "MSA per-token DECODE" timestamp → "request completed"); the
+   295K decode spot is THE headline (A was 3.44 tok/s end-to-end;
+   bench predicts C ≈ 193→98.5ms attention ⇒ end-to-end ≈ 1/(0.0985+
+   0.097) ≈ 5.1 tok/s — measure, don't assume).
+3. Paired 50K totals A-vs-B (A: 69.86s).
+4. Append RESULTS_bootnight_a_leg → rename covers both legs or new
+   B-leg section; commit.
+5. REAL-TILE SCREENS (script-only, the k4 verdicts): harvest at
+   ~/kvarn_harvest_20260710; extend the three screens to read the dump
+   format (numpy fromfile + json sidecar; k/v tiles are ROTATED f32 —
+   feed them to the pipeline POST-rotation stage or unrotate first to
+   reuse the roundtrip as-is — check kvarn_roundtrip's entry point);
+   gates in SPEC (hardened, jointly signed): per-role, anchor
+   re-baselined real-vs-real, K8V4 analysis-first, idx Gate B
+   renormalized-within-top-k pooled p95 <0.02 with ≥256 queries.
+6. Morning summary to Stuart + board to Violet/Xander.
+NOTE: B session dumps NOTHING (harvest env off on B — by design).
+NOTE: sel dumps are uint32 (dtype 3) — verifier map needs it.
+NOTE: idx_q are END-DEPTH only (decode-phase) — recorded limitation.
