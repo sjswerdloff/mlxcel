@@ -66,6 +66,27 @@ fn kvarn_all_layers_forced() -> bool {
     })
 }
 
+/// MLXCEL_MSA_CORE=sdpa swaps the blocked-gather decode core for the
+/// fused-SDPA masked core on the GATHERED path (harness plan §H1, approach
+/// G). Default OFF — zero behavior change; every existing suite pins the
+/// blocked core. Env-gated for the bench rank; production selection joins
+/// the decode_config enum if G wins (select-among-implementations, per the
+/// H2 disable-only convention).
+fn msa_core_sdpa_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = std::env::var("MLXCEL_MSA_CORE").is_ok_and(|v| v == "sdpa")
+        ;
+        if on {
+            tracing::info!(
+                "MLXCEL_MSA_CORE=sdpa: gathered decode uses the fused-SDPA masked core (G) — \
+                 blocked-gather core disabled for this process"
+            );
+        }
+        on
+    })
+}
+
 fn k1_profile_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -1350,17 +1371,36 @@ impl SparseAttention {
         }
         let pos_compact = mlxcel_core::from_slice_f32(&pos, &[n_blocks * bs]);
 
-        let out = self.sparse_decode_core(
-            q,
-            &k_c,
-            &v_c,
-            &remapped,
-            &pos_compact,
-            n_blocks,
-            b,
-            l,
-            offset,
-        );
+        // G (harness plan §H1): same compact (window, indices, positions)
+        // triple, two interchangeable cores. The blocked-gather core is the
+        // default; MLXCEL_MSA_CORE=sdpa selects the fused-SDPA masked core.
+        // Hooked HERE (the gathered flow, small compact window) and not on
+        // the full-window path, where a per-slot mask would be O(T).
+        let out = if msa_core_sdpa_enabled() {
+            self.sparse_decode_core_sdpa(
+                q,
+                &k_c,
+                &v_c,
+                &remapped,
+                &pos_compact,
+                n_blocks,
+                b,
+                l,
+                offset,
+            )
+        } else {
+            self.sparse_decode_core(
+                q,
+                &k_c,
+                &v_c,
+                &remapped,
+                &pos_compact,
+                n_blocks,
+                b,
+                l,
+                offset,
+            )
+        };
         if profiling {
             mlxcel_core::eval(&out);
             k1_prof_record(3, &t3);
@@ -1524,6 +1564,110 @@ impl SparseAttention {
 
         let out = mlxcel_core::reshape(&out, &[b, self.num_heads, l, self.head_dim]);
         let out = mlxcel_core::transpose_axes(&out, &[0, 2, 1, 3]);
+        let out = mlxcel_core::reshape(&out, &[b, l, self.num_heads * self.head_dim]);
+        self.o_proj.forward(&out)
+    }
+
+    /// G core (harness plan §H1): identical contract to
+    /// [`Self::sparse_decode_core`] — same (q, window, selected, positions)
+    /// inputs, same output shape — computed as ONE fused SDPA call over the
+    /// whole compact window with a per-(kv-head, token) additive mask,
+    /// instead of the 6-D blocked take_along_axis gather + hand-rolled
+    /// matmul/softmax/matmul. Semantics (Xander, design review 2026-07-10):
+    /// softmax over the window with -inf on non-selected slots IS softmax
+    /// over the gathered slots — masked slots contribute nothing. The
+    /// candidate exists because the blocked core's cost at decode shapes is
+    /// op-DISPATCH count, not arithmetic (~40 dispatches, serialized
+    /// 1.25 ms/layer at 300K); this core is ~15, one of which is the fused
+    /// attention kernel. Hooked only on the GATHERED flow, where the window
+    /// is compact (union blocks) — on the full window the per-slot mask
+    /// would be O(T).
+    ///
+    /// Numerics: NOT bit-identical to the blocked core (the fused kernel's
+    /// accumulation order differs) — equivalence is tolerance-gated, the
+    /// same acceptance the K2 plan records for kernel changes. The contract
+    /// test pins both cores on identical inputs at fp16 tolerance.
+    #[allow(clippy::too_many_arguments)]
+    fn sparse_decode_core_sdpa(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        v: &MlxArray,
+        selected: &MlxArray,
+        pos_full: &MlxArray,
+        num_key_blocks: i32,
+        b: i32,
+        l: i32,
+        offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        let w = num_key_blocks * self.block_size;
+        let q_dtype = mlxcel_core::array_dtype(q);
+
+        // Block-membership: block j is attendable by (kv-head h, token t)
+        // iff j appears in selected[b, h, t, :]. Built at BLOCK granularity
+        // (nkb columns), then broadcast ×block_size to slots — never
+        // O(top_k × W).
+        let block_ids = mlxcel_core::arange_f32(0.0, num_key_blocks as f32, 1.0);
+        let block_ids = mlxcel_core::reshape(&block_ids, &[1, 1, 1, 1, num_key_blocks]);
+        let sel5 = mlxcel_core::reshape(selected, &[b, self.num_kv_heads, l, self.top_k, 1]);
+        let sel5 = mlxcel_core::astype(&sel5, mlxcel_core::dtype::FLOAT32);
+        let eq = mlxcel_core::equal(&sel5, &block_ids);
+        let hits = mlxcel_core::sum_axis(
+            &mlxcel_core::astype(&eq, mlxcel_core::dtype::FLOAT32),
+            3,
+            false,
+        );
+        let zero_f32 = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::dtype::FLOAT32);
+        let member = mlxcel_core::greater(&hits, &zero_f32); // bool [b, h_kv, l, nkb]
+
+        // Position rule, identical to the blocked core: slot position ≤
+        // query position. Subsumes within-block causality and padding.
+        let pos_row = mlxcel_core::reshape(pos_full, &[1, 1, 1, w]);
+        let q_pos = mlxcel_core::arange_f32(offset as f32, (offset + l) as f32, 1.0);
+        let q_pos = mlxcel_core::reshape(&q_pos, &[1, 1, l, 1]);
+        let pos_ok = mlxcel_core::less_equal(&pos_row, &q_pos); // bool [1, 1, l, w]
+
+        // One additive mask [b, h_kv, l, w]: 0 where attendable, -inf
+        // otherwise. Nested where avoids needing a logical_and op.
+        let mask_shape = [b, self.num_kv_heads, l, w];
+        let zero = mlxcel_core::full_f32(&[1], 0.0, q_dtype);
+        let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, q_dtype);
+        let zero_b = mlxcel_core::broadcast_to(&zero, &mask_shape);
+        let neg_b = mlxcel_core::broadcast_to(&neg_inf, &mask_shape);
+        let pos_ok_b = mlxcel_core::broadcast_to(&pos_ok, &mask_shape);
+        let pos_additive = mlxcel_core::where_cond(&pos_ok_b, &zero_b, &neg_b);
+        let member_slots = {
+            let m = mlxcel_core::reshape(&member, &[b, self.num_kv_heads, l, num_key_blocks, 1]);
+            let m = mlxcel_core::broadcast_to(
+                &m,
+                &[b, self.num_kv_heads, l, num_key_blocks, self.block_size],
+            );
+            mlxcel_core::reshape(&m, &mask_shape)
+        };
+        let additive = mlxcel_core::where_cond(&member_slots, &pos_additive, &neg_b);
+
+        // GQA: the fused kernel handles h_q > h_kv natively for K/V, but the
+        // mask must arrive at query-head granularity (contiguous grouping,
+        // matching the blocked core's expand).
+        let n_rep = self.num_heads / self.num_kv_heads;
+        let additive = {
+            let a = mlxcel_core::reshape(&additive, &[b, self.num_kv_heads, 1, l, w]);
+            let a = mlxcel_core::broadcast_to(&a, &[b, self.num_kv_heads, n_rep, l, w]);
+            mlxcel_core::reshape(&a, &[b, self.num_heads, l, w])
+        };
+
+        let raw = unsafe {
+            mlxcel_core::layers::attention_from_ptr(
+                q,
+                k,
+                v,
+                self.scale,
+                additive.as_ref().unwrap() as *const MlxArray,
+                0.0,
+                0,
+            )
+        };
+        let out = mlxcel_core::transpose_axes(&raw, &[0, 2, 1, 3]);
         let out = mlxcel_core::reshape(&out, &[b, l, self.num_heads * self.head_dim]);
         self.o_proj.forward(&out)
     }
@@ -5155,6 +5299,70 @@ mod tests {
             "gathered decode diverges from the full-window path on identical \
              KVarN8 state — union/remap/positions bug (l2 diff {})",
             output_l2_diff(&gathered_out, &v1_out)
+        );
+    }
+
+    /// G contract (plan §H1): the fused-SDPA masked core must equal the
+    /// blocked-gather core on identical (q, window, selected, positions)
+    /// inputs — tolerance-gated (different kernel accumulation order), the
+    /// same acceptance K2 records for kernel changes. Deterministic inputs;
+    /// multi-token l=2 exercises the per-token membership + position rules;
+    /// selection includes past, local, and (implicitly masked) future
+    /// blocks. Both cores assume selected blocks are UNIQUE per (head,
+    /// token) — guaranteed by top-k selection (duplicates would
+    /// double-count keys in the blocked core's softmax but not in the
+    /// masked one).
+    #[test]
+    fn sdpa_core_matches_blocked_core_on_identical_inputs() {
+        let attn = make_test_sparse_attention();
+        let (b, h_kv, nh, hd) = (1, attn.num_kv_heads, attn.num_heads, attn.head_dim);
+        let (bs, top_k) = (attn.block_size, attn.top_k);
+        let nkb = 5;
+        let w = nkb * bs; // 10
+        let l = 2;
+        let offset = w - l; // q tokens at positions 8, 9 (local block = 4)
+
+        let det = |n: usize, phase: f32| -> Vec<f32> {
+            (0..n).map(|i| ((i as f32) * 0.37 + phase).sin() * 0.5).collect()
+        };
+        let k = mlxcel_core::from_slice_f32(&det((b * h_kv * w * hd) as usize, 0.1), &[b, h_kv, w, hd]);
+        let v = mlxcel_core::from_slice_f32(&det((b * h_kv * w * hd) as usize, 1.3), &[b, h_kv, w, hd]);
+        let q = mlxcel_core::from_slice_f32(&det((b * nh * l * hd) as usize, 2.7), &[b, nh, l, hd]);
+        let pos_full = mlxcel_core::arange_f32(0.0, w as f32, 1.0);
+
+        // Per (kv-head, token) block picks: always include the local block
+        // (4, half-masked by the position rule at t=0) plus a distinct past
+        // block per row — unique per row, per the shared assumption.
+        let sel_f: Vec<f32> = vec![
+            1.0, 4.0, // h0 t0
+            2.0, 4.0, // h0 t1
+            0.0, 4.0, // h1 t0
+            3.0, 4.0, // h1 t1
+        ];
+        let selected = mlxcel_core::astype(
+            &mlxcel_core::from_slice_f32(&sel_f, &[b, h_kv, l, top_k]),
+            mlxcel_core::dtype::INT32,
+        );
+
+        let out_blocked =
+            attn.sparse_decode_core(&q, &k, &v, &selected, &pos_full, nkb, b, l, offset);
+        let out_sdpa =
+            attn.sparse_decode_core_sdpa(&q, &k, &v, &selected, &pos_full, nkb, b, l, offset);
+        mlxcel_core::eval(&out_blocked);
+        mlxcel_core::eval(&out_sdpa);
+
+        assert_eq!(
+            mlxcel_core::array_shape(&out_blocked),
+            mlxcel_core::array_shape(&out_sdpa),
+            "output shapes"
+        );
+        let close = mlxcel_core::allclose(&out_blocked, &out_sdpa, 1e-3, 1e-3);
+        mlxcel_core::eval(&close);
+        assert!(
+            mlxcel_core::item_bool(&close),
+            "G fused-SDPA core diverged from blocked-gather core on identical \
+             inputs (l2 diff {})",
+            output_l2_diff(&out_blocked, &out_sdpa)
         );
     }
 }
