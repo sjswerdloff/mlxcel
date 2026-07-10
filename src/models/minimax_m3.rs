@@ -1629,6 +1629,12 @@ impl SparseAttention {
 
         // One additive mask [b, h_kv, l, w]: 0 where attendable, -inf
         // otherwise. Nested where avoids needing a logical_and op.
+        // INVARIANT (shared with the blocked core, Clement's G review): at
+        // least one slot per (head, token) row must be attendable or the
+        // softmax row is all -inf and NaNs — production selection always
+        // includes the token's own local block, whose position passes
+        // pos <= q_pos. A selection change that drops the local block would
+        // NaN both cores, not just this one.
         let mask_shape = [b, self.num_kv_heads, l, w];
         let zero = mlxcel_core::full_f32(&[1], 0.0, q_dtype);
         let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, q_dtype);
