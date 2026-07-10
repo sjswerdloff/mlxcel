@@ -102,6 +102,15 @@ use super::{
 /// as `Turbo4Asym` but the V buffer carries the 24-bit-grouped 3-bit indices
 /// The `mode` field on the handle preserves the bit-width
 /// distinction so adopt rebuilds the right `TurboQuantParams3` instance.
+impl DetachedKVCache {
+    /// Test-only accessor for the detached indexer cache (contract tests
+    /// pin the exact-length slice-to-fill behavior of clone_handle).
+    #[cfg(test)]
+    pub(crate) fn m3_idx_k_for_tests(&self) -> Option<&MlxArray> {
+        self.m3_idx_k.as_deref()
+    }
+}
+
 pub struct DetachedKVCache {
     pub(super) keys: Option<UniquePtr<MlxArray>>,
     pub(super) values: Option<UniquePtr<MlxArray>>,
@@ -676,6 +685,21 @@ impl KVCache {
     pub fn clone_handle(&mut self) -> DetachedKVCache {
         self.compact_turbo4_delegated_fp16_sidecars();
 
+        // The live indexer cache is a CAPACITY buffer (grow-by-doubling,
+        // see m3_idx_k_update_and_fetch) whose logical length is
+        // m3_idx_offset. The detached contract documents exact-length
+        // shape `[b, 1, m3_idx_offset, index_dim]` — trim_to and any
+        // future serialization rely on it — so slice-to-fill here. One
+        // O(fill) copy per detach (per turn, not per token).
+        let m3_idx_k_exact = self.m3_idx_k.take().map(|buf| {
+            let s = ffi::array_shape(&buf);
+            if s[2] == self.m3_idx_offset {
+                buf
+            } else {
+                ffi::slice(&buf, &[0, 0, 0, 0], &[s[0], s[1], self.m3_idx_offset, s[3]])
+            }
+        });
+
         let handle = DetachedKVCache {
             keys: self.keys.take(),
             values: self.values.take(),
@@ -694,7 +718,7 @@ impl KVCache {
             hot_threshold: self.hot_threshold,
             delegated_fp16_fast_path: self.delegated_fp16_fast_path,
             delegated_fp16_sidecar_policy: self.delegated_fp16_sidecar_policy,
-            m3_idx_k: self.m3_idx_k.take(),
+            m3_idx_k: m3_idx_k_exact,
             m3_idx_offset: std::mem::replace(&mut self.m3_idx_offset, 0),
             kvarn_sink_k: self.kvarn_sink_k.take(),
             kvarn_sink_v: self.kvarn_sink_v.take(),

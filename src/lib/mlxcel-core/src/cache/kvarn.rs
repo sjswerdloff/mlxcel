@@ -886,3 +886,76 @@ mod block_fetch_tests {
         assert!(!cache.supports_block_fetch());
     }
 }
+
+/// The indexer-cache capacity buffer (m3_idx_k_update_and_fetch) must be
+/// invisible to readers: exact-length windows with exactly the appended
+/// values, across the 4096-token growth boundary, and slice-to-fill on
+/// detach. This is the contract the concat-based implementation met by
+/// construction; the capacity-buffer rewrite must meet it byte-for-byte.
+#[cfg(test)]
+mod m3_idx_capacity_tests {
+    use super::*;
+    use crate::cache::KVCache;
+
+    fn chunk(vals_base: f32, len: i32, dim: i32) -> UniquePtr<MlxArray> {
+        let data: Vec<f32> = (0..len * dim).map(|i| vals_base + i as f32).collect();
+        ffi::from_slice_f32(&data, &[1, 1, len, dim])
+    }
+
+    fn window_as_vec(w: &MlxArray) -> Vec<f32> {
+        ffi::eval(w);
+        ffi::array_to_raw_bytes(w)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn m3_idx_capacity_growth_preserves_window() {
+        let dim = 4i32;
+        let mut cache = KVCache::new();
+        let mut expected: Vec<f32> = Vec::new();
+        let mut total = 0i32;
+
+        // Chunks sized to cross 4096 twice-over: 40 x 130 = 5200 tokens.
+        for i in 0..40 {
+            let len = 130i32;
+            let c = chunk((i * 100_000) as f32, len, dim);
+            expected.extend((0..len * dim).map(|j| (i * 100_000) as f32 + j as f32));
+            total += len;
+            let win = cache.m3_idx_k_update_and_fetch(&c);
+            assert_eq!(
+                ffi::array_shape(&win),
+                vec![1, 1, total, dim],
+                "window shape after chunk {i} (fill {total})"
+            );
+            // Spot-check the FULL window contents at the boundaries where
+            // the growth copy happens (before/at/after 4096) and the ends.
+            if [0, 30, 31, 32, 39].contains(&i) {
+                assert_eq!(
+                    window_as_vec(&win),
+                    expected,
+                    "window contents diverged after chunk {i} — capacity \
+                     growth copy or slice_update wrote the wrong region"
+                );
+            }
+        }
+        assert_eq!(cache.m3_idx_offset(), 5200);
+
+        // Detach must carry the EXACT-length window (documented contract),
+        // not the capacity buffer.
+        let detached = cache.clone_handle();
+        let idx = detached_m3_idx(&detached);
+        assert_eq!(
+            ffi::array_shape(idx),
+            vec![1, 1, 5200, dim],
+            "detached m3_idx_k must be sliced to fill, not capacity"
+        );
+        assert_eq!(window_as_vec(idx), expected, "detached contents");
+    }
+
+    fn detached_m3_idx(d: &crate::cache::DetachedKVCache) -> &MlxArray {
+        d.m3_idx_k_for_tests()
+            .expect("detached handle must carry m3_idx_k")
+    }
+}

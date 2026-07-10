@@ -4190,20 +4190,50 @@ impl KVCache {
     pub fn m3_idx_k_update_and_fetch(&mut self, new_idx_k: &MlxArray) -> UniquePtr<MlxArray> {
         let new_shape = ffi::array_shape(new_idx_k);
         let chunk_len = new_shape[2];
-        let combined = match self.m3_idx_k.as_ref() {
-            None => {
-                // First write: produce an independently-owned copy via a
-                // full-range slice. The simpler path would be to store
-                // `new_idx_k` directly, but the caller passes `&MlxArray`
-                // (we don't take ownership of a `UniquePtr`).
-                ffi::slice(
-                    new_idx_k,
-                    &[0, 0, 0, 0],
-                    &[new_shape[0], new_shape[1], new_shape[2], new_shape[3]],
-                )
+        let fill = self.m3_idx_offset;
+        let needed = fill + chunk_len;
+
+        // CAPACITY buffer with grow-by-doubling + slice_update — the
+        // update_fp16 pattern applied to the indexer cache. The previous
+        // implementation concatenated the FULL cached window per call:
+        // O(window) read+write+alloc per layer per token, which K1
+        // profiling (2026-07-10) identified as the dominant M3 decode
+        // cost at depth (~0.5 GB/token of pure copying at 32K). The
+        // buffer's logical length is `m3_idx_offset`; readers get an
+        // exact-length slice, and clone_handle slices-to-fill so the
+        // detached contract (exact-length shape) is unchanged.
+        let capacity = self.m3_idx_k.as_ref().map_or(0, |a| ffi::array_shape(a)[2]);
+        if needed > capacity {
+            const M3_IDX_INITIAL_CAPACITY: i32 = 4096;
+            let new_cap = needed.max(capacity * 2).max(M3_IDX_INITIAL_CAPACITY);
+            let dtype_id = ffi::array_dtype(new_idx_k);
+            let mut fresh = ffi::zeros(
+                &[new_shape[0], new_shape[1], new_cap, new_shape[3]],
+                dtype_id,
+            );
+            if let Some(prev) = self.m3_idx_k.as_ref() {
+                if fill > 0 {
+                    let ps = ffi::array_shape(prev);
+                    let prev_fill = ffi::slice(prev, &[0, 0, 0, 0], &[ps[0], ps[1], fill, ps[3]]);
+                    fresh = ffi::slice_update(
+                        &fresh,
+                        &prev_fill,
+                        &[0, 0, 0, 0],
+                        &[ps[0], ps[1], fill, ps[3]],
+                    );
+                }
             }
-            Some(prev) => concatenate(prev, new_idx_k, 2),
-        };
+            self.m3_idx_k = Some(fresh);
+        }
+
+        let buf = self.m3_idx_k.as_ref().unwrap();
+        let bs = ffi::array_shape(buf);
+        let combined = ffi::slice_update(
+            buf,
+            new_idx_k,
+            &[0, 0, fill, 0],
+            &[bs[0], bs[1], needed, bs[3]],
+        );
         self.m3_idx_offset += chunk_len;
         self.m3_idx_k = Some(combined);
         // Break the lazy-eval graph reference to the prior iteration's
@@ -4221,13 +4251,16 @@ impl KVCache {
         // and the dense path discards the returned slice without ever
         // reading it — meaning no downstream attention op forces eval.
         ffi::eval(self.m3_idx_k.as_ref().unwrap());
-        // Return another independently-owned slice of the full cached idx_k.
+        // Return the LOGICAL window: slice the capacity buffer to the fill
+        // level. Same values the old concat-based implementation returned —
+        // a reader that received the raw buffer instead would see trailing
+        // capacity zeros and score phantom blocks.
         let full = self.m3_idx_k.as_ref().unwrap();
         let full_shape = ffi::array_shape(full);
         ffi::slice(
             full,
             &[0, 0, 0, 0],
-            &[full_shape[0], full_shape[1], full_shape[2], full_shape[3]],
+            &[full_shape[0], full_shape[1], needed, full_shape[3]],
         )
     }
 
