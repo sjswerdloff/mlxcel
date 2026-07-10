@@ -43,6 +43,16 @@ run kvarn8_sdpa "MLXCEL_MSA_CORE=sdpa" --cache-mode kvarn8
 run fp16g_blocked "" --cache-mode fp16-gathered
 # Cell 4: fp16-gathered fetch × sdpa core (G)
 run fp16g_sdpa "MLXCEL_MSA_CORE=sdpa" --cache-mode fp16-gathered
+# Cell 5: kvarn8 × C (qmm fused fetch+core — replaces BOTH stages; the
+# MSA_CORE env is irrelevant where C dispatches). Fail-loud: the env
+# announce says C was REQUESTED; only the model's first-dispatch line
+# proves C actually RAN — require it, or the capture lies (a gate
+# fall-through would silently run the blocked core under a qmm label).
+run kvarn8_qmm "MLXCEL_MSA_FETCH=qmm" --cache-mode kvarn8
+if ! grep -q "C qmm-fetch fused core active" "$OUT/rank_kvarn8_qmm_d${DEPTH}.txt"; then
+  echo "FATAL: cell kvarn8_qmm requested the qmm core but the model never dispatched it — wrong binary or gate fall-through" >&2
+  exit 1
+fi
 # Reference: all-fp16 full-window flow (v1 shape)
 run fp16_full "" --cache-mode fp16
 

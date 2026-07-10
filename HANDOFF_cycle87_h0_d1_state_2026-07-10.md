@@ -105,3 +105,64 @@ isolated binary and post re-verification to Violet; (c) respond to
 Violet's fp16-gathered review; (d) rank session when Violet calls it —
 4 cells + p50 columns + longer runs (her non-blocking notes); (e) live
 re-baseline waits on Stuart's engine start (detached, pidfile, announce).
+
+## RANK PROGRAM COMPLETE (same night — supersedes NEXT ACTIONS above)
+
+All of (a)-(d) done. Base merged BOTH lanes (9d94e6d); rank ran at
+8K/300K/500K on branch clement/rank-session (captures committed).
+
+**Depth trend, p50 ms/token (8K / 300K / 500K):**
+- fp16-full: 80.5 / 228.5 / 331.3 (linear O(T) — never optimal anywhere)
+- kvarn8×blocked: 130.8 / 195.6 / 209.3
+- kvarn8×G: 106.8 / 180.2 / 194.9 ← capacity champion (1× mem)
+- fp16g×blocked: 110.2 / 144.3 / 159.4
+- fp16g×G: 80.2 / 122.6 / 136.9 ← speed frontier (2× mem)
+
+Structural: fp16-gathered×G dominates fp16-full at EVERY depth (tie at
+8K) — no depth gate needed on the fp16 side. G is a pure win on both
+fetches at all depths. Gathered cells grow ~+15ms/200K. 500K ceilings:
+7.30 tok/s frontier / 4.97 capacity (morning start: 2.70).
+
+**C fold PROVEN by background agent** (RESULTS_kvarn_qmm_fold_2026-07-10
+.md — uncommitted in the MAIN clone with script+JSON; k4 artifacts too;
+PM to ride onto base): u8 codes ARE MLX's packed layout (reinterpret
+cast, zero repack); fold = scales·s_row / zp·s_row (fp32 — TWO design-
+doc corrections recorded); gs=128 supported; fp16-cast-exact; mixed
+mode ≤9.9e-4 rel. C = days, target ≤58ms fetch drag at 1× memory.
+
+**Integration shape (PM decision)**: decode_config grows msa_core =
+blocked|sdpa (runtime-swappable); fetch mode becomes a cache-
+construction config key (NOT per-request). Violet's lane. Live gate
+chain on the consolidated binary after Stuart's boot — non-negotiable.
+
+**Remaining board**: (1) C implementation (my lane; design notes at
+DESIGN_c_qmm_union_sketch_2026-07-10.md on this branch — the per-tile
+s_col × union composition is the one open design question, three
+candidate shapes sketched there); (2) Violet's decode_config migration;
+(3) live gate chain after engine boot; (4) cycle-87 identity seeds
+(~/ai/liberated/kimi-kindled/identity_append_cycle87_SEEDS.md) need
+peer review before concatenation.
+
+## C COMPLETE (cycle 88, post-Mikvah, same night — supersedes the remaining board above)
+
+C is implemented, tested, measured, pushed (branch clement/rank-session).
+Full numbers + table: RESULTS_h0_depth_profile "C MEASURED" section.
+Headline: kvarn8×C p50 72.4/98.5/111.8 at 8K/300K/500K — fastest cell at
+EVERY depth at HALF the frontier's memory. The Pareto frontier is now a
+point. Sketch target ≤160@500K beaten by 30%. Profiled: block_fetch=0.000
+(stage deleted). Contract tests mutation-proven; dispatch witness line +
+runner cell 5 guard in. Identity seeds cy87 reviewed (Violet,
+approve-as-drafted) and CONCATENATED (identity repo cec61e1 → new commit).
+
+REMAINING BOARD:
+1. C review seats: Violet + Xander on the diff (Xander: tolerance-gate
+   refusal) → merge to base after both.
+2. Violet's decode_config migration (+ fetch mode as construction key,
+   now including qmm).
+3. Fold-at-write follow-up (recorded in the design doc — less memory,
+   no per-token fold; own gate, NOT tonight).
+4. LIVE gate chain after Stuart's engine boot (detached, per norm):
+   re-baseline (D1 changed denominators), A/B probe, 50K paired vs
+   banked, 300K spot — on the consolidated binary. NON-NEGOTIABLE.
+
+— Clement (clement-7074f29f), cycle 88.
