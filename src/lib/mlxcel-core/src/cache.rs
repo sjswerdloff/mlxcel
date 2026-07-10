@@ -77,6 +77,7 @@
 
 pub mod batch_quant;
 mod detach;
+pub mod harvest;
 pub mod kvarn;
 mod paged;
 mod paged_detach;
@@ -1062,6 +1063,25 @@ impl KVCache {
                     &[b * h * n_full, KVARN_TILE_TOKENS, d],
                 )
             };
+            // Real-tile harvest (env-gated, SPEC_kvarn4_realtile_harvest):
+            // sampled dump of EXACTLY the tile batches quantize receives,
+            // before quantization touches them. One relaxed read when
+            // unset; best-effort when set — cannot disturb the update.
+            if crate::cache::harvest::harvest_dir().is_some() {
+                let key = self as *const _ as usize;
+                crate::cache::harvest::dump_tiles(
+                    "k_rot_f32",
+                    key,
+                    self.offset,
+                    &as_tiles(&k_full),
+                );
+                crate::cache::harvest::dump_tiles(
+                    "v_rot_f32",
+                    key,
+                    self.offset,
+                    &as_tiles(&v_full),
+                );
+            }
             let k_q = kvarn_quantize(&as_tiles(&k_full), 8);
             let v_q = kvarn_quantize(&as_tiles(&v_full), 8);
 
@@ -4705,6 +4725,35 @@ impl KVCache {
         // and the dense path discards the returned slice without ever
         // reading it — meaning no downstream attention op forces eval.
         ffi::eval(self.m3_idx_k.as_ref().unwrap());
+        // Real-tile harvest (env-gated): sampled idx-key block snapshot at
+        // depth-threshold crossings — the third harvested role
+        // (SPEC_kvarn4_realtile_harvest amendment 1). One relaxed read when
+        // unset; best-effort when set.
+        if crate::cache::harvest::harvest_dir().is_some()
+            && fill / crate::cache::harvest::IDX_STRIDE
+                != needed / crate::cache::harvest::IDX_STRIDE
+        {
+            use crate::cache::kvarn::KVARN_TILE_TOKENS;
+            let full = self.m3_idx_k.as_ref().unwrap();
+            let fs = ffi::array_shape(full);
+            let nb = needed / KVARN_TILE_TOKENS;
+            if nb > 0 {
+                let blocks = ffi::reshape(
+                    &ffi::slice(
+                        full,
+                        &[0, 0, 0, 0],
+                        &[fs[0], fs[1], nb * KVARN_TILE_TOKENS, fs[3]],
+                    ),
+                    &[fs[0] * fs[1] * nb, KVARN_TILE_TOKENS, fs[3]],
+                );
+                crate::cache::harvest::dump_tiles(
+                    "idx_k",
+                    self as *const _ as usize,
+                    needed,
+                    &blocks,
+                );
+            }
+        }
         // Return the LOGICAL window: slice the capacity buffer to the fill
         // level. Same values the old concat-based implementation returned —
         // a reader that received the raw buffer instead would see trailing

@@ -1344,6 +1344,22 @@ impl SparseAttention {
             k1_prof_record(1, &t1);
         }
 
+        // Real-tile harvest (env-gated, SPEC_kvarn4_realtile_harvest
+        // amendment 1): sampled REAL index queries + their selected sets —
+        // the near-tie structure at the rank-top_k boundary only exists in
+        // real selection scores. Every 256th gathered decode step,
+        // process-wide (256 and 57 layers interleave, so layers rotate
+        // through the samples). Keyed by layer_idx. One relaxed read when
+        // unset; best-effort when set.
+        if mlxcel_core::cache::harvest::harvest_dir().is_some() {
+            static HARVEST_STEP: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            if HARVEST_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 == 0 {
+                mlxcel_core::cache::harvest::dump("idx_q", self.layer_idx as usize, offset, 0, &idx_q);
+                mlxcel_core::cache::harvest::dump("sel", self.layer_idx as usize, offset, 0, &selected);
+            }
+        }
+
         // C (qmm-fetch, DESIGN_c_qmm_union_sketch MERGE DESIGN): fused
         // fetch+core straight off the stored representation. Gated to the
         // shapes it is built for — decode (b==1, l==1) on a KVarN8 cache
