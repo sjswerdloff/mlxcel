@@ -49,7 +49,10 @@ Gates (jointly pre-registered tonight, applied PER-ROLE on real tiles):
   marginal-over-anchor < 0.05
 - SUBAGENT tier (task-scoped, short-context ≤ ~32K): marginal gate
   EXCLUDED by design; flips < 0.05 (per the role actually quantized) AND
-  composed p95 < 0.10.
+  composed p95 < 0.10. Clarification (refinement 3): flips are
+  score-side by definition — for V-only variants this reads as the
+  composition's K-variant flip rate (k8's own 0.88% for K8V4); there is
+  no V-flip metric and none should be hunted for.
 
 Analysis ORDER: K8V4 first — its synthetic kill is the one most likely
 to be proxy artifact (single-generator-for-both-roles is exactly its
@@ -100,10 +103,17 @@ anywhere yet; this tier has no retrospective history):
   one sample = one (harvested real query, kv-head) pair; error of a
   sample = sum of clean-side softmax block-mass (softmax over ALL clean
   block scores for that query/head) carried by blocks present in the
-  clean top-k but absent from the quantized top-k. Gate binds on the
-  p95 over ALL samples POOLED across layers and depth strata < 0.02;
-  per-stratum and per-layer breakdowns are REPORTED (drift diagnostics),
-  never substituted for the pooled gate. A silently dropped
+  clean top-k but absent from the quantized top-k, RENORMALIZED WITHIN
+  the clean top-k set (dropped mass ÷ total clean-top-k mass): "of the
+  attention the model would actually pay, how much is lost" — strictly
+  ≥ the all-blocks version for every sample, so the same 0.02 bound is
+  strictly stricter (Violet's co-sign refinement 1, pre-data). Gate
+  binds on the p95 over ALL samples POOLED across layers and depth
+  strata < 0.02; per-stratum and per-layer breakdowns are REPORTED
+  (drift diagnostics), never substituted for the pooled gate.
+  POPULATION POWER FLOOR (refinement 2, pre-data): ≥256 harvested real
+  queries spanning the depth strata — a p95 gate without a sample floor
+  can be passed by under-powering the tail. A silently dropped
   mass-carrying block is the failure mode; near-tie churn is not.
 - Same necessary-not-sufficient status: a pass buys engine A/B, not
   deployment. Selection failure is silent-and-total per event — the
