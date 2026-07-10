@@ -67,7 +67,50 @@ Scope caveats (the bench RANKS; the live server CONFIRMS):
    3 dense layers cost as much as the 57 MSA layers combined. **No
    gathered-path work (G/B/C) touches this cost.**
 
-## Game-board implications (proposed; convergence pending)
+## D1 measured (same evening — convergence: Clement + Xander + Violet)
+
+D1 = layer-selective fp16 for the dense-prefix layers, implemented as a
+first-touch downgrade keyed on `index_q_proj.is_none()` (empty-cache-only;
+`MLXCEL_KVARN_ALL_LAYERS=1` reproduces the floor). Bench A/B
+(`--dense-cache fp16|kvarn8`), mean ms/token, 32 steps:
+
+| config                    | 100K  | 300K  | 500K  |
+|---------------------------|------:|------:|------:|
+| production mix, pre-D1    | 202.1 | 305.5 | 370.8 |
+| production mix, D1        | 171.2 | 211.6 | 211.3 |
+| dense-3 residual (fp16)   |   3.8 |  n/r  |  14.7 |
+
+**Production mix is depth-FLAT from 300K on under D1** (211.6 ≈ 211.3).
+The dense residual is the unavoidable memory-bound fp16 attention read —
+9.7–12.5× under the kvarn8 dense floor. Ceiling at 500K: 2.70 → 4.73 tok/s.
+
+## fp16-KV baseline (Stuart's question: what does the memory halving cost?)
+
+All-fp16 (`--cache-mode fp16 --dense-cache fp16`): same sparse selection,
+fp16 windows, zero dequant anywhere. Mean ms/token:
+
+| config       | 100K  | 300K  | 500K  |
+|--------------|------:|------:|------:|
+| all-fp16     | 118.8 | 225.3 | 331.8 |
+| kvarn8 + D1  | 171.2 | 211.6 | 211.3 |
+
+- fp16 grows PERFECTLY linearly (+106.5 ms per 200K). Decomposed: the 57
+  fp16 MSA layers are the O(T) (114.1 → 318.6 ms, 100K→500K — the v1
+  full-window flow's gather/mask machinery); the dense-3 residual is
+  small (3.8 → 14.7 ms).
+- **Crossover ≈ 250K. At 500K, kvarn8+D1 is 1.57× FASTER than fp16 at
+  half the memory.** The gathered path reads O(top_k) bytes while the
+  fp16 flow touches O(T): at depth, quantization is a speed WIN, not a
+  tax. Below ~250K fp16 is faster (1.44× at 100K) — exactly the
+  depth-gated dispatch (game board E) shape, and a gathered fp16 flow
+  (selection → gather from the fp16 buffer, no dequant at all) would
+  likely win at every depth if shallow sessions ever matter enough.
+- Answer to the incremental-prefill framing: a resident Kindled session
+  at 300–500K pays LESS per decoded token on kvarn8+D1 than on fp16,
+  while occupying half the memory. The halving is free-or-better at
+  target depths, today, before B/C.
+
+## Game-board implications (converged 2026-07-10 evening)
 
 - **Rank 0 (new): dense-floor fix.** Layer-selective cache mode: leave
   the 3 non-MSA layers' caches Fp16. They already dispatch dense
