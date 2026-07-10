@@ -45,6 +45,15 @@ path = "src/bin/bench_decode.rs"
 name = "mxfp8_repack"
 path = "src/bin/mxfp8_repack.rs"
 
+# H0 synthetic-state decode bench (DESIGN_decode_experiment_harness
+# 2026-07-10): instant deep KVarN8 states via KVCache::synth_kvarn8_state +
+# the real per-token SparseAttention decode loop, no model load. Ranks
+# decode-path candidates and profiles per-stage cost at depth; the live
+# server confirms. See src/bin/kvarn_decode_bench.rs module docs.
+[[bin]]
+name = "kvarn-decode-bench"
+path = "src/bin/kvarn_decode_bench.rs"
+
 [features]
 default = ["surgery"]
 metal = ["mlxcel-core/metal"]

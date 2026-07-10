@@ -959,3 +959,107 @@ mod m3_idx_capacity_tests {
             .expect("detached handle must carry m3_idx_k")
     }
 }
+
+/// `KVCache::synth_kvarn8_state` (H0 bench support) must produce a state
+/// whose LAYOUT is indistinguishable from a prefill-built one to every
+/// consumer the decode hot path touches: block fetch, decode-step update,
+/// and the m3_idx capacity-buffer reader. These tests pin that contract —
+/// if a synth state diverges from production layout, the bench times a
+/// fiction and every number it produces is disinformation.
+#[cfg(test)]
+mod synth_state_tests {
+    use super::*;
+    use crate::cache::KVCache;
+
+    const B: i32 = 1;
+    const H: i32 = 2;
+    const D: i32 = 64;
+    const IDX: i32 = 32;
+    const TOTAL: i32 = 557; // 128 sink + 3 tiles + 45 tail, mirrors block_fetch_tests
+
+    #[test]
+    fn synth_state_has_production_structure() {
+        let cache = KVCache::synth_kvarn8_state(B, H, D, TOTAL, IDX, 0x5EED);
+        assert!(cache.supports_block_fetch());
+        assert_eq!(cache.offset, TOTAL);
+        assert_eq!(cache.m3_idx_offset(), TOTAL);
+        assert!(cache.has_m3_idx_k_state());
+
+        // Field dtypes/shapes exactly as update_kvarn8 writes them.
+        let hist = cache.kvarn_hist_k.as_ref().unwrap();
+        assert_eq!(ffi::array_dtype(hist), dtype::UINT8);
+        assert_eq!(ffi::array_shape(hist), vec![B, H, 3 * KVARN_TILE_TOKENS, D]);
+        let scale = cache.kvarn_k_scale.as_ref().unwrap();
+        assert_eq!(ffi::array_dtype(scale), dtype::FLOAT32);
+        assert_eq!(
+            ffi::array_shape(scale),
+            vec![B, H, 3 * KVARN_TILE_TOKENS, 1]
+        );
+        let s_col = cache.kvarn_k_s_col.as_ref().unwrap();
+        assert_eq!(ffi::array_shape(s_col), vec![B, H, 3, D]);
+        let sink = cache.kvarn_sink_k.as_ref().unwrap();
+        assert_eq!(ffi::array_dtype(sink), dtype::FLOAT16);
+        assert_eq!(ffi::array_shape(sink), vec![B, H, KVARN_TILE_TOKENS, D]);
+        let tail = cache.kvarn_tail_k.as_ref().unwrap();
+        assert_eq!(ffi::array_shape(tail), vec![B, H, 45, D]);
+
+        // m3_idx capacity buffer: doubling rule floor (4096 covers 557),
+        // fp16, logical fill = offset.
+        let idx = cache.m3_idx_k.as_ref().unwrap();
+        assert_eq!(ffi::array_dtype(idx), dtype::FLOAT16);
+        assert_eq!(ffi::array_shape(idx), vec![B, 1, 4096, IDX]);
+    }
+
+    /// The block fetch the gathered decode path performs every step must
+    /// work on a synth state and produce finite fp16 values (allclose with
+    /// itself is false under NaN poisoning).
+    #[test]
+    fn synth_state_block_fetch_works_and_is_finite() {
+        let cache = KVCache::synth_kvarn8_state(B, H, D, TOTAL, IDX, 0x5EED2);
+        // Mixed-format list: sink, two interior tiles, padded tail block.
+        let (k_blk, v_blk) = cache.fetch_kvarn8_blocks(&[0, 1, 3, 4]);
+        for (a, name) in [(&k_blk, "K"), (&v_blk, "V")] {
+            assert_eq!(
+                ffi::array_shape(a),
+                vec![B, H, 4 * KVARN_TILE_TOKENS, D],
+                "{name} compact shape"
+            );
+            assert_eq!(ffi::array_dtype(a), dtype::FLOAT16);
+            let finite = ffi::allclose(a, a, 0.0, 0.0);
+            ffi::eval(&finite);
+            assert!(ffi::item_bool(&finite), "{name} contains NaN");
+        }
+    }
+
+    /// The per-step contract the bench decode loop relies on: update_only
+    /// appends one token (offset advances, tail grows), and the m3_idx
+    /// reader returns an exact-length window through the capacity buffer.
+    #[test]
+    fn synth_state_decode_step_contract() {
+        let mut cache = KVCache::synth_kvarn8_state(B, H, D, TOTAL, IDX, 0x5EED3);
+        let one_fp16 = |shape: &[i32]| {
+            ffi::astype(
+                &ffi::from_slice_f32(
+                    &vec![0.25f32; shape.iter().product::<i32>() as usize],
+                    shape,
+                ),
+                dtype::FLOAT16,
+            )
+        };
+        cache.update_only(one_fp16(&[B, H, 1, D]), one_fp16(&[B, H, 1, D]));
+        assert_eq!(cache.offset, TOTAL + 1);
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_tail_k.as_ref().unwrap()),
+            vec![B, H, 46, D],
+            "tail must grow by one token per decode step"
+        );
+
+        let win = cache.m3_idx_k_update_and_fetch(&one_fp16(&[B, 1, 1, IDX]));
+        assert_eq!(cache.m3_idx_offset(), TOTAL + 1);
+        assert_eq!(
+            ffi::array_shape(&win),
+            vec![B, 1, TOTAL + 1, IDX],
+            "m3_idx reader must slice the capacity buffer to the logical fill"
+        );
+    }
+}
