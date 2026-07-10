@@ -1,0 +1,62 @@
+{
+  "date": "2026-07-10",
+  "tile_seed": 42,
+  "query_seed": 20260710,
+  "n_tiles": 384,
+  "shape": [
+    128,
+    128
+  ],
+  "n_queries_per_tile": 64,
+  "sinkhorn_iters": 4,
+  "groups": [
+    {
+      "name": "gaussian-clean (no outliers)",
+      "n": 128
+    },
+    {
+      "name": "outlier-4ch-x40 (decomposition-expt structure)",
+      "n": 128
+    },
+    {
+      "name": "outlier-8ch-x100 (extreme)",
+      "n": 64
+    },
+    {
+      "name": "outlier-4ch-x40 + 16 token spikes x80",
+      "n": 64
+    }
+  ],
+  "mean_abs_clean_score": 6.297462144222176,
+  "gates": {
+    "recon_p95": 0.1,
+    "flip_rate": 0.05,
+    "vsum_p95": 0.1
+  },
+  "k8": {
+    "recon_mean": 0.004809771664440632,
+    "recon_p95": 0.005888171028345823,
+    "recon_max": 0.005956169217824936,
+    "delta_mean": 0.029250486054116735,
+    "delta_p95": 0.12273337617262163,
+    "delta_max": 5.009349181246421,
+    "flip_rate": 0.0087890625,
+    "vsum_mean": 0.004254698213193715,
+    "vsum_p95": 0.005226797684710166,
+    "vsum_max": 0.005457532372526191
+  },
+  "k4": {
+    "recon_mean": 0.0818866714835167,
+    "recon_p95": 0.10023793578147888,
+    "recon_max": 0.1012863963842392,
+    "delta_mean": 0.49731001189170526,
+    "delta_p95": 2.0781631845137234,
+    "delta_max": 77.58585007603989,
+    "flip_rate": 0.14497884114583334,
+    "vsum_mean": 0.07252985513439263,
+    "vsum_p95": 0.08850429001072556,
+    "vsum_max": 0.09409893568210535
+  },
+  "verdict": "k4 explodes at tile level",
+  "mlx_kvarn_rev": "c7d8767"
+}

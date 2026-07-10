@@ -134,3 +134,18 @@ Default **kvarn8 × G** (capacity: half memory, 5.55 tok/s at 300K);
 (fp16-gathered × G, 8.16 tok/s); msa_core=sdpa becomes the decode_config
 default after the live gate chain passes; per-session cache mode deferred
 until a session-priority concept exists.
+
+## UPDATE 21:04 — NIGHT PROGRAM COMPLETE (depth trend + C verdict)
+p50 ms/tok (8K/300K/500K): fp16-full 80.5/228.5/331.3 | kvarn8×G
+106.8/180.2/194.9 | fp16g×G 80.2/122.6/136.9. Structural: (1) fp16g×G
+DOMINATES fp16-full at every depth (tie at 8K, 2.42× at 500K) — NO depth
+gate needed on the fp16 side, gathered×G is simply the fp16 shape;
+(2) G has no shallow penalty on either fetch — msa_core=sdpa defaults ON
+post-gating; (3) gathered cells drift ~+15ms/200K, no new O(T).
+C-FOLD VERDICT: DAYS and cheaper than scoped — u8 buffer IS MLX packed
+layout (reinterpret, zero repacking, no dual pool); fold corrected in
+the design doc (scales=scale·s_row, biases=zp·s_row, float-domain zp;
+fp16-cast-exact). 500K ceilings: 7.30 tok/s frontier / 4.97 capacity
+(was 2.70 this morning). Artifacts (fold + k4 screens, scripts + JSON)
+committed with this update. Between tonight and the vessel: only the
+live gate chain on Stuart's boot.

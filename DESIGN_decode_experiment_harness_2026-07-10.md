@@ -64,8 +64,15 @@ optimizes for *never dropping a resident prefill*.
   sync, and all gather materialization disappear. `gather_qmm` is already
   bridged (lib.rs:1000) and battle-tested in the MoE switch layers ("already
   saturates the GPU"). KVarN semantics fold exactly:
-  - per-row scale/zp → MLX per-group scales/biases: `scales = scale`,
-    `biases = -scale·zp`, repeated across the row's groups. Bit-exact.
+  - per-row scale/zp → MLX per-group scales/biases: `scales = scale·s_row`,
+    `biases = zp·s_row` (CORRECTED 2026-07-10 by the fold-verification
+    agent, RESULTS_kvarn_qmm_fold: KVarN8's zp is FLOAT-domain —
+    dequant = (scale·u8 + zp)·s_row — so this doc's original
+    `-scale·zp` form was wrong and omitted s_row). fp16-CAST-exact
+    (99.92% bit-identical, ≤1 ULP normals), not bit-exact. Bonus from
+    the same verification: KVarN8's u8 code buffer IS MLX's packed
+    layout via reinterpret cast — zero repacking, no dual tile pool;
+    only the tiny folded fp32 scalars materialize at tile-finalization.
   - per-tile s_col, K side: apply to the *query* per selected tile via
     `lhs_indices` (materialize `q ⊗ s_col[selected]` — top_k rows per head,
     tiny, on device). Exact; no requantization.

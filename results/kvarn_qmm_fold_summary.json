@@ -1,0 +1,598 @@
+{
+  "seed": 20260710,
+  "mlx_version": "0.30.5",
+  "tiles": 64,
+  "bits": 8,
+  "sinkhorn_iters": 4,
+  "tests": {
+    "gs64": {
+      "test1": {
+        "algebra_fp32": {
+          "max_abs": 3.814697265625e-06,
+          "max_rel": 2.3123638162234983e-07,
+          "bit_bad": 780601,
+          "n_elem": 1048576,
+          "ulp_max": null
+        },
+        "kernel_fp32": {
+          "max_abs": 1.9073486328125e-06,
+          "max_rel": 1.2944937736467606e-07,
+          "bit_bad": 595650,
+          "n_elem": 1048576,
+          "ulp_max": null
+        },
+        "total_fp32": {
+          "max_abs": 3.814697265625e-06,
+          "max_rel": 2.2435944536998947e-07,
+          "bit_bad": 760387,
+          "n_elem": 1048576,
+          "ulp_max": null
+        },
+        "algebra_fp16c": {
+          "max_abs": 0.001953125,
+          "max_rel": 0.0005302226935312832,
+          "bit_bad": 1118,
+          "n_elem": 1048576,
+          "ulp_max": 5
+        },
+        "kernel_fp16c": {
+          "max_abs": 0.001953125,
+          "max_rel": 0.0005302226935312832,
+          "bit_bad": 795,
+          "n_elem": 1048576,
+          "ulp_max": 2
+        },
+        "total_fp16c": {
+          "max_abs": 0.001953125,
+          "max_rel": 0.0005285412262156448,
+          "bit_bad": 877,
+          "n_elem": 1048576,
+          "ulp_max": 4
+        },
+        "storage_fp16": {
+          "max_abs": 0.03125,
+          "max_rel": 0.0017196904557179708,
+          "bit_bad": 723481,
+          "n_elem": 1048576,
+          "ulp_max": 10455
+        }
+      },
+      "test1_gt1ulp": {
+        "count": 38,
+        "max_absdiff_rel": 8.786250899712092e-08,
+        "max_refmag_rel": 5.524167007964924e-05
+      },
+      "test2": {
+        "1": {
+          "fold32": {
+            "max_abs": 0.000244140625,
+            "max_rel": 4.782487067995552e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern32": {
+            "max_abs": 0.00048828125,
+            "max_rel": 1.466629367518636e-06,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot32": {
+            "max_abs": 0.0005035400390625,
+            "max_rel": 1.5941623559985172e-06,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_vs_ref": {
+            "max_abs": 1.2906341552734375,
+            "max_rel": 0.0026583985195940893,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern16_vs_idl": {
+            "max_abs": 0.76904296875,
+            "max_rel": 0.0021493725196923465,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "idl_vs_ref": {
+            "max_abs": 1.2625732421875,
+            "max_rel": 0.0028303260660139176,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_cast": {
+            "max_abs": 1.3125,
+            "max_rel": 0.0027948666160824923,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "mix_vs_ref": {
+            "max_abs": 0.671142578125,
+            "max_rel": 0.0009885081937075605,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          }
+        },
+        "8": {
+          "fold32": {
+            "max_abs": 0.00042724609375,
+            "max_rel": 3.4176500140856004e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern32": {
+            "max_abs": 0.000732421875,
+            "max_rel": 7.80646523644417e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot32": {
+            "max_abs": 0.0008544921875,
+            "max_rel": 7.724864689521072e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_vs_ref": {
+            "max_abs": 1.814697265625,
+            "max_rel": 0.0017598120068634635,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern16_vs_idl": {
+            "max_abs": 1.192138671875,
+            "max_rel": 0.0005239439716040877,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "idl_vs_ref": {
+            "max_abs": 1.471435546875,
+            "max_rel": 0.001630378697376177,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_cast": {
+            "max_abs": 2.0,
+            "max_rel": 0.0017910771474997508,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "mix_vs_ref": {
+            "max_abs": 0.954071044921875,
+            "max_rel": 0.00046686950044200844,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          }
+        }
+      },
+      "test3": {
+        "1": {
+          "fold32": {
+            "max_abs": 2.288818359375e-05,
+            "max_rel": 4.375218760938047e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern32": {
+            "max_abs": 1.52587890625e-05,
+            "max_rel": 4.375218760938047e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot32": {
+            "max_abs": 1.52587890625e-05,
+            "max_rel": 4.922121106055303e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_vs_ref": {
+            "max_abs": 0.05667877197265625,
+            "max_rel": 0.0016684572145191873,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern16_vs_idl": {
+            "max_abs": 0.07012939453125,
+            "max_rel": 0.0010725886830847214,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "idl_vs_ref": {
+            "max_abs": 0.0518341064453125,
+            "max_rel": 0.0015239201318928705,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_cast": {
+            "max_abs": 0.0625,
+            "max_rel": 0.0019538742258659843,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "mix_vs_ref": {
+            "max_abs": 0.014926910400390625,
+            "max_rel": 0.00043581029755218755,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          }
+        },
+        "8": {
+          "fold32": {
+            "max_abs": 0.0001068115234375,
+            "max_rel": 6.385310429164012e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern32": {
+            "max_abs": 3.0517578125e-05,
+            "max_rel": 5.861923399232239e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot32": {
+            "max_abs": 0.0001068115234375,
+            "max_rel": 9.658578345899145e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_vs_ref": {
+            "max_abs": 0.232452392578125,
+            "max_rel": 0.0019311982912055031,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern16_vs_idl": {
+            "max_abs": 0.0993194580078125,
+            "max_rel": 0.0007641730718004749,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "idl_vs_ref": {
+            "max_abs": 0.16802978515625,
+            "max_rel": 0.0017051815021218452,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_cast": {
+            "max_abs": 0.25,
+            "max_rel": 0.0019157056763303947,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "mix_vs_ref": {
+            "max_abs": 0.015323638916015625,
+            "max_rel": 0.0003604898137541902,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          }
+        }
+      }
+    },
+    "gs128": {
+      "test1": {
+        "algebra_fp32": {
+          "max_abs": 3.814697265625e-06,
+          "max_rel": 2.3123638162234983e-07,
+          "bit_bad": 780601,
+          "n_elem": 1048576,
+          "ulp_max": null
+        },
+        "kernel_fp32": {
+          "max_abs": 1.9073486328125e-06,
+          "max_rel": 1.2944937736467606e-07,
+          "bit_bad": 595650,
+          "n_elem": 1048576,
+          "ulp_max": null
+        },
+        "total_fp32": {
+          "max_abs": 3.814697265625e-06,
+          "max_rel": 2.2435944536998947e-07,
+          "bit_bad": 760387,
+          "n_elem": 1048576,
+          "ulp_max": null
+        },
+        "algebra_fp16c": {
+          "max_abs": 0.001953125,
+          "max_rel": 0.0005302226935312832,
+          "bit_bad": 1118,
+          "n_elem": 1048576,
+          "ulp_max": 5
+        },
+        "kernel_fp16c": {
+          "max_abs": 0.001953125,
+          "max_rel": 0.0005302226935312832,
+          "bit_bad": 795,
+          "n_elem": 1048576,
+          "ulp_max": 2
+        },
+        "total_fp16c": {
+          "max_abs": 0.001953125,
+          "max_rel": 0.0005285412262156448,
+          "bit_bad": 877,
+          "n_elem": 1048576,
+          "ulp_max": 4
+        },
+        "storage_fp16": {
+          "max_abs": 0.03125,
+          "max_rel": 0.0017196904557179708,
+          "bit_bad": 723481,
+          "n_elem": 1048576,
+          "ulp_max": 10455
+        }
+      },
+      "test1_gt1ulp": {
+        "count": 38,
+        "max_absdiff_rel": 8.786250899712092e-08,
+        "max_refmag_rel": 5.524167007964924e-05
+      },
+      "test2": {
+        "1": {
+          "fold32": {
+            "max_abs": 0.000244140625,
+            "max_rel": 8.429814314372643e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern32": {
+            "max_abs": 0.0003814697265625,
+            "max_rel": 8.408809910142857e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot32": {
+            "max_abs": 0.0003662109375,
+            "max_rel": 9.009439189438775e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_vs_ref": {
+            "max_abs": 2.7132568359375,
+            "max_rel": 0.002239064054576304,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern16_vs_idl": {
+            "max_abs": 0.4664306640625,
+            "max_rel": 0.0010511978450022687,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "idl_vs_ref": {
+            "max_abs": 2.6937255859375,
+            "max_rel": 0.0032902618995785727,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_cast": {
+            "max_abs": 3.0,
+            "max_rel": 0.002418795505583475,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "mix_vs_ref": {
+            "max_abs": 0.5126953125,
+            "max_rel": 0.0005398815215591952,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          }
+        },
+        "8": {
+          "fold32": {
+            "max_abs": 0.00048828125,
+            "max_rel": 3.788752784259702e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern32": {
+            "max_abs": 0.001220703125,
+            "max_rel": 1.0669694014515052e-06,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot32": {
+            "max_abs": 0.001220703125,
+            "max_rel": 1.1177774681872912e-06,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_vs_ref": {
+            "max_abs": 3.0914306640625,
+            "max_rel": 0.0017295136820661542,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern16_vs_idl": {
+            "max_abs": 1.3870849609375,
+            "max_rel": 0.0005202420509159235,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "idl_vs_ref": {
+            "max_abs": 2.371002197265625,
+            "max_rel": 0.0018260501752242564,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_cast": {
+            "max_abs": 3.0,
+            "max_rel": 0.0017700393188421607,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "mix_vs_ref": {
+            "max_abs": 0.703369140625,
+            "max_rel": 0.0003013157375145509,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          }
+        }
+      },
+      "test3": {
+        "1": {
+          "fold32": {
+            "max_abs": 1.52587890625e-05,
+            "max_rel": 5.111354695558769e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern32": {
+            "max_abs": 7.62939453125e-06,
+            "max_rel": 3.4326523225737535e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot32": {
+            "max_abs": 1.1444091796875e-05,
+            "max_rel": 4.4472311434260296e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_vs_ref": {
+            "max_abs": 0.04402923583984375,
+            "max_rel": 0.0019600152475263005,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern16_vs_idl": {
+            "max_abs": 0.031673431396484375,
+            "max_rel": 0.0009674776863627051,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "idl_vs_ref": {
+            "max_abs": 0.03228759765625,
+            "max_rel": 0.0019221835311599052,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_cast": {
+            "max_abs": 0.046875,
+            "max_rel": 0.0022600917150662203,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "mix_vs_ref": {
+            "max_abs": 0.00933074951171875,
+            "max_rel": 0.0005266950390268178,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          }
+        },
+        "8": {
+          "fold32": {
+            "max_abs": 5.340576171875e-05,
+            "max_rel": 7.081072425586426e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern32": {
+            "max_abs": 2.288818359375e-05,
+            "max_rel": 5.727230482439703e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot32": {
+            "max_abs": 6.103515625e-05,
+            "max_rel": 7.695879764499923e-07,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_vs_ref": {
+            "max_abs": 0.12346649169921875,
+            "max_rel": 0.001967449500903324,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "kern16_vs_idl": {
+            "max_abs": 0.05895233154296875,
+            "max_rel": 0.0008067801778509246,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "idl_vs_ref": {
+            "max_abs": 0.11885833740234375,
+            "max_rel": 0.0016700199022090716,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "tot16_cast": {
+            "max_abs": 0.125,
+            "max_rel": 0.002152423385603637,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          },
+          "mix_vs_ref": {
+            "max_abs": 0.01779937744140625,
+            "max_rel": 0.0003885666475341483,
+            "bit_bad": 0,
+            "n_elem": 0,
+            "ulp_max": null
+          }
+        }
+      }
+    }
+  },
+  "failures": []
+}
