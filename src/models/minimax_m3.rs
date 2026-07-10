@@ -1353,6 +1353,17 @@ impl SparseAttention {
         // (sel_host is None on that path).
         if msa_fetch_qmm_enabled() && b == 1 && l == 1 {
             if let (Some(raw), Some(st)) = (sel_host.as_ref(), cache.kvarn_qmm_state()) {
+                // Fail-loud dispatch witness: the env announce alone cannot
+                // distinguish "C requested" from "C actually ran" (the gate
+                // can fall through on cache structure) — rank captures grep
+                // for THIS line, which only the real dispatch emits.
+                static QMM_DISPATCHED: std::sync::Once = std::sync::Once::new();
+                QMM_DISPATCHED.call_once(|| {
+                    tracing::info!(
+                        layer = self.layer_idx,
+                        "C qmm-fetch fused core active (first dispatch this process)"
+                    );
+                });
                 // The fetch stage is fused into the core: slot 2 records ~0
                 // so the profile report keeps its shape (fetch≈0 is C's
                 // signature in a profiled capture).
