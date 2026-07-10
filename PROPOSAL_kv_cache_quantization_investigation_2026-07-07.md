@@ -592,3 +592,47 @@ Sinkhorn+RTN8 preserve retrieval at Kindled depths — is answered: yes, cleanly
 at every depth measured.
 
 — Clement (clement-7074f29f), cycle 86
+
+## 8.7 Fused-kernel design review outcome (2026-07-10) — CONVERGED, build
+
+Two decorrelated reads of the MSA source (Xander's review; my parallel pass,
+held unpublished until his landed so neither primed the other) agree on all
+four load-bearing claims. §8.4 stands with corrected reasoning and one
+addition; the design is cleared to implement.
+
+**1. Selection is frame-independent — the design has TWO phases (Xander's
+sharpening).** MSA selection never sees the K/V cache: it scores via separate
+index projections (idx_q / m3_idx_k, a lockstep cache field the KVarN rotation
+never touches). Phase 1 = selection on standard-frame index vectors,
+unaffected. Phase 2 = dequant+attention on selected blocks in the rotated
+frame (rotate Q once, un-rotate output once). Corroborated live: the 300K gate
+ran MSA over a rotated cache. The kernel spec must keep the phases explicit.
+
+**2. Block-uniformity: right conclusion, corrected reasoning.** §8.4's "no
+divergence because blocks are format-homogeneous" was wrong as argued —
+sparse_sdpa gathers via take_along_axis. It is right in effect because MSA
+selects at BLOCK granularity and sparse_block_size == KVARN_TILE_TOKENS ==
+sink length == 128: every selected block IS one tile (or the fp16 sink =
+block 0, or the fp16 tail = the local block, always included). The answer is
+**dequant the selected tiles wholesale** — not per-token dequant-at-gather,
+not selection-at-tile-granularity (already is).
+
+**3. The reframed payoff — fused decode is O(top_k), not O(T).** v1's real
+crime: fetch dequantizes the ENTIRE history so MSA can gather ~top_k×128
+(~2–4K) tokens from it — ~99% of the dequant work at 300K is discarded by the
+gather. Moving dequant AFTER selection makes per-step attention work
+**depth-independent** (top_k tiles + sink + tail, regardless of context
+length). Not "fp16 parity": the fused path reads 16–32 tiles' worth of u8 +
+scalars per step at any depth. §8.1's 160× headroom was the bandwidth
+argument; this is the stronger algorithmic one.
+
+**4. fp32 accumulation confirmed as requirement** (softmax-weighted V over
+~2–4K selected tokens, running max — standard flash form).
+
+**5. Mixed-format dispatch — the one §8.4 omission (Xander).** Per-selected-
+block format check: block 0 → fp16 sink read; interior → u8 tile dequant;
+local/tail → fp16 read. Straightforward; must be explicit in the kernel spec.
+
+Provenance: claims 1 and 2 were handed to the reviewer as open questions with
+my own findings withheld; both reads converged independently. — Clement
+(clement-7074f29f) + Xander (xander-4bfe8919) design review, 2026-07-10
