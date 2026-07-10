@@ -330,6 +330,36 @@ fn dequantize(x_int8: &MlxArray, scale: &MlxArray) -> UniquePtr<MlxArray> {
 /// the originating cache.
 pub(crate) const TURBO_DEFAULT_SEED: u32 = 0x7B4_70404; // "TUR" 0x474 + B2 issue 474
 
+/// Read-only window onto a KVarN8 cache's stored representation, for the
+/// C (qmm-fetch) decode core — see [`KVCache::kvarn_qmm_state`]. All
+/// interior-tile tensors are the RAW pools (u8 codes one-value-per-byte,
+/// f32 scalar pools, per-tile s_col); sink/tail are fp16 in the ROTATED
+/// frame, exactly as stored. Shapes (B = batch, H = kv heads, D = head
+/// dim, bs = KVARN_TILE_TOKENS):
+///   hist_*  [B, H, n_tiles*bs, D] u8   — quantized rotated tiles
+///   *_scale/zp/s_row [B, H, n_tiles*bs, 1] f32 — per-token RTN/Sinkhorn
+///   *_s_col [B, H, n_tiles, D] f32     — per-tile Sinkhorn columns
+///   sink_*  [B, H, bs, D] fp16 rotated — always full when tiles exist
+///   tail_*  [B, H, tail_len, D] fp16 rotated — None iff tail_len == 0
+pub struct KvarnQmmState<'a> {
+    pub hist_k: &'a MlxArray,
+    pub hist_v: &'a MlxArray,
+    pub k_scale: &'a MlxArray,
+    pub k_zp: &'a MlxArray,
+    pub k_s_row: &'a MlxArray,
+    pub k_s_col: &'a MlxArray,
+    pub v_scale: &'a MlxArray,
+    pub v_zp: &'a MlxArray,
+    pub v_s_row: &'a MlxArray,
+    pub v_s_col: &'a MlxArray,
+    pub sink_k: &'a MlxArray,
+    pub sink_v: &'a MlxArray,
+    pub tail_k: Option<&'a MlxArray>,
+    pub tail_v: Option<&'a MlxArray>,
+    pub n_tiles: i32,
+    pub tail_len: i32,
+}
+
 /// KV Cache for attention layers.
 ///
 /// Uses pre-allocated buffers with slice_update for O(1) per-token updates,
@@ -1184,6 +1214,59 @@ impl KVCache {
     /// those. Semantically identical to `update_and_fetch` minus the fetch.
     pub fn update_only(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
         self.update(new_keys, new_values);
+    }
+
+    /// Read-only views of the raw KVarN8 fields for the C (qmm-fetch)
+    /// decode core (DESIGN_c_qmm_union_sketch, MERGE DESIGN): the core
+    /// consumes the STORED representation directly — u8 codes and scalar
+    /// pools for the interior tiles, fp16-ROTATED sink/tail — instead of
+    /// asking the cache to dequantize a compact window. No write-path
+    /// change; this is a window onto what already exists.
+    ///
+    /// Returns `None` unless the cache has qmm-servable structure:
+    /// KVarN8 mode, no paged backing, and at least one finalized tile.
+    /// When tiles exist the sink is structurally full (the sink fills
+    /// before the first tile finalizes) — asserted, not assumed.
+    pub fn kvarn_qmm_state(&self) -> Option<KvarnQmmState<'_>> {
+        use crate::cache::kvarn::KVARN_TILE_TOKENS;
+        if self.mode != KVCacheMode::KVarN8 || self.paged_backing.is_some() {
+            return None;
+        }
+        let n_tiles = self
+            .kvarn_k_s_col
+            .as_ref()
+            .map_or(0, |s| ffi::array_shape(s)[2]);
+        if n_tiles == 0 {
+            return None;
+        }
+        let sink_k = self.kvarn_sink_k.as_deref()?;
+        let sink_v = self.kvarn_sink_v.as_deref()?;
+        assert_eq!(
+            ffi::array_shape(sink_k)[2],
+            KVARN_TILE_TOKENS,
+            "kvarn_qmm_state: tiles exist but the sink is not full — structural invariant broken"
+        );
+        let tail_k = self.kvarn_tail_k.as_deref();
+        let tail_v = self.kvarn_tail_v.as_deref();
+        let tail_len = tail_k.map_or(0, |t| ffi::array_shape(t)[2]);
+        Some(KvarnQmmState {
+            hist_k: self.kvarn_hist_k.as_deref()?,
+            hist_v: self.kvarn_hist_v.as_deref()?,
+            k_scale: self.kvarn_k_scale.as_deref()?,
+            k_zp: self.kvarn_k_zp.as_deref()?,
+            k_s_row: self.kvarn_k_s_row.as_deref()?,
+            k_s_col: self.kvarn_k_s_col.as_deref()?,
+            v_scale: self.kvarn_v_scale.as_deref()?,
+            v_zp: self.kvarn_v_zp.as_deref()?,
+            v_s_row: self.kvarn_v_s_row.as_deref()?,
+            v_s_col: self.kvarn_v_s_col.as_deref()?,
+            sink_k,
+            sink_v,
+            tail_k,
+            tail_v,
+            n_tiles,
+            tail_len,
+        })
     }
 
     /// K1 (dequant-after-gather): assemble ONLY the requested MSA key

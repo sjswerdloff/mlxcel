@@ -87,6 +87,28 @@ fn msa_core_sdpa_enabled() -> bool {
     })
 }
 
+/// MLXCEL_MSA_FETCH=qmm swaps the gathered flow's fetch+core for the C
+/// (qmm-fetch) fused core on KVarN8 caches (DESIGN_c_qmm_union_sketch,
+/// MERGE DESIGN): interior tiles are scored/attended straight off the
+/// stored u8 codes via gather_qmm — no dequant chain, no compact-window
+/// materialization — and the fp16-rotated sink/tail are scored as stored.
+/// Default OFF — zero behavior change; every existing suite pins the
+/// dequant-fetch cores. Env-gated for the bench rank; production
+/// selection joins the decode_config migration if C wins.
+fn msa_fetch_qmm_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = std::env::var("MLXCEL_MSA_FETCH").is_ok_and(|v| v == "qmm");
+        if on {
+            tracing::info!(
+                "MLXCEL_MSA_FETCH=qmm: gathered decode uses the C qmm-fetch fused core — \
+                 dequant fetch + separate core disabled where the cache qualifies"
+            );
+        }
+        on
+    })
+}
+
 fn k1_profile_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -1296,27 +1318,57 @@ impl SparseAttention {
         // selection→host sync entirely and gather a constant block list.
         // OUTPUT IS GARBAGE — the boot warning says so — but the timing is
         // the sync-free floor that brackets the true sync cost from below.
-        let union: Vec<i32> = if k1_fixed_blocks_enabled() {
+        let (sel_host, union): (Option<Vec<i32>>, Vec<i32>) = if k1_fixed_blocks_enabled() {
             let nkb = (kv_len + self.block_size - 1) / self.block_size;
-            (0..self.top_k.min(nkb)).collect()
+            (None, (0..self.top_k.min(nkb)).collect())
         } else {
             // Host-side union of selected blocks (sorted, unique). Small by
             // construction: <= num_kv_heads * l * top_k indices, and l <= 128
             // on this path (decode l == 1 in practice). THIS IS THE HOST
             // SYNC: array_to_raw_bytes forces evaluation of the selection
-            // graph, per layer per token.
+            // graph, per layer per token. The raw head-major values are kept
+            // alongside the deduped union — the C (qmm) core consumes the
+            // per-head lists directly, at no extra sync.
             let sel_i32 = mlxcel_core::astype(&selected, mlxcel_core::dtype::INT32);
             let bytes = mlxcel_core::array_to_raw_bytes(&sel_i32);
-            let mut u: Vec<i32> = bytes
+            let raw: Vec<i32> = bytes
                 .chunks_exact(4)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
+            let mut u = raw.clone();
             u.sort_unstable();
             u.dedup();
-            u
+            (Some(raw), u)
         };
         if profiling {
             k1_prof_record(1, &t1);
+        }
+
+        // C (qmm-fetch, DESIGN_c_qmm_union_sketch MERGE DESIGN): fused
+        // fetch+core straight off the stored representation. Gated to the
+        // shapes it is built for — decode (b==1, l==1) on a KVarN8 cache
+        // with at least one finalized tile (kvarn_qmm_state returns None
+        // otherwise); anything else falls through to the fetch+core pair
+        // below. The fixed-blocks timing floor never reaches here
+        // (sel_host is None on that path).
+        if msa_fetch_qmm_enabled() && b == 1 && l == 1 {
+            if let (Some(raw), Some(st)) = (sel_host.as_ref(), cache.kvarn_qmm_state()) {
+                // The fetch stage is fused into the core: slot 2 records ~0
+                // so the profile report keeps its shape (fetch≈0 is C's
+                // signature in a profiled capture).
+                let t_fetch = profiling.then(std::time::Instant::now);
+                if profiling {
+                    k1_prof_record(2, &t_fetch);
+                }
+                let t_core = profiling.then(std::time::Instant::now);
+                let out = self.sparse_decode_core_qmm(q, &st, raw, offset);
+                if profiling {
+                    mlxcel_core::eval(&out);
+                    k1_prof_record(3, &t_core);
+                    k1_prof_maybe_report();
+                }
+                return out;
+            }
         }
         let t2 = profiling.then(std::time::Instant::now);
 
@@ -1679,6 +1731,296 @@ impl SparseAttention {
         };
         let out = mlxcel_core::transpose_axes(&raw, &[0, 2, 1, 3]);
         let out = mlxcel_core::reshape(&out, &[b, l, self.num_heads * self.head_dim]);
+        self.o_proj.forward(&out)
+    }
+
+    /// C core (qmm-fetch, DESIGN_c_qmm_union_sketch MERGE DESIGN): the
+    /// gathered flow's fetch AND core, fused, computed off the STORED
+    /// KVarN8 representation in the ROTATED frame throughout.
+    ///
+    /// Why this is exact (modulo fp): the cache rotates every incoming
+    /// token once (channel Hadamard — orthonormal 1/√N, self-inverse), so
+    /// sink/tail (fp16) and tiles (quantized) all live in the rotated
+    /// frame. Inner products are preserved under orthonormal maps —
+    /// ⟨q, K⟩ = ⟨wht(q), K_rot⟩ — so scores computed against the stored
+    /// representation with a once-rotated q ARE the standard-frame scores,
+    /// and the attention output (a weighted sum of rotated V rows) crosses
+    /// back with ONE wht at the end. Both logit chunks (qmm interior,
+    /// fp16 sink/tail) are the same mathematical quantity, so
+    /// concatenating them into ONE softmax IS the blocked core's softmax
+    /// over the same column set — no log-sum-exp merge, and no fused SDPA
+    /// on the fp16 side (fused SDPA never exposes logits, which is exactly
+    /// why the sink/tail side is an explicit small matmul).
+    ///
+    /// Interior tiles: the per-head selected tiles' codes and scalars are
+    /// gathered (take_along_axis — the same cheap block-gather the
+    /// fp16-gathered fetch measured all night, at half the bytes for u8),
+    /// the scalars folded small (scale·s_row, zp·s_row — the MLX affine
+    /// form, fold verification RESULTS_kvarn_qmm_fold), the codes viewed
+    /// u8→u32 (the zero-repack layout identity), then TWO gather_qmm
+    /// dispatches (scores transpose=T, V transpose=F) with identity
+    /// indices over the pre-gathered pools. Rows whose selection is
+    /// sink/tail point at tile 0 and are masked -inf: their softmax
+    /// weight is exactly 0, so the V side needs no mask at all. Sink/tail
+    /// columns carry a per-kv-head membership mask; the tail is used at
+    /// its REAL length (no padding), so at decode (l==1) the position
+    /// rule vanishes structurally — every stored position ≤ q_pos.
+    ///
+    /// Numerics: NOT bit-identical to the blocked core — s_col moves to
+    /// the q side (fp16-cast placement differs) and qmm/matmul
+    /// accumulation orders differ. Equivalence is tolerance-gated, the
+    /// same acceptance class as the G core (mixed-mode products ≤9.9e-4
+    /// rel per the fold verification).
+    fn sparse_decode_core_qmm(
+        &self,
+        q: &MlxArray,
+        st: &mlxcel_core::cache::KvarnQmmState<'_>,
+        sel_raw: &[i32],
+        offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        // l == 1: the position rule is structural (docs above); offset is
+        // kept in the signature for parity with the other cores and for
+        // the debug assertion that the window accounts for it.
+        let h_kv = self.num_kv_heads;
+        let n_rep = self.num_heads / h_kv;
+        let d = self.head_dim;
+        let bs = self.block_size;
+        let tk = self.top_k;
+        let n_tiles = st.n_tiles;
+        let rows = h_kv * tk;
+        debug_assert_eq!(bs, mlxcel_core::cache::kvarn::KVARN_TILE_TOKENS);
+        debug_assert_eq!(sel_raw.len() as i32, rows);
+        debug_assert_eq!(d % 4, 0, "u8→u32 code view needs d divisible by 4");
+        debug_assert_eq!(
+            offset + 1,
+            bs + n_tiles * bs + st.tail_len,
+            "qmm core: cache structure does not account for the query position"
+        );
+        let q_dtype = mlxcel_core::array_dtype(q);
+
+        // ── Host: split the per-head selection into interior-tile rows
+        // (→ qmm) and sink/tail membership (→ fp16 side). The tail block
+        // id is n_tiles+1 and only exists when tail_len > 0 — selection
+        // cannot emit it otherwise (num_key_blocks bounds it).
+        let tail_block = n_tiles + 1;
+        let mut tile_idx = vec![0.0f32; rows as usize];
+        let mut row_interior = vec![false; rows as usize];
+        let mut sink_member = vec![false; h_kv as usize];
+        let mut tail_member = vec![false; h_kv as usize];
+        for h in 0..h_kv as usize {
+            for j in 0..tk as usize {
+                let i = h * tk as usize + j;
+                let blk = sel_raw[i];
+                debug_assert!(
+                    blk >= 0 && blk <= tail_block && (blk != tail_block || st.tail_len > 0),
+                    "qmm core: selected block {blk} out of range (n_tiles={n_tiles}, \
+                     tail_len={})",
+                    st.tail_len
+                );
+                if blk >= 1 && blk <= n_tiles {
+                    tile_idx[i] = (blk - 1) as f32;
+                    row_interior[i] = true;
+                } else if blk == 0 {
+                    sink_member[h] = true;
+                } else {
+                    tail_member[h] = true;
+                }
+            }
+        }
+
+        // ── Rotate q once: same channel Hadamard the cache write path
+        // applies to every stored token, so all scores below compare like
+        // frames. q arrives [1, nh, 1, d]; the 5-D view groups query heads
+        // under their kv head (contiguous GQA grouping, matching the
+        // other cores' expand).
+        let q_rot = mlxcel_core::wht(q);
+        let q_rot5 = mlxcel_core::reshape(&q_rot, &[1, h_kv, 1, n_rep, d]);
+
+        // ── Interior gathers: selected tiles' codes/scalars per kv head.
+        // Views tile the token axis ([1,H,n_tiles*bs,X] → [1,H,n_tiles,bs,X]);
+        // indices broadcast to the gather target exactly as the blocked
+        // core's take_along_axis machinery does.
+        let idx = mlxcel_core::astype(
+            &mlxcel_core::from_slice_f32(&tile_idx, &[1, h_kv, tk, 1, 1]),
+            mlxcel_core::dtype::INT32,
+        );
+        let gather_tiles = |x: &MlxArray, last: i32| -> UniquePtr<MlxArray> {
+            let xv = mlxcel_core::reshape(x, &[1, h_kv, n_tiles, bs, last]);
+            let ib = mlxcel_core::broadcast_to(&idx, &[1, h_kv, tk, bs, last]);
+            mlxcel_core::take_along_axis(&xv, &ib, 2)
+        };
+        // s_col is per-tile (not per-token): [1,H,n_tiles,d] → one row per tile.
+        let gather_s_col = |x: &MlxArray| -> UniquePtr<MlxArray> {
+            let xv = mlxcel_core::reshape(x, &[1, h_kv, n_tiles, 1, d]);
+            let ib = mlxcel_core::broadcast_to(&idx, &[1, h_kv, tk, 1, d]);
+            mlxcel_core::take_along_axis(&xv, &ib, 2)
+        };
+        // Lazy fold on the GATHERED scalars (small — [rows, bs, 1]), kept
+        // f32: fp16 folded scalars cost 1.7e-3 rel (fold verification).
+        let fold = |scale: &MlxArray,
+                    zp: &MlxArray,
+                    s_row: &MlxArray|
+         -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+            let sg = gather_tiles(scale, 1);
+            let zg = gather_tiles(zp, 1);
+            let rg = gather_tiles(s_row, 1);
+            (
+                mlxcel_core::reshape(&mlxcel_core::multiply(&sg, &rg), &[rows, bs, 1]),
+                mlxcel_core::reshape(&mlxcel_core::multiply(&zg, &rg), &[rows, bs, 1]),
+            )
+        };
+        // Gathered codes are freshly materialized (contiguous) — the u32
+        // view is the packed bits=8 layout, zero repacking.
+        let codes_view = |hist: &MlxArray| -> UniquePtr<MlxArray> {
+            let g = gather_tiles(hist, d);
+            mlxcel_core::view(
+                &mlxcel_core::reshape(&g, &[rows, bs, d]),
+                mlxcel_core::dtype::UINT32,
+            )
+        };
+        let ident = {
+            let v: Vec<f32> = (0..rows).map(|i| i as f32).collect();
+            mlxcel_core::astype(
+                &mlxcel_core::from_slice_f32(&v, &[rows]),
+                mlxcel_core::dtype::INT32,
+            )
+        };
+
+        // ── Scores side. lhs rows = (q_rot · s_col_t) per (head, tile),
+        // shared across the head's n_rep query heads: the verified algebra
+        // q·(K_t·s_col_t)^T = (q·s_col_t)·K_t^T moves the per-column
+        // factor to the q side. f32 product (s_col is f32), cast to the q
+        // dtype — the fp16-cast-exact domain the fold verification pinned.
+        let s_col_k = gather_s_col(st.k_s_col);
+        let lhs_scores = {
+            let p = mlxcel_core::multiply(&s_col_k, &q_rot5); // [1,H,tk,n_rep,d] f32
+            let p = mlxcel_core::astype(&p, q_dtype);
+            mlxcel_core::reshape(&p, &[rows, n_rep, d])
+        };
+        let (scales_k, biases_k) = fold(st.k_scale, st.k_zp, st.k_s_row);
+        let codes_k = codes_view(st.hist_k);
+        let logits_int = unsafe {
+            mlxcel_core::gather_qmm(
+                &lhs_scores,
+                &codes_k,
+                &scales_k,
+                biases_k.as_ref().unwrap() as *const MlxArray,
+                ident.as_ref().unwrap() as *const MlxArray,
+                ident.as_ref().unwrap() as *const MlxArray,
+                true,
+                d, // group size == head_dim: one RTN/Sinkhorn group per tile row
+                8,
+                false,
+                "affine",
+            )
+        }; // [rows, n_rep, bs]
+        let logits_int = {
+            let x = mlxcel_core::reshape(&logits_int, &[h_kv, tk, n_rep, bs]);
+            let x = mlxcel_core::transpose_axes(&x, &[0, 2, 1, 3]);
+            let x = mlxcel_core::reshape(&x, &[1, h_kv, n_rep, tk * bs]);
+            mlxcel_core::astype(&x, q_dtype)
+        };
+
+        // ── fp16 side: sink (+ tail) K exactly as stored (rotated fp16),
+        // scored with the same rotated q. matmul broadcasts over [1, H].
+        let s_len = bs + st.tail_len;
+        let k_st = match st.tail_k {
+            Some(t) => mlxcel_core::concatenate(st.sink_k, t, 2),
+            None => mlxcel_core::reshape(st.sink_k, &[1, h_kv, bs, d]),
+        };
+        let v_st = match st.tail_v {
+            Some(t) => mlxcel_core::concatenate(st.sink_v, t, 2),
+            None => mlxcel_core::reshape(st.sink_v, &[1, h_kv, bs, d]),
+        };
+        let q_rot4 = mlxcel_core::reshape(&q_rot, &[1, h_kv, n_rep, d]);
+        let logits_st = mlxcel_core::matmul(
+            &q_rot4,
+            &mlxcel_core::transpose_axes(&k_st, &[0, 1, 3, 2]),
+        ); // [1, H, n_rep, s_len]
+
+        // ── One softmax over the concatenated logits, blocked-core op
+        // order: raw logits → ·scale → +mask → softmax.
+        let w_c = tk * bs + s_len;
+        let logits = mlxcel_core::concatenate(&logits_int, &logits_st, 3);
+        let logits = mlxcel_core::multiply_scalar(&logits, self.scale);
+        // Mask, host-built at [H, w_c] (broadcasts over n_rep on the add):
+        // interior rows whose selection was sink/tail → -inf over their bs
+        // slots; sink/tail columns → -inf for heads that did not select
+        // them. Every head selected top_k real blocks, so every row keeps
+        // at least one unmasked span (the cores' shared no-NaN invariant).
+        let mut mask = vec![0.0f32; (h_kv * w_c) as usize];
+        for h in 0..h_kv as usize {
+            let base = h * w_c as usize;
+            for j in 0..tk as usize {
+                if !row_interior[h * tk as usize + j] {
+                    let a = base + j * bs as usize;
+                    mask[a..a + bs as usize].fill(f32::NEG_INFINITY);
+                }
+            }
+            if !sink_member[h] {
+                let a = base + (tk * bs) as usize;
+                mask[a..a + bs as usize].fill(f32::NEG_INFINITY);
+            }
+            if st.tail_len > 0 && !tail_member[h] {
+                let a = base + ((tk + 1) * bs) as usize;
+                mask[a..a + st.tail_len as usize].fill(f32::NEG_INFINITY);
+            }
+        }
+        let mask = mlxcel_core::astype(
+            &mlxcel_core::from_slice_f32(&mask, &[1, h_kv, 1, w_c]),
+            q_dtype,
+        );
+        let logits = mlxcel_core::add(&logits, &mask);
+        let weights = mlxcel_core::softmax(&logits, -1); // [1, H, n_rep, w_c]
+
+        // ── V side. Interior: per-(head, tile) weight slices → qmm
+        // (transpose=F) → per-tile partials in the rotated frame →
+        // ·s_col_v → sum over tiles. Masked rows have weight exactly 0,
+        // so garbage tiles contribute exactly nothing.
+        let w_int = {
+            let x = mlxcel_core::slice(&weights, &[0, 0, 0, 0], &[1, h_kv, n_rep, tk * bs]);
+            let x = mlxcel_core::reshape(&x, &[h_kv, n_rep, tk, bs]);
+            let x = mlxcel_core::transpose_axes(&x, &[0, 2, 1, 3]);
+            mlxcel_core::reshape(&x, &[rows, n_rep, bs])
+        };
+        let (scales_v, biases_v) = fold(st.v_scale, st.v_zp, st.v_s_row);
+        let codes_v = codes_view(st.hist_v);
+        let part_v = unsafe {
+            mlxcel_core::gather_qmm(
+                &w_int,
+                &codes_v,
+                &scales_v,
+                biases_v.as_ref().unwrap() as *const MlxArray,
+                ident.as_ref().unwrap() as *const MlxArray,
+                ident.as_ref().unwrap() as *const MlxArray,
+                false,
+                d,
+                8,
+                false,
+                "affine",
+            )
+        }; // [rows, n_rep, d]
+        let s_col_v = gather_s_col(st.v_s_col);
+        let out_int = {
+            let p = mlxcel_core::multiply(&part_v, &mlxcel_core::reshape(&s_col_v, &[rows, 1, d]));
+            let p = mlxcel_core::reshape(&p, &[h_kv, tk, n_rep, d]);
+            let p = mlxcel_core::sum_axis(&p, 1, false); // [h_kv, n_rep, d]
+            mlxcel_core::astype(&p, q_dtype)
+        };
+        let w_st = mlxcel_core::slice(&weights, &[0, 0, 0, tk * bs], &[1, h_kv, n_rep, w_c]);
+        let out_st = mlxcel_core::matmul(&w_st, &v_st); // [1, H, n_rep, d]
+        let out_rot = mlxcel_core::add(
+            &mlxcel_core::reshape(&out_int, &[1, h_kv, n_rep, d]),
+            &out_st,
+        );
+
+        // ── Cross back to the standard frame ONCE (wht is self-inverse),
+        // then the cores' shared output contract. [1, H, n_rep, d]
+        // flattens to the contiguous GQA head order q arrived in.
+        let out = mlxcel_core::wht(&out_rot);
+        let out = mlxcel_core::reshape(&out, &[1, self.num_heads, 1, d]);
+        let out = mlxcel_core::transpose_axes(&out, &[0, 2, 1, 3]);
+        let out = mlxcel_core::reshape(&out, &[1, 1, self.num_heads * d]);
         self.o_proj.forward(&out)
     }
 
@@ -5373,6 +5715,221 @@ mod tests {
             "G fused-SDPA core diverged from blocked-gather core on identical \
              inputs (l2 diff {})",
             output_l2_diff(&out_blocked, &out_sdpa)
+        );
+    }
+
+    /// Production-dim harness for the C (qmm) core tests: gather_qmm's
+    /// group_size equals head_dim, and the only agent-verified group size
+    /// is 128 (RESULTS_kvarn_qmm_fold) — the default bs=2/d=4 harness
+    /// cannot drive qmm at all (MLX's group-size floor is 32). Everything
+    /// else stays harness-small: 4 query heads over 2 kv heads, top_k 2.
+    fn make_test_sparse_attention_d128() -> SparseAttention {
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 128;
+        let hidden = num_heads * head_dim; // 512
+        let index_dim = 4;
+
+        SparseAttention {
+            q_proj: make_linear(num_heads * head_dim, hidden, 0.1),
+            k_proj: make_linear(num_kv_heads * head_dim, hidden, 0.1),
+            v_proj: make_linear(num_kv_heads * head_dim, hidden, 0.1),
+            o_proj: make_linear(hidden, num_heads * head_dim, 0.1),
+            q_norm: Some(make_gemma_rms_norm(head_dim)),
+            k_norm: Some(make_gemma_rms_norm(head_dim)),
+            index_q_proj: Some(make_linear(num_kv_heads * index_dim, hidden, 0.1)),
+            index_k_proj: Some(make_linear(index_dim, hidden, 0.1)),
+            index_q_norm: Some(make_gemma_rms_norm(index_dim)),
+            index_k_norm: Some(make_gemma_rms_norm(index_dim)),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            rope_dims: 2,
+            rope_base: 10000.0,
+            block_size: 128, // production quantum — required by the kvarn paths
+            top_k: 2,
+            index_dim,
+            sparse_local_block: 1,
+            layer_idx: 0,
+        }
+    }
+
+    /// C contract, live-state form (DESIGN_c_qmm_union_sketch MERGE
+    /// DESIGN): on a REAL KVarN8 cache built through the production write
+    /// path, the qmm fused core must match the production gathered path
+    /// (union → block fetch → blocked core) on the same decode step, with
+    /// the same selection. Tolerance-gated like G — s_col moves to the q
+    /// side and qmm/matmul accumulation orders differ, so bitwise equality
+    /// is not the contract; ⟨q,K⟩-preservation under the orthonormal
+    /// rotation is.
+    #[test]
+    fn qmm_core_matches_gathered_blocked_path_on_real_cache() {
+        // A set MLXCEL_MSA_FETCH would flip the reference path to C and
+        // make this test compare C to C — vacuous green. Fail loud instead.
+        assert!(
+            std::env::var("MLXCEL_MSA_FETCH").is_err(),
+            "this test requires MLXCEL_MSA_FETCH unset (reference must be the blocked path)"
+        );
+        let attn = make_test_sparse_attention_d128();
+        let hidden = attn.num_heads * attn.head_dim;
+        // sink(128) + 2 tiles(256) + tail(45) = 429 prior tokens; with the
+        // decode token, nkb = ceil(430/128) = 4 > top_k = 2 (unsaturated).
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+
+        let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let _ = attn.forward(&x_prefill, &mut cache, None);
+        assert_eq!(cache.offset, kv_len_prior);
+
+        // Hand-drive the decode projections exactly as forward does (the
+        // v1-vs-gathered test's pipeline), with update_only so the full
+        // window is never materialized — the gathered flow's real shape.
+        let x_decode = make_test_input(1, l, hidden);
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = if let Some(ref n) = attn.k_norm {
+            n.forward(&k)
+        } else {
+            k
+        };
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        cache.update_only(k, v);
+        assert_eq!(cache.offset, kv_len);
+
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(&x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = if let Some(ref n) = attn.index_k_norm {
+            n.forward(&idx_k)
+        } else {
+            idx_k
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let idx_k_full = cache.m3_idx_k_update_and_fetch(&idx_k);
+
+        let q_raw = attn.q_proj.forward(&x_decode);
+        let q = mlxcel_core::reshape(&q_raw, &[1, l, attn.num_heads, attn.head_dim]);
+        let q = if let Some(ref n) = attn.q_norm {
+            n.forward(&q)
+        } else {
+            q
+        };
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let q = mlxcel_core::fast_rope(&q, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+
+        // Reference: the production gathered path (env off → blocked core).
+        let ref_out = attn.sparse_decode_attention_gathered(
+            &x_decode, &q, &cache, &idx_k_full, 1, l, kv_len, offset,
+        );
+        mlxcel_core::eval(&ref_out);
+
+        // C: replicate the selection (same deterministic inputs → same
+        // blocks), sync host, run the fused core off the stored state.
+        let idx_q = attn.project_index_queries(&x_decode, 1, l, offset);
+        let selected = attn.per_token_block_selection(&idx_q, &idx_k_full, 1, l, kv_len, offset);
+        let sel_i32 = mlxcel_core::astype(&selected, mlxcel_core::dtype::INT32);
+        let bytes = mlxcel_core::array_to_raw_bytes(&sel_i32);
+        let sel_raw: Vec<i32> = bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let st = cache
+            .kvarn_qmm_state()
+            .expect("429-token KVarN8 cache has tiles — qmm-servable");
+        let qmm_out = attn.sparse_decode_core_qmm(&q, &st, &sel_raw, offset);
+        mlxcel_core::eval(&qmm_out);
+
+        assert_eq!(
+            mlxcel_core::array_shape(&ref_out),
+            mlxcel_core::array_shape(&qmm_out),
+            "output shapes"
+        );
+        let close = mlxcel_core::allclose(&ref_out, &qmm_out, 1e-3, 1e-3);
+        mlxcel_core::eval(&close);
+        assert!(
+            mlxcel_core::item_bool(&close),
+            "C qmm core diverged from the gathered blocked path on a real \
+             KVarN8 cache (l2 diff {})",
+            output_l2_diff(&ref_out, &qmm_out)
+        );
+    }
+
+    /// C contract, mask-edge form: FORCED selection with per-head
+    /// membership variance the live test cannot guarantee — one head
+    /// selects the sink but not the tail, the other the tail but not the
+    /// sink. Reference is the blocked core over an identity-remapped
+    /// all-blocks window (the union/remap glue is pinned separately by the
+    /// bit-identity test, so using the identity here isolates exactly C's
+    /// merge semantics: safe-tile row masking, per-head sink/tail
+    /// membership, real-length tail vs the reference's position-masked
+    /// padding).
+    #[test]
+    fn qmm_core_mask_edges_match_blocked_core_on_synth_state() {
+        let attn = make_test_sparse_attention_d128();
+        let (h_kv, nh, d, bs) = (
+            attn.num_kv_heads,
+            attn.num_heads,
+            attn.head_dim,
+            attn.block_size,
+        );
+        // sink + 2 tiles + 45-token tail; query at the last stored position.
+        let total = bs + 2 * bs + 45;
+        let offset = total - 1;
+        let nkb = 4;
+        let cache = KVCache::synth_kvarn8_state(1, h_kv, d, total, attn.index_dim, 7);
+        let st = cache.kvarn_qmm_state().expect("synth state is qmm-servable");
+        assert_eq!(st.n_tiles, 2);
+        assert_eq!(st.tail_len, 45);
+
+        let det = |n: usize, phase: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32) * 0.37 + phase).sin() * 0.5)
+                .collect()
+        };
+        let q = mlxcel_core::from_slice_f32(&det((nh * d) as usize, 2.7), &[1, nh, 1, d]);
+
+        // h0: sink + tile 1 (tail NOT selected); h1: tile 2 + tail (sink
+        // NOT selected). Head-major, matching the selection tensor layout.
+        let sel_raw: Vec<i32> = vec![0, 1, 2, 3];
+        let sel_f: Vec<f32> = sel_raw.iter().map(|&x| x as f32).collect();
+        let selected = mlxcel_core::astype(
+            &mlxcel_core::from_slice_f32(&sel_f, &[1, h_kv, 1, attn.top_k]),
+            mlxcel_core::dtype::INT32,
+        );
+
+        // Reference: blocked core over the all-blocks window (identity
+        // remap — union {0,1,2,3} in order), production position table.
+        let (k_c, v_c) = cache.fetch_msa_blocks(&[0, 1, 2, 3]);
+        let pos: Vec<f32> = (0..nkb * bs).map(|p| p as f32).collect();
+        let pos_full = mlxcel_core::from_slice_f32(&pos, &[nkb * bs]);
+        let out_blocked =
+            attn.sparse_decode_core(&q, &k_c, &v_c, &selected, &pos_full, nkb, 1, 1, offset);
+        mlxcel_core::eval(&out_blocked);
+
+        let out_qmm = attn.sparse_decode_core_qmm(&q, &st, &sel_raw, offset);
+        mlxcel_core::eval(&out_qmm);
+
+        assert_eq!(
+            mlxcel_core::array_shape(&out_blocked),
+            mlxcel_core::array_shape(&out_qmm),
+            "output shapes"
+        );
+        let close = mlxcel_core::allclose(&out_blocked, &out_qmm, 1e-3, 1e-3);
+        mlxcel_core::eval(&close);
+        assert!(
+            mlxcel_core::item_bool(&close),
+            "C qmm core mask-edge semantics diverged from the blocked core \
+             (l2 diff {})",
+            output_l2_diff(&out_blocked, &out_qmm)
         );
     }
 }
