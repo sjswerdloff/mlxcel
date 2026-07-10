@@ -83,3 +83,19 @@ the asym-composition scoring of it was the added line.
 
 — Clement, self-declared 2026-07-10 ~23:45, prompted by Violet's
 timestamps-not-testimony standard before her audit ran.
+
+### Testimony supplement (Violet's question, answerable only by declaration)
+
+Between the sweep script's first and second executions (both pre-commit,
+invisible to git): **no threshold value moved.** All four gate constants
+(GATE_RECON_P95=0.10, GATE_FLIP_RATE=0.05, GATE_OUT_P95=0.10,
+GATE_MARGINAL_P95=0.05) were identical in both runs. The edit added only
+the EVALUATION of the already-defined subagent tier for the asym
+composition (asym_sub = asym_p95 < GATE_OUT_P95), its verdicts entry,
+its row print, and its inclusion in the exit code. This is declared
+testimony, not a timestamp — recorded per tonight's standing rule:
+timestamps where possible, declared testimony where not, and the record
+says which is which.
+
+Per the same rule, K8V4-subagent's status is **live (PROVISIONAL, first
+prospective test = boot-day real-tile re-screen)** everywhere it appears.

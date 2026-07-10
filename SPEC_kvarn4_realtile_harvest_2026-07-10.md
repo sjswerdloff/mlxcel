@@ -73,7 +73,13 @@ axis the memory arithmetic points at: idx is 256B/token/layer fp16 —
 post-k4 it would be the LARGEST state term (29%), and post-C the
 selection read is the dominant remaining O(T) decode term, growing real
 at liberation depths. The true-2×-vs-kvarn8 configurations all require
-idx compression (K4V4+idx8 = 1.81×, K4V4+idx4 = 1.97×).
+idx compression. CEILING AND FLOOR, stated together per the
+no-flattering-frames rule: the 1.97× (K4V4+idx4) is a THREE-GATES-DEEP
+ceiling — K4 is dead-pending-harvest, V4 is live-PROVISIONAL at the
+subagent tier only, idx4 is unscreened anywhere. The floor that is real
+today is 1.00× (kvarn8); the nearest provisional rung is K8V4 at 1.22×,
+itself awaiting its first prospective test. Intermediate: K4V4+idx8 =
+1.81× if the first two gates clear.
 
 Harvest addition: capture INDEX-KEY tiles (the m3_idx cache contents,
 post-RoPE, single shared head, index_dim=128) alongside K and V, same
@@ -89,10 +95,16 @@ anywhere yet; this tier has no retrospective history):
   index queries; block-pool; top-k per head.
 - Gate A (selection set): top-k set change rate — reported, not gated
   (near-tie swaps are expected and benign).
-- Gate B (the binding one): ATTENTION-MASS-WEIGHTED selection error —
-  softmax mass (under the real full-attention reference) carried by
-  wrongly-dropped blocks, p95 over (query, head) < 0.02. A silently
-  dropped mass-carrying block is the failure mode; near-tie churn is not.
+- Gate B (the binding one): ATTENTION-MASS-WEIGHTED selection error.
+  POPULATION, fixed in advance so no aggregation can be chosen later:
+  one sample = one (harvested real query, kv-head) pair; error of a
+  sample = sum of clean-side softmax block-mass (softmax over ALL clean
+  block scores for that query/head) carried by blocks present in the
+  clean top-k but absent from the quantized top-k. Gate binds on the
+  p95 over ALL samples POOLED across layers and depth strata < 0.02;
+  per-stratum and per-layer breakdowns are REPORTED (drift diagnostics),
+  never substituted for the pooled gate. A silently dropped
+  mass-carrying block is the failure mode; near-tie churn is not.
 - Same necessary-not-sufficient status: a pass buys engine A/B, not
   deployment. Selection failure is silent-and-total per event — the
   copy-precision chain remains the production arbiter.
