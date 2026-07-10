@@ -325,3 +325,22 @@ Day ledger (corrected, Clement): capacity point 500K 2.70 → 8.94 = 3.3×; 300K
   The MORNING binary carries runtime msa_core — G's live A/B leg needs
   one boot + admin toggles, no reboot. Task #31 closed; #28 leg 2
   armed.
+
+## UPDATE 01:36 (Jul 11) — WATCH PASS: flip executed, B healthy, harvest verified
+
+- **Supervisor contract executed end-to-end** at 01:30:56: exact-token
+  signal → TERM+grace → RAM 450GB → announce → boot B → health check
+  passed (+30s). B alive PID 19376; flip spent, no restart path
+  remains. Leg-1 irreplaceables completed in 55 minutes.
+- **Harvest verified at artifact level (watch spot-check)**: 10,798
+  files. ~4,104 k/v dumps (stride-gate estimate confirmed live);
+  **513 idx_k — the declared-gap branch produced real files**; 391
+  idx_q/sel pairs. Sidecars: k_rot [8,128,128] f32 = exact 512K,
+  n_full=64 spread-sampled, first dump spans the 8192 crossing
+  (offset 6144, pre-update semantics confirmed); idx_k at exactly
+  offset 32768, n_full=256. Same cache key across roles.
+- **Both attribution witnesses separately in the record**: log.a
+  config-INTENT (kvarn_decode_path=auto version=0 source=default,
+  SIGHUP watcher installed) + engine flow-RAN announces.
+- Clement driving boot-B validation (C live re-baseline). Next watch
+  03:36; supervisor exits 2/3 route to Violet MQTT.
