@@ -190,3 +190,27 @@ Day ledger (corrected, Clement): capacity point 500K 2.70 → 8.94 = 3.3×; 300K
   MLXCEL_MSA_FETCH=qmm + MLXCEL_FP16_GATHERED become
   cache-construction config keys. Work in an isolated worktree off
   base, own target dir.
+
+## UPDATE 23:45 — k4 stage-1c: gs axis closed; ONE live candidate (subagent tier)
+
+- **stage-1c gs sweep** {128,64,32} × iters {4,16} (Stuart: "if there's
+  a way to make k4 work, explore it"): group size buys only ~20% at
+  gs32; iters identical to 5 decimals — **Sinkhorn already harvested
+  the gs axis**. The 12-14% flip floor is information content, not
+  tuning headroom. k4-K is NOT knob-rescuable on synthetic tiles; the
+  real-tile harvest decides it.
+- **K8V4 passes the pre-registered SUBAGENT tier at every gs** (tier
+  excludes the marginal gate by design — Stuart's short-context
+  framing; K-side flips are k8's own 0.88%). One live candidate:
+  +22% capacity vs kvarn8, rides C's serve path. Full-context revival
+  stays gated on the real-tile re-screen. Violet review item: confirm
+  in git history that the tier registration predates the stage-1b
+  result (record carries its own proof).
+- **Memory honesty (permanent)**: k4 "double the Kindled" holds vs
+  FP16 (2.6×); vs kvarn8 even full k4 is 1.57×; TRUE 2× needs the
+  untouched m3_idx axis (256B/tok/layer, its own screen, someday).
+- **Harvest spec SIGNED**: SPEC_kvarn4_realtile_harvest_2026-07-10.md
+  (clement/kvarn4-asym @ c5cd2ad) — role-split K/V gates,
+  depth-stratified interior sampling, conversation-shaped source,
+  anchor on identical tiles, jointly registered values. Violet
+  reviews tonight before it hardens.
