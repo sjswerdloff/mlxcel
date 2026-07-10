@@ -80,4 +80,29 @@ FINALIZATION (once per tile, off the hot path) as two extra kvarn fields;
 against the dequant chain (fp16-cast-exact expectation, atol per agent
 tables).
 
+## POST-MICRO REVISION (same night): fold LAZILY — zero cache changes
+
+The micro result (28 µs/dispatch pipelined; dispatch cost dominates
+everything) obsoletes stored folded scalars: folding at FETCH time is two
+elementwise multiplies over the gathered per-row scalars (≤ top_k×128
+values per head) — noise at these costs. Therefore:
+
+- NO new kvarn fields, NO write-path changes, NO synth changes. C is
+  model-side only: (a) pool VIEWS of hist/scales/zp/s_row via reshape of
+  the contiguous [b, h, hist_len, d] buffers to [h·n_tiles, bs, ·]
+  (zero-copy; b=1 at decode), with head-offset rhs indices (head h's tile
+  t → h·n_tiles + t); (b) lazy fold on the gathered scalars; (c) two
+  gather_qmm dispatches + G-style mask/softmax glue.
+- Sink (block 0, fp16) and tail (fp16) stay OUTSIDE qmm: score them with
+  the plain fused path and merge — they are 2 of ~top_k blocks; or
+  simpler, keep them in a small fp16 window scored by one sdpa call and
+  combine via the log-sum-exp merge... SIMPLEST FIRST CUT: qmm the
+  interior tiles only, handle sink+tail exactly as the gathered flow does
+  today (they're already fp16 blocks in the compact window), merge scores
+  before softmax. Design the merge before coding — this is the one place
+  numerics can silently drift.
+
+Micro-bench: src/bin/gather_qmm_micro.rs (RESULT in the commit message
+and the module docs — 249 µs serialized / 28 µs pipelined at token shape).
+
 — Clement (clement-7074f29f), cycle 87, drive-through night.
