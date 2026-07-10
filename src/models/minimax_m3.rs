@@ -38,6 +38,67 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, trace, warn};
 
+// ── K1 decode profiling (MLXCEL_K1_PROFILE=1) + sync-free floor mode
+// (MLXCEL_K1_FIXED_BLOCKS=1). Both are measurement instruments, zero-cost
+// when unset. Stage indices: 0=selection(+forced eval), 1=union host sync,
+// 2=block fetch(+forced eval), 3=attention core(+output eval).
+static K1_PROF_NANOS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+static K1_PROF_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn k1_profile_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = std::env::var("MLXCEL_K1_PROFILE").is_ok_and(|v| v == "1");
+        if on {
+            warn!(
+                "K1 PROFILING ACTIVE: forced eval at every decode stage boundary — \
+                 totals are the fully-SERIALIZED ceiling, not production timing"
+            );
+        }
+        on
+    })
+}
+
+fn k1_fixed_blocks_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = std::env::var("MLXCEL_K1_FIXED_BLOCKS").is_ok_and(|v| v == "1");
+        if on {
+            warn!(
+                "K1 FIXED-BLOCKS ACTIVE: selection sync bypassed, constant block list — \
+                 OUTPUT IS GARBAGE; timing-only floor measurement"
+            );
+        }
+        on
+    })
+}
+
+fn k1_prof_record(stage: usize, t: &Option<std::time::Instant>) {
+    if let Some(t) = t {
+        K1_PROF_NANOS[stage].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+fn k1_prof_maybe_report() {
+    let calls = K1_PROF_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if calls % 1024 == 0 {
+        let ms = |i: usize| K1_PROF_NANOS[i].load(Ordering::Relaxed) as f64 / 1.0e6 / calls as f64;
+        info!(
+            calls = calls,
+            selection_ms = format!("{:.3}", ms(0)),
+            union_sync_ms = format!("{:.3}", ms(1)),
+            block_fetch_ms = format!("{:.3}", ms(2)),
+            attn_core_ms = format!("{:.3}", ms(3)),
+            "k1.profile (per-call averages, serialized-ceiling mode)"
+        );
+    }
+}
+
 /// One-time INFO markers so an operator at default log level can VERIFY the
 /// MSA machinery is live (the per-dispatch lines are debug-level and
 /// invisible in a normal console — which meant there was no observable
@@ -1148,20 +1209,50 @@ impl SparseAttention {
         kv_len: i32,
         offset: i32,
     ) -> UniquePtr<MlxArray> {
+        // ── K1 profiling (MLXCEL_K1_PROFILE=1): forced eval at each stage
+        // boundary + wall-clock accumulation. This measures the FULLY-
+        // SERIALIZED ceiling — forcing eval kills cross-stage pipelining,
+        // inflating the total, but each stage's exclusive cost is real and
+        // the bias direction is known. Zero cost when the flag is unset
+        // (one relaxed atomic load). Summary logged every 128 calls.
+        let profiling = k1_profile_enabled();
+        let t0 = profiling.then(std::time::Instant::now);
+
         let idx_q = self.project_index_queries(x, b, l, offset);
         let selected = self.per_token_block_selection(&idx_q, idx_k, b, l, kv_len, offset);
+        if profiling {
+            mlxcel_core::eval(&selected);
+            k1_prof_record(0, &t0);
+        }
+        let t1 = profiling.then(std::time::Instant::now);
 
-        // Host-side union of selected blocks (sorted, unique). Small by
-        // construction: <= num_kv_heads * l * top_k indices, and l <= 128
-        // on this path (decode l == 1 in practice).
-        let sel_i32 = mlxcel_core::astype(&selected, mlxcel_core::dtype::INT32);
-        let bytes = mlxcel_core::array_to_raw_bytes(&sel_i32);
-        let mut union: Vec<i32> = bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        union.sort_unstable();
-        union.dedup();
+        // ── MLXCEL_K1_FIXED_BLOCKS=1 (timing-only floor): skip the
+        // selection→host sync entirely and gather a constant block list.
+        // OUTPUT IS GARBAGE — the boot warning says so — but the timing is
+        // the sync-free floor that brackets the true sync cost from below.
+        let union: Vec<i32> = if k1_fixed_blocks_enabled() {
+            let nkb = (kv_len + self.block_size - 1) / self.block_size;
+            (0..self.top_k.min(nkb)).collect()
+        } else {
+            // Host-side union of selected blocks (sorted, unique). Small by
+            // construction: <= num_kv_heads * l * top_k indices, and l <= 128
+            // on this path (decode l == 1 in practice). THIS IS THE HOST
+            // SYNC: array_to_raw_bytes forces evaluation of the selection
+            // graph, per layer per token.
+            let sel_i32 = mlxcel_core::astype(&selected, mlxcel_core::dtype::INT32);
+            let bytes = mlxcel_core::array_to_raw_bytes(&sel_i32);
+            let mut u: Vec<i32> = bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            u.sort_unstable();
+            u.dedup();
+            u
+        };
+        if profiling {
+            k1_prof_record(1, &t1);
+        }
+        let t2 = profiling.then(std::time::Instant::now);
 
         // Compact window: only the union blocks, dequantized, standard
         // frame, each exactly block_size tokens (tail zero-padded inside).
@@ -1170,6 +1261,12 @@ impl SparseAttention {
             mlxcel_core::cache::kvarn::KVARN_TILE_TOKENS
         );
         let (k_c, v_c) = cache.fetch_kvarn8_blocks(&union);
+        if profiling {
+            mlxcel_core::eval(&k_c);
+            mlxcel_core::eval(&v_c);
+            k1_prof_record(2, &t2);
+        }
+        let t3 = profiling.then(std::time::Instant::now);
         let n_blocks = union.len() as i32;
 
         // Remap selection: absolute block index -> compact slot. Built as
@@ -1208,7 +1305,7 @@ impl SparseAttention {
         }
         let pos_compact = mlxcel_core::from_slice_f32(&pos, &[n_blocks * bs]);
 
-        self.sparse_decode_core(
+        let out = self.sparse_decode_core(
             q,
             &k_c,
             &v_c,
@@ -1218,7 +1315,13 @@ impl SparseAttention {
             b,
             l,
             offset,
-        )
+        );
+        if profiling {
+            mlxcel_core::eval(&out);
+            k1_prof_record(3, &t3);
+            k1_prof_maybe_report();
+        }
+        out
     }
 
     /// The shared per-token sparse attention core: gather the selected key
