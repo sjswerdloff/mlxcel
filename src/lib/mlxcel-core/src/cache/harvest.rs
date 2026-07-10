@@ -29,7 +29,10 @@
 //!     blocks; excerpts cannot reproduce it). Each write replaces the
 //!     prior one, so the session ends holding the deepest window — the
 //!     only one end-depth `idx_q` queries can pair with (~4 GB retained
-//!     at 295K × 57 layers vs ~20 GB if every crossing were kept);
+//!     at 295K × 57 layers vs ~20 GB if every crossing were kept). The
+//!     crossing write stalls that layer's update for the write duration
+//!     and grows linearly with depth (~72 MB/layer at 295K) — a latency
+//!     spike that is harvest instrumentation, not a production mode;
 //!   * `idx_q` / `sel` — model-side real index queries + their selected
 //!     sets (the near-tie statistic needs real queries). Dtypes live in
 //!     the sidecar, not the role name; only `*_rot_f32` roles carry a
@@ -174,6 +177,14 @@ pub fn latest_basename(role: &str, cache_key: usize) -> String {
 /// use. Not budget-counted: the caller's stride gate bounds call volume
 /// and replacement bounds retention to one file per cache. Sidecar
 /// schema matches [`dump`] with `seq:-1` marking keep-latest.
+///
+/// The replace is ATOMIC per file (write `.tmp`, then `fs::rename` on the
+/// same filesystem): a session killed mid-write — the exact any-session-end
+/// the keep-latest design exists to survive — leaves the PRIOR valid pair,
+/// never a torn file. A kill between the two renames leaves new bin + old
+/// json, whose shape-vs-size mismatch the screen loader detects loudly
+/// (reshape fails) rather than silently consumes. Orphaned `.tmp` residue
+/// from a failed write is overwritten by the next crossing.
 pub fn dump_latest(role: &str, cache_key: usize, offset: i32, n_full: i32, a: &MlxArray) {
     let Some(dir) = harvest_dir() else { return };
     let shape = ffi::array_shape(a);
@@ -184,8 +195,12 @@ pub fn dump_latest(role: &str, cache_key: usize, offset: i32, n_full: i32, a: &M
         "{{\"role\":\"{role}\",\"shape\":{shape:?},\"dtype\":{dt},\"offset\":{offset},\
          \"n_full\":{n_full},\"cache\":\"{cache_key:x}\",\"seq\":-1}}"
     );
-    if let Err(e) = std::fs::write(base.with_extension("bin"), &bytes)
-        .and_then(|()| std::fs::write(base.with_extension("json"), &sidecar))
+    let bin_tmp = base.with_extension("bin.tmp");
+    let json_tmp = base.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&bin_tmp, &bytes)
+        .and_then(|()| std::fs::write(&json_tmp, &sidecar))
+        .and_then(|()| std::fs::rename(&bin_tmp, base.with_extension("bin")))
+        .and_then(|()| std::fs::rename(&json_tmp, base.with_extension("json")))
     {
         tracing::warn!(role, error = %e, "harvest keep-latest dump failed (best-effort, continuing)");
     }
