@@ -26,6 +26,13 @@ run() {
   echo "== cell: $label (depth=$DEPTH steps=$STEPS) =="
   env $envs "$BENCH" --depth "$DEPTH" --steps "$STEPS" --warmup "$WARMUP" "$@" \
     2>&1 | tee "$OUT/rank_${label}_d${DEPTH}.txt" | grep -E "BOOT|dispatch|RESULT"
+  # Mis-attribution guard: an sdpa-labeled cell on a binary WITHOUT the G
+  # core would silently run the blocked core (env no-op). G's helper logs
+  # an INFO line when active — require it, or the capture lies.
+  if [[ $envs == *"MSA_CORE=sdpa"* ]] && ! grep -q "MLXCEL_MSA_CORE=sdpa" "$OUT/rank_${label}_d${DEPTH}.txt"; then
+    echo "FATAL: cell $label requested the sdpa core but the binary never announced it — wrong binary for this cell" >&2
+    exit 1
+  fi
 }
 
 # Cell 1: kvarn8 fetch × blocked core (today's production shape, D1 dense)
