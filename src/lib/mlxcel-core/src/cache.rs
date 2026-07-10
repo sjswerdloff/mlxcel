@@ -7685,27 +7685,40 @@ mod tests {
 
         let mut cache = KVCache::new();
         let zeros = vec![0.0_f32; (HEADS * HEAD_DIM * CHUNK_LEN) as usize];
+        let mut last_view: Option<UniquePtr<MlxArray>> = None;
         for _ in 0..ITERS {
             let chunk = ffi::from_slice_f32(&zeros, &[1, HEADS, CHUNK_LEN, HEAD_DIM]);
-            let _ = cache.m3_idx_k_update_and_fetch(&chunk);
+            last_view = Some(cache.m3_idx_k_update_and_fetch(&chunk));
         }
         assert_eq!(
             cache.m3_idx_offset(),
             ITERS as i32 * CHUNK_LEN,
             "offset must advance once per iteration"
         );
-        // Materialise the final cached buffer. Under the bug this forces
-        // MLX to walk a N-deep concat chain (which would be ~200 calls
-        // here — easy in-process — but at 57 layers × 123K tokens in
-        // production it overruns the handle ceiling). The eval should
-        // succeed regardless.
+        // Materialise the final cached buffer — the eval must succeed
+        // regardless of iteration count (the original point of this smoke
+        // test: no unbounded concat chain).
+        //
+        // Post-fdef67b contract (capacity buffer): the RAW field is
+        // capacity-sized (grow-by-doubling, here the 4096 floor — rows past
+        // the logical fill are junk by design); READERS get exact-length
+        // slices. This assertion originally checked the raw field for the
+        // exact logical shape — pre-capacity-buffer semantics — and sat RED
+        // but invisible from fdef67b (2026-07-10) until the first
+        // `fetch`-filtered suite run matched its name: no standard chain
+        // (kvarn / detach / minimax / batch) ever ran it.
         let full = cache.m3_idx_k.as_ref().expect("m3_idx_k must be populated");
         ffi::eval(full);
-        let full_shape = ffi::array_shape(full);
+        let raw_shape = ffi::array_shape(full);
+        assert!(
+            raw_shape[2] >= ITERS as i32 * CHUNK_LEN,
+            "raw capacity buffer must cover the logical fill; got {raw_shape:?}"
+        );
+        let view = last_view.expect("at least one iteration ran");
         assert_eq!(
-            full_shape,
+            ffi::array_shape(&view),
             vec![1, HEADS, ITERS as i32 * CHUNK_LEN, HEAD_DIM],
-            "final cached idx_k shape must match cumulative concat"
+            "reader view must be the exact-length logical window"
         );
     }
 
