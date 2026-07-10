@@ -64,6 +64,14 @@
 //! sweep toggling runtime keys must not fail because a frozen key sits in the
 //! same file. `POST /admin/decode-config` refuses construction keys outright.
 //!
+//! Latch-order property (why the freeze is race-free on both process
+//! shapes): on the SERVER path, [`init_and_watch`] runs the boot-time file
+//! load inside `create_app`, BEFORE any request can reach a dispatch site —
+//! so the file's construction values always win the latch. A process that
+//! never loads a TOML (bench) latches the env-seeded default at first
+//! dispatch touch, by design. There is no path on which a dispatch read
+//! precedes the intended initializer.
+//!
 //! ## Env seeding (bench compatibility)
 //!
 //! The legacy env instruments (`MLXCEL_MSA_CORE=sdpa`, `MLXCEL_MSA_FETCH=qmm`,
