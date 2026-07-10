@@ -1,0 +1,91 @@
+{
+  "seeds": {
+    "tile": 42,
+    "query": 20260710
+  },
+  "anchor_p95": 0.025475243786361564,
+  "k8_bytes": {
+    "codes": 1024,
+    "scalars": 96,
+    "s_col": 32,
+    "idx": 256,
+    "total": 1408
+  },
+  "variants": {
+    "k4/gs128/it4": {
+      "recon_p95": 0.10023793578147888,
+      "flips": 0.14497884114583334,
+      "asym_p95": 0.08963668654452182,
+      "full_p95": 0.3526732183442689,
+      "bytes": 896,
+      "vs_k8_mem": 1.5714285714285714,
+      "verdicts": {
+        "K_production": false,
+        "K8V4_production": false,
+        "K8V4_subagent": true,
+        "K4V4_production": false,
+        "K4V4_subagent": false
+      }
+    },
+    "k4/gs64/it4": {
+      "recon_p95": 0.08984190225601196,
+      "flips": 0.13509114583333334,
+      "asym_p95": 0.0824825194542226,
+      "full_p95": 0.33805019914719925,
+      "bytes": 960,
+      "vs_k8_mem": 1.4666666666666666,
+      "verdicts": {
+        "K_production": false,
+        "K8V4_production": false,
+        "K8V4_subagent": true,
+        "K4V4_production": false,
+        "K4V4_subagent": false
+      }
+    },
+    "k4/gs32/it4": {
+      "recon_p95": 0.07844959199428558,
+      "flips": 0.12373860677083333,
+      "asym_p95": 0.07591187976727994,
+      "full_p95": 0.29958055740106315,
+      "bytes": 1088,
+      "vs_k8_mem": 1.2941176470588236,
+      "verdicts": {
+        "K_production": false,
+        "K8V4_production": false,
+        "K8V4_subagent": true,
+        "K4V4_production": false,
+        "K4V4_subagent": false
+      }
+    },
+    "k4/gs64/it16": {
+      "recon_p95": 0.08984190225601196,
+      "flips": 0.13509114583333334,
+      "asym_p95": 0.0824825194542226,
+      "full_p95": 0.33805019914719925,
+      "bytes": 960,
+      "vs_k8_mem": 1.4666666666666666,
+      "verdicts": {
+        "K_production": false,
+        "K8V4_production": false,
+        "K8V4_subagent": true,
+        "K4V4_production": false,
+        "K4V4_subagent": false
+      }
+    },
+    "k4/gs32/it16": {
+      "recon_p95": 0.07844959199428558,
+      "flips": 0.12373860677083333,
+      "asym_p95": 0.07591187976727994,
+      "full_p95": 0.29958055740106315,
+      "bytes": 1088,
+      "vs_k8_mem": 1.2941176470588236,
+      "verdicts": {
+        "K_production": false,
+        "K8V4_production": false,
+        "K8V4_subagent": true,
+        "K4V4_production": false,
+        "K4V4_subagent": false
+      }
+    }
+  }
+}
