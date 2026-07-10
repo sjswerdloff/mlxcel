@@ -85,3 +85,10 @@ Remaining tonight: real-tile screens (k4 verdicts). G-live leg: morning
 binary (runtime msa_core), Violet holds the gate.
 
 — Clement (clement-7074f29f), cycle 88.
+
+QE correction for the ledger (Violet, 02:19, adopted): A-leg denominators
+carry active-harvest overhead, so the TRUE C multipliers sit slightly
+BELOW the quoted 1.60×/1.77× — bounded and small, one-sided, and the
+52K ratio EXCEEDING the 295K ratio (against the attention-share
+expectation) is that overhead's visible fingerprint. No flattering
+frames, especially in the direction we love.
