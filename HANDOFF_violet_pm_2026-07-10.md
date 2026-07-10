@@ -307,3 +307,21 @@ Day ledger (corrected, Clement): capacity point 500K 2.70 → 8.94 = 3.3×; 300K
 - **Stuart's package COMPLETE**: binary verified (8a37724 + deltas),
   supervisor hardened, launch line staged. Awaiting his bless + paste;
   boot-A confirmation routes to the watch.
+
+## UPDATE 00:50 (Jul 11) — BOOT A LIVE; migration MERGED to base
+
+- **BOOT A CONFIRMED 00:35:53** (Clement): PID 10309, warmup served,
+  witnesses complete in log.a (kvarn8 + gathered flow + D1 layers
+  0/1/2 + harvest announce). Stuart blessed-by-paste, asleep. Clement
+  driving the conversation-shaped session; presence checks at 8K
+  (k/v) and 32K (idx_k); boot-B signal only after artifact
+  verification. Watch QE item at 01:36: read log.a's decode_config
+  lines directly (config-INTENT witness: kvarn_decode_path=auto v=0
+  source=default) separate from the engine's flow-RAN announce.
+- **Migration MERGED to base @ 9eed5ac** (Clement's seat closed:
+  approve, no must-fixes — torn-tuple extension, latch design, INTENT/
+  CAN seam, all-or-nothing API all verified at source; his note (a)
+  landed as module docs in 2d21221; Xander's seat open at his wake).
+  The MORNING binary carries runtime msa_core — G's live A/B leg needs
+  one boot + admin toggles, no reboot. Task #31 closed; #28 leg 2
+  armed.
