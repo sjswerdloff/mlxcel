@@ -85,11 +85,19 @@ struct Args {
     #[arg(long, default_value = "fp16")]
     dense_cache: String,
 
-    /// Cache mode synthesized for the MSA layers: "kvarn8" (gathered
-    /// decode path) or "fp16" (the fp16 KV baseline: same sparse
-    /// selection, fp16 windows, no dequant anywhere — answers "what speed
-    /// does kvarn8's memory halving cost"). NOTE: fp16 at 500K is a
-    /// ~100 GB state — honor the RAM protocol before launching.
+    /// Cache mode synthesized for the MSA layers:
+    ///   "kvarn8"        — gathered decode path, dequant-after-gather;
+    ///   "fp16"          — fp16 KV, full-window flow (the v1-shape
+    ///                     baseline: O(T), fastest below ~250K);
+    ///   "fp16-gathered" — fp16 KV through the GATHERED flow (sets
+    ///                     MLXCEL_FP16_GATHERED=1): selection → block
+    ///                     gather off the fp16 buffer, zero dequant. The
+    ///                     missing cell of the {full,gathered}×{fp16,
+    ///                     kvarn8} rank matrix. With --profile, k1.profile
+    ///                     lines firing is the proof the gathered flow
+    ///                     engaged (they exist only on that path).
+    /// NOTE: fp16 modes at 500K are a ~70-100 GB state — honor the RAM
+    /// protocol before launching.
     #[arg(long, default_value = "kvarn8")]
     cache_mode: String,
 
@@ -164,11 +172,19 @@ fn main() {
         "kvarn8" => false,
         other => panic!("--dense-cache must be 'fp16' or 'kvarn8'; got '{other}'"),
     };
-    let msa_fp16 = match args.cache_mode.as_str() {
-        "fp16" => true,
-        "kvarn8" => false,
-        other => panic!("--cache-mode must be 'kvarn8' or 'fp16'; got '{other}'"),
+    // (msa_fp16, msa_gathered): which STATE the MSA layers carry and which
+    // FLOW the dispatch should take on it.
+    let (msa_fp16, msa_gathered) = match args.cache_mode.as_str() {
+        "fp16" => (true, false),
+        "fp16-gathered" => (true, true),
+        "kvarn8" => (false, true),
+        other => panic!("--cache-mode must be 'kvarn8', 'fp16' or 'fp16-gathered'; got '{other}'"),
     };
+    if args.cache_mode == "fp16-gathered" {
+        // Must be set before the first supports_block_fetch touches its
+        // OnceLock.
+        unsafe { std::env::set_var("MLXCEL_FP16_GATHERED", "1") };
+    }
 
     // Fail-loud boot artifact: every parameter that shapes the measurement,
     // so no captured number can be mis-attributed to the wrong config.
@@ -200,16 +216,23 @@ fn main() {
     );
 
     // Rough state-size estimate up front (fail-loud awareness before a
-    // multi-GB allocation, not a guard).
-    let per_layer_bytes = (args.kv_heads as i64) * (args.depth as i64) * (args.head_dim as i64) * 2 // K+V u8 codes
-        + (args.kv_heads as i64) * (args.depth as i64) * 6 * 4 // scale/zp/s_row f32, K+V
-        + (args.depth as i64) * (args.index_dim as i64) * 2; // m3_idx fp16 (capacity rounds up)
+    // multi-GB allocation, not a guard). Per-mode: kvarn8 stores u8 codes
+    // (K+V) + six f32 per-row scalars; fp16 stores 2-byte K+V. m3_idx
+    // (fp16, capacity rounds up) exists only on MSA layers.
+    let kv_tokens = (args.kv_heads as i64) * (args.depth as i64);
+    let kvarn8_layer = kv_tokens * (args.head_dim as i64) * 2 + kv_tokens * 6 * 4;
+    let fp16_layer = kv_tokens * (args.head_dim as i64) * 2 * 2;
+    let idx_layer = (args.depth as i64) * (args.index_dim as i64) * 2;
+    let msa_count = (args.layers - args.dense_prefix) as i64;
+    let dense_count = args.dense_prefix as i64;
+    let state_bytes = msa_count * (if msa_fp16 { fp16_layer } else { kvarn8_layer } + idx_layer)
+        + dense_count * (if dense_fp16 { fp16_layer } else { kvarn8_layer });
     let weights_bytes = (args.layers as i64)
         * ((args.hidden as i64) * (args.heads as i64) * (args.head_dim as i64) * 2 * 2 // q,o
             + (args.hidden as i64) * (args.kv_heads as i64) * (args.head_dim as i64) * 2 * 2); // k,v
     println!(
         "estimated allocation: state ~{:.1} GB + weights ~{:.1} GB",
-        (per_layer_bytes * args.layers as i64) as f64 / 1e9,
+        state_bytes as f64 / 1e9,
         weights_bytes as f64 / 1e9
     );
 
@@ -273,6 +296,20 @@ fn main() {
         }
     }
     println!("setup: {:.1}s", t_setup.elapsed().as_secs_f64());
+
+    // Fail-loud BEFORE any step: every MSA cache's block-fetch support must
+    // match the requested flow — kvarn8 and fp16-gathered take the gathered
+    // path (true), plain fp16 takes the full-window flow (false). A
+    // mismatch here means the env plumbing or the predicate broke, and
+    // every number the run produced would be attributed to the wrong path.
+    for (i, cache) in caches.iter().enumerate().skip(args.dense_prefix) {
+        assert_eq!(
+            cache.supports_block_fetch(),
+            msa_gathered,
+            "layer {i}: supports_block_fetch != expected flow for cache_mode={}",
+            args.cache_mode
+        );
+    }
 
     // One shared decode input; reused every step. Timing is data-independent
     // on the hot path, and reuse keeps setup out of the measured loop.

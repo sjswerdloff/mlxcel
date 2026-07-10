@@ -1299,13 +1299,17 @@ impl SparseAttention {
         }
         let t2 = profiling.then(std::time::Instant::now);
 
-        // Compact window: only the union blocks, dequantized, standard
-        // frame, each exactly block_size tokens (tail zero-padded inside).
+        // Compact window: only the union blocks, standard frame, each
+        // exactly block_size tokens (tail zero-padded inside). Fetch is
+        // mode-dispatched: kvarn8 dequants exactly the requested tiles;
+        // fp16 (behind MLXCEL_FP16_GATHERED) block-gathers with no dequant.
+        // Same return contract either way, so everything downstream is
+        // fetch-source-agnostic.
         debug_assert_eq!(
             self.block_size,
             mlxcel_core::cache::kvarn::KVARN_TILE_TOKENS
         );
-        let (k_c, v_c) = cache.fetch_kvarn8_blocks(&union);
+        let (k_c, v_c) = cache.fetch_msa_blocks(&union);
         if profiling {
             mlxcel_core::eval(&k_c);
             mlxcel_core::eval(&v_c);
