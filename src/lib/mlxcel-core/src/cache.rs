@@ -4761,6 +4761,18 @@ impl KVCache {
                     needed,
                     &blocks,
                 );
+                // Gate B reads the FULL index window (its statistic is a
+                // global top-k over all blocks; excerpts can't reproduce
+                // it). Keep-latest: one replaced file per layer-cache, so
+                // the session ends holding the deepest window — the only
+                // one the end-depth idx_q queries can pair with.
+                crate::cache::harvest::dump_latest(
+                    "idx_k_win",
+                    self as *const _ as usize,
+                    needed,
+                    nb,
+                    &blocks,
+                );
             }
         }
         // Return the LOGICAL window: slice the capacity buffer to the fill
