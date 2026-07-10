@@ -50,6 +50,22 @@ static K1_PROF_NANOS: [std::sync::atomic::AtomicU64; 4] = [
 ];
 static K1_PROF_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// MLXCEL_KVARN_ALL_LAYERS=1 forces KVarN8 on ALL layers — disables the D1
+/// dense-prefix fp16 downgrade so A/B runs can reproduce the O(T) floor.
+fn kvarn_all_layers_forced() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = std::env::var("MLXCEL_KVARN_ALL_LAYERS").is_ok_and(|v| v == "1");
+        if on {
+            warn!(
+                "MLXCEL_KVARN_ALL_LAYERS=1: D1 dense-prefix fp16 downgrade DISABLED — \
+                 dense layers pay the O(T) kvarn8 dequant floor (A/B mode)"
+            );
+        }
+        on
+    })
+}
+
 fn k1_profile_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -358,6 +374,29 @@ impl SparseAttention {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
         let l = shape[1];
+
+        // D1 (dense-prefix floor, RESULTS_h0_depth_profile_2026-07-10.md):
+        // a layer with no index projections can never take the gathered
+        // path, so KVarN8 buys it ~nothing in memory while costing a full
+        // O(T) window dequant EVERY decode step (measured 109.7 ms/token
+        // at 300K for M3's 3 dense layers). Downgrade an EMPTY KVarN8
+        // cache to Fp16 at first touch — structurally keyed on the same
+        // fact the dispatch below keys on, so it can never desync from
+        // the dense dispatch. Empty-only: this is a deferred
+        // construction-time choice, never a mid-session format change,
+        // and it self-heals through every reset/reallocation path because
+        // those hand back empty caches. MLXCEL_KVARN_ALL_LAYERS=1 keeps
+        // KVarN8 on all layers (A/B escape hatch for floor measurements).
+        if self.index_q_proj.is_none()
+            && !kvarn_all_layers_forced()
+            && cache.downgrade_kvarn8_to_fp16_if_empty()
+        {
+            info!(
+                layer = self.layer_idx,
+                "kvarn8→fp16 cache downgrade: dense-prefix layer (no index \
+                 projections) — O(T) full-window dequant floor removed (D1)"
+            );
+        }
 
         trace!(
             layer = self.layer_idx,

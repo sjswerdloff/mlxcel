@@ -1345,6 +1345,195 @@ impl KVCache {
         (k, v)
     }
 
+    /// BENCH SUPPORT — synthesize a deep KVarN8 cache state directly.
+    ///
+    /// Writes random codes/scales straight into the kvarn fields (no
+    /// prefill, no model load): instant 100K/300K/500K states for the
+    /// decode experiment harness (DESIGN_decode_experiment_harness
+    /// 2026-07-10, phase H0). Timing-representative because the decode hot
+    /// path has no data-dependent branches — garbage values time the same
+    /// as real ones. NEVER a production path: the VALUES are meaningless,
+    /// only the LAYOUT is production-true — fp16 sink block, u8 interior
+    /// tiles with per-row scale/zp/s_row (f32) and per-tile s_col (f32),
+    /// fp16 tail, and the post-fdef67b m3_idx capacity buffer (fp16,
+    /// grow-by-doubling sizing, logical fill = `m3_idx_offset`).
+    ///
+    /// `total >= 2 * KVARN_TILE_TOKENS` is required (full sink plus at
+    /// least one quantized tile — the same floor below which production
+    /// dispatches dense). The m3_idx buffer capacity replicates the
+    /// doubling rule in [`Self::m3_idx_k_update_and_fetch`] (4096 doubled
+    /// until it covers `total`) so the bench exercises the capacity-buffer
+    /// reader path, not a bespoke layout. All fields are eval'd before
+    /// returning so synthesis cost cannot leak into a caller's step timing.
+    pub fn synth_kvarn8_state(
+        b: i32,
+        h: i32,
+        d: i32,
+        total: i32,
+        index_dim: i32,
+        seed: u64,
+    ) -> KVCache {
+        use crate::cache::kvarn::KVARN_TILE_TOKENS;
+
+        assert!(
+            total >= 2 * KVARN_TILE_TOKENS,
+            "synth_kvarn8_state needs a full sink plus at least one tile; got total={total}"
+        );
+        ffi::random_seed(seed);
+        let normal_fp16 = |shape: &[i32]| -> UniquePtr<MlxArray> {
+            unsafe { ffi::random_normal(shape, dtype::FLOAT16, std::ptr::null()) }
+        };
+        let uniform_f32 = |lo: f32, hi: f32, shape: &[i32]| -> UniquePtr<MlxArray> {
+            unsafe { ffi::random_uniform(lo, hi, shape, dtype::FLOAT32, std::ptr::null()) }
+        };
+
+        let hist_total = total - KVARN_TILE_TOKENS;
+        let n_tiles = hist_total / KVARN_TILE_TOKENS;
+        let tail_len = hist_total % KVARN_TILE_TOKENS;
+        let hist_len = n_tiles * KVARN_TILE_TOKENS;
+
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        cache.kvarn_sink_k = Some(normal_fp16(&[b, h, KVARN_TILE_TOKENS, d]));
+        cache.kvarn_sink_v = Some(normal_fp16(&[b, h, KVARN_TILE_TOKENS, d]));
+        // u8 codes: uniform over the full code range.
+        cache.kvarn_hist_k = Some(ffi::astype(
+            &uniform_f32(0.0, 255.999, &[b, h, hist_len, d]),
+            dtype::UINT8,
+        ));
+        cache.kvarn_hist_v = Some(ffi::astype(
+            &uniform_f32(0.0, 255.999, &[b, h, hist_len, d]),
+            dtype::UINT8,
+        ));
+        // Sane scalar magnitudes (positive scales, negative-ish zero points)
+        // so downstream softmax/topk see finite values — timing-neutral, but
+        // NaN poisoning would make the bench diverge from production math.
+        for (scale, zp, s_row) in [
+            (
+                &mut cache.kvarn_k_scale,
+                &mut cache.kvarn_k_zp,
+                &mut cache.kvarn_k_s_row,
+            ),
+            (
+                &mut cache.kvarn_v_scale,
+                &mut cache.kvarn_v_zp,
+                &mut cache.kvarn_v_s_row,
+            ),
+        ] {
+            *scale = Some(uniform_f32(2e-3, 2e-2, &[b, h, hist_len, 1]));
+            *zp = Some(uniform_f32(-1.5, 0.0, &[b, h, hist_len, 1]));
+            *s_row = Some(uniform_f32(0.5, 2.0, &[b, h, hist_len, 1]));
+        }
+        cache.kvarn_k_s_col = Some(uniform_f32(0.5, 2.0, &[b, h, n_tiles, d]));
+        cache.kvarn_v_s_col = Some(uniform_f32(0.5, 2.0, &[b, h, n_tiles, d]));
+        if tail_len > 0 {
+            cache.kvarn_tail_k = Some(normal_fp16(&[b, h, tail_len, d]));
+            cache.kvarn_tail_v = Some(normal_fp16(&[b, h, tail_len, d]));
+        }
+        cache.offset = total;
+
+        // m3_idx capacity buffer, production layout: capacity follows the
+        // grow-by-doubling rule (4096 doubled until >= total); rows past the
+        // logical fill are junk exactly as in production (readers slice to
+        // `m3_idx_offset`).
+        let mut capacity = 4096i32;
+        while capacity < total {
+            capacity *= 2;
+        }
+        cache.m3_idx_k = Some(normal_fp16(&[b, 1, capacity, index_dim]));
+        cache.m3_idx_offset = total;
+
+        for field in [
+            &cache.kvarn_sink_k,
+            &cache.kvarn_sink_v,
+            &cache.kvarn_hist_k,
+            &cache.kvarn_hist_v,
+            &cache.kvarn_k_scale,
+            &cache.kvarn_k_zp,
+            &cache.kvarn_k_s_row,
+            &cache.kvarn_k_s_col,
+            &cache.kvarn_v_scale,
+            &cache.kvarn_v_zp,
+            &cache.kvarn_v_s_row,
+            &cache.kvarn_v_s_col,
+            &cache.kvarn_tail_k,
+            &cache.kvarn_tail_v,
+            &cache.m3_idx_k,
+        ] {
+            if let Some(a) = field.as_ref() {
+                ffi::eval(a);
+            }
+        }
+        cache
+    }
+
+    /// BENCH SUPPORT — synthesize a deep FP16 cache state directly (the
+    /// fp16 counterpart of [`Self::synth_kvarn8_state`]): random fp16 K/V
+    /// buffers filled exactly to `total`, `offset = total`. The next
+    /// `update` appends via the production growth path.
+    ///
+    /// `index_dim = 0` omits m3_idx state (layers WITHOUT index
+    /// projections — the D1 dense-prefix shape); `index_dim > 0` adds the
+    /// capacity-buffer m3_idx state exactly as [`Self::synth_kvarn8_state`]
+    /// does (MSA-eligible layers on fp16 caches — the fp16-baseline bench
+    /// mode: same sparse selection, no dequant anywhere).
+    pub fn synth_fp16_state(
+        b: i32,
+        h: i32,
+        d: i32,
+        total: i32,
+        index_dim: i32,
+        seed: u64,
+    ) -> KVCache {
+        ffi::random_seed(seed);
+        let mut cache = KVCache::new_with_mode(KVCacheMode::Fp16);
+        let k = unsafe { ffi::random_normal(&[b, h, total, d], dtype::FLOAT16, std::ptr::null()) };
+        let v = unsafe { ffi::random_normal(&[b, h, total, d], dtype::FLOAT16, std::ptr::null()) };
+        ffi::eval(&k);
+        ffi::eval(&v);
+        cache.keys = Some(k);
+        cache.values = Some(v);
+        cache.offset = total;
+        if index_dim > 0 {
+            let mut capacity = 4096i32;
+            while capacity < total {
+                capacity *= 2;
+            }
+            let idx = unsafe {
+                ffi::random_normal(
+                    &[b, 1, capacity, index_dim],
+                    dtype::FLOAT16,
+                    std::ptr::null(),
+                )
+            };
+            ffi::eval(&idx);
+            cache.m3_idx_k = Some(idx);
+            cache.m3_idx_offset = total;
+        }
+        cache
+    }
+
+    /// D1 (dense-prefix floor, RESULTS_h0_depth_profile_2026-07-10.md):
+    /// downgrade an EMPTY KVarN8 cache to Fp16. Returns whether it fired.
+    ///
+    /// Layers that never take the gathered path (M3's dense-prefix layers,
+    /// structurally identified by `index_q_proj.is_none()`) pay KVarN8's
+    /// full O(T) dequant every decode step for a memory saving that is
+    /// noise next to the 57 MSA layers' (measured: 109.7 ms/token at 300K
+    /// for 3 layers vs ~1.2 GB fp16 cost). The model-side dispatch calls
+    /// this at first touch; empty-only (`offset == 0`, no paged backing)
+    /// makes it exactly a deferred construction-time choice — never a
+    /// mid-session format change. Fp16 is also the one detach/persist-
+    /// supported mode, so downgraded layers gain snapshot support rather
+    /// than losing anything.
+    pub fn downgrade_kvarn8_to_fp16_if_empty(&mut self) -> bool {
+        if self.mode == KVCacheMode::KVarN8 && self.offset == 0 && self.paged_backing.is_none() {
+            self.mode = KVCacheMode::Fp16;
+            true
+        } else {
+            false
+        }
+    }
+
     /// FP16 (standard) update path — original pre-allocated buffer logic.
     ///
     /// Operates in **buffer-slot** coordinates: `prev = self.offset

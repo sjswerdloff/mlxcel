@@ -1,0 +1,11 @@
+kvarn-decode-bench BOOT: depth=100000 steps=16 warmup=4 layers=3 dense_prefix=3 dense_cache=fp16 cache_mode=kvarn8 seed=42 profile=false
+geometry: hidden=6144 heads=64 kv_heads=4 head_dim=128 index_dim=128 top_k=32 block_size=128 rope_dims=64 rope_base=5000000
+estimated allocation: state ~0.4 GB + weights ~0.6 GB
+setup: 0.1s
+dispatch check PASSED: 3 dense (fp16) + 0 MSA (kvarn8) layers on the expected paths
+step    0 (warmup):     15.9 ms
+step    1 (warmup):      3.8 ms
+step    2 (warmup):      3.8 ms
+step    3 (warmup):      3.8 ms
+step    4:      3.8 ms
+RESULT depth=100000 layers=3 dense_prefix=3 dense_cache=fp16 cache_mode=kvarn8: mean 3.8 ms/token, p50 3.8 ms, min 3.8 ms, max 3.8 ms over 16 steps → attention-only ceiling 263.44 tok/s
