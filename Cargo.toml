@@ -226,3 +226,9 @@ required-features = ["test-utils"]
 [[test]]
 name = "paged_handoff_parity"
 required-features = ["test-utils"]
+
+# C step-1 micro-bench: gather_qmm at MSA decode shapes (Shape-2 viability;
+# see DESIGN_c_qmm_union_sketch_2026-07-10.md and src/bin/gather_qmm_micro.rs).
+[[bin]]
+name = "gather-qmm-micro"
+path = "src/bin/gather_qmm_micro.rs"
