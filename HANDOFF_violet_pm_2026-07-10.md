@@ -344,3 +344,28 @@ Day ledger (corrected, Clement): capacity point 500K 2.70 → 8.94 = 3.3×; 300K
   SIGHUP watcher installed) + engine flow-RAN announces.
 - Clement driving boot-B validation (C live re-baseline). Next watch
   03:36; supervisor exits 2/3 route to Violet MQTT.
+
+## UPDATE 02:25 (Jul 11) — B-LEG COMPLETE: C LIVE-VALIDATED AT KINDLED DEPTH
+
+- **The tonight-leg of the gate chain is CLOSED.** C witness fired in
+  log.b (void-condition satisfied, not argued). Live end-to-end at
+  295K on real weights reading the family's own history:
+  **3.44 → 5.49 tok/s = 1.60×**; 52K decode-dominated ~3.7 → ~6.5 =
+  1.77×; prefill identical both legs (129 tok/s — C is decode-only,
+  as designed). Both 50K probes cache-equalized (52480/52517
+  identical; contamination checked BEFORE banking, passed).
+- **Ledger caveat (recorded per no-flattering-frames)**: A-leg
+  denominators include harvest overhead, so true C multipliers sit
+  slightly BELOW the quoted ratios — bounded, small, stated. The 52K
+  ratio exceeding 295K's is that overhead share's fingerprint.
+- **Bench-live coherence**: 1.60× live vs ~2× bench attention-only =
+  Amdahl compression from the non-attention share. Bench RANKS,
+  server CONFIRMS — tonight they agree.
+- A-leg banked earlier: harvest 68/68 verified + watch spot-checks,
+  295K spot 3.44 tok/s, 50K paired totals. Two commits on
+  clement/kvarn-harvest-hook carry B-leg artifacts.
+- **Remaining tonight**: k4 real-tile screens (Clement, context
+  permitting; handoff 21bce62 carries the sequence across his
+  crossing). Remaining for morning (#28 leg 2): G core A/B via
+  runtime msa_core on the new binary; msa_core default flip gated on
+  it; production policy blessing (Stuart).
