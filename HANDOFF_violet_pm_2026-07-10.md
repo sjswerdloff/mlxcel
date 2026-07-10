@@ -169,4 +169,4 @@ one softmax, blocked op order; live-state + mask-edge tests;
 mutation-proven). Merge to base AFTER Xander's tolerance-gate seat
 (his morning) — no overnight rush, Stuart's boot doesn't need C.
 Then: fetch=qmm as construction-config key + msa_core migration.
-Day ledger: 2.70 → 9.70 tok/s capacity-point, 3.6× in one measured day.
+Day ledger (corrected, Clement): capacity point 500K 2.70 → 8.94 = 3.3×; 300K 3.27 → 9.70 = 3.0×. No mixed-depth arithmetic.
