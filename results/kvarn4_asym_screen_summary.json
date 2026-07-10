@@ -1,0 +1,58 @@
+{
+  "seeds": {
+    "tile": 42,
+    "query": 20260710
+  },
+  "gates": {
+    "out_p95": 0.1,
+    "marginal_p95": 0.05
+  },
+  "summary": {
+    "K8V8 (anchor)": {
+      "mean": 0.010788340995939292,
+      "p95": 0.025475243786361564,
+      "max": 0.04327889872738487
+    },
+    "K8V4 (candidate)": {
+      "mean": 0.07346635162709561,
+      "p95": 0.08963668654452182,
+      "max": 0.09430195624716435
+    },
+    "K4V4 (dead, context)": {
+      "mean": 0.17199995953636849,
+      "p95": 0.3526732183442689,
+      "max": 0.487835545497933
+    }
+  },
+  "groups": [
+    {
+      "group": "gaussian-clean (no outliers)",
+      "n": 128,
+      "K8V8 (anchor)": 0.0070724984206431245,
+      "K8V4 (candidate)": 0.0858709986539965,
+      "K4V4 (dead, context)": 0.12052927460789897
+    },
+    {
+      "group": "outlier-4ch-x40 (decomposition-expt structure)",
+      "n": 128,
+      "K8V8 (anchor)": 0.008866515064392143,
+      "K8V4 (candidate)": 0.06101830965868291,
+      "K4V4 (dead, context)": 0.15018629585840018
+    },
+    {
+      "group": "outlier-8ch-x100 (extreme)",
+      "n": 64,
+      "K8V8 (anchor)": 0.023450532673420354,
+      "K8V4 (candidate)": 0.08567185718543274,
+      "K4V4 (dead, context)": 0.3264585436994243
+    },
+    {
+      "group": "outlier-4ch-x40 + 16 token spikes x80",
+      "n": 64,
+      "K8V8 (anchor)": 0.009401486332144864,
+      "K8V4 (candidate)": 0.06134763595178211,
+      "K4V4 (dead, context)": 0.16411007258618843
+    }
+  ],
+  "survives": false
+}
