@@ -90,8 +90,30 @@ async fn api_key_auth(
 /// 2 MiB default because real audio uploads commonly exceed that threshold.
 const AUDIO_MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 
+/// Echo the effective decode-path config on every response (harness plan
+/// §H2): a probe capturing any HTTP exchange gets the authoritative
+/// `path=..; v=N` it measured under, so a measurement can never silently
+/// mis-attribute its decode path. Header, not body — the response schemas
+/// stay OpenAI/Anthropic-shaped.
+async fn decode_config_echo(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let snap = crate::decode_config::snapshot();
+    if let Ok(value) = header::HeaderValue::from_str(&format!(
+        "path={}; v={}",
+        snap.kvarn_decode_path, snap.version
+    )) {
+        response
+            .headers_mut()
+            .insert("x-mlxcel-decode-config", value);
+    }
+    response
+}
+
 /// Create the Axum application router
 pub fn create_app(state: AppState) -> Router {
+    // Load the decode-path config file (if any) and install the SIGHUP
+    // watcher. Idempotent; inert outside a tokio runtime (bare router tests).
+    crate::decode_config::init_and_watch();
     let enable_slots = state.config.enable_slots_endpoint;
     let enable_props = state.config.enable_props_endpoint;
     let enable_metrics = state.config.enable_metrics_endpoint;
@@ -136,6 +158,12 @@ pub fn create_app(state: AppState) -> Router {
         // off so monitoring clients can poll without conditional logic).
         .route("/v1/cache/stats", get(routes::cache_stats))
         .route("/v1/cache/reset", post(routes::cache_reset))
+        // Runtime decode-path config (harness plan §H2). Same auth posture
+        // as /v1/cache/reset: behind api_key_auth when a key is configured.
+        .route(
+            "/admin/decode-config",
+            get(routes::decode_config_get).post(routes::decode_config_set),
+        )
         // Audio routes (speech, transcriptions, translations) come from the
         // sub-router that carries the larger body-limit layer.
         .merge(audio_routes)
@@ -180,6 +208,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/", get(routes::health_check))
         // Middleware
         .layer(middleware::from_fn_with_state(state.clone(), api_key_auth))
+        .layer(middleware::from_fn(decode_config_echo))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
