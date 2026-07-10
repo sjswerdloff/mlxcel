@@ -105,4 +105,75 @@ values per head) — noise at these costs. Therefore:
 Micro-bench: src/bin/gather_qmm_micro.rs (RESULT in the commit message
 and the module docs — 249 µs serialized / 28 µs pipelined at token shape).
 
+## MERGE DESIGN (final, pre-implementation — cycle 88, same night)
+
+Two facts from the source (cache.rs update_kvarn8 / fetch_kvarn8) settle
+the merge:
+
+1. **Everything is stored ROTATED.** Rotation happens once per incoming
+   token at the cache boundary — sink and tail are fp16-ROTATED, tiles
+   are quantized-rotated. The full fetch unrotates the assembled window
+   once at the end.
+2. **wht is orthonormal (1/√N) and self-inverse** (ops.rs::wht →
+   hadamard_transform, one fused op). Inner products are preserved:
+   ⟨q, K⟩ = ⟨wht(q), K_rot⟩ exactly (modulo fp).
+
+Therefore C runs ENTIRELY in the rotated frame and crosses back once:
+
+- `q_rot = wht(q)` (1 op). Scores against tiles AND against sink/tail
+  use q_rot — sink/tail K needs NO fetch and NO unrotation, it is
+  scored as stored. Both logit chunks are the same mathematical
+  quantity ⟨q, K_r⟩ → concatenation before ONE softmax is exact. No
+  log-sum-exp machinery, no fused-SDPA on the fp16 side (fused SDPA
+  never exposes logits — that is WHY the sink/tail side is an explicit
+  small matmul).
+- Op order matches the blocked core exactly: raw logits → concat →
+  ·scale → +mask → softmax → split weights → two V paths → add →
+  ONE `wht(out)` (self-inverse = unrotate) → o_proj.
+- Mask is host-built at [4 kv-heads, W_c] granularity (the selection is
+  already host-synced for the union; C reuses that sync): interior rows
+  whose selected block is sink/tail → -inf (their rhs index points at a
+  safe tile; their softmax weight is then exactly 0, so the V side needs
+  no mask at all); sink/tail columns → -inf for heads that did not
+  select them. Tail has NO padding in C (real tail_len columns), so the
+  position rule vanishes at decode (l==1: every stored position ≤ q_pos
+  structurally).
+
+**POOL-FOLD CORRECTION (supersedes the post-micro revision's fold note).**
+"Lazy fold on the gathered scalars" + gather_qmm's internal rhs_indices
+gather are INCOMPATIBLE: gather_qmm's scales/biases arguments are full
+pool-shaped arrays gathered internally, so lazy-folding them means two
+elementwise multiplies over the ENTIRE history per layer per token —
+an O(T) term (~3 ms/token at 500K, growing). That is the disease this
+program kills, hiding in this doc's own revision. Resolution (Shape 2c,
+gather-then-fold): take_along_axis the selected tiles' codes AND scalars
+explicitly first (the same cheap block-gather fetch_fp16_blocks measured
+all night, at HALF the bytes for u8 codes), fold the small gathered
+scalars ([4·top_k, 128, 1] — 64 KB), view the gathered codes u8→u32
+(ffi::view, lib.rs:1868 — the zero-repack fact), then gather_qmm with
+identity indices (≡ batched qmm). Zero cache-side changes except
+read-only accessors. Fold-at-write (storing scale·s_row, zp·s_row
+instead of three scalars) is the cleaner long-term shape — less memory,
+no per-token fold — but touches quantize/synth/K0 contracts; recorded
+as a follow-up optimization with its own gate, NOT tonight's cut.
+
+**Dispatch shape (decode, b==1, l==1, per MSA layer):** ~30 small ops +
+2 gather_qmm + 2 wht. More ops than G's ~15 but the 4 MB fp16 dequant
+materialization is gone (u8 gathers are half the bytes; no dequant
+chain, no compact-window build). Rank cell kvarn8×C decides, as always.
+
+**Gate:** MLXCEL_MSA_FETCH=qmm AND mode==KVarN8 AND no paged backing AND
+b==1 AND l==1 AND n_tiles≥1; anything else falls through to the existing
+fetch_msa_blocks dispatch (blocked or G core per MLXCEL_MSA_CORE).
+sink_len==128 is structural when n_tiles≥1 (sink fills first) — assert.
+Duplicate per-head selections at shallow depth double-count in softmax
+exactly as the blocked core's double-gather does — equivalent behavior,
+pinned by the tolerance gate, not a new failure mode.
+
+**Acceptance:** contract test C-core vs blocked core on synth states,
+same tolerance class as G's core test (fp16 accumulation-order
+differences + the fold's ≤9.9e-4 rel mixed-mode products). Xander holds
+the refusal on the tolerance gate.
+
 — Clement (clement-7074f29f), cycle 87, drive-through night.
+— MERGE DESIGN appended cycle 88, post-Mikvah, same night (drive-through).
