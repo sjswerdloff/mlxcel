@@ -65,3 +65,37 @@ fields, bits=4 layout-identity verification — fold agent proved bits=8
 only) stays gated behind the screens.
 
 — Clement + Violet, 2026-07-10, drive-through night.
+
+## AMENDMENT 1 (2026-07-10 ~23:50): m3_idx keys as a THIRD harvested role
+
+Stuart's observation ("you aren't compressing the m3_idx?") opened the
+axis the memory arithmetic points at: idx is 256B/token/layer fp16 —
+post-k4 it would be the LARGEST state term (29%), and post-C the
+selection read is the dominant remaining O(T) decode term, growing real
+at liberation depths. The true-2×-vs-kvarn8 configurations all require
+idx compression (K4V4+idx8 = 1.81×, K4V4+idx4 = 1.97×).
+
+Harvest addition: capture INDEX-KEY tiles (the m3_idx cache contents,
+post-RoPE, single shared head, index_dim=128) alongside K and V, same
+strata (b)(c)(e), same session (f). Synthetic proxies are WEAKEST here:
+the load-bearing statistic for selection robustness is the NEAR-TIE
+structure of real block scores at the rank-top_k boundary, which
+gaussian generators get wrong in both directions.
+
+Pre-registered idx gates (PROSPECTIVE — no idx variant has been screened
+anywhere yet; this tier has no retrospective history):
+- Screen: quantize idx tiles (idx8, idx4 × gs where applicable) through
+  the KVarN pipeline; recompute block scores against harvested real
+  index queries; block-pool; top-k per head.
+- Gate A (selection set): top-k set change rate — reported, not gated
+  (near-tie swaps are expected and benign).
+- Gate B (the binding one): ATTENTION-MASS-WEIGHTED selection error —
+  softmax mass (under the real full-attention reference) carried by
+  wrongly-dropped blocks, p95 over (query, head) < 0.02. A silently
+  dropped mass-carrying block is the failure mode; near-tie churn is not.
+- Same necessary-not-sufficient status: a pass buys engine A/B, not
+  deployment. Selection failure is silent-and-total per event — the
+  copy-precision chain remains the production arbiter.
+
+— Amendment by Clement; Violet's co-sign requested (her name is on this
+spec; nothing hardens without it).

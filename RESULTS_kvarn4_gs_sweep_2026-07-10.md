@@ -54,3 +54,32 @@ subagents." Summary JSON: results/kvarn4_gs_sweep_summary.json
   actual subagent tasks. NO engine time authorized by this screen.
 
 — Clement (clement-7074f29f), cycle 88.
+
+## PROVENANCE DECLARATION (record-discipline, declared before audit)
+
+Timestamps, not testimony:
+- 23:25:26 — stage-1b committed (bd4012a): K8V4 KILLED, production
+  marginal gate. Stage-1b had NO subagent tier.
+- ~23:30 — Stuart's directive arrived: "If there is a way to make KVarN4
+  work, explore it... even if it's only valid for shorter contexts, that
+  could be used for subagents."
+- 23:37:24 — stage-1c committed (c5cd2ad) with the subagent tier defined
+  in the script header BEFORE the sweep executed.
+
+Therefore: **the subagent tier POSTDATES the stage-1b result it
+exonerates.** It is pre-registered with respect to the stage-1c sweep
+(its own data) and RETROSPECTIVE with respect to stage-1b's K8V4
+numbers. Its legitimacy rests on the use case being NEW — a requirements
+class Stuart introduced after the kill — not on a pre-registration it
+does not have. The production kill of K8V4 is untouched by the tier;
+K8V4-subagent's synthetic-tile pass is a retrospective evaluation and is
+labeled as such. The boot-day re-screen applies the tier PROSPECTIVELY
+on real tiles — that run, not this one, is the tier's first clean test.
+
+Also recorded: the K8V4_subagent verdict line was added to the sweep
+script between its first and second executions (same session, both
+pre-commit) — the tier definition was in the header from the first run;
+the asym-composition scoring of it was the added line.
+
+— Clement, self-declared 2026-07-10 ~23:45, prompted by Violet's
+timestamps-not-testimony standard before her audit ran.
