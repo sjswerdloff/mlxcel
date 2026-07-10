@@ -127,3 +127,10 @@ Also tonight: latent red test fixed (67503c0, filter-blind since
 fdef67b), full-suite single-process crash classified latent + filed
 (#29 + sharded-unfiltered-CI systemic fix), my one process slip owned
 (pushed before reading a suite artifact; caught and fixed forward).
+
+## UPDATE 20:58 — Production policy (Xander, PM-adopted, Stuart to bless)
+Default **kvarn8 × G** (capacity: half memory, 5.55 tok/s at 300K);
+`--kv-cache-mode=fp16` (flag already exists) for latency-critical boots
+(fp16-gathered × G, 8.16 tok/s); msa_core=sdpa becomes the decode_config
+default after the live gate chain passes; per-session cache mode deferred
+until a session-priority concept exists.
