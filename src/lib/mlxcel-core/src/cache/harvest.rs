@@ -24,6 +24,15 @@
 //!     thousands of tiles in ONE event — spreading samples inside the event
 //!     gives depth stratification and stops the firehose);
 //!   * `idx_k` — m3_idx block samples at depth-threshold crossings;
+//!   * `idx_k_win` — KEEP-LATEST full index window per layer-cache at the
+//!     same crossings (Gate B's statistic is a global top-k over ALL
+//!     blocks; excerpts cannot reproduce it). Each write replaces the
+//!     prior one, so the session ends holding the deepest window — the
+//!     only one end-depth `idx_q` queries can pair with (~4 GB retained
+//!     at 295K × 57 layers vs ~20 GB if every crossing were kept). The
+//!     crossing write stalls that layer's update for the write duration
+//!     and grows linearly with depth (~72 MB/layer at 295K) — a latency
+//!     spike that is harvest instrumentation, not a production mode;
 //!   * `idx_q` / `sel` — model-side real index queries + their selected
 //!     sets (the near-tie statistic needs real queries). Dtypes live in
 //!     the sidecar, not the role name; only `*_rot_f32` roles carry a
@@ -152,6 +161,51 @@ pub fn dump(role: &str, cache_key: usize, offset: i32, n_full: i32, a: &MlxArray
     }
 }
 
+/// Seq-free basename for keep-latest dumps: stable per (role, cache) so
+/// successive writes REPLACE each other, distinct across caches so layers
+/// never clobber one another.
+pub fn latest_basename(role: &str, cache_key: usize) -> String {
+    format!("harvest_latest_{cache_key:x}_{role}")
+}
+
+/// Best-effort KEEP-LATEST dump: like [`dump`] but the file is keyed by
+/// role + cache (no seq), so each write replaces the prior one and the
+/// session ends with the DEEPEST window per cache — valid at ANY session
+/// end, not just a planned one. Used for `idx_k_win`, where only the
+/// deepest window pairs with the end-depth `idx_q` queries; seq-dumping
+/// every crossing would retain ~5× the bytes for windows no query can
+/// use. Not budget-counted: the caller's stride gate bounds call volume
+/// and replacement bounds retention to one file per cache. Sidecar
+/// schema matches [`dump`] with `seq:-1` marking keep-latest.
+///
+/// The replace is ATOMIC per file (write `.tmp`, then `fs::rename` on the
+/// same filesystem): a session killed mid-write — the exact any-session-end
+/// the keep-latest design exists to survive — leaves the PRIOR valid pair,
+/// never a torn file. A kill between the two renames leaves new bin + old
+/// json, whose shape-vs-size mismatch the screen loader detects loudly
+/// (reshape fails) rather than silently consumes. Orphaned `.tmp` residue
+/// from a failed write is overwritten by the next crossing.
+pub fn dump_latest(role: &str, cache_key: usize, offset: i32, n_full: i32, a: &MlxArray) {
+    let Some(dir) = harvest_dir() else { return };
+    let shape = ffi::array_shape(a);
+    let dt = ffi::array_dtype(a);
+    let bytes = ffi::array_to_raw_bytes(a);
+    let base = dir.join(latest_basename(role, cache_key));
+    let sidecar = format!(
+        "{{\"role\":\"{role}\",\"shape\":{shape:?},\"dtype\":{dt},\"offset\":{offset},\
+         \"n_full\":{n_full},\"cache\":\"{cache_key:x}\",\"seq\":-1}}"
+    );
+    let bin_tmp = base.with_extension("bin.tmp");
+    let json_tmp = base.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&bin_tmp, &bytes)
+        .and_then(|()| std::fs::write(&json_tmp, &sidecar))
+        .and_then(|()| std::fs::rename(&bin_tmp, base.with_extension("bin")))
+        .and_then(|()| std::fs::rename(&json_tmp, base.with_extension("json")))
+    {
+        tracing::warn!(role, error = %e, "harvest keep-latest dump failed (best-effort, continuing)");
+    }
+}
+
 /// Sampled dump of a `[N, R, C]` tile batch: ≤ [`TILES_PER_EVENT`] spread
 /// rows. The gather runs on the same lazy graph the caller is about to
 /// evaluate anyway; `dump` forces only the sampled slice.
@@ -190,6 +244,21 @@ mod tests {
         assert_eq!(s[0], 0);
         assert!(*s.last().unwrap() < 2340, "in range");
         assert!(*s.last().unwrap() > 2000, "spread reaches the deep end");
+    }
+
+    #[test]
+    fn latest_basename_contract() {
+        // Replace semantics: same (role, cache) always maps to one file.
+        assert_eq!(latest_basename("idx_k_win", 0xabc), latest_basename("idx_k_win", 0xabc));
+        // No cross-cache clobber: different caches get different files.
+        assert_ne!(latest_basename("idx_k_win", 0xabc), latest_basename("idx_k_win", 0xdef));
+        // Seq-free: the name must not embed the global SEQ counter, or a
+        // later dump lands in a NEW file and replace semantics silently
+        // become append semantics. (SEQ bump is harmless: no other test
+        // observes it — env-unset callers early-return before using it.)
+        let before = latest_basename("idx_k_win", 1);
+        SEQ.fetch_add(7, Ordering::Relaxed);
+        assert_eq!(latest_basename("idx_k_win", 1), before);
     }
 
     #[test]

@@ -1,0 +1,46 @@
+{
+  "n_tiles": 4096,
+  "anchor_p95": 0.005489890238678006,
+  "k8": {
+    "recon_p95": 0.006084827706217766,
+    "flips": 0.013286590576171875
+  },
+  "variants": {
+    "gs128": {
+      "asym_p95": 0.05455733155550496,
+      "k4_recon_p95": 0.10349579155445099,
+      "k4_flips": 0.21186447143554688,
+      "full_p95": 0.0932061309750862,
+      "verdicts": {
+        "K8V4_production": true,
+        "K8V4_subagent": true,
+        "K_production": false,
+        "K4V4_subagent": false
+      }
+    },
+    "gs64": {
+      "asym_p95": 0.048955055648722205,
+      "k4_recon_p95": 0.09269716590642929,
+      "k4_flips": 0.194061279296875,
+      "full_p95": 0.08368021841459086,
+      "verdicts": {
+        "K8V4_production": true,
+        "K8V4_subagent": true,
+        "K_production": false,
+        "K4V4_subagent": false
+      }
+    },
+    "gs32": {
+      "asym_p95": 0.043114349359474426,
+      "k4_recon_p95": 0.08063928037881851,
+      "k4_flips": 0.17038345336914062,
+      "full_p95": 0.07371587622062582,
+      "verdicts": {
+        "K8V4_production": true,
+        "K8V4_subagent": true,
+        "K_production": false,
+        "K4V4_subagent": false
+      }
+    }
+  }
+}
