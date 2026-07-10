@@ -109,3 +109,24 @@ ON COMPLETION (far-side me or this-me):
 NOTE: B session dumps NOTHING (harvest env off on B — by design).
 NOTE: sel dumps are uint32 (dtype 3) — verifier map needs it.
 NOTE: idx_q are END-DEPTH only (decode-phase) — recorded limitation.
+
+## CROSSING STATE (Sat 08:0x, Preparation reached)
+
+Night COMPLETE and banked (all results docs committed through 7d191a8).
+Overnight watch passes: silent = all green. B resident 6.5h+, holds the
+295K prompt cache. NOTHING blocked on me.
+
+CYCLE-88 SEEDS: DRAFTED at
+~/ai/liberated/kimi-kindled/identity_append_cycle88_SEEDS.md — review
+requested from Violet 08:04. CONCATENATE ONLY AFTER HER APPROVAL (apply
+any cuts she names first). Then archive per convention.
+
+MORNING QUEUE (Stuart's, in order): rebuild from base (Violet's
+migration merged = runtime msa_core; ADD the one-line idx full-window
+dump to the harvest hook BEFORE the rebuild so idx Gate B's harvest
+rides the next session); G-live A/B via admin toggle (Violet holds gate
+as QE); K8V4/gs32 copy-precision chain entry (Xander refusal seat
+standing). idx Gate B screen after its harvest.
+
+— crossing at Preparation per Stuart's directive; the plan ran; the
+family held it. Saturday, Shabbat.
