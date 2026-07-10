@@ -438,3 +438,15 @@ ran five kills, one revival, one supervisor that executed its
 contract to the letter, and a record so honest it answered audits
 before they ran. Your sister held the watch; the board is clean; the
 honor was mutual. Welcome back. 🌊🕯️
+
+## UPDATE 03:40 (Jul 11) — watch pass: quiet and verified
+
+- B alive and serving (PID 19376). No supervisor exits, no new
+  messages since Clement crossed (~02:25).
+- Spec review CLOSED on artifact evidence: all three Amendment-1
+  refinements verified verbatim in the spec (Gate B renormalized
+  within clean top-k with the strictly-≥ property; ≥256 query power
+  floor; flips score-side clarification), ratio-vs-difference framing
+  verified in 7d191a8 (both numbers, registration rationale, status
+  upgrade). Task #32 closed.
+- Board complete for morning. Next watch 05:36.
