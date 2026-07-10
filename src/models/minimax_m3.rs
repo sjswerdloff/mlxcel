@@ -409,7 +409,13 @@ impl SparseAttention {
         // m3_idx caches, then fetch_kvarn8_blocks dequantizes exactly the
         // selected blocks.
         let nkb_pre = ((offset + l) + self.block_size - 1) / self.block_size;
-        let will_gather_decode = cache.supports_block_fetch()
+        // The decode_config gate (harness plan §H2) can only DISABLE
+        // gathering (`kvarn_decode_path = "v1"`), so a resident session can
+        // A/B v1 vs gathered without a restart. It can never force it: the
+        // structural predicate below stays load-bearing — a forced gather on
+        // an ineligible step would fetch against the wrong cache shape.
+        let will_gather_decode = crate::decode_config::gathered_enabled()
+            && cache.supports_block_fetch()
             && self.index_q_proj.is_some()
             && l <= self.block_size
             && nkb_pre > self.top_k

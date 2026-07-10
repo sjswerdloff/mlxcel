@@ -19,6 +19,7 @@
 
 pub mod audio;
 pub mod cli;
+pub mod decode_config;
 pub mod distributed;
 pub mod downloader;
 pub mod execution;
