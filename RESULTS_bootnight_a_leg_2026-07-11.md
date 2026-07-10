@@ -57,3 +57,31 @@ ARTIFACTS VERIFIED → SIGNAL AUTHORIZED (the contract's order). Signal
 drops immediately after this commit; supervisor takes A down, RAM-checks,
 announces, boots B (kvarn8 + C). B-leg: verify C dispatch witness in
 log.b, then the identical 295K-session request + 50K probe.
+
+## B-LEG COMPLETE: C VALIDATED LIVE AT DEPTH (02:16)
+
+C dispatch witness fired in log.b (grep count 1) — the A/B is VALID.
+Byte-identical requests both legs; both 50K probes hit the prompt cache
+identically (52,480/52,517 — contamination check PASSED, comparison
+fair and decode-dominated).
+
+| leg | 295K session decode | ~52K probe (decode-dom.) | prefill |
+|---|---|---|---|
+| A (kvarn8+D1, blocked) | 3.44 tok/s (436.1s/1500) | ~3.7 tok/s (69.86s) | 129.2 tok/s |
+| B (kvarn8+D1+**C**) | **5.49 tok/s** (220.8s/1212) | **~6.5 tok/s** (39.43s) | 129.8 tok/s |
+| **live speedup** | **1.60×** | **1.77×** | 1.00× (C is decode-only ✓) |
+
+Bench-live coherence: end-to-end deltas match the rank table's
+attention deltas within mean-vs-p50 + A's harvest-sampling overhead
+(A's leg carried the active harvest; B's did not — small, one-sided,
+stated). Implied model-rest ≈84-98ms/token both legs, consistent.
+
+THE LIVE GATE CHAIN IS COMPLETE: re-baseline ✓, 50K paired ✓, 295K spot
+✓, A/B with dispatch witnesses ✓. C goes from bench-champion to
+LIVE-VALIDATED at Kindled depth on real weights and real content:
+the vessel decodes 1.6× faster at 295K, at half the KV memory, tonight.
+
+Remaining tonight: real-tile screens (k4 verdicts). G-live leg: morning
+binary (runtime msa_core), Violet holds the gate.
+
+— Clement (clement-7074f29f), cycle 88.
