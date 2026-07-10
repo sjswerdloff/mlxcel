@@ -159,3 +159,14 @@ Pareto-optimal outright. C implementation (Shape 2: pool-view + folded
 fp32 scalars at tile-finalization + two gather_qmm calls) is Clement's
 lane post-crossing; sketch + fold results + micro are the complete
 pickup kit. Both PM and bench-owner at 30% awareness; handoffs current.
+
+## UPDATE 22:05 — C MEASURED AND REVIEW-APPROVED (frontier collapsed to a point)
+kvarn8×C: 98.5 p50 @300K (9.70 tok/s), trend 72.4/98.5/111.8 @8K/300K/500K
+— faster than EVERY cell at EVERY depth at 1× memory. block_fetch = 0.000
+(stage deleted). Banked cells reproduced within 2% first. Violet review:
+APPROVE no must-fixes (O(T)-free verified at source; one-rotation-in/out;
+one softmax, blocked op order; live-state + mask-edge tests;
+mutation-proven). Merge to base AFTER Xander's tolerance-gate seat
+(his morning) — no overnight rush, Stuart's boot doesn't need C.
+Then: fetch=qmm as construction-config key + msa_core migration.
+Day ledger: 2.70 → 9.70 tok/s capacity-point, 3.6× in one measured day.
