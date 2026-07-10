@@ -66,47 +66,30 @@ fn kvarn_all_layers_forced() -> bool {
     })
 }
 
-/// MLXCEL_MSA_CORE=sdpa swaps the blocked-gather decode core for the
-/// fused-SDPA masked core on the GATHERED path (harness plan §H1, approach
-/// G). Default OFF — zero behavior change; every existing suite pins the
-/// blocked core. Env-gated for the bench rank; production selection joins
-/// the decode_config enum if G wins (select-among-implementations, per the
-/// H2 disable-only convention).
+/// The gathered flow's CORE selection (harness plan §H1, approach G):
+/// `msa_core = "sdpa"` in decode_config swaps the blocked-gather decode
+/// core for the fused-SDPA masked core on the GATHERED path. Runtime-
+/// reloadable (TOML + SIGHUP + admin POST), one relaxed atomic load per
+/// call; the legacy env instrument MLXCEL_MSA_CORE=sdpa seeds the default
+/// for bench processes that never load a config. Config says INTENT, the
+/// dispatch-site predicate says CAN — this selects among contract-
+/// equivalent cores and never widens where gathering happens.
 fn msa_core_sdpa_enabled() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| {
-        let on = std::env::var("MLXCEL_MSA_CORE").is_ok_and(|v| v == "sdpa")
-        ;
-        if on {
-            tracing::info!(
-                "MLXCEL_MSA_CORE=sdpa: gathered decode uses the fused-SDPA masked core (G) — \
-                 blocked-gather core disabled for this process"
-            );
-        }
-        on
-    })
+    crate::decode_config::msa_core_sdpa()
 }
 
-/// MLXCEL_MSA_FETCH=qmm swaps the gathered flow's fetch+core for the C
-/// (qmm-fetch) fused core on KVarN8 caches (DESIGN_c_qmm_union_sketch,
-/// MERGE DESIGN): interior tiles are scored/attended straight off the
-/// stored u8 codes via gather_qmm — no dequant chain, no compact-window
-/// materialization — and the fp16-rotated sink/tail are scored as stored.
-/// Default OFF — zero behavior change; every existing suite pins the
-/// dequant-fetch cores. Env-gated for the bench rank; production
-/// selection joins the decode_config migration if C wins.
+/// The gathered flow's FETCH selection on KVarN8 caches (C, qmm-fetch
+/// fused core; DESIGN_c_qmm_union_sketch MERGE DESIGN): interior tiles are
+/// scored/attended straight off the stored u8 codes via gather_qmm — no
+/// dequant chain, no compact-window materialization — and the fp16-rotated
+/// sink/tail are scored as stored. `[construction] msa_fetch = "qmm"` in
+/// decode_config, boot-frozen; the legacy env instrument
+/// MLXCEL_MSA_FETCH=qmm seeds the default for bench processes. Config says
+/// INTENT, cache structure says CAN: the dispatch below still falls
+/// through to the dequant fetch+core pair whenever `kvarn_qmm_state()`
+/// returns `None` — enabling qmm never bypasses the structural gate.
 fn msa_fetch_qmm_enabled() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| {
-        let on = std::env::var("MLXCEL_MSA_FETCH").is_ok_and(|v| v == "qmm");
-        if on {
-            tracing::info!(
-                "MLXCEL_MSA_FETCH=qmm: gathered decode uses the C qmm-fetch fused core — \
-                 dequant fetch + separate core disabled where the cache qualifies"
-            );
-        }
-        on
-    })
+    crate::decode_config::msa_fetch_qmm()
 }
 
 fn k1_profile_enabled() -> bool {
@@ -1402,7 +1385,8 @@ impl SparseAttention {
         // Compact window: only the union blocks, standard frame, each
         // exactly block_size tokens (tail zero-padded inside). Fetch is
         // mode-dispatched: kvarn8 dequants exactly the requested tiles;
-        // fp16 (behind MLXCEL_FP16_GATHERED) block-gathers with no dequant.
+        // fp16 (behind the fp16_gathered construction key) block-gathers
+        // with no dequant.
         // Same return contract either way, so everything downstream is
         // fetch-source-agnostic.
         debug_assert_eq!(
@@ -1456,10 +1440,21 @@ impl SparseAttention {
 
         // G (harness plan §H1): same compact (window, indices, positions)
         // triple, two interchangeable cores. The blocked-gather core is the
-        // default; MLXCEL_MSA_CORE=sdpa selects the fused-SDPA masked core.
-        // Hooked HERE (the gathered flow, small compact window) and not on
-        // the full-window path, where a per-slot mask would be O(T).
+        // default; msa_core = "sdpa" (decode_config, runtime-reloadable)
+        // selects the fused-SDPA masked core. Hooked HERE (the gathered
+        // flow, small compact window) and not on the full-window path,
+        // where a per-slot mask would be O(T).
         let out = if msa_core_sdpa_enabled() {
+            // Fail-loud dispatch witness (C's rationale): the config echo
+            // says which core was REQUESTED; only the dispatch itself can
+            // witness which core RAN. One line per core per process — the
+            // live A/B probe requires both witnesses across its toggles.
+            static SDPA_CORE_DISPATCHED: std::sync::Once = std::sync::Once::new();
+            SDPA_CORE_DISPATCHED.call_once(|| {
+                tracing::info!(
+                    "G fused-SDPA masked core active (first sdpa-core dispatch this process)"
+                );
+            });
             self.sparse_decode_core_sdpa(
                 q,
                 &k_c,
@@ -1472,6 +1467,12 @@ impl SparseAttention {
                 offset,
             )
         } else {
+            static BLOCKED_CORE_DISPATCHED: std::sync::Once = std::sync::Once::new();
+            BLOCKED_CORE_DISPATCHED.call_once(|| {
+                tracing::info!(
+                    "blocked-gather core active (first blocked-core dispatch this process)"
+                );
+            });
             self.sparse_decode_core(
                 q,
                 &k_c,
@@ -5794,9 +5795,16 @@ mod tests {
     fn qmm_core_matches_gathered_blocked_path_on_real_cache() {
         // A set MLXCEL_MSA_FETCH would flip the reference path to C and
         // make this test compare C to C — vacuous green. Fail loud instead.
+        // Both the env seed AND the effective store value are pinned: the
+        // env var only seeds decode_config's default, so checking it alone
+        // would miss a store latched some other way.
         assert!(
             std::env::var("MLXCEL_MSA_FETCH").is_err(),
             "this test requires MLXCEL_MSA_FETCH unset (reference must be the blocked path)"
+        );
+        assert!(
+            !crate::decode_config::msa_fetch_qmm(),
+            "this test requires effective msa_fetch=dequant (reference must be the blocked path)"
         );
         let attn = make_test_sparse_attention_d128();
         let hidden = attn.num_heads * attn.head_dim;

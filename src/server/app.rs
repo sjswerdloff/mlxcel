@@ -92,15 +92,18 @@ const AUDIO_MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 
 /// Echo the effective decode-path config on every response (harness plan
 /// §H2): a probe capturing any HTTP exchange gets the authoritative
-/// `path=..; v=N` it measured under, so a measurement can never silently
-/// mis-attribute its decode path. Header, not body — the response schemas
-/// stay OpenAI/Anthropic-shaped.
+/// `path=..; core=..; v=N` it measured under, so a measurement can never
+/// silently mis-attribute its decode path. Header, not body — the response
+/// schemas stay OpenAI/Anthropic-shaped. Construction keys are NOT echoed
+/// per-response (boot-frozen; the boot artifact line carries them) — the
+/// `core=` field sits BETWEEN the existing fields so `path=X` prefix and
+/// `v=N` suffix greps keep working.
 async fn decode_config_echo(request: Request<Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
     let snap = crate::decode_config::snapshot();
     if let Ok(value) = header::HeaderValue::from_str(&format!(
-        "path={}; v={}",
-        snap.kvarn_decode_path, snap.version
+        "path={}; core={}; v={}",
+        snap.kvarn_decode_path, snap.msa_core, snap.version
     )) {
         response
             .headers_mut()
