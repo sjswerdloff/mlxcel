@@ -2124,6 +2124,16 @@ impl BatchScheduler {
             decode_storage_backend = ?self.decode_storage_backend,
             paged_block_size = DEFAULT_PAGED_BLOCK_SIZE,
             paged_pool_shared = (effective_mode == KVCacheMode::Fp16),
+            // K1 (plan §K1 fail-loud artifact): which kvarn decode path
+            // this BUILD routes — "gathered" = dequant-after-gather
+            // (O(top_k) per step), "n/a" for non-kvarn modes. A kvarn8
+            // probe run on a binary printing "n/a" (or nothing) is
+            // measuring the wrong decode path.
+            kvarn_decode_path = if effective_mode == KVCacheMode::KVarN8 {
+                "gathered"
+            } else {
+                "n/a"
+            },
             "KV cache quantization as resolved by the server (non-Fp16 modes bypass the shared paged pool: sequences get dense per-layer caches converted to the mode after make_caches)"
         );
 

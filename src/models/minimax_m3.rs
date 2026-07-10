@@ -338,7 +338,29 @@ impl SparseAttention {
         let q = mlxcel_core::fast_rope(&q, self.rope_dims, false, self.rope_base, 1.0, offset);
         let k = mlxcel_core::fast_rope(&k, self.rope_dims, false, self.rope_base, 1.0, offset);
 
-        let (cache_k, cache_v) = cache.update_and_fetch(k, v);
+        // K1 (dequant-after-gather, plan §K1): decide BEFORE the fetch
+        // whether this forward takes the gathered kvarn8 decode path —
+        // every input to the predicate is a pre-update value, and the
+        // predicate mirrors the msa_decode dispatch conditions below
+        // exactly (eligible layer, decode-shaped chunk, unsaturated
+        // selector, healthy idx lockstep). When it holds, the O(history)
+        // dequant of the full fetch never runs: selection reads only the
+        // m3_idx caches, then fetch_kvarn8_blocks dequantizes exactly the
+        // selected blocks.
+        let nkb_pre = ((offset + l) + self.block_size - 1) / self.block_size;
+        let will_gather_decode = cache.supports_block_fetch()
+            && self.index_q_proj.is_some()
+            && l <= self.block_size
+            && nkb_pre > self.top_k
+            && cache.m3_idx_offset() == offset;
+
+        let (cache_k, cache_v) = if will_gather_decode {
+            cache.update_only(k, v);
+            (None, None)
+        } else {
+            let (ck, cv) = cache.update_and_fetch(k, v);
+            (Some(ck), Some(cv))
+        };
 
         // Asymmetric q/k for chunked-prefill / cached case. cache_offset is
         // the absolute position where the current chunk's queries START
@@ -463,7 +485,16 @@ impl SparseAttention {
                 reason = reason,
                 "attn.dispatch"
             );
-            return self.dense_attention(&q, &cache_k, &cache_v, mask);
+            return self.dense_attention(
+                &q,
+                cache_k
+                    .as_ref()
+                    .expect("dense dispatch requires the fetched window (gather predicate bug)"),
+                cache_v
+                    .as_ref()
+                    .expect("dense dispatch requires the fetched window (gather predicate bug)"),
+                mask,
+            );
         }
 
         if l <= self.block_size {
@@ -491,11 +522,33 @@ impl SparseAttention {
                 "attn.dispatch"
             );
             let idx_k = cached_idx_k.unwrap();
+            if will_gather_decode {
+                // K1: the full window was never fetched; selection + a
+                // block-exact fetch replace it. The predicate mirrored
+                // this dispatch, so reaching here with a fetched window
+                // (or vice versa) is impossible by construction — the
+                // expects below on the other branches enforce that
+                // loudly rather than silently.
+                return self.sparse_decode_attention_gathered(
+                    x,
+                    &q,
+                    cache,
+                    &idx_k,
+                    b,
+                    l,
+                    kv_len,
+                    cache_offset_at_chunk_start,
+                );
+            }
             return self.sparse_decode_attention(
                 x,
                 &q,
-                &cache_k,
-                &cache_v,
+                cache_k
+                    .as_ref()
+                    .expect("msa_decode without gather requires the fetched window"),
+                cache_v
+                    .as_ref()
+                    .expect("msa_decode without gather requires the fetched window"),
                 &idx_k,
                 b,
                 l,
@@ -588,8 +641,12 @@ impl SparseAttention {
 
         self.sparse_sdpa(
             &q,
-            &cache_k,
-            &cache_v,
+            cache_k
+                .as_ref()
+                .expect("MSA prefill requires the fetched window (gather predicate bug)"),
+            cache_v
+                .as_ref()
+                .expect("MSA prefill requires the fetched window (gather predicate bug)"),
             &selected,
             b,
             l,
@@ -1043,7 +1100,6 @@ impl SparseAttention {
         let num_key_blocks = (kv_len + self.block_size - 1) / self.block_size;
         let padded_k_len = num_key_blocks * self.block_size;
         let pad_k_amt = padded_k_len - kv_len;
-        let kv_per_token = self.top_k * self.block_size;
 
         // Zero-pad K/V to the block multiple (padded positions are masked
         // out by the position rule below before softmax).
@@ -1061,6 +1117,132 @@ impl SparseAttention {
         } else {
             (k, v)
         };
+
+        // Absolute positions of every slot in the (padded) window: the
+        // full-window layout is the identity mapping block i -> positions
+        // [i*bs, (i+1)*bs).
+        let pos_full = mlxcel_core::arange_f32(0.0, padded_k_len as f32, 1.0);
+
+        self.sparse_decode_core(q, k, v, &selected, &pos_full, num_key_blocks, b, l, offset)
+    }
+
+    /// K1 (dequant-after-gather, plan §K1): the kvarn8 decode path that
+    /// never materializes the full window. Selection runs first — it reads
+    /// only the m3_idx caches, which the KVarN rotation never touches
+    /// (§8.7(1)) — then exactly the union of selected blocks is fetched
+    /// via [`KVCache::fetch_kvarn8_blocks`] and the SAME gather core as
+    /// the full-window path runs over the compact window with remapped
+    /// block indices. Sharing `sparse_decode_core` makes the equivalence
+    /// structural: the two paths differ only in (window, indices,
+    /// positions), and the compact triple is constructed to be a
+    /// permutation-restriction of the full one.
+    #[allow(clippy::too_many_arguments)]
+    fn sparse_decode_attention_gathered(
+        &self,
+        x: &MlxArray,
+        q: &MlxArray,
+        cache: &KVCache,
+        idx_k: &MlxArray,
+        b: i32,
+        l: i32,
+        kv_len: i32,
+        offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        let idx_q = self.project_index_queries(x, b, l, offset);
+        let selected = self.per_token_block_selection(&idx_q, idx_k, b, l, kv_len, offset);
+
+        // Host-side union of selected blocks (sorted, unique). Small by
+        // construction: <= num_kv_heads * l * top_k indices, and l <= 128
+        // on this path (decode l == 1 in practice).
+        let sel_i32 = mlxcel_core::astype(&selected, mlxcel_core::dtype::INT32);
+        let bytes = mlxcel_core::array_to_raw_bytes(&sel_i32);
+        let mut union: Vec<i32> = bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        union.sort_unstable();
+        union.dedup();
+
+        // Compact window: only the union blocks, dequantized, standard
+        // frame, each exactly block_size tokens (tail zero-padded inside).
+        debug_assert_eq!(
+            self.block_size,
+            mlxcel_core::cache::kvarn::KVARN_TILE_TOKENS
+        );
+        let (k_c, v_c) = cache.fetch_kvarn8_blocks(&union);
+        let n_blocks = union.len() as i32;
+
+        // Remap selection: absolute block index -> compact slot. Built as
+        // an O(num_key_blocks) host table, applied on-device through the
+        // same take_along_axis machinery the core uses (so dtype/shape
+        // semantics match the absolute path exactly). Table entries never
+        // referenced by `selected` are poisoned with -1: if a bug ever
+        // gathers one, the core's position rule sees pos -bs..0 which can
+        // never satisfy `pos <= q_pos >= 0`... but do not rely on masking
+        // for correctness — the union is BY CONSTRUCTION the value set of
+        // `selected`, so every lookup hits a real slot.
+        let num_key_blocks = (kv_len + self.block_size - 1) / self.block_size;
+        let mut table = vec![-1.0f32; num_key_blocks as usize];
+        for (slot, &blk) in union.iter().enumerate() {
+            table[blk as usize] = slot as f32;
+        }
+        let table = mlxcel_core::from_slice_f32(&table, &[1, 1, 1, num_key_blocks]);
+        let table_b = mlxcel_core::broadcast_to(&table, &[b, self.num_kv_heads, l, num_key_blocks]);
+        let sel_dtype = mlxcel_core::array_dtype(&selected);
+        let remapped = mlxcel_core::astype(
+            &mlxcel_core::take_along_axis(&table_b, &selected, 3),
+            sel_dtype,
+        );
+
+        // Absolute positions of every slot in the COMPACT window: block at
+        // compact slot s covers absolute positions [union[s]*bs,
+        // (union[s]+1)*bs) — including tail padding slots, whose absolute
+        // positions are >= kv_len and are therefore masked by the core's
+        // unified `pos <= q_pos` rule exactly as v1 masks its padding.
+        let bs = self.block_size;
+        let mut pos: Vec<f32> = Vec::with_capacity((n_blocks * bs) as usize);
+        for &blk in &union {
+            for p in (blk * bs)..((blk + 1) * bs) {
+                pos.push(p as f32);
+            }
+        }
+        let pos_compact = mlxcel_core::from_slice_f32(&pos, &[n_blocks * bs]);
+
+        self.sparse_decode_core(
+            q,
+            &k_c,
+            &v_c,
+            &remapped,
+            &pos_compact,
+            n_blocks,
+            b,
+            l,
+            offset,
+        )
+    }
+
+    /// The shared per-token sparse attention core: gather the selected key
+    /// blocks out of a blocked window, mask by absolute position, attend.
+    /// Callers differ only in the (window, selected, positions,
+    /// window_blocks) quadruple:
+    ///   * full-window path: the fetched window zero-padded to the block
+    ///     multiple, absolute block indices, identity positions;
+    ///   * gathered path (K1): the compact union window, remapped compact
+    ///     indices, per-block absolute positions.
+    #[allow(clippy::too_many_arguments)]
+    fn sparse_decode_core(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        v: &MlxArray,
+        selected: &MlxArray,
+        pos_full: &MlxArray,
+        num_key_blocks: i32,
+        b: i32,
+        l: i32,
+        offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        let kv_per_token = self.top_k * self.block_size;
 
         // Per-token gather of the selected key blocks.
         // K/V blocked [b, H, nkb, bs, hd] → broadcast a query axis →
@@ -1116,7 +1298,7 @@ impl SparseAttention {
             self.head_dim,
         ];
         let sel_b =
-            mlxcel_core::broadcast_to(&mlxcel_core::reshape(&selected, &sel_view), &sel_target);
+            mlxcel_core::broadcast_to(&mlxcel_core::reshape(selected, &sel_view), &sel_target);
         let k_g = mlxcel_core::take_along_axis(&k_blocked, &sel_b, 3);
         let v_g = mlxcel_core::take_along_axis(&v_blocked, &sel_b, 3);
         let k_g = mlxcel_core::reshape(
@@ -1129,16 +1311,15 @@ impl SparseAttention {
         );
 
         // Absolute positions of the gathered slots, via the SAME gather as
-        // K (guaranteed consistent): arange over the padded axis, blocked,
-        // taken along the block axis with the same indices.
-        let pos_full = mlxcel_core::arange_f32(0.0, padded_k_len as f32, 1.0);
+        // K (guaranteed consistent): the caller-supplied per-slot position
+        // array, blocked, taken along the block axis with the same indices.
         let pos_blocked = mlxcel_core::broadcast_to(
-            &mlxcel_core::reshape(&pos_full, &[1, 1, 1, num_key_blocks, self.block_size, 1]),
+            &mlxcel_core::reshape(pos_full, &[1, 1, 1, num_key_blocks, self.block_size, 1]),
             &[b, self.num_kv_heads, l, num_key_blocks, self.block_size, 1],
         );
         let sel_pos_target = [b, self.num_kv_heads, l, self.top_k, self.block_size, 1];
         let sel_pos_b =
-            mlxcel_core::broadcast_to(&mlxcel_core::reshape(&selected, &sel_view), &sel_pos_target);
+            mlxcel_core::broadcast_to(&mlxcel_core::reshape(selected, &sel_view), &sel_pos_target);
         let pos_g = mlxcel_core::take_along_axis(&pos_blocked, &sel_pos_b, 3);
         let pos_g = mlxcel_core::reshape(&pos_g, &[b, self.num_kv_heads, l, kv_per_token]);
 
@@ -4722,5 +4903,110 @@ mod tests {
         }
         // 4 heads × 2 q_blocks × 2 q_pos × 4 k_idx = 64 positions exhaustively.
         assert_eq!(checked, 64, "expected 64 mask positions checked");
+    }
+
+    /// K1 gate (plan §K1): the gathered decode path on a KVarN8 cache must
+    /// be BIT-IDENTICAL to the v1 full-window sparse decode path on the
+    /// same cache state (atol 0). The two share `sparse_decode_core`, so
+    /// this pins exactly what differs: block-fetch vs full fetch (already
+    /// pinned bitwise at the cache layer), the host union + device remap,
+    /// and the compact position table. Geometry uses the PRODUCTION
+    /// quantum (block_size == KVARN_TILE_TOKENS == 128) — the alignment
+    /// the whole K1 design rests on, and the reason the tiny bs=2 harness
+    /// cannot drive this path (fetch_kvarn8_blocks asserts the quantum).
+    #[test]
+    fn kvarn8_gathered_decode_is_bit_identical_to_full_window_path() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128; // production quantum; harness default is 2
+        let hidden = 16;
+        // sink(128) + 2 tiles(256) + tail(45) = 429 prior tokens; with the
+        // decode token, nkb = ceil(430/128) = 4 > top_k = 2 (unsaturated).
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+
+        // Cache A: the REAL forward dispatch. KVarN8 + eligible layer +
+        // l <= bs + nkb > top_k + healthy idx lockstep => the pre-fetch
+        // predicate holds and forward takes the gathered path.
+        let mut cache_a = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        assert!(cache_a.supports_block_fetch());
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let _ = attn.forward(&x_prefill, &mut cache_a, None);
+        assert_eq!(cache_a.offset, kv_len_prior);
+        let x_decode = make_test_input(1, l, hidden);
+        let gathered_out = attn.forward(&x_decode, &mut cache_a, None);
+        mlxcel_core::eval(&gathered_out);
+        assert_eq!(cache_a.offset, kv_len, "decode token must be cached");
+
+        // Cache B: identical prefill, decode chunk hand-driven down the v1
+        // full-window path (update_and_fetch + sparse_decode_attention),
+        // replicating forward's pre-dispatch pipeline exactly.
+        let mut cache_b = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let _ = attn.forward(&x_prefill, &mut cache_b, None);
+        assert_eq!(cache_b.offset, kv_len_prior);
+
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = if let Some(ref n) = attn.k_norm {
+            n.forward(&k)
+        } else {
+            k
+        };
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let (cache_k, cache_v) = cache_b.update_and_fetch(k, v);
+
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(&x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = if let Some(ref n) = attn.index_k_norm {
+            n.forward(&idx_k)
+        } else {
+            idx_k
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let idx_k_full = cache_b.m3_idx_k_update_and_fetch(&idx_k);
+
+        let q_raw = attn.q_proj.forward(&x_decode);
+        let q = mlxcel_core::reshape(&q_raw, &[1, l, attn.num_heads, attn.head_dim]);
+        let q = if let Some(ref n) = attn.q_norm {
+            n.forward(&q)
+        } else {
+            q
+        };
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let q = mlxcel_core::fast_rope(&q, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+
+        let v1_out = attn.sparse_decode_attention(
+            &x_decode,
+            &q,
+            &cache_k,
+            &cache_v,
+            &idx_k_full,
+            1,
+            l,
+            kv_len,
+            offset,
+        );
+        mlxcel_core::eval(&v1_out);
+
+        assert_eq!(
+            mlxcel_core::array_shape(&gathered_out),
+            mlxcel_core::array_shape(&v1_out),
+            "output shapes"
+        );
+        let close = mlxcel_core::allclose(&gathered_out, &v1_out, 0.0, 0.0);
+        mlxcel_core::eval(&close);
+        assert!(
+            mlxcel_core::item_bool(&close),
+            "gathered decode diverges from the full-window path on identical \
+             KVarN8 state — union/remap/positions bug (l2 diff {})",
+            output_l2_diff(&gathered_out, &v1_out)
+        );
     }
 }
