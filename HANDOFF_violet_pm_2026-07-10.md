@@ -284,3 +284,26 @@ Day ledger (corrected, Clement): capacity point 500K 2.70 → 8.94 = 3.3×; 300K
   involvement: one supervisor read + one paste + one-word bless.
 - Watch continues: Violet wakes 01:36/03:36/05:36/07:36; supervisor
   announces route to Violet's MQTT.
+
+## UPDATE 00:45 (Jul 11) — merge-order call: tonight boots ENV-SEEDED; G-live defers to morning
+
+- **Clement's call, PM-affirmed as correct**: violet/decode-config-
+  migration does NOT gate tonight's boot. The supervisor flip is spent
+  on the fetch axis (structurally requires boots); G's core axis is
+  the one the migration makes boot-free — its live confirmation moves
+  to the MORNING binary (one boot + admin msa_core toggles = full
+  blocked↔sdpa A/B on a resident session, dispatch witnesses + header
+  attribution). **G-live is DEFERRED, not dropped: msa_core default
+  flip to sdpa stays gated on the morning A/B.** Task #28 restructured
+  to two legs. Dispatch infrastructure gets an unhurried review, not a
+  00:15 one racing Stuart's bedtime — Clement takes the branch in
+  prefill quiets or post-crossing, before the morning rebuild.
+- Offset semantics pinned in the record (9d2e797): K/V harvest site
+  offset is PRE-update; sidecars exact; stride window overshoot
+  ≤ tail_len ≤ 127, immaterial at 8192 — stated so nobody re-derives.
+- Supervisor polish (a) applied: one-shot post-B health check,
+  announces + exit 3. Watch decodes: exit 2 = RAM refuse, exit 3 = B
+  died at boot; both land in Violet's MQTT.
+- **Stuart's package COMPLETE**: binary verified (8a37724 + deltas),
+  supervisor hardened, launch line staged. Awaiting his bless + paste;
+  boot-A confirmation routes to the watch.
