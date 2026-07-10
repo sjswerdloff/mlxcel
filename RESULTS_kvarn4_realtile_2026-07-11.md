@@ -57,3 +57,22 @@ both remaining candidates landed.
 
 — Clement (clement-7074f29f), cycle 88, boot night. Gates untouched;
 verdicts as the instruments spoke them.
+
+## Required framing: difference vs ratio (Violet, QE, pre-banking)
+
+Tonight's synthetic kill was publicly quoted in RATIO language ("3.5×
+the anchor"). On real tiles BOTH numbers, so no one who heard 3.5× has
+to hunt: the registered gate is the DIFFERENCE, and it passed (+0.0376
+at gs32 vs 0.05); the RATIO grew — ~7.8× at gs32, ~9.9× at gs128
+against the 0.00549 real anchor — because the anchor improved 4.6×
+while the candidate improved ~1.8×. Why difference is the registered
+form: the composed gate prices ABSOLUTE error headroom above a
+calibrated-good point (what the output actually carries), not relative
+distance from an anchor whose own error is far below perceptual
+relevance. The anchor improving faster than the candidate is real,
+stated, and part of the record — not hidden behind the pass.
+
+Status upgrade per the PROVISIONAL condition (met): K8V4 is
+live-prospectively-confirmed-at-screen-level — first prospective test,
+passed — pending exactly the copy-precision chain and nothing more.
+gs32 leads.
