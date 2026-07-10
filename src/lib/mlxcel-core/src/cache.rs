@@ -1138,6 +1138,179 @@ impl KVCache {
         (k, v)
     }
 
+    /// True iff this cache can serve [`Self::fetch_kvarn8_blocks`] — the K1
+    /// dequant-after-gather decode path (DESIGN_fused_msa_kvarn_decode_plan).
+    /// Only the dense KVarN8 mode qualifies; paged backing never carries
+    /// KVarN8 state (non-fp16 modes bypass the shared pool at construction).
+    pub fn supports_block_fetch(&self) -> bool {
+        self.mode == KVCacheMode::KVarN8 && self.paged_backing.is_none()
+    }
+
+    /// Write new K/V into the cache WITHOUT materializing the fetched
+    /// window. The K1 gathered-decode path uses this so the O(history)
+    /// dequant of [`Self::fetch_kvarn8`] never runs on a decode step —
+    /// selection (which reads only the m3_idx caches) decides which blocks
+    /// are needed, then [`Self::fetch_kvarn8_blocks`] dequantizes exactly
+    /// those. Semantically identical to `update_and_fetch` minus the fetch.
+    pub fn update_only(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
+        self.update(new_keys, new_values);
+    }
+
+    /// K1 (dequant-after-gather): assemble ONLY the requested MSA key
+    /// blocks, in the STANDARD frame (fp16), each padded/exact at
+    /// `KVARN_TILE_TOKENS` tokens. Returns `(k_compact, v_compact)` of
+    /// shape `[B, H, blocks.len() * KVARN_TILE_TOKENS, D]`, blocks laid
+    /// out in the order given.
+    ///
+    /// Block indexing follows the MSA blocked view of the full window
+    /// (sparse_block_size == KVARN_TILE_TOKENS == 128, the alignment the
+    /// whole K1 design rests on — see proposal §8.7):
+    ///   block 0            == the fp16 sink (always exactly one tile long
+    ///                         by the time any interior tile exists),
+    ///   blocks 1..=n_tiles == quantized tiles (block i == tile i-1),
+    ///   block n_tiles+1    == the fp16 tail, zero-padded to a full block
+    ///                         (padded slots carry absolute positions
+    ///                         >= kv_len, so the caller's position rule
+    ///                         masks them exactly as the v1 path does).
+    ///
+    /// `blocks` must be strictly increasing, unique, and in-range. This
+    /// REFUSES (panic with context) on any violation rather than mis-map
+    /// silently — the caller derives the list from the selection tensor,
+    /// so an out-of-contract index is an upstream bug, and a silently
+    /// wrong block is the exact silent-wrong failure class the KVarN gates
+    /// exist to prevent.
+    ///
+    /// Bit-identity contract (K0 experiment, Q1+Q3): per-tile dequant is
+    /// independent and the inverse WHT is per-token, so dequant+unrotate of
+    /// the selected blocks is BITWISE identical to selecting the same
+    /// blocks out of [`Self::fetch_kvarn8`]'s full window. The
+    /// `kvarn_block_fetch_matches_full_window` test pins this in-engine.
+    pub fn fetch_kvarn8_blocks(
+        &self,
+        blocks: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        use crate::cache::kvarn::{KVARN_TILE_TOKENS, kvarn_rotate};
+
+        assert!(
+            self.supports_block_fetch(),
+            "fetch_kvarn8_blocks on a cache that does not support it (mode={:?})",
+            self.mode
+        );
+        assert!(!blocks.is_empty(), "fetch_kvarn8_blocks: empty block list");
+
+        // Window structure, derived from the kvarn fields themselves.
+        let sink_len = self
+            .kvarn_sink_k
+            .as_ref()
+            .map_or(0, |s| ffi::array_shape(s)[2]);
+        let n_tiles = self
+            .kvarn_k_s_col
+            .as_ref()
+            .map_or(0, |s| ffi::array_shape(s)[2]);
+        let tail_len = self
+            .kvarn_tail_k
+            .as_ref()
+            .map_or(0, |t| ffi::array_shape(t)[2]);
+        assert!(
+            sink_len == KVARN_TILE_TOKENS,
+            "fetch_kvarn8_blocks requires a full sink (block 0); got sink_len={sink_len} — \
+             callers must dispatch dense until the window has full-block structure"
+        );
+        let last_block = if tail_len > 0 { n_tiles + 1 } else { n_tiles };
+
+        let mut prev = -1i32;
+        for &b in blocks {
+            assert!(
+                b > prev && b >= 0 && b <= last_block,
+                "fetch_kvarn8_blocks: block list must be strictly increasing, unique and \
+                 in-range 0..={last_block}; got {blocks:?}"
+            );
+            prev = b;
+        }
+
+        // Per-side assembly in the ROTATED frame (f32), one part per block,
+        // then a single per-token inverse WHT + fp16 cast — the same op
+        // order as fetch_kvarn8's assemble, restricted to the requested
+        // blocks (bitwise-equal per K0 Q1+Q3).
+        let assemble_blocks = |sink: &Option<UniquePtr<MlxArray>>,
+                               hist: &Option<UniquePtr<MlxArray>>,
+                               scale: &Option<UniquePtr<MlxArray>>,
+                               zp: &Option<UniquePtr<MlxArray>>,
+                               s_row: &Option<UniquePtr<MlxArray>>,
+                               s_col: &Option<UniquePtr<MlxArray>>,
+                               tail: &Option<UniquePtr<MlxArray>>|
+         -> UniquePtr<MlxArray> {
+            let mut parts: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(blocks.len());
+            for &blk in blocks {
+                if blk == 0 {
+                    parts.push(ffi::astype(sink.as_ref().unwrap(), dtype::FLOAT32));
+                } else if blk <= n_tiles {
+                    let t = blk - 1;
+                    let (r0, r1) = (t * KVARN_TILE_TOKENS, (t + 1) * KVARN_TILE_TOKENS);
+                    let q = hist.as_ref().unwrap();
+                    let qs = ffi::array_shape(q);
+                    let (b_, h_, d_) = (qs[0], qs[1], qs[3]);
+                    let row = |a: &MlxArray, last: i32| {
+                        ffi::slice(a, &[0, 0, r0, 0], &[b_, h_, r1, last])
+                    };
+                    let qf = ffi::astype(&row(q, d_), dtype::FLOAT32);
+                    let de = ffi::add(
+                        &ffi::multiply(&qf, &row(scale.as_ref().unwrap(), 1)),
+                        &row(zp.as_ref().unwrap(), 1),
+                    );
+                    let de = ffi::multiply(&de, &row(s_row.as_ref().unwrap(), 1));
+                    // s_col is per-tile [B,H,n_tiles,D] -> this tile's row,
+                    // shaped [B,H,1,D] to broadcast over the tile's tokens.
+                    let sc =
+                        ffi::slice(s_col.as_ref().unwrap(), &[0, 0, t, 0], &[b_, h_, t + 1, d_]);
+                    parts.push(ffi::multiply(&de, &sc));
+                } else {
+                    // Tail block: fp16-rotated, zero-padded to a full block.
+                    // wht(0) == 0, so padding in the rotated frame is
+                    // identical to padding after un-rotation (the v1-path
+                    // equivalent of zero-padding the assembled window).
+                    let t = tail.as_ref().unwrap();
+                    let ts = ffi::array_shape(t);
+                    let mut p = ffi::astype(t, dtype::FLOAT32);
+                    if tail_len < KVARN_TILE_TOKENS {
+                        let pad = ffi::full_f32(
+                            &[ts[0], ts[1], KVARN_TILE_TOKENS - tail_len, ts[3]],
+                            0.0,
+                            dtype::FLOAT32,
+                        );
+                        p = crate::ops::concatenate(&p, &pad, 2);
+                    }
+                    parts.push(p);
+                }
+            }
+            let mut rotated = parts.remove(0);
+            for p in parts {
+                rotated = crate::ops::concatenate(&rotated, &p, 2);
+            }
+            ffi::astype(&kvarn_rotate(&rotated), dtype::FLOAT16)
+        };
+
+        let k = assemble_blocks(
+            &self.kvarn_sink_k,
+            &self.kvarn_hist_k,
+            &self.kvarn_k_scale,
+            &self.kvarn_k_zp,
+            &self.kvarn_k_s_row,
+            &self.kvarn_k_s_col,
+            &self.kvarn_tail_k,
+        );
+        let v = assemble_blocks(
+            &self.kvarn_sink_v,
+            &self.kvarn_hist_v,
+            &self.kvarn_v_scale,
+            &self.kvarn_v_zp,
+            &self.kvarn_v_s_row,
+            &self.kvarn_v_s_col,
+            &self.kvarn_tail_v,
+        );
+        (k, v)
+    }
+
     /// FP16 (standard) update path — original pre-allocated buffer logic.
     ///
     /// Operates in **buffer-slot** coordinates: `prev = self.offset

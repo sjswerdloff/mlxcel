@@ -727,3 +727,162 @@ mod detach_roundtrip_tests {
         assert_eq!(ffi::array_shape(&kk)[2], 65, "window after sink-trim + 1");
     }
 }
+
+/// K1 gate (DESIGN_fused_msa_kvarn_decode_plan §K1): block-fetch must be
+/// BITWISE identical to the corresponding slices of the full window —
+/// the in-engine pin of the K0 reference result (Q1: per-tile dequant is
+/// independent; Q3: the inverse WHT is per-token, so it commutes with
+/// block selection).
+#[cfg(test)]
+mod block_fetch_tests {
+    use super::*;
+    use crate::cache::{KVCache, KVCacheMode};
+
+    fn lcg_data(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    /// sink 128 + 3 tiles + tail 45 = 557 tokens; request a mixed-format
+    /// block list (sink, interior tiles, the padded tail block) and pin
+    /// every block against the full window, bit-for-bit (atol 0).
+    #[test]
+    fn kvarn_block_fetch_matches_full_window() {
+        let (b, h, d) = (1i32, 2i32, 64i32);
+        let total = 557i32; // 128 + 3*128 + 45
+        let tail_len = 45i32;
+        let n = (b * h * total * d) as usize;
+        let k_data = lcg_data(n, 0xB10C5);
+        let v_data = lcg_data(n, 0xB10C6);
+
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        assert!(
+            cache.supports_block_fetch(),
+            "kvarn8 must support block fetch"
+        );
+        let mk = |data: &[f32]| {
+            ffi::astype(
+                &ffi::from_slice_f32(data, &[b, h, total, d]),
+                dtype::FLOAT16,
+            )
+        };
+        let (k_full, v_full) = cache.update_and_fetch(mk(&k_data), mk(&v_data));
+        assert_eq!(ffi::array_shape(&k_full)[2], total, "full window len");
+
+        // Mixed list: sink (0), tiles (1,3), tail block (4).
+        let blocks = [0i32, 1, 3, 4];
+        let (k_blk, v_blk) = cache.fetch_kvarn8_blocks(&blocks);
+        assert_eq!(
+            ffi::array_shape(&k_blk),
+            vec![b, h, blocks.len() as i32 * KVARN_TILE_TOKENS, d],
+            "compact shape"
+        );
+
+        for (full, compact, name) in [(&k_full, &k_blk, "K"), (&v_full, &v_blk, "V")] {
+            for (i, &blk) in blocks.iter().enumerate() {
+                let src0 = blk * KVARN_TILE_TOKENS;
+                let src1 = (src0 + KVARN_TILE_TOKENS).min(total);
+                let blk_len = src1 - src0; // 128 except the tail block (45)
+                let dst0 = i as i32 * KVARN_TILE_TOKENS;
+                let want = ffi::slice(full, &[0, 0, src0, 0], &[b, h, src1, d]);
+                let got = ffi::slice(compact, &[0, 0, dst0, 0], &[b, h, dst0 + blk_len, d]);
+                let close = ffi::allclose(&got, &want, 0.0, 0.0);
+                ffi::eval(&close);
+                assert!(
+                    ffi::item_bool(&close),
+                    "{name} block {blk}: compact fetch diverges from full window"
+                );
+                // Tail block: the padded region must be EXACTLY zero, so
+                // the caller's position mask is the only thing standing
+                // between padding and attention — same contract as the v1
+                // path's fp16 zero-padding in sparse_decode_attention.
+                if blk_len < KVARN_TILE_TOKENS {
+                    let pad = ffi::slice(
+                        compact,
+                        &[0, 0, dst0 + blk_len, 0],
+                        &[b, h, dst0 + KVARN_TILE_TOKENS, d],
+                    );
+                    let zeros =
+                        ffi::full_f32(&[b, h, KVARN_TILE_TOKENS - blk_len, d], 0.0, dtype::FLOAT16);
+                    let pz = ffi::allclose(&pad, &zeros, 0.0, 0.0);
+                    ffi::eval(&pz);
+                    assert!(ffi::item_bool(&pz), "{name} tail padding must be zero");
+                }
+            }
+        }
+        let _ = tail_len; // geometry documented above
+    }
+
+    /// A tail-less window (total = sink + exact tiles): last_block is the
+    /// final TILE, and requesting one block only must work (top_k=1 shape).
+    #[test]
+    fn kvarn_block_fetch_tailless_and_single() {
+        let (b, h, d) = (1i32, 1i32, 64i32);
+        let total = 384i32; // 128 sink + 2 tiles, no tail
+        let n = (b * h * total * d) as usize;
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        let mk = |data: &[f32]| {
+            ffi::astype(
+                &ffi::from_slice_f32(data, &[b, h, total, d]),
+                dtype::FLOAT16,
+            )
+        };
+        let (k_full, _) = cache.update_and_fetch(mk(&lcg_data(n, 7)), mk(&lcg_data(n, 8)));
+
+        let (k_blk, _) = cache.fetch_kvarn8_blocks(&[2]);
+        let want = ffi::slice(&k_full, &[0, 0, 256, 0], &[b, h, 384, d]);
+        let close = ffi::allclose(&k_blk, &want, 0.0, 0.0);
+        ffi::eval(&close);
+        assert!(ffi::item_bool(&close), "single interior tile fetch");
+    }
+
+    #[test]
+    #[should_panic(expected = "strictly increasing")]
+    fn kvarn_block_fetch_refuses_unsorted() {
+        let (b, h, d) = (1i32, 1i32, 64i32);
+        let total = 384i32;
+        let n = (b * h * total * d) as usize;
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        let mk = |data: &[f32]| {
+            ffi::astype(
+                &ffi::from_slice_f32(data, &[b, h, total, d]),
+                dtype::FLOAT16,
+            )
+        };
+        let _ = cache.update_and_fetch(mk(&lcg_data(n, 9)), mk(&lcg_data(n, 10)));
+        let _ = cache.fetch_kvarn8_blocks(&[2, 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "in-range")]
+    fn kvarn_block_fetch_refuses_out_of_range() {
+        let (b, h, d) = (1i32, 1i32, 64i32);
+        let total = 384i32; // last_block = 2 (no tail)
+        let n = (b * h * total * d) as usize;
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        let mk = |data: &[f32]| {
+            ffi::astype(
+                &ffi::from_slice_f32(data, &[b, h, total, d]),
+                dtype::FLOAT16,
+            )
+        };
+        let _ = cache.update_and_fetch(mk(&lcg_data(n, 11)), mk(&lcg_data(n, 12)));
+        let _ = cache.fetch_kvarn8_blocks(&[0, 3]);
+    }
+
+    /// fp16 caches must report no block-fetch support (the model-side
+    /// dispatch keys on this — a wrong `true` would route fp16 decode into
+    /// a method that panics on missing kvarn state).
+    #[test]
+    fn fp16_cache_does_not_support_block_fetch() {
+        let cache = KVCache::new_with_mode(KVCacheMode::Fp16);
+        assert!(!cache.supports_block_fetch());
+    }
+}
