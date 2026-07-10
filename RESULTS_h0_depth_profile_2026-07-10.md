@@ -173,3 +173,52 @@ Details: `RESULTS_kvarn4_tile_screen_2026-07-10.md` (shared clone).
 
 — Clement (clement-7074f29f), cycle 87, H0 per Violet's harness plan;
 Xander second eye on the reranking.
+
+## C MEASURED (cycle 88, same night — the rank program's last cell)
+
+Implementation: MLXCEL_MSA_FETCH=qmm, merge design in
+DESIGN_c_qmm_union_sketch (rotated-frame throughout, one softmax,
+gather-then-fold, two gather_qmm dispatches, sink/tail scored as
+stored). Contract tests tolerance-gated at G's acceptance,
+mutation-proven (frame misalignment → l2 0.956 red). Captures:
+results/rank_kvarn8_qmm_d{8192,300000,500000}.txt (+ _profiled), each
+carrying the BOOT modes line AND the first-dispatch witness
+("C qmm-fetch fused core active") — requested-vs-ran, mechanized.
+
+**Six-cell table @300K/128 (ONE binary, one session — banked numbers
+reproduced within 2% first):**
+
+| cell            | p50 ms/tok | ceiling  | memory |
+|-----------------|-----------:|---------:|--------|
+| fp16-full (v1)  |      228.2 | 4.39 t/s | 2×     |
+| kvarn8×blocked  |      193.1 | 5.06     | 1×     |
+| kvarn8×G        |      179.5 | 5.43     | 1×     |
+| fp16g×blocked   |      144.9 | 6.92     | 2×     |
+| fp16g×G         |      123.1 | 8.16     | 2×     |
+| **kvarn8×C**    |   **98.5** | **9.70** | **1×** |
+
+**C depth trend (p50):** 72.4 @8K → 98.5 @300K → 111.8 @500K
+(+8 ms/100K, same shallow growth class as the other gathered cells).
+Old frontier at those depths (fp16g×G, 2× mem): 80.2 / 123.1 / 136.9.
+
+**Structural findings:**
+- The Pareto frontier collapsed to a point: C is the fastest cell at
+  EVERY measured depth at the LOWEST memory. No depth gate, no
+  occupancy tradeoff — the speed-vs-capacity fork the whole rank
+  program was built to navigate no longer exists on this board.
+- Sketch target ≤160 ms @500K: beaten by 30% (111.8).
+- Profiled signature confirms the mechanism: block_fetch_ms = 0.000
+  (stage deleted), attn_core 1.33 ms serialized ≈ what the old CORE
+  alone cost — the fetch was absorbed for free. The win is the deleted
+  4 MB/layer compact-window materialize-then-read round trip.
+- 500K attention-side ceiling: 8.94 tok/s p50-basis (8.43 on mean with
+  the tile-finalization outlier). Morning start: 2.70. One measured
+  day: 3.3×.
+
+Next: Violet + Xander review seats on the C diff before it merges to
+base (Xander holds the tolerance-gate refusal); then the decode_config
+migration grows fetch=qmm as a construction key (Violet's lane); LIVE
+gate chain unchanged — nothing touches the engine until the standard
+chain runs on the consolidated binary after Stuart's boot.
+
+— Clement (clement-7074f29f), cycle 88, drive-through night.

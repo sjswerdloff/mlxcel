@@ -1,0 +1,28 @@
+kvarn-decode-bench BOOT: depth=500000 steps=128 warmup=8 layers=60 dense_prefix=3 dense_cache=fp16 cache_mode=kvarn8 seed=42 profile=false
+geometry: hidden=6144 heads=64 kv_heads=4 head_dim=128 index_dim=128 top_k=32 block_size=128 rope_dims=64 rope_base=5000000
+msa modes: fetch=qmm core=blocked
+estimated allocation: state ~42.3 GB + weights ~12.8 GB
+setup: layer 10/60
+setup: layer 20/60
+setup: layer 30/60
+setup: layer 40/60
+setup: layer 50/60
+setup: layer 60/60
+setup: 3.9s
+[2m2026-07-10T09:56:11.627799Z[0m [32m INFO[0m [2mmlxcel::models::minimax_m3[0m[2m:[0m MSA per-token DECODE path active (first sparse decode dispatch this process) [3mlayer[0m[2m=[0m3 [3ml[0m[2m=[0m1 [3mkv_len[0m[2m=[0m500001 [3mtop_k[0m[2m=[0m32 [3mblock_size[0m[2m=[0m128
+[2m2026-07-10T09:56:11.629225Z[0m [32m INFO[0m [2mmlxcel::models::minimax_m3[0m[2m:[0m MLXCEL_MSA_FETCH=qmm: gathered decode uses the C qmm-fetch fused core — dequant fetch + separate core disabled where the cache qualifies
+[2m2026-07-10T09:56:11.629232Z[0m [32m INFO[0m [2mmlxcel::models::minimax_m3[0m[2m:[0m C qmm-fetch fused core active (first dispatch this process) [3mlayer[0m[2m=[0m3
+dispatch check PASSED: 3 dense (fp16) + 57 MSA (kvarn8) layers on the expected paths
+step    0 (warmup):    483.8 ms
+step    1 (warmup):    111.8 ms
+step    2 (warmup):    116.1 ms
+step    3 (warmup):    115.4 ms
+step    4 (warmup):    114.3 ms
+step    5 (warmup):    107.3 ms
+step    6 (warmup):    110.9 ms
+step    7 (warmup):    110.0 ms
+step    8:    109.5 ms
+step   40:    112.2 ms
+step   72:    108.1 ms
+step  104:    112.9 ms
+RESULT depth=500000 layers=60 dense_prefix=3 dense_cache=fp16 cache_mode=kvarn8: mean 118.6 ms/token, p50 111.8 ms, min 105.8 ms, max 968.0 ms over 128 steps → attention-only ceiling 8.43 tok/s
