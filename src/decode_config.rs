@@ -52,7 +52,7 @@
 //! exactly the state this module exists to preserve.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -117,13 +117,18 @@ pub struct Store {
     /// Hot-path mirror of `inner.path == V1`. The dispatch site reads ONLY
     /// this, one relaxed load per attention forward.
     gather_disabled: AtomicBool,
-    version: AtomicU64,
     config_file: Option<PathBuf>,
 }
 
 struct Inner {
     path: KvarnDecodePath,
     source: String,
+    /// Lives INSIDE the lock, on purpose (Clement's H2 review): path and
+    /// version must move together, or a snapshot racing an apply could echo
+    /// (new path, old version) — two different configs sharing a version
+    /// number, which is precisely the mis-attribution the echo surfaces
+    /// exist to make impossible.
+    version: u64,
 }
 
 impl Store {
@@ -132,9 +137,9 @@ impl Store {
             inner: RwLock::new(Inner {
                 path: KvarnDecodePath::Auto,
                 source: "default".to_string(),
+                version: 0,
             }),
             gather_disabled: AtomicBool::new(false),
-            version: AtomicU64::new(0),
             config_file,
         }
     }
@@ -148,7 +153,7 @@ impl Store {
         let inner = self.inner.read().expect("decode_config lock poisoned");
         EffectiveConfig {
             kvarn_decode_path: inner.path,
-            version: self.version.load(Ordering::Relaxed),
+            version: inner.version,
             source: inner.source.clone(),
             config_file: self.config_file.clone(),
         }
@@ -156,18 +161,33 @@ impl Store {
 
     /// Apply a new path. Bumps the version, updates the hot-path mirror, and
     /// logs the effective config (the fail-loud echo).
+    ///
+    /// Invariant: (path, version, source) update atomically under the write
+    /// lock and are only ever read together under the read lock, so every
+    /// snapshot — hence every response-header echo — is a pair some apply
+    /// produced (or the (auto, 0) default). Sequenced probes get perfect
+    /// attribution; a response already in flight when apply lands is
+    /// ambiguous by nature, which the harness handles by switching paths
+    /// between generation segments, never during one.
     pub fn apply(&self, path: KvarnDecodePath, source: &str) -> EffectiveConfig {
-        {
+        let snap = {
             let mut inner = self.inner.write().expect("decode_config lock poisoned");
             inner.path = path;
             inner.source = source.to_string();
-        }
-        // Mirror updated after inner so a concurrent snapshot can never show
-        // a version/path pair older than what the dispatch site enforces.
+            inner.version += 1;
+            EffectiveConfig {
+                kvarn_decode_path: inner.path,
+                version: inner.version,
+                source: inner.source.clone(),
+                config_file: self.config_file.clone(),
+            }
+        };
+        // The mirror only gates dispatch behavior (never attribution), so a
+        // relaxed store after the lock is fine: the echo reads the locked
+        // state, and mid-apply dispatch ambiguity is the documented
+        // in-flight case above.
         self.gather_disabled
             .store(path == KvarnDecodePath::V1, Ordering::Relaxed);
-        self.version.fetch_add(1, Ordering::Relaxed);
-        let snap = self.snapshot();
         tracing::info!(
             "decode_config applied: kvarn_decode_path={} version={} source={}",
             snap.kvarn_decode_path,
@@ -247,26 +267,39 @@ pub fn init_and_watch() {
             );
         }
         #[cfg(unix)]
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async {
-                let Ok(mut hup) =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                else {
-                    tracing::warn!("decode_config: could not install SIGHUP handler");
-                    return;
-                };
-                loop {
-                    hup.recv().await;
-                    match global().reload_from_file("sighup") {
-                        Ok(snap) => tracing::info!(
-                            "decode_config SIGHUP reload: kvarn_decode_path={} version={}",
-                            snap.kvarn_decode_path,
-                            snap.version
-                        ),
-                        Err(e) => tracing::warn!("decode_config SIGHUP reload failed: {e}"),
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async {
+                    let Ok(mut hup) =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                    else {
+                        tracing::warn!("decode_config: could not install SIGHUP handler");
+                        return;
+                    };
+                    tracing::info!("decode_config: SIGHUP watcher installed");
+                    loop {
+                        hup.recv().await;
+                        match global().reload_from_file("sighup") {
+                            Ok(snap) => tracing::info!(
+                                "decode_config SIGHUP reload: kvarn_decode_path={} version={}",
+                                snap.kvarn_decode_path,
+                                snap.version
+                            ),
+                            Err(e) => tracing::warn!("decode_config SIGHUP reload failed: {e}"),
+                        }
                     }
-                }
-            });
+                });
+            }
+            Err(_) => {
+                // Installation is once-per-process: a first call from a bare
+                // (non-runtime) context permanently forgoes SIGHUP reload, so
+                // say so out loud rather than degrading silently (Clement's
+                // H2 review). The admin endpoint remains fully functional.
+                tracing::warn!(
+                    "decode_config: no tokio runtime at init — SIGHUP reload unavailable \
+                     for this process (admin endpoint unaffected)"
+                );
+            }
         }
     });
 }
@@ -354,5 +387,58 @@ mod tests {
         let s = Store::new(None);
         let err = s.reload_from_file("sighup").unwrap_err();
         assert!(err.contains("MLXCEL_DECODE_CONFIG"));
+    }
+
+    /// Clement's H2 review regression: a snapshot racing an apply must never
+    /// observe a torn (path, version) pair — every echoed pair has to be one
+    /// some apply produced (or the (auto, 0) default). Red on the
+    /// version-outside-the-lock implementation; green with version inside.
+    #[test]
+    fn snapshot_never_observes_a_torn_path_version_pair() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool as StopFlag;
+
+        let s = Arc::new(Store::new(None));
+        let stop = Arc::new(StopFlag::new(false));
+        const APPLIES: u64 = 500;
+
+        let reader = {
+            let s = Arc::clone(&s);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let snap = s.snapshot();
+                    seen.push((snap.kvarn_decode_path, snap.version));
+                }
+                seen
+            })
+        };
+
+        // Alternate paths so every version has exactly one valid partner:
+        // odd versions are V1, even are Auto (version 0 = default Auto).
+        for i in 1..=APPLIES {
+            let expect = if i % 2 == 1 {
+                KvarnDecodePath::V1
+            } else {
+                KvarnDecodePath::Auto
+            };
+            let snap = s.apply(expect, "test");
+            assert_eq!((snap.kvarn_decode_path, snap.version), (expect, i));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let seen = reader.join().expect("reader thread");
+
+        for (path, version) in seen {
+            let valid = if version % 2 == 1 {
+                KvarnDecodePath::V1
+            } else {
+                KvarnDecodePath::Auto
+            };
+            assert_eq!(
+                path, valid,
+                "torn pair echoed: version {version} paired with {path}"
+            );
+        }
     }
 }
