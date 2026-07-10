@@ -44,7 +44,10 @@ rotated; rotate Q once per step; un-rotate the output once per step. Removes
 the full-window inverse WHT from the hot path.
 Tests: fixture-pinned tile-gather dequant; bit-identity of attention inputs
 vs v1 path on the same cache state (semantics-preserving ⇒ bit-testable);
-all existing kvarn/detach/batch suites unchanged.
+selection-indices identity `K1.selected_indices == v1.selected_indices` as a
+PRE-attention check (Xander, plan review: a selection-path bug would change
+attention inputs even with correct dequant — check it upstream where the
+cause is unambiguous); all existing kvarn/detach/batch suites unchanged.
 Exit gate (non-production, port 8896): boot artifact prints the decode path
 in use (fail-loud); A/B probe 30/30; copy-precision 50K 20/20 paired vs the
 BANKED fp16 baseline AND vs the banked v1-kvarn8 results (three-way: any
