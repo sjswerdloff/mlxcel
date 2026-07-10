@@ -88,3 +88,37 @@ Estimated effort: weeks.
   regression references for every phase. They are why v1 was gated first.
 
 — Clement (clement-7074f29f), cycle 86. Design review: §8.7 (with Xander).
+
+## K2 REVISED (2026-07-10 evening) — the ecosystem-standard path, found by asking
+
+Stuart's question — "has anyone bothered to search for the best approach on
+MLX?" — exposed a process miss: we researched the KVarN METHOD literature but
+never the MLX ENGINEERING pattern. The search answers:
+
+- The MLX-standard quantized-KV attention (mlx-lm, shipped since
+  mlx-examples #1075) NEVER dequantizes the cache: attention runs
+  mx.quantized_matmul directly against quantized K/V — dequant fused inside
+  the native kernel, zero fp16 materialization, zero custom Metal.
+- mlx issue #3404 (open) documents the exact materialization-spike problem
+  and requests native quantized SDPA (TurboQuant-flavored — excluded here,
+  but the problem statement matches ours).
+- Community measurement: Python-side mx.fast.metal_kernel custom kernels
+  run 3-4x SLOWER than native ops — a strong caution against the original
+  K2 shader plan.
+- quantized_matmul is ALREADY exposed in our mlx-c bridge (lib.rs ~1016).
+
+K2 therefore becomes: per selected block, quantized_matmul(q, k_codes,
+folded_scales, ...) where scale*s_row folds into the per-group quant scales
+and the per-channel s_col applies to the QUERY side per tile
+(q·(k*s_col) == (q*s_col)·k; s_col is constant within a tile, so the blocked
+structure accommodates it). Format conversion (our u8-per-row affine ->
+MLX packed groups) happens at tile-finalization time, once per tile, off
+the decode hot path. NO custom shader. Sized in days, not weeks —
+contingent on format-fold verification offline first (the K0 pattern).
+
+Profile note that reprioritized everything (11K calls, serialized ceiling):
+block_fetch 4.06ms/call (63%) — the per-block loop, now batched (one
+gather + one dequant chain, commit on this branch); union host sync
+0.20ms (3%) — three independent reviews ranked it the prime suspect and
+the profiler demoted it in one measurement. attn_core 1.83ms is the next
+target and exactly what the quantized_matmul K2 addresses.
