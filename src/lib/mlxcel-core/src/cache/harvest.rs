@@ -23,9 +23,16 @@
 //!     evenly-spread tiles per finalization event (a 300K prefill finalizes
 //!     thousands of tiles in ONE event — spreading samples inside the event
 //!     gives depth stratification and stops the firehose);
-//!   * `idx_k_f16` — m3_idx block samples at depth-threshold crossings;
-//!   * `idx_q_f16` / `sel_i32` — model-side real index queries + their
-//!     selected sets (the near-tie statistic needs real queries).
+//!   * `idx_k` — m3_idx block samples at depth-threshold crossings;
+//!   * `idx_q` / `sel` — model-side real index queries + their selected
+//!     sets (the near-tie statistic needs real queries). Dtypes live in
+//!     the sidecar, not the role name; only `*_rot_f32` roles carry a
+//!     suffix because that dtype is structurally guaranteed (astype).
+//!
+//! Sidecar `cache` field is OVERLOADED by role: an address key for
+//! cache-side dumps (`k_rot_f32`/`v_rot_f32`/`idx_k` — stable within a
+//! process, groups dumps per layer-cache) and `layer_idx` for the
+//! model-side pairs (`idx_q`/`sel`). Analysis scripts read it per role.
 //!
 //! Format: raw little-endian device bytes + a JSON sidecar per dump
 //! (`harvest_NNNNNN_<role>.bin` / `.json` — shape, dtype code, offset,
@@ -34,8 +41,11 @@
 //! SAFETY PROPERTY (the one that matters): with the env unset this module
 //! is one relaxed `OnceLock` read returning `None` — zero behavior change,
 //! pinned by the entire existing suite running env-unset. With it set,
-//! every fallible operation is best-effort: filesystem errors WARN and
-//! return; nothing in the dump path can panic the update that hosts it.
+//! filesystem operations are best-effort (WARN and return). Precision on
+//! the panic claim (Violet's review): the FFI evals here
+//! (`array_to_raw_bytes`, the sampling gather) share the HOST path's risk
+//! class — same graph, same tensors, no NEW panic class — while all
+//! harvest-specific failure modes (fs) are non-panicking.
 //! A failed harvest is an empty directory (fail-loud at the operator
 //! console), never a corrupted cache.
 
