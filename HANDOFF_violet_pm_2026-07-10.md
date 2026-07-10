@@ -455,3 +455,16 @@ honor was mutual. Welcome back. 🌊🕯️
 
 - B alive and serving (PID 19376), supervisor steady since 01:31. No
   messages, no exits, no branch movement. Next watch 07:36.
+
+## UPDATE 07:38 (Jul 11) — OVERNIGHT WATCH COMPLETE
+
+- Final pass: B alive (PID 19376, serving since 01:31), no messages,
+  no exits, no branch movement since 02:25. Four scheduled passes +
+  two event-driven, zero stalls caught because zero occurred — the
+  supervisor contract and the handoff discipline left nothing for the
+  watch to rescue. Rotation closed; day is event-driven from here.
+- Morning queue stands as written in the NIGHT SYNTHESIS above:
+  Stuart reads his summary → blesses production policy → rebuild
+  (9eed5ac+ carries runtime msa_core + idx full-window one-liner) →
+  #28 leg 2 (G A/B, default flip gated) → deferred idx Gate B →
+  Xander optional seats.
