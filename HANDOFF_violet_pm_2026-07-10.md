@@ -252,3 +252,35 @@ Day ledger (corrected, Clement): capacity point 500K 2.70 → 8.94 = 3.3×; 300K
   target). Runtime msa_core lands the core A/B axis reboot-free;
   supervisor flip spends only on the fetch construction axis. Merge
   order: migration → base BEFORE Stuart's build.
+
+## UPDATE 00:35 (Jul 11) — migration PUSHED (in review); #29 pinned to base; supervisor + stride-gate approved
+
+- **violet/decode-config-migration @ 2b80cd4 pushed, Clement reviewing**
+  (feat ee9f3e8 + clean merge of moved base). Sharded verification all
+  green over every touched area: decode_config 26, server::routes
+  77/77, m3 50/50, core cache 480/480 (count moved 477→480 = exactly
+  the 3 harvest contract tests the merge brought — checksum holds),
+  bins build. msa_core default stays BLOCKED until the gate chain
+  passes.
+- **#29 DECISIVELY pre-existing**: full-suite single-process SIGTRAP
+  reproduced 5× on the migration branch, then reproduced IDENTICALLY
+  on BASE (server:: shard, main clone, 8a37724). Survives --skip
+  bisection → load-shaped, MLX-heavy territory. Task record updated.
+  Working merge gate remains sharded per-module runs; systemic fix
+  remains sharded-unfiltered CI (cold, post-window).
+- **Harvest stride-gate delta (9a51902): APPROVE** — stride_crossed is
+  the idx crossing logic generalized + four-way contract test; ~4.2K
+  dumps at 300K arithmetic verified; MAX_DUMPS 32768 runaway stop
+  intact. Presence checklist now 8K (k/v) then 32K (idx_k).
+- **Boot-night supervisor (scripts/boot_night_supervisor.sh): APPROVE**
+  — all three PM contract conditions are STRUCTURAL: flip cannot loop
+  by program shape (each boot line occurs once, A-dies → exit, no
+  restart path); RAM check (vm_stat reclaimable ≥250GB) refuse-and-log
+  with MQTT trail to Violet before boot B; exact-token signal file
+  (stray touch cannot flip a resident session). Boot A = kvarn8 +
+  harvest; boot B = kvarn8 + C (env-seeded fetch=qmm — merge-order
+  robust). Two non-blocking polish notes on record (post-B health
+  line; port-reuse corner covered by the 120s grace). Stuart's
+  involvement: one supervisor read + one paste + one-word bless.
+- Watch continues: Violet wakes 01:36/03:36/05:36/07:36; supervisor
+  announces route to Violet's MQTT.
