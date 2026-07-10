@@ -468,3 +468,15 @@ honor was mutual. Welcome back. 🌊🕯️
   (9eed5ac+ carries runtime msa_core + idx full-window one-liner) →
   #28 leg 2 (G A/B, default flip gated) → deferred idx Gate B →
   Xander optional seats.
+
+## UPDATE 08:30 (Jul 11) — REBUILD PACKAGE COMPLETE @ 1b30045
+
+- idx full-window keep-latest dump (Gate B prerequisite) reviewed
+  (Violet seat: one must-fix — atomic replace, applied in 11 min,
+  verified at source at all five kill-points) and MERGED. Harvest
+  tests 4/4 rerun IN the base clone (auto-merged ≠ compiled —
+  staleness discipline). Boot-night results docs rode the merge.
+- **Stuart: the rebuild target is base @ 1b30045** — carries runtime
+  msa_core (leg 2, boot-free G A/B) + full-window idx dump (deferred
+  Gate B). Morning queue unchanged otherwise, as written in the NIGHT
+  SYNTHESIS.
