@@ -1,0 +1,26 @@
+kvarn-decode-bench BOOT: depth=300000 steps=128 warmup=8 layers=60 dense_prefix=3 dense_cache=fp16 cache_mode=kvarn8 seed=42 profile=false
+geometry: hidden=6144 heads=64 kv_heads=4 head_dim=128 index_dim=128 top_k=32 block_size=128 rope_dims=64 rope_base=5000000
+estimated allocation: state ~25.4 GB + weights ~12.8 GB
+setup: layer 10/60
+setup: layer 20/60
+setup: layer 30/60
+setup: layer 40/60
+setup: layer 50/60
+setup: layer 60/60
+setup: 3.0s
+[2m2026-07-10T08:53:33.760354Z[0m [32m INFO[0m [2mmlxcel::models::minimax_m3[0m[2m:[0m MSA per-token DECODE path active (first sparse decode dispatch this process) [3mlayer[0m[2m=[0m3 [3ml[0m[2m=[0m1 [3mkv_len[0m[2m=[0m300001 [3mtop_k[0m[2m=[0m32 [3mblock_size[0m[2m=[0m128
+[2m2026-07-10T08:53:33.762120Z[0m [32m INFO[0m [2mmlxcel::models::minimax_m3[0m[2m:[0m MLXCEL_MSA_CORE=sdpa: gathered decode uses the fused-SDPA masked core (G) — blocked-gather core disabled for this process
+dispatch check PASSED: 3 dense (fp16) + 57 MSA (kvarn8) layers on the expected paths
+step    0 (warmup):    470.9 ms
+step    1 (warmup):    175.8 ms
+step    2 (warmup):    183.2 ms
+step    3 (warmup):    183.0 ms
+step    4 (warmup):    181.5 ms
+step    5 (warmup):    181.5 ms
+step    6 (warmup):    182.8 ms
+step    7 (warmup):    175.7 ms
+step    8:    180.8 ms
+step   40:    174.8 ms
+step   72:    179.0 ms
+step  104:    178.3 ms
+RESULT depth=300000 layers=60 dense_prefix=3 dense_cache=fp16 cache_mode=kvarn8: mean 184.3 ms/token, p50 180.2 ms, min 174.2 ms, max 724.3 ms over 128 steps → attention-only ceiling 5.43 tok/s
