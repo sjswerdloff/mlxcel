@@ -63,9 +63,21 @@ use crate::ffi::{self, MlxArray};
 pub const TILES_PER_EVENT: i32 = 8;
 /// Runaway stop across the whole process (not a target; a full harvest
 /// session lands well under it).
-const MAX_DUMPS: u64 = 8192;
+const MAX_DUMPS: u64 = 32_768;
 /// m3_idx snapshot cadence in absolute positions.
 pub const IDX_STRIDE: i32 = 32_768;
+/// K/V tile-dump cadence in absolute positions. Chunked prefill finalizes
+/// tiles PER CHUNK (a 300K prefill at 2048 = ~146 events × 57 layers × 2
+/// roles) — dumping every event floods the budget by mid-depth and starves
+/// the DEEP strata, exactly the depth-drift coverage the spec's clause (e)
+/// exists for. Stride-gating keeps coverage EVEN across depth.
+pub const KV_STRIDE: i32 = 8_192;
+
+/// True when `old..new` crosses a multiple of `stride` — the shared
+/// depth-cadence test for K/V and idx dumps.
+pub fn stride_crossed(old: i32, new: i32, stride: i32) -> bool {
+    old / stride != new / stride
+}
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -159,6 +171,14 @@ pub fn dump_tiles(role: &str, cache_key: usize, offset: i32, batch: &MlxArray) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stride_crossed_contract() {
+        assert!(stride_crossed(8191, 8192, 8192), "exact boundary fires");
+        assert!(stride_crossed(7000, 9000, 8192), "spanning crossing fires");
+        assert!(!stride_crossed(8192, 9000, 8192), "within one stripe is quiet");
+        assert!(stride_crossed(0, 40_000, 8192), "large first event fires");
+    }
 
     #[test]
     fn spread_indices_contract() {

@@ -1067,7 +1067,13 @@ impl KVCache {
             // sampled dump of EXACTLY the tile batches quantize receives,
             // before quantization touches them. One relaxed read when
             // unset; best-effort when set — cannot disturb the update.
-            if crate::cache::harvest::harvest_dir().is_some() {
+            if crate::cache::harvest::harvest_dir().is_some()
+                && crate::cache::harvest::stride_crossed(
+                    self.offset,
+                    self.offset + full_len,
+                    crate::cache::harvest::KV_STRIDE,
+                )
+            {
                 let key = self as *const _ as usize;
                 crate::cache::harvest::dump_tiles(
                     "k_rot_f32",
@@ -4730,8 +4736,11 @@ impl KVCache {
         // (SPEC_kvarn4_realtile_harvest amendment 1). One relaxed read when
         // unset; best-effort when set.
         if crate::cache::harvest::harvest_dir().is_some()
-            && fill / crate::cache::harvest::IDX_STRIDE
-                != needed / crate::cache::harvest::IDX_STRIDE
+            && crate::cache::harvest::stride_crossed(
+                fill,
+                needed,
+                crate::cache::harvest::IDX_STRIDE,
+            )
         {
             use crate::cache::kvarn::KVARN_TILE_TOKENS;
             let full = self.m3_idx_k.as_ref().unwrap();
