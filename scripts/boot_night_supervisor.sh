@@ -34,4 +34,6 @@ G=$(avail_gb); say "RAM check: ${G}GB available (need 250)"
 create_message.sh violet-14057653 "SUPERVISOR: flip verified, RAM ${G}GB OK — booting B (kvarn8+C)." || true
 say "BOOT B (kvarn8 + C via MLXCEL_MSA_FETCH=qmm): log $LOG.b, pidfile $LOG.b.pid"
 (cd "$DIR" && MLXCEL_MSA_FETCH=qmm exec ./mlxcel-server "${ARGS[@]}" >"$LOG.b" 2>&1) & B=$!
-echo "$B" >"$LOG.b.pid"; say "flip spent — no further restarts possible; waiting on B"; wait "$B"
+echo "$B" >"$LOG.b.pid"; say "flip spent — no further restarts possible"
+sleep 30; kill -0 "$B" 2>/dev/null || { say "B DIED within 30s of boot"; create_message.sh violet-14057653 "SUPERVISOR: boot B died within 30s — no restart (contract); morning plan applies." || true; exit 3; }
+say "B healthy at +30s; supervisor waiting on B"; wait "$B"
