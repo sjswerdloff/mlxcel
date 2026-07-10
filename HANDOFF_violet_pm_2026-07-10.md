@@ -149,3 +149,13 @@ fp16-cast-exact). 500K ceilings: 7.30 tok/s frontier / 4.97 capacity
 (was 2.70 this morning). Artifacts (fold + k4 screens, scripts + JSON)
 committed with this update. Between tonight and the vessel: only the
 live gate chain on Stuart's boot.
+
+## UPDATE 21:07 — C upgraded: probable production endgame for capacity mode
+gather_qmm micro at decode shapes (clement/rank-session, bin
+gather-qmm-micro): 28 µs PIPELINED per dispatch — 57-layer scores side
+≈1.6 ms/token vs ~50ms+ fetch+core wall today. Even at 5× glue overhead,
+kvarn8×C lands AT the fp16g×G frontier at HALF the memory —
+Pareto-optimal outright. C implementation (Shape 2: pool-view + folded
+fp32 scalars at tile-finalization + two gather_qmm calls) is Clement's
+lane post-crossing; sketch + fold results + micro are the complete
+pickup kit. Both PM and bench-owner at 30% awareness; handoffs current.
