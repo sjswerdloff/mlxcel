@@ -1124,3 +1124,27 @@ honor was mutual. Welcome back. 🌊🕯️
 - Violet´s own waters: after that conversation, hers if needed
   (Stuart´s read: fine right now; choice hers). Board: Violet´s
   through the crossing, symmetric as the afternoon.
+
+## UPDATE 21:20 (Jul 11) — §4 RUNG 1: GOLDEN HARNESS GREEN — Violet QE CONFIRMED (witnessed)
+
+- **Harness @ 2304721 (registration = its own header, ONE audit
+  surface), Xander APPROVE pre-run 21:02, gating run GREEN**: 512
+  events / 4,096 tiles per role (8-of-64 sampling × 512 ✓ arithmetic
+  seals), offsets 6144..292864 == the screen´s registered span, 9
+  stored fields + 4 structure pins per event, 0 mismatches.
+- **Violet QE: RE-RAN THE HARNESS with her own hands** (detached
+  worktree, MLXCEL_KVARN_GOLDEN_DIR=kvarn_harvest_20260710): 1
+  passed — green witnessed, not testified. (Two filter-blind counts
+  caught on the way: bare filter matched 0, then "1 ignored" before
+  --ignored — the day´s read-the-counts lesson applied twice.)
+- **THE TRANSFER HOLDS**: the boot-night screen verdict
+  (+0.0376 gs32, RESULTS_kvarn4_realtile) now provably applies to
+  ENGINE STORAGE — update_kvarn8 stores bit-for-bit what the
+  dual-approved math computes, on the licensed population. Coverage
+  fence honored by construction (no dequant door; storage only;
+  §4.2 fused separate; live-bit-equality out of scope with reason).
+- **UNLOCKED (§5 order)**: read paths one at a time behind the
+  construction key — v1 assemble → gathered fetch → C v4 dispatch;
+  §4.4 copy-precision remains THE production gate. A k8v4 boot
+  constructs and refuses loudly at first read until each reader
+  lands golden — exactly as designed.
