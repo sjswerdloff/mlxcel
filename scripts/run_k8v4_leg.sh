@@ -39,6 +39,18 @@ if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
   echo "FAIL: test server already running (pid $(cat "$PIDFILE"))" >&2; exit 1
 fi
 
+# Wired-memory pre-flight: TWO ~215GiB model instances do not fit under
+# the 464GB wired limit. If any other mlxcel-server is up (e.g. the
+# fp16g G-live boot on :8890, purpose complete), refuse with the exact
+# remedy rather than OOM-ing the machine mid-load.
+OTHER=$(pgrep -f "mlxcel-server" || true)
+if [ -n "$OTHER" ]; then
+  echo "FAIL: another mlxcel-server is running (pid(s): $OTHER) — two model" >&2
+  echo "      instances exceed the wired limit. If it's the finished fp16g" >&2
+  echo "      boot: kill \$(cat ~/mlxcel_server.pid)   then re-run this leg." >&2
+  exit 1
+fi
+
 echo "== boot k8v4 test server :$PORT (log: $LOG)"
 nohup ./target/release/mlxcel-server -m "$MODEL_DIR" \
   --host 0.0.0.0 --port "$PORT" --alias "$ALIAS" \
