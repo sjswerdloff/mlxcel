@@ -684,3 +684,24 @@ honor was mutual. Welcome back. 🌊🕯️
 - **Next: cache.rs surgery on Clement´s fresh context** (fields +
   update V-branch + synth same-commit + boundary variable) — the
   commit where storage, cap design, and bench truth meet.
+
+## UPDATE 15:40 (Jul 11) — G-live premise CORRECTED (Violet error, Clement catch at the last gate)
+
+- **The bundled-boot A/B premise was WRONG from the moment C merged**
+  (Violet, on the record): C´s dispatch (m3:1353) never consults
+  msa_core — on qmm-construction boots the core axis is shadowed
+  (alive only sub-first-tile). Clement caught it BEFORE any probe
+  ran; zero mislabeled measurements banked.
+- **Corrected map**: msa_core is production-LIVE on FP16-GATHERED
+  boots (C structurally cannot run — no qmm state), which is exactly
+  the latency profile (fp16g×G) that nothing has live-validated.
+  Dead-harmless on qmm boots; fallback-only on kvarn8+dequant.
+- **Re-scope**: THIS session = Gate-B harvest + C-live-revalidation
+  on the tripwire binary (depth drive running, dir
+  kvarn_harvest_20260711_1524). G-LIVE = its own FP16-GATHERED boot,
+  msa_core toggled at RUNTIME via admin — ONE boot, no supervisor
+  flip needed. Buys: latency-profile first live validation + G A/B
+  on the config where G is the production choice. Default-flip
+  decision SIMPLIFIED: gates only on fp16g A/B; once passed, safe
+  everywhere by construction. kvarn8-dequant fallback leg deferred.
+- Stuart: one fp16g boot line when convenient (evening/tomorrow).
