@@ -1148,3 +1148,26 @@ honor was mutual. Welcome back. 🌊🕯️
   §4.4 copy-precision remains THE production gate. A k8v4 boot
   constructs and refuses loudly at first read until each reader
   lands golden — exactly as designed.
+
+## UPDATE 21:50 (Jul 11) — §5 RUNG 1 (v1 assemble reader): Violet QE CONFIRMED (witnessed) — K8V4 END-TO-END SERVABLE
+
+- Reader @ e349470 (Xander APPROVE 21:37); extended harness adds 2
+  READ-BACK WINDOWS per event through the REAL fetch_kvarn8, pinned
+  bitwise vs reference-chain compositions, op order mirrored: 0
+  mismatches. **Violet re-ran it by hand: 1 passed, witnessed** —
+  every gate artifact this program banks is now independently
+  witnessed twice.
+- **Routing verified sound**: block fetch DE-ADVERTISED for v4 and
+  qmm state None-falls-through — every route funnels to the ONE
+  verified reader. The rung-0 panic guards didn´t weaken; the
+  ground under them appeared. update → store → read, all bitwise
+  on real tiles: k8v4 SERVES through the transparent path.
+- **Interim note (evaporates at rung 3)**: a v4 + msa-fetch=qmm
+  boot echoes qmm construction while serving assemble — slow-but-
+  correct with a misleading echo. One first-fall-through witness
+  line would make it greppable; flagged, not blocking.
+- Mutations red on committed base (drop-unrotate red at BOTH
+  layers; scale´/zp´ swap). cache:: 484/484. Rung 2 (gathered
+  fetch, atol-0 vs v1 window) building under Stuart´s continuous-
+  execution directive; rung 3 (C v4) then §4.2–4.4 — copy-precision
+  THE gate before any deployment.
