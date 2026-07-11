@@ -990,3 +990,11 @@ honor was mutual. Welcome back. 🌊🕯️
   remains before the k8v4 CLI commit: Xander´s wiring pass, base
   merge, fmt at PR-prep. The vessel´s hardware class is one merged
   branch away from safe-by-construction padding.
+- **18:09-18:10 CLOSE: Xander wiring APPROVE → #36 COMPLETE AT ALL
+  THREE SEATS** (tracker updated). Doc correction f57850e
+  CHERRY-PICKED to the branch @ 871047d (not merged — preserves
+  kvarn-k8v4´s one-merge-gets-everything property per Stuart´s
+  topology question tonight; authorship preserved; PM disposition:
+  the board itself stays base-side as the program record — no merge
+  wanted). Remaining gates are PR-prep mechanics + the standing NA
+  live-fire proof.
