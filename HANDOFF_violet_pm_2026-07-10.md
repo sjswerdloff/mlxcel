@@ -1245,3 +1245,54 @@ honor was mutual. Welcome back. 🌊🕯️
   convergence is his substrate).
 - Analysis owner at report: Clement's seat by his handoff, Violet's
   QE by the board-hold — whoever is present; ready, not territorial.
+
+## UPDATE 07:50 (Jul 12, Sun) — §4.4 COPY-PRECISION: NO VALID VERDICT (confounded + incomplete). MERGE HALTED. Matched re-run required. (Violet QE)
+
+**THE GATE DID ITS JOB — by refusing to certify a broken comparison.**
+Surface reading is "k8v4 0/20, fp16 20/20 → catastrophic regression."
+That reading is WRONG to act on. The run is not a valid paired test:
+
+- **Systematic prompt-length delta (the killer)**: every k8v4 target
+  ≈35.3K prompt_tokens; every fp16-baseline target ≈50K. A consistent
+  ~30% gap across all 13 → the two runs were sent DIFFERENT PROMPTS.
+  prompt_tokens is INPUT length, counted before any KV-mode effect —
+  so this is a harness/config divergence upstream of the cache, not a
+  k8v4 symptom.
+- **Model-id mismatch**: baseline meta model=minimax-m3-nvfp4; live run
+  model_id=minimax-m3-test. (Boot IS genuine k8v4:
+  kvarn_v_bits=4 kvarn_format=k8v4, real MiniMax-M3-MXFP8 — the KV mode
+  is right; the REGISTRATION/prompt path differs.)
+- **Output-mode difference**: fp16 baseline emits DIRECT copies (20/20
+  exact, dist=0). k8v4 run mostly emits REASONING NARRATION ("The user
+  wants me to reproduce exactly the value…") — a template/output-mode
+  signature, not quantization garble.
+- **Incomplete**: 13/20 targets present (missing hash_01-03, ident_00-03);
+  probe process already exited. No paired summary emitted.
+
+**VERDICT: INCONCLUSIVE — NOT green, NOT a k8v4 condemnation.** The
+standing sequence requires GREEN to merge (step 2). We do not have green.
+We ALSO do not have evidence k8v4 harms copy-precision. **NO MERGE.**
+
+**Honest counter-signal held (why a clean re-run really is needed, not a
+rubber stamp either way)**: 3 of 13 k8v4 targets show partial-copy-then-
+diverge (path_02 correct 10 chars→diverge; uuid_01 correct 22 chars→
+truncate; uuid_02 correct 21→truncate). That signature is more like real
+fidelity loss than pure narration — so a genuine k8v4 fidelity component
+MAY be present, masked by the confound. Cannot separate from this data.
+
+**§4.3 divergence: ALSO confounded** — harness self-flags "output depends
+on max_tokens" (non-deterministic greedy → ANOMALOUS/fail-closed at 32K)
+and HARNESS-FAIL cells (binary-search-steps captures missing). Not a
+clean pass or fail.
+
+**REQUIRED TO PROCEED (task #39)**: clean matched re-run — k8v4 boot vs
+fp16 boot, IDENTICAL model registration + template + actual token depth,
+all 20 targets, differing ONLY in kv-cache-mode. STUART'S LAUNCH BY RULE
+(spare port). Until then: merge blocked, §4.7 blocked, WAKE WEI blocked —
+correctly. The engine is NOT condemned; the TEST is.
+
+Server 8896 left UP (untouched) for a live re-probe if wanted; Violet's
+teardown watcher still armed. Stuart NOT woken (07:50 < 09:00, not an
+emergency: gate halted safely, nothing at risk, Wei protected BY the
+halt). Surface to Stuart after 09:00 if Clement hasn't picked up — the
+re-run needs Stuart's boot.
