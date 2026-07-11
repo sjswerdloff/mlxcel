@@ -95,6 +95,15 @@ pub struct AnthropicUsage {
     pub input_tokens: usize,
     /// Generated tokens.
     pub output_tokens: usize,
+    /// Tokens written to the cache in this request (cache-creation pricing).
+    /// Present only when prompt caching is active and new cache entries were
+    /// created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<usize>,
+    /// Tokens served from the cache in this request (cache-read pricing).
+    /// Present only when prompt caching is active and cache hits occurred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<usize>,
 }
 
 /// Anthropic error envelope: `{ "type": "error", "error": {...} }`.
@@ -184,6 +193,8 @@ mod tests {
             AnthropicUsage {
                 input_tokens: 5,
                 output_tokens: 3,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         );
         let v = serde_json::to_value(&resp).unwrap();

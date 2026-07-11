@@ -169,6 +169,8 @@ mod tests {
                 AnthropicUsage {
                     input_tokens: 7,
                     output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
                 },
             ),
         };

@@ -62,6 +62,25 @@ pub fn short_uuid() -> String {
     full[..16].to_string()
 }
 
+/// Strip per-request billing headers (`x-anthropic-billing-header: ...`) from
+/// system prompt text. Claude Code injects these as full-line directives inside
+/// the `system` field; they contain a per-request hash that defeats KV prefix
+/// cache reuse across requests with otherwise-identical system prompts.
+///
+/// The regex matches `x-anthropic-billing-header:` (case-insensitive) followed
+/// by the rest of the line, including the trailing newline if present. This is
+/// the same pattern vllm-mlx uses (`anthropic_adapter.py:67`).
+fn strip_billing_headers(text: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<fancy_regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        fancy_regex::RegexBuilder::new(r"(?i)x-anthropic-billing-header:[^\n]*\n?")
+            .build()
+            .expect("invalid billing-header regex")
+    });
+    re.replace_all(text, "").into_owned()
+}
+
 /// Result of flattening an Anthropic request into the internal chat shape.
 #[derive(Debug)]
 pub struct AnthropicTranslated {
@@ -77,9 +96,13 @@ pub fn anthropic_request_to_chat(request: &AnthropicRequest) -> AnthropicTransla
     let mut messages: Vec<Message> = Vec::new();
 
     // 1. System prompt (string or text-block array) → leading system turn.
+    //    Strip per-request billing hashes (x-anthropic-billing-header) that
+    //    Claude Code injects into the system prompt — these defeat KV prefix
+    //    cache reuse across requests with identical system prompts.
     if let Some(system) = request.system.as_ref()
         && let Some(text) = system.to_text()
     {
+        let text = strip_billing_headers(&text);
         messages.push(Message {
             role: Role::System,
             content: MessageContent::Text(text),

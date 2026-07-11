@@ -245,6 +245,8 @@ async fn non_stream_messages(
         AnthropicUsage {
             input_tokens: result.prompt_tokens,
             output_tokens: result.completion_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
     );
 
@@ -326,6 +328,8 @@ async fn stream_messages(
             AnthropicUsage {
                 input_tokens: prompt_tokens,
                 output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         );
         let _ = sender.send_event(&AnthropicStreamEvent::MessageStart {

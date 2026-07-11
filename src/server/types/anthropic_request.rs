@@ -211,6 +211,12 @@ pub enum AnthropicContentBlock {
         content: Option<AnthropicToolResultContent>,
         #[serde(default)]
         name: Option<String>,
+        /// Whether the tool call errored. When `true`, the content is treated
+        /// as an error message rather than a successful result. Propagated
+        /// into the internal `Message` so downstream consumers can distinguish
+        /// tool success from tool failure.
+        #[serde(default)]
+        is_error: Option<bool>,
     },
     /// Extended-thinking block (dropped during inbound translation).
     #[serde(rename = "thinking")]
