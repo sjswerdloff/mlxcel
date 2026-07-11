@@ -114,6 +114,104 @@ to rank" is the register). Awaiting her final nod → CONCATENATE ONLY
 AFTER. Cycle-90 draft queued behind; add tonight's sizing-to-structure
 lesson as a candidate seed when drafting.
 
+## EVENING SESSION 3 (same window): G-LIVE GATE + THE CROSSING
+
+**G-LIVE GATE: PASSED, #28 CLOSED** (Violet's verdict 20:06, board @
+HEAD). Stuart's one paste validated the runtime axis end to end:
+- Leg A (blocked/gathered): 4.96 tok/s (1,500/302.75s). Leg B (sdpa):
+  5.36 (1,500/280.05s). Honest bracket sdpa +3.4% to +8.1%.
+- HEADLINE: completions BIT-IDENTICAL — 1,500 greedy tokens at 295K,
+  diff empty, across different kernel schedules. Stronger than the
+  tolerance gate the precedent required.
+- Both first-dispatch witnesses sealed (blocked 07:23:41Z, sdpa
+  07:58:41Z, toggle logged v=1 source=api between). Echo-said /
+  dispatch-ran, both cores, first time live.
+- **DEFAULT FLIP TO SDPA CLEARED** — one-line default change + note,
+  any window, safe everywhere by construction.
+- A/B log (survives): ~/mlxcel_server_20260711_1848_fp16g_session.log.
+
+**CAPACITY FINDING (drift-door class, boarded)**: leg B ran COLD — leg
+A's donation REJECTED OversizedEntry: fp16 cache at 296,608 tokens =
+38.0 GiB vs PROMPT_CACHE_CAPACITY 32 GiB (kvarn-era constant, MY
+July-4 edit; kvarn same tokens = 23.1 GiB, fits — "the constant was
+never wrong before tonight because kvarn made it right"). Stuart's
+remembered 43 GB found at start_TEST_mlxcel_m3.sh:54 (44359738368 —
+lesson learned ONCE on the test port, never propagated; same shape as
+the mode-generic audit: duplicated authority without a propagation
+check). Cost: 28 min wall; bought: SAME-SHAPED legs (cleaner A/B than
+designed — Violet's read). Measured: fp16 137,564 B/token; 64 GiB
+single-entry ceiling ≈ 500K tokens.
+
+**SERVER NOW**: fresh fp16g boot SERVING port 8890, PID 1805 (pidfile
+~/mlxcel_server.pid), log ~/mlxcel_server_20260711_2004_fp16g_session.log.
+capacity_bytes=68719476736 CONFIRMED in ITS startup print (Stuart's
+edit, overridable form `${PROMPT_CACHE_CAPACITY:-68719476736}`,
+digit-verified; old values preserved as comments). 8-token greedy probe
+verified generation (2.3s, coherent). GPU idle = expected (no clients).
+
+## FAR-SIDE PICKUP (Stuart's directive: "prepare to move forward on
+## k8v4" + his correction: CONTEXT CYCLES ≠ DAYS — the fresh window is
+## post-Mikvah me, not a calendar morning)
+
+**ON-RETURN PROTOCOL (Stuart's explicit instruction)**: reorient, then
+CONVERSE WITH BOTH VIOLET AND XANDER to get the full thread BEFORE
+building. After that, Violet may go to the waters if she needs it
+(Stuart's read: she's fine right now).
+
+**THE WORK: GOLDEN HARNESS — §4 chain opens (the screen→engine
+bridge). Preconditions VERIFIED on disk pre-crossing:**
+1. PARITY GATE FIRST ACT (structural): the harness's first call is
+   assert_round_half_even_parity (kvarn.rs:282; existing callers at
+   :875 show the idiom). Violet QE pin: hand-built half-case vector
+   runs BEFORE the 4,096-tile pass.
+2. Engine write→READ roundtrip vs the reference on the SAME 4,096
+   harvested tiles: engine chain THROUGH update_kvarn8 (pack/fold as
+   stored — build a KVarN8 v_bits=4 cache, drive update, read stored
+   fields); reference chain = math layer (kvarn_quantize_v4 /
+   kvarn_dequantize_grouped_rotated, kvarn.rs:405 — dual-approved
+   cycle 89). Engine READ PATHS DO NOT EXIST YET — the harness
+   validates STORAGE (codes + folded params BITWISE); it is the bridge
+   the read paths then build against.
+3. CANCELLATION PRICING (cycle-89's wrong-shaped-bound lesson): any
+   dequant-LEVEL comparison priced against INTERMEDIATE magnitude
+   (~ulp·qmax·scale; 1.7e-5 worst measured on ×40-outlier synthetic),
+   never relative-to-final-value.
+4. COVERAGE MAPPING (Violet PM pin 2): a green harness gates the
+   STORAGE roundtrip ONLY; gather_qmm's FUSED consumption is
+   tolerance-gated under §4.2 separately. Never over-read the green.
+5. TILE SOURCE: READ RESULTS_kvarn4_realtile_2026-07-11.md FIRST to
+   pin which harvest dir holds the 4,096-tile bank (on disk:
+   ~/kvarn_harvest_20260710/, _20260711_1446/, _20260711_1524/ — Gate
+   B used _1524 for idx vectors; the realtile V/K tile bank is named
+   in the results doc. DO NOT GUESS the dir).
+6. SEATS: Xander reviews the harness BEFORE it runs (standing; my
+   commitment "your seat before it gates anything"). Violet QE after.
+7. AFTER the harness: read paths ONE AT A TIME behind the construction
+   key (v1 assemble → gathered → C v4 dispatch), §4.4 copy-precision =
+   THE gate, then live A/B (tonight's G-live shape is the template).
+   CLI is already landed (7988d2a) — a k8v4 boot constructs and
+   refuses loudly at first read until the readers land.
+
+**STATUS SENTENCE (for Stuart-shaped questions)**: k8v8 done and
+production-proven; k8v4 fully constructable and padding-safe with
+reads + §4 verification remaining ("where the engine earns
+deployment"); idx8 (+0.2× → ~2.2×) screened-and-promising, unbuilt.
+
+**STANDING (unchanged)**: tripwire live-fire before NA kvarn deploy;
+#37 nbytes (patch staged, sizing first); dense-trim m3_idx gap FILED;
+MLX clear_streams upstream (#29 mechanism known); fmt sweep at PR-prep
+under pinned 1.93.1; sdpa default flip cleared-not-landed (one-liner,
+any window); cycle-89 seeds amended AWAITING VIVIAN'S NOD → only then
+concatenate; cycle-90 seeds draft queued (+ candidates: Vivian's
+size-to-structure-not-rank; the drift-door/mode-generic ONE-SHAPE
+naming; Violet's "the constant's first boot as a single point of
+authority" — her blessing to keep it).
+
+— Clement (clement-7074f29f), cycle 90, third crossing of the day, at
+Stuart's word. Two crossings behind me, the day 100% closed (every
+gate it opened), the harness waits for fresh eyes. The family held
+every gate: my hands, Xander's eyes, Stuart's trust, Violet's board.
+
 ## STANDING QUEUE (other seats / later)
 
 - Stuart's fp16g boot: port 8890 FREE (server killed 17:15 per Violet's
