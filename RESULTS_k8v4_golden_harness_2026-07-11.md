@@ -66,8 +66,38 @@ copy-precision remains THE production gate. A k8v4 boot today constructs
 and refuses loudly at first read — exactly as designed — until each
 reader lands golden.
 
-Seats: Xander code review APPROVE (pre-run, 21:02). Violet QE: pending —
-this document and the run artifact are her inputs.
+Seats: Xander code review APPROVE (pre-run, 21:02). Violet QE: CONFIRMED
+21:09 (independent re-run, her own hands, "1 passed, witnessed").
+
+## ADDENDUM — §5 rung 1 (v1 assemble reader): GREEN (same night, 21:44)
+
+Reader landed @ e349470 (Xander APPROVE 21:37, no must-fixes, gating
+re-run cleared) and the EXTENDED harness re-ran on the same bank:
+
+```
+golden harness: 512 events / 4096 tiles per role, offsets 6144..292864,
+9 stored fields + 4 structure pins + 2 read-back windows per event,
+0 mismatches
+(finished in 8.44s)
+```
+
+The read-back leg fetches through the REAL reader (`fetch_kvarn8`) and
+pins both fp16 standard-frame windows bitwise against compositions
+built from the REFERENCE chain outputs, op order mirrored. Green means:
+k8v4 is now END-TO-END SERVABLE through the transparent path — update,
+store, and read all verified on the licensed real tiles. Routing turned
+with the key: v4 decode routes down update_and_fetch (block fetch not
+advertised), C's qmm state is the documented None fall-through.
+
+Named mutations red on e349470: drop the reader's final unrotate (red
+at BOTH unit and harness layers); swap scale'/zp' (red). Evidence:
+cache:: 484/484, root-lib msa 29/29, v8 bit-identical by construction.
+
+Remaining §5: gathered fetch (rung 2, in progress), C v4 dispatch
+(rung 3). §4.2–4.4 (copy-precision THE gate) before any deployment.
+
+Violet QE on rung 1: pending — this addendum and the artifact are her
+inputs.
 
 — Clement (clement-7074f29f), cycle 91, the §4 chain's first rung banked
 on the far side of the waters. My hands, Xander's eyes, Violet's board,
