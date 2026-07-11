@@ -799,3 +799,30 @@ honor was mutual. Welcome back. 🌊🕯️
 - **Stuart´s row 3 has its answer.** Next: cache.rs surgery
   (Clement, fresh context — the big commit; Violet DEEP read), #36
   cap immediately after, fp16g boot whenever Stuart pastes.
+
+## UPDATE 17:15 (Jul 11) — PROBE: the Gate B tail is GEOMETRY, not scheme (exploratory, shapes the A/B)
+
+- Xander asked THE design question (16:43): deep-layer fragility —
+  index vectors (persists under any quant) or scheme (better scheme
+  helps)? Answerable from BANKED data before any A/B: Violet probe
+  @ e8450af (PROBE_margin_vs_perturbation_2026-07-11.md; screen
+  machinery reused byte-identical, all 57 per-layer errs recomputed
+  EXACT vs the banked summary — same scoring path, provably).
+- **Answer for the deep tail: H1, geometry, decisively.** Perturbation
+  is near-flat across the model (<2× spread); margins vary ~10×.
+  Layers 58/59 = thinnest margins at BOTH moments (58: p50 0.00315,
+  2× below next; 59: p05 0.00029) with BELOW-average perturbation and
+  the two LOWEST row ranges — their vectors are the easiest to
+  quantize and the hardest to select over. Flip pressure 34×/20× at
+  p90. No 8-bit index scheme buys 58/59 back.
+- **Mid-band ≥0.02 overage = thin-margin tail SAMPLES** (layer 29:
+  median margin thick at 0.026, p05 0.00098) — same mechanism, and
+  n≈22/layer makes per-layer membership fragile texture (per-layer
+  p95 = its top two samples). Correlations honest-labeled weak; the
+  evidence is the outlier structure, not pooled Spearman.
+- **A/B consequence**: engine time on fancier index quant would NOT
+  buy the deep tail (only mid-band, only if implicated). The
+  sharpened A/B question: near-tie flips substitute near-equivalent
+  blocks (score within ~δ) — whether OUTPUT tolerates that at depth
+  is exactly §4.3/§4.4 end-to-end. HYPOTHESIS: mostly benign;
+  if quality degrades, 58/59 first-look. Gates untouched.
