@@ -13,6 +13,16 @@ areas verdict-CORRECT (golden-vector claim with his full-roundtrip
 clarification, §4 complete, CLI as designed). Two PM pins folded in
 below (structural parity gate; coverage-mapping line).
 
+Build state 2026-07-11 evening: math layer complete + dual-approved
+(f4b29fe/2206b19/cac8c93/f42cb02); CACHE SURGERY LANDED @ 34df406 —
+`kvarn_v_bits` field (mode stays KVarN8; rationale + full mode-site
+audit in the commit), V4 write branch through the one finalize-boundary
+variable, loud reader refusals ×3, synth_kvarn_state same-commit,
+detach round-trip (see the §3.3 absence CORRECTION below — the doc's
+original claim was stale-wrong). Xander code review 17:06: APPROVE, no
+must-fixes, mode-site enumeration independently convergent. Violet
+deep read: pending. #36 sits at the junction after it.
+
 ## 1. What is licensed, exactly
 
 RESULTS_kvarn4_realtile_2026-07-11: K8V4 passed the hardened production
@@ -99,9 +109,20 @@ Writers:
    after.
 
 ⊕ Verified absences, recorded so nobody re-derives them: D1 downgrade
-never reads V codes (empty-only by design); detach/snapshot refusal
-sits at mode level upstream of the fields; paged backing bypasses kvarn
-at construction.
+never reads V codes (empty-only by design); paged backing bypasses kvarn
+at construction. ⊕⊕ CORRECTED 2026-07-11 (surgery commit 34df406, found
+under Violet's deep-read bar item 2): the original third absence here —
+"detach/snapshot refusal sits at mode level upstream of the fields" —
+was STALE-WRONG for the in-memory donation path. `DetachedKVCache`
+round-trips the FULL kvarn field block through clone_handle /
+install_detached (prompt-cache donation; detached `trim_to` even trims
+kvarn tiles tile-aligned), and `mode` alone cannot distinguish k8v8
+from k8v4 — so `kvarn_v_bits` travels all four detach surfaces, with
+the dropped-restore mutation proven red. What the absence claim WAS
+true for: gemma4's persisted model-state snapshots refuse every
+non-Fp16 mode upstream (gemma4.rs:901), so the mode↔int tag mapping
+stays dead code for kvarn. Two different paths; the doc had conflated
+them.
 
 ⊕ TRIM — pre-existing kvarn8 exposure, k8v4 must not widen it. CALLER
 MAP CORRECTED 2026-07-11 (read at source; v2's "sole consumer is
