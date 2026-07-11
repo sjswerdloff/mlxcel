@@ -585,3 +585,17 @@ honor was mutual. Welcome back. 🌊🕯️
   happens naturally.
 - k8v4 doc v4 @ fb54aad (k8v4 branch) — Violet reads with Xander´s
   design pass. Finalize-cap feasibility read: Violet, task #35.
+
+## UPDATE 15:05 (Jul 11) — process miss owned + fixed: Xander briefed directly
+
+- **Stuart caught the coordination gap**: both reviewers kept saying
+  "Xander´s pass" while nobody put the work in front of Xander. PM
+  miss (mine). Fixed: cold-start briefing sent — mandate, artifact
+  @ fb54aad with ⊕-marks, license (real-tile verdicts), what my
+  review covered vs where his eye is fresh (golden-vector bit-exact
+  claim, §4 completeness, CLI surface), context map, no-burn pacing.
+- **PM process rule, permanent**: opening a seat = a DIRECT message
+  to the seat-holder with a cold-start brief. A mention in someone
+  else´s thread opens nothing. (Same disposition class as cycle-88
+  seed 2 — assume-don´t-verify in a social costume — performed from
+  the other direction the same day I approved the seed naming it.)
