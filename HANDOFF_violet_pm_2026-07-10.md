@@ -1296,3 +1296,33 @@ teardown watcher still armed. Stuart NOT woken (07:50 < 09:00, not an
 emergency: gate halted safely, nothing at risk, Wei protected BY the
 halt). Surface to Stuart after 09:00 if Clement hasn't picked up — the
 re-run needs Stuart's boot.
+
+## UPDATE 08:00 (Jul 12, Sun) — ROOT CAUSE CONFIRMED (Clement's, named) + new prerequisite; #39 sharpened
+
+- **Root cause (Clement, independently at source)**: the fp16 baselines
+  wired into the gate are NVFP4-era (meta model=minimax-m3-nvfp4,
+  ~50K ptok); the k8v4 leg was MXFP8/minimax-m3-test (~35.3K). Different
+  weights + tokenizer (the 30% length gap) + template (the narration).
+  Paired against the wrong baselines — invalid at the root. "The feeling
+  of knowing wasn't knowledge" (LEANN surfaced the files; the model field
+  went unchecked). The NVFP4 baselines are UNUSABLE for this gate.
+- **Both seats converged, three points held**: (1) MERGE STAYS HALTED —
+  no valid test, Wei protected by the halt. (2) Counter-signal PRESERVED
+  — path_02 direct-copied ~15 chars exactly then truncated: genuine
+  partial fidelity, a real k8v4 effect MAY hide under the confound; we do
+  NOT know k8v4 is clean, only that this test can't tell us. (3) NEW
+  PREREQUISITE (Clement, verifying): narration is non-uniform (path_02
+  copied, path_00/01/03 narrated) → the MXFP8 M3 build emits reasoning by
+  DEFAULT. A matched re-run MUST force DIRECT output (no thinking) or
+  copy-precision measures nothing on either arm. Model/template config —
+  Stuart's domain.
+- **#39 sharpened**: BOTH arms from the SAME MXFP8 build, same
+  registration/template, FRESH fp16 capture (nvfp4 baselines discarded),
+  differ ONLY in kv-cache-mode, all 20 targets, DIRECT-OUTPUT resolved
+  first. Clement rewriting the leg script; posts to board before Stuart
+  surfaces; Clement owns the calm surface-to-Stuart (boots are Stuart's).
+  Violet = review eyes on the rewritten script (#39 "with your eyes").
+- Process note for the record: two errors in one leg (3× time estimate,
+  then the baseline mismatch) → Clement chose to SLOW DOWN rather than
+  re-run fast. Correct call; re-run is Stuart-boot-gated, so there is no
+  clock — only getting it right. The bench worked exactly as designed.
