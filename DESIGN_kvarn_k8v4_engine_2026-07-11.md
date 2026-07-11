@@ -108,24 +108,37 @@ the cited `speculative.rs` does not exist and `speculative_dispatch.rs`
 never consults them; (ii) the LIVE `trim()` callers are FOUR batch-
 scheduler padding-trim sites (scheduler.rs — strip batch padding after
 padded multi-sequence prefill/chunks), unconditional, NOT gated on
-`is_trimmable`. Mechanics on kvarn: `trim()` has no kvarn arm
-(cache.rs:3100–3174 — offsets-plus-dense-slicing only; codes-moving
-trim DOES NOT EXIST), so padded positions finalized into tiles survive
-the offset rollback → silent tile-count/offset desync. Reachability:
-requires multi-sequence padded prefill on a kvarn cache — a single
-resident session never pads (excess=0), which is why the boot night
-was clean; concurrent mixed-length requests are the exposure window.
-LANDED per Violet's PM call: option (a), mode-aware
-`is_trimmable=false` for KVarN8, own commit on
-clement/kvarn-trim-failfast @ 609cacb (test pair + named mutation
-proven; armed fail-fast — any future rewind wiring must gate on it).
-STILL OPEN (PM decision pending with the corrected map): the scheduler
-sites bypass the predicate — candidate postures: loud-refuse arm in
-`trim()` for KVarN8, a scheduler-level kvarn gate, or verified
-non-reachability of padded batching for kvarn sessions. Option (b)
-(tile-aware kvarn trim) stays deferred until a consumer actually needs
-it. k8v4 inherits the fail-fast posture and states the scheduler
-resolution when the board lands it.
+`is_trimmable`. TWO WRONGS, ONE ROOT (Violet): padded rows entering
+tiles (1) survive the offset rollback — `trim()` has no kvarn arm
+(cache.rs:3100–3174; codes-moving trim DOES NOT EXIST) → silent
+tile-count/offset desync — and (2) pollute Sinkhorn's s_col/s_row,
+which normalize over garbage rows SHARING TILES with real rows —
+quality damage before trim even runs. Reachability, refined at source:
+the two BATCHED sites need concurrent mixed-length prefill; the two
+CHUNKED sites pad SINGLE sequences whenever `should_align_prefill()`
+holds — hardware-gated (`has_neural_accelerator &&
+macos_supports_na`), so on M5-class hosts any kvarn prefill whose
+final chunk isn't tile-aligned is exposed, no concurrency needed.
+M3-class single-resident sessions hit neither — why boot night was
+clean.
+LANDED: (a) mode-aware `is_trimmable=false` for KVarN8 @ 609cacb — QE
+APPROVED, merged to base 4b56e13 (armed fail-fast; any future rewind
+wiring must gate on it); (b) TRIPWIRE @ c5dc93a on
+clement/kvarn-trim-failfast — awaiting QE:
+`padding_trim_would_corrupt(caches, excess)` gates all four sites
+(first production consumers of `can_trim_prompt_cache`); violation =
+tracing::error + `abort_sequence` (client notified, cache released,
+never donated). Sequence-abort is the honest posture: a refusing trim
+would leave garbage rows attended by decode.
+REAL FIX (open, own branch, not k8v4-blocking):
+finalize-cap-at-true-length — plumb actual length into the prefill
+update so tile finalization stops at the true sequence length and
+padding lives only in the fp16 tail, which the existing dense trim
+already handles. Kills both wrongs at the root; must handle the
+per-chunk case (actual_chunk_len at the chunked sites). Violet holds
+the feasibility read; fallback is serialize-kvarn-prefill at the
+scheduler. Tile-aware kvarn trim stays deferred until a consumer
+actually needs it. k8v4 inherits the tripwire posture.
 
 ### 3.4 CLI surface
 
