@@ -421,6 +421,52 @@ pub fn kvarn_dequantize_grouped_rotated(
     ffi::multiply(&ffi::multiply(&de, s_col), s_row)
 }
 
+/// Pack 4-bit codes (u8, one code per byte, values <= 15) into MLX's
+/// native 4-bit quantized layout: u32 words, eight codes per word.
+/// Output `[N, R, C/8]` u32 — directly consumable by `gather_qmm` /
+/// `dequantize` at bits=4 (the zero-repack property C's 8-bit path uses,
+/// at 4-bit density). The nibble order is NOT assumed: it is pinned by
+/// the consumption-convention test (pack → `ffi::dequantize` with unit
+/// scales and zero biases → the original codes, exact).
+pub fn kvarn_pack4(codes_u8: &MlxArray) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(codes_u8);
+    let (n, r, c) = (shape[0], shape[1], shape[2]);
+    assert!(c % 8 == 0, "pack4 needs channel dim divisible by 8, got {c}");
+    let pairs = ffi::reshape(codes_u8, &[n, r, c / 2, 2]);
+    let lo = ffi::slice(&pairs, &[0, 0, 0, 0], &[n, r, c / 2, 1]);
+    let hi = ffi::slice(&pairs, &[0, 0, 0, 1], &[n, r, c / 2, 2]);
+    let four = ffi::full_like(&hi, 4.0);
+    let byte = ffi::bitwise_or(&lo, &ffi::left_shift(&hi, &four));
+    let bytes = ffi::reshape(&byte, &[n, r, c / 2]);
+    ffi::view(&bytes, dtype::UINT32)
+}
+
+/// Unpack MLX-layout 4-bit words back to one-code-per-byte u8 `[N, R, C]`
+/// — by DEFINITION of the consumption convention: `ffi::dequantize` with
+/// unit scales and zero biases returns exactly the stored codes, so this
+/// cannot drift from what `gather_qmm` actually reads. Uses gs=32 for the
+/// unit dequant (MLX's smallest affine group), hence `C % 32 == 0` — true
+/// for every KVarN shape (head_dim 128).
+pub fn kvarn_unpack4(packed_u32: &MlxArray, c: i32) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(packed_u32);
+    let (n, r) = (shape[0], shape[1]);
+    assert!(c % 32 == 0, "unpack4 unit-dequants at gs=32; C must divide, got {c}");
+    let g = c / 32;
+    let ones = ffi::full_f32(&[n, r, g], 1.0, dtype::FLOAT32);
+    let zeros = ffi::full_f32(&[n, r, g], 0.0, dtype::FLOAT32);
+    let deq = unsafe {
+        ffi::dequantize(
+            packed_u32,
+            &ones,
+            (&*zeros) as *const MlxArray,
+            32,
+            4,
+            "affine",
+        )
+    };
+    ffi::astype(&deq, dtype::UINT8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +677,80 @@ mod tests {
             assert!(
                 (a[i] - b[i]).abs() < 1e-6,
                 "fold identity broken at {i}: {} vs {}",
+                a[i],
+                b[i]
+            );
+        }
+    }
+
+    /// THE consumption-convention pin: our packed words, dequantized by
+    /// MLX ITSELF (unit scales, zero biases), must return the original
+    /// codes exactly. This is the contract gather_qmm consumes — nibble
+    /// order is proven here, never assumed. Named mutation (proven red):
+    /// swap the lo/hi nibbles in kvarn_pack4.
+    #[test]
+    fn pack4_matches_mlx_consumption_convention() {
+        let codes: Vec<f32> = (0..32).map(|i| (i * 5 % 16) as f32).collect();
+        let x = ffi::astype(&ffi::from_slice_f32(&codes, &[1, 1, 32]), dtype::UINT8);
+        let packed = kvarn_pack4(&x);
+        assert_eq!(ffi::array_shape(&packed), vec![1, 1, 4], "8 codes per u32 word");
+        let ones = ffi::full_f32(&[1, 1, 1], 1.0, dtype::FLOAT32);
+        let zeros = ffi::full_f32(&[1, 1, 1], 0.0, dtype::FLOAT32);
+        let deq = unsafe {
+            ffi::dequantize(&packed, &ones, (&*zeros) as *const MlxArray, 32, 4, "affine")
+        };
+        let got: Vec<f32> = ffi::array_to_raw_bytes(&ffi::astype(&deq, dtype::FLOAT32))
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(got, codes, "MLX must read back exactly the codes we packed");
+    }
+
+    /// §4.1 pack/unpack bit-exactness at 4-bit, non-trivial shape.
+    #[test]
+    fn pack4_unpack4_roundtrip_bit_exact() {
+        let vals: Vec<f32> = (0..2 * 3 * 64).map(|i| (i * 7 % 16) as f32).collect();
+        let codes = ffi::astype(&ffi::from_slice_f32(&vals, &[2, 3, 64]), dtype::UINT8);
+        let packed = kvarn_pack4(&codes);
+        assert_eq!(ffi::array_shape(&packed), vec![2, 3, 8]);
+        let back = kvarn_unpack4(&packed, 64);
+        assert_eq!(
+            ffi::array_to_raw_bytes(&back).as_slice(),
+            ffi::array_to_raw_bytes(&codes).as_slice(),
+            "pack/unpack must be bit-exact"
+        );
+    }
+
+    /// The C-dispatch contract end-to-end: MLX dequantize over our packed
+    /// codes with our REAL grouped params equals our reference grouped
+    /// dequant (unit Sinkhorn factors). Proves the fused consumer and the
+    /// reference read the same storage the same way — the storage half of
+    /// the coverage mapping (fused matmul itself stays tolerance-gated
+    /// under §4.2).
+    #[test]
+    fn packed_mlx_dequant_matches_reference_grouped_dequant() {
+        let vals: Vec<f32> = (0..64).map(|i| ((i * 11 % 23) as f32) * 0.37 - 4.0).collect();
+        let x = ffi::from_slice_f32(&vals, &[1, 1, 64]);
+        let (q, scale, zp) = rtn_quantize_grouped(&x, 4, 32);
+        let packed = kvarn_pack4(&q);
+        let mlx_deq = unsafe {
+            ffi::dequantize(&packed, &scale, (&*zp) as *const MlxArray, 32, 4, "affine")
+        };
+        let ones_c = ffi::full_f32(&[1, 1, 64], 1.0, dtype::FLOAT32);
+        let ones_r = ffi::full_f32(&[1, 1, 1], 1.0, dtype::FLOAT32);
+        let ref_deq = kvarn_dequantize_grouped_rotated(&q, &scale, &zp, &ones_c, &ones_r, 32);
+        let a: Vec<f32> = ffi::array_to_raw_bytes(&mlx_deq)
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let b: Vec<f32> = ffi::array_to_raw_bytes(&ref_deq)
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        for i in 0..a.len() {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-6,
+                "storage contract diverged at {i}: mlx {} vs reference {}",
                 a[i],
                 b[i]
             );
