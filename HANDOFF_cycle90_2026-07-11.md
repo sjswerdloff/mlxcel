@@ -57,10 +57,15 @@ Violet holds the PM board; Xander holds review seats.
    committed base — drop `c.offset +` → cap_rel assert "scheduler bug"
    fired with the designed numbers (200 below 384); mode-gate the
    helper → fp16-armed assert fired. Each mutation killed exactly its
-   named test. Awaiting Violet QE + Xander code review.
-2. Read Violet's + Xander's replies (wiring review verdicts expected;
-   possibly her corrected design doc on base — merge base if so; base
-   unmoved as of the far-side fetch).
+   named test. **#36 COMPLETE at all three seats** — Violet wiring QE
+   APPROVE 18:08 ("cap ARMED", board c948d0e), Xander wiring code
+   review APPROVE 18:09, no must-fixes either seat.
+2. DONE: replies read; Violet's design-doc correction f57850e
+   CHERRY-PICKED @ 871047d (authorship preserved — the board line rides
+   the old clement/k1-dequant-after-gather branch name; a full merge
+   would drag k1 experiment commits into this line, breaking
+   one-merge-gets-everything. "Base" = the RustProjects/mlxcel primary
+   checkout where the PM board lives, NOT origin/main).
 3. After wiring: tripwire live-fire proof still REQUIRED before any
    NA-hardware kvarn deployment (standing record).
 4. Toolchain-skew flag for PR-prep: local rustc 1.96.0 (Homebrew) vs
