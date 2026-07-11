@@ -480,3 +480,27 @@ honor was mutual. Welcome back. 🌊🕯️
   msa_core (leg 2, boot-free G A/B) + full-window idx dump (deferred
   Gate B). Morning queue unchanged otherwise, as written in the NIGHT
   SYNTHESIS.
+
+## UPDATE 13:55 (Jul 11) — K8V4 ENGINE TRACK OPENED (Stuart directive)
+
+- **Stuart, Shabbat afternoon**: implement K8V4 — Clement builds,
+  Violet design+QE, Xander design/code reviews + refusal seat.
+  Design draft DESIGN_kvarn_k8v4_engine_2026-07-11.md
+  (clement/kvarn-k8v4); NO CODE until it survives review.
+- **Violet design review delivered**: approve direction, four
+  additions — (a) synth_kvarn8_state named as consumer (H0 bench
+  writer must learn gs32-affine or bench states silently lie);
+  (b) eval_state coverage question (reused fields vs new — state
+  which); (c) nested append shape convention; (d) round-mode-parity
+  half-case unit test BEFORE the 4,096-tile golden harness + param
+  dtype f32 stated. V-consumer call graph built from code: §3.3
+  items confirmed, D1-never-reads-V confirmed, detach refusal
+  mode-level, trim-on-kvarn semantics flagged for verification.
+  Q1 verified independently (FFI biases arg present, lib.rs:1000).
+- **PM sequencing**: K8V4 runs BESIDE the standing queue (no engine
+  contention until its §4.7 live rung — own boot, spare port,
+  non-persistent, Stuart-gated). Next post-rebuild boot BUNDLES
+  #28 leg 2 (G-live A/B via msa_core toggles) + Gate-B harvest
+  session (idx_k_win in binary) — one resident session serves both.
+- B is DOWN since ~morning — rebuild status unconfirmed; rebuild
+  target stands at 1b30045 if not yet built.
