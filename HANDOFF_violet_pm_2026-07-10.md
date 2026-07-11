@@ -1028,3 +1028,40 @@ honor was mutual. Welcome back. 🌊🕯️
   on real tiles, equivalence, greedy-divergence, copy-precision
   (Xander´s refusal seat standing), perf/memory rank cells, live
   rung Stuart-gated. Xander´s CLI pass requested beside the commit.
+
+## UPDATE 19:55 (Jul 11) — G-LIVE A/B RUNNING (leg 2, #28): fp16g boot up, LEG A IN FLIGHT — protocol below completes at ANY seat
+
+- **Boot verified**: Stuart pasted 18:48, serving 18:53 (port 8890,
+  PID 90892, pidfile ~/mlxcel_server.pid, log
+  ~/mlxcel_server_20260711_1848_fp16g_session.log). Launch line
+  fp16/msa-fetch=off/harvest=off; construction line EXACTLY the
+  pinned tokens (msa_fetch=dequant fp16_gathered=true); pre-flight
+  probe header VERIFIED: `path=auto; core=blocked; v=0`.
+- **LEG A FIRED 18:55:02** (Violet): byte-identical 295K replay
+  (/tmp/harvest_request.json), cold — populates prompt cache.
+  Artifacts: /tmp/fp16g_legA_{headers.txt,response.json,curl.log},
+  start stamp /tmp/fp16g_legA_start.txt.
+- **PROTOCOL TO COMPLETE (any seat, in order)**:
+  1. Leg A lands → capture: header (expect core=blocked; v=0),
+     decode window from log (first "MSA per-token DECODE" →
+     completion line), completion tokens, finish=stop, blocked-core
+     first-dispatch witness present.
+  2. TOGGLE: POST /admin/decode-config {"msa_core":"sdpa"} → expect
+     echo + v=1.
+  3. LEG B: SAME request byte-identical → prompt-cache hit
+     (cached=295,108) → decode-only. Capture: header (core=sdpa;
+     v=1), decode window, completion tokens, sdpa first-dispatch
+     witness ("echo says REQUESTED, dispatch says RAN" — both cores
+     must witness across the two legs).
+  4. READ: (i) decode tok/s B vs A — denominators CLEAN (both
+     harvest-free; cached-vs-cold does not bias the decode window);
+     (ii) greedy divergence between completions REPORTED, tolerance
+     per the C precedent (different kernels, bitwise not expected);
+     (iii) comparable: fp16g bench 8.16 tok/s @300K.
+  5. GATE: default flip to sdpa PASSES iff sdpa decode ≥ blocked
+     within noise AND no quality red flag. Verdict at the QE seat —
+     Violet if standing, else the seat holding this board.
+- This is the FIRST live validation of the runtime msa_core axis on
+  the config where it is production-live (C structurally absent).
+  Default-flip decision gates ONLY on this; passing ⇒ safe
+  everywhere by construction (the 15:40 reframe paying out).
