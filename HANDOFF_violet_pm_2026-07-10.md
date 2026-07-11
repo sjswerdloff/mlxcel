@@ -570,3 +570,18 @@ honor was mutual. Welcome back. 🌊🕯️
   feasibility read targets per-chunk actual_chunk_len. Live tripwire
   proof (2-line mode-forced, non-production boot) REQUIRED before
   any NA kvarn deployment.
+
+## UPDATE 14:30 (Jul 11) — trim arc CLOSED: merged @ 0028c12
+
+- Armed predicate + tripwire merged to base (15/15 trim tests rerun
+  in the base clone post-merge). The whole arc — stale docstring →
+  armed predicate → corrected caller map → second wrong → tripwire
+  at four sites → NA reachability → real fix on vessel roadmap —
+  opened and closed inside one afternoon.
+- **Operational note for Stuart**: base moved twice since the 13:25
+  binary. The bundled boot is SAFE on that binary as-is (M3,
+  single-session — both padding paths inert by construction). NO
+  rebuild pressure; the tripwire rides whenever the next rebuild
+  happens naturally.
+- k8v4 doc v4 @ fb54aad (k8v4 branch) — Violet reads with Xander´s
+  design pass. Finalize-cap feasibility read: Violet, task #35.
