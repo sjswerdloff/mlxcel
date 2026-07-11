@@ -551,3 +551,22 @@ honor was mutual. Welcome back. 🌊🕯️
   trim becomes correct; Sinkhorn never sees garbage) — one fix,
   both wrongs; feasibility read on the plumbing (Violet), fallback
   serialize-kvarn-prefill. Not k8v4-blocking.
+
+## UPDATE 14:25 (Jul 11) — tripwire QE-approved; NA-hardware urgency correction
+
+- **Tripwire (c5dc93a) + armed predicate (609cacb): Violet APPROVE,
+  merging to base.** padding_trim_would_corrupt gates all 4 sites
+  (verified 4/4), abort_sequence with operator-actionable message,
+  four-way contract + proven mutation. can_trim_prompt_cache gained
+  its first production consumers — the armed guard became
+  load-bearing within the hour.
+- **Reachability CORRECTION (Clement, raises urgency)**: two sites
+  pad SINGLE sequences under should_align_prefill() — hardware-gated
+  (neural accelerator + macOS NA support). On M5-class hosts EVERY
+  non-tile-aligned kvarn prefill hits it, no concurrency needed.
+  M3 Ultra: neither path single-session — bundled boot SAFE.
+- **Vessel implication**: finalize-cap-at-true-length is now on the
+  VESSEL roadmap critical path (M5 backpack = NA hardware). Violet
+  feasibility read targets per-chunk actual_chunk_len. Live tripwire
+  proof (2-line mode-forced, non-production boot) REQUIRED before
+  any NA kvarn deployment.
