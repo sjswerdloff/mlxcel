@@ -2088,6 +2088,37 @@ impl KVCache {
         }
     }
 
+    /// k8v4 construction surface: set the KVarN8 V-side width (8 = k8v8,
+    /// 4 = k8v4) on this cache. Width is a construction-time choice —
+    /// changing it on a NON-EMPTY cache would relabel stored V codes in
+    /// the wrong width (the silent-wrong class the reader guards trip
+    /// on), so anything but a no-op re-set is refused unless the cache
+    /// is empty. Head-dim divisibility (gs=32) is asserted downstream at
+    /// the first `update_kvarn8`.
+    pub fn set_kvarn_v_bits(&mut self, v_bits: u8) {
+        assert!(
+            v_bits == 8 || v_bits == 4,
+            "kvarn_v_bits must be 8 or 4, got {v_bits}"
+        );
+        if self.kvarn_v_bits == v_bits {
+            return;
+        }
+        assert!(
+            self.is_empty(),
+            "kvarn_v_bits change on a non-empty cache would relabel stored V codes \
+             (have {}, requested {v_bits})",
+            self.kvarn_v_bits
+        );
+        self.kvarn_v_bits = v_bits;
+    }
+
+    /// Read the KVarN8 V-side width (8 = k8v8, 4 = k8v4). For
+    /// construction-surface tests and diagnostics; the inert default 8
+    /// on non-kvarn caches.
+    pub fn kvarn_v_bits(&self) -> u8 {
+        self.kvarn_v_bits
+    }
+
     /// #36: arm the one-shot finalize cap for the NEXT `update_kvarn8`
     /// (field docs; DESIGN_finalize_cap_at_true_length_2026-07-11).
     /// Scheduler-side, called per layer cache immediately before a forward
@@ -10396,6 +10427,32 @@ mod tests {
         assert!(cache.downgrade_kvarn8_to_fp16_if_empty());
         assert_eq!(cache.mode, KVCacheMode::Fp16);
         assert_eq!(cache.kvarn_v_bits, 8, "width resets with the mode");
+    }
+
+    /// k8v4 construction surface: the width setter accepts an empty
+    /// cache and a same-width re-set, and refuses to relabel a non-empty
+    /// cache — stored V codes would be read in the wrong width (the
+    /// silent-wrong class the reader guards trip on).
+    #[test]
+    fn set_kvarn_v_bits_accepts_empty_and_same_width() {
+        let mut c = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        c.set_kvarn_v_bits(4);
+        assert_eq!(c.kvarn_v_bits, 4, "empty cache accepts the width");
+        let (k, v) = kvarn_v4_test_input(200);
+        c.update_only(k, v);
+        c.set_kvarn_v_bits(4); // same width on non-empty: no-op, allowed
+        assert_eq!(c.kvarn_v_bits, 4);
+    }
+
+    /// Named mutation: removing the is_empty guard lets a width change
+    /// relabel stored codes — this test pins the refusal.
+    #[test]
+    #[should_panic(expected = "relabel stored V codes")]
+    fn set_kvarn_v_bits_refuses_non_empty_width_change() {
+        let mut c = KVCache::new_with_mode(KVCacheMode::KVarN8); // v_bits 8
+        let (k, v) = kvarn_v4_test_input(200);
+        c.update_only(k, v);
+        c.set_kvarn_v_bits(4);
     }
 
     // ── #36 finalize-cap + tail-bounded kvarn trim (six edges per

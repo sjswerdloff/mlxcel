@@ -269,12 +269,22 @@ fn run_memory_preflight(
         return Ok(None);
     }
 
-    let kv_cache_mode = resolve_kv_cache_mode(
+    let resolved_kv = resolve_kv_cache_mode(
         args.generation.turbo.cache_type_k.as_deref(),
         args.generation.turbo.cache_type_v.as_deref(),
         args.generation.turbo.kv_cache_mode.as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
+    // k8v4 construction lives on the server path (scheduler-applied
+    // kvarn_v_bits); the generate/chat paths have no width plumbing.
+    // Refuse loudly rather than silently running k8v8 under a k8v4 label.
+    if resolved_kv.kvarn_v_bits != 8 {
+        anyhow::bail!(
+            "k8v4 is not supported by `mlxcel generate`/chat (server-only \
+             construction); use kvarn8/k8v8 here"
+        );
+    }
+    let kv_cache_mode = resolved_kv.mode;
     let kv_int8 = matches!(kv_cache_mode, KVCacheMode::Int8);
 
     // Size the KV cache for the tokens that can actually enter the cache:
@@ -1323,12 +1333,22 @@ fn install_surgery_pipeline_from_cli(args: &GenerateArgs) -> Result<()> {
 /// model's config once the model directory is resolved, mirroring the one-shot
 /// path's `read_eos_token_ids(&args.model.model)`.
 fn chat_options_from_args(args: &GenerateArgs) -> Result<crate::commands::ChatOptions> {
-    let kv_cache_mode = resolve_kv_cache_mode(
+    let resolved_kv = resolve_kv_cache_mode(
         args.generation.turbo.cache_type_k.as_deref(),
         args.generation.turbo.cache_type_v.as_deref(),
         args.generation.turbo.kv_cache_mode.as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
+    // k8v4 construction lives on the server path (scheduler-applied
+    // kvarn_v_bits); the generate/chat paths have no width plumbing.
+    // Refuse loudly rather than silently running k8v8 under a k8v4 label.
+    if resolved_kv.kvarn_v_bits != 8 {
+        anyhow::bail!(
+            "k8v4 is not supported by `mlxcel generate`/chat (server-only \
+             construction); use kvarn8/k8v8 here"
+        );
+    }
+    let kv_cache_mode = resolved_kv.mode;
 
     let sampling = ResolvedSamplingParams {
         temperature: args.sampling.temp,
@@ -1513,12 +1533,22 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
     // group. The helper accepts the same precedence rules as `mlxcel serve`
     // and `mlxcel-server` (split flags > legacy shorthand > FP16 default),
     // so all three binaries route through one resolution path.
-    let kv_cache_mode = resolve_kv_cache_mode(
+    let resolved_kv = resolve_kv_cache_mode(
         args.generation.turbo.cache_type_k.as_deref(),
         args.generation.turbo.cache_type_v.as_deref(),
         args.generation.turbo.kv_cache_mode.as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
+    // k8v4 construction lives on the server path (scheduler-applied
+    // kvarn_v_bits); the generate/chat paths have no width plumbing.
+    // Refuse loudly rather than silently running k8v8 under a k8v4 label.
+    if resolved_kv.kvarn_v_bits != 8 {
+        anyhow::bail!(
+            "k8v4 is not supported by `mlxcel generate`/chat (server-only \
+             construction); use kvarn8/k8v8 here"
+        );
+    }
+    let kv_cache_mode = resolved_kv.mode;
 
     // SAFETY: translate `--turbo-boundary-v` into the `MLXCEL_KV_BOUNDARY_V_LAYERS`
     // env var BEFORE any generator or worker thread is spawned. mlxcel-core

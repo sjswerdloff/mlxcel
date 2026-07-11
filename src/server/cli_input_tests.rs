@@ -919,63 +919,63 @@ use mlxcel_core::cache::KVCacheMode;
 /// Default (no flags) → FP16.
 #[test]
 fn kv_cache_mode_default_is_fp16() {
-    let mode = resolve_kv_cache_mode(None, None, None).expect("default must succeed");
+    let mode = resolve_kv_cache_mode(None, None, None).expect("default must succeed").mode;
     assert_eq!(mode, KVCacheMode::Fp16);
 }
 
 /// Both sides fp16 → Fp16.
 #[test]
 fn kv_cache_mode_fp16_fp16_maps_to_fp16() {
-    let mode = resolve_kv_cache_mode(Some("fp16"), Some("fp16"), None).unwrap();
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("fp16"), None).unwrap().mode;
     assert_eq!(mode, KVCacheMode::Fp16);
 }
 
 /// Both sides int8 → Int8.
 #[test]
 fn kv_cache_mode_int8_int8_maps_to_int8() {
-    let mode = resolve_kv_cache_mode(Some("int8"), Some("int8"), None).unwrap();
+    let mode = resolve_kv_cache_mode(Some("int8"), Some("int8"), None).unwrap().mode;
     assert_eq!(mode, KVCacheMode::Int8);
 }
 
 /// K=fp16, V=turbo4 → Turbo4Asym.
 #[test]
 fn kv_cache_mode_fp16_turbo4_maps_to_turbo4asym() {
-    let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo4"), None).unwrap();
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo4"), None).unwrap().mode;
     assert_eq!(mode, KVCacheMode::Turbo4Asym);
 }
 
 /// K=fp16, V=turbo4-asym (explicit alias) → Turbo4Asym.
 #[test]
 fn kv_cache_mode_fp16_turbo4_asym_maps_to_turbo4asym() {
-    let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo4-asym"), None).unwrap();
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo4-asym"), None).unwrap().mode;
     assert_eq!(mode, KVCacheMode::Turbo4Asym);
 }
 
 /// K=turbo4, V=turbo4 → Turbo4 (symmetric, allowlist-gated at runtime).
 #[test]
 fn kv_cache_mode_turbo4_turbo4_maps_to_turbo4() {
-    let mode = resolve_kv_cache_mode(Some("turbo4"), Some("turbo4"), None).unwrap();
+    let mode = resolve_kv_cache_mode(Some("turbo4"), Some("turbo4"), None).unwrap().mode;
     assert_eq!(mode, KVCacheMode::Turbo4);
 }
 
 /// K=fp16, V=turbo4-delegated → Turbo4Delegated.
 #[test]
 fn kv_cache_mode_fp16_turbo4_delegated_maps_to_delegated() {
-    let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo4-delegated"), None).unwrap();
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo4-delegated"), None).unwrap().mode;
     assert_eq!(mode, KVCacheMode::Turbo4Delegated);
 }
 
 /// Unspecified K defaults to fp16 — K=None + V=turbo4 → Turbo4Asym.
 #[test]
 fn kv_cache_mode_k_defaults_to_fp16_when_unset() {
-    let mode = resolve_kv_cache_mode(None, Some("turbo4"), None).unwrap();
+    let mode = resolve_kv_cache_mode(None, Some("turbo4"), None).unwrap().mode;
     assert_eq!(mode, KVCacheMode::Turbo4Asym);
 }
 
 /// Unspecified V defaults to fp16 — K=None + V=None → Fp16.
 #[test]
 fn kv_cache_mode_v_defaults_to_fp16_when_unset() {
-    let mode = resolve_kv_cache_mode(Some("fp16"), None, None).unwrap();
+    let mode = resolve_kv_cache_mode(Some("fp16"), None, None).unwrap().mode;
     assert_eq!(mode, KVCacheMode::Fp16);
 }
 
@@ -1028,14 +1028,14 @@ fn kv_cache_mode_unknown_v_string_errors() {
 #[test]
 fn kv_cache_mode_legacy_flag_sets_mode() {
     let mode =
-        resolve_kv_cache_mode(None, None, Some("fp16+turbo4")).expect("legacy flag must work");
+        resolve_kv_cache_mode(None, None, Some("fp16+turbo4")).expect("legacy flag must work").mode;
     assert_eq!(mode, KVCacheMode::Turbo4Asym);
 }
 
 /// Legacy --kv-cache-mode=int8 shorthand sets Int8.
 #[test]
 fn kv_cache_mode_legacy_int8_sets_int8() {
-    let mode = resolve_kv_cache_mode(None, None, Some("int8")).expect("legacy int8 must work");
+    let mode = resolve_kv_cache_mode(None, None, Some("int8")).expect("legacy int8 must work").mode;
     assert_eq!(mode, KVCacheMode::Int8);
 }
 
@@ -1043,7 +1043,7 @@ fn kv_cache_mode_legacy_int8_sets_int8() {
 #[test]
 fn kv_cache_mode_split_flags_take_precedence_over_legacy() {
     // split says fp16/fp16 (Fp16), legacy says int8 — split wins
-    let mode = resolve_kv_cache_mode(Some("fp16"), Some("fp16"), Some("int8")).unwrap();
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("fp16"), Some("int8")).unwrap().mode;
     assert_eq!(
         mode,
         KVCacheMode::Fp16,
@@ -1060,6 +1060,111 @@ fn kv_cache_mode_legacy_unknown_value_errors() {
         err.contains("unknown-mode"),
         "error must name the bad value, got: {err}"
     );
+}
+
+// ── kvarn matrix (K8V4 design §3.4) ─────────────────────────────────
+
+/// K=kvarn8, V=kvarn8 → KVarN8 with v_bits 8 (k8v8).
+#[test]
+fn kv_cache_mode_kvarn8_kvarn8_maps_to_k8v8() {
+    let resolved = resolve_kv_cache_mode(Some("kvarn8"), Some("kvarn8"), None).unwrap();
+    assert_eq!(resolved.mode, KVCacheMode::KVarN8);
+    assert_eq!(resolved.kvarn_v_bits, 8);
+}
+
+/// K=kvarn8, V=kvarn4 → KVarN8 with v_bits 4 (k8v4, THE candidate).
+/// The kvarn-k8v8 alias normalizes on the K side too.
+#[test]
+fn kv_cache_mode_kvarn8_kvarn4_maps_to_k8v4() {
+    let resolved = resolve_kv_cache_mode(Some("kvarn8"), Some("kvarn4"), None).unwrap();
+    assert_eq!(resolved.mode, KVCacheMode::KVarN8);
+    assert_eq!(resolved.kvarn_v_bits, 4);
+
+    let aliased = resolve_kv_cache_mode(Some("kvarn-k8v8"), Some("kvarn4"), None).unwrap();
+    assert_eq!(aliased, resolved, "kvarn-k8v8 alias resolves identically");
+}
+
+/// K=kvarn4 is dead with prejudice — rejected at startup with the
+/// registered reason, cited BY NAME (design §3.4: the operator hitting
+/// the rejection deserves the record, not a shrug).
+#[test]
+fn kv_cache_mode_kvarn4_k_side_rejected_with_citation() {
+    let err = resolve_kv_cache_mode(Some("kvarn4"), Some("kvarn4"), None)
+        .expect_err("kvarn4 on K must be rejected");
+    assert!(
+        err.contains("RESULTS_kvarn4_realtile_2026-07-11"),
+        "rejection must cite the registered verdict by name, got: {err}"
+    );
+}
+
+/// kvarn does not mix with other cache types (unvalidated) — both
+/// orientations rejected.
+#[test]
+fn kv_cache_mode_kvarn_turbo_mix_rejected() {
+    let err = resolve_kv_cache_mode(Some("kvarn8"), Some("turbo4"), None)
+        .expect_err("kvarn8/turbo4 must be rejected");
+    assert!(err.contains("kvarn does not mix"), "got: {err}");
+
+    let err = resolve_kv_cache_mode(Some("fp16"), Some("kvarn8"), None)
+        .expect_err("fp16/kvarn8 must be rejected");
+    assert!(err.contains("kvarn does not mix"), "got: {err}");
+}
+
+/// V=kvarn4 with K unset (defaults fp16) → rejected, and the error names
+/// the requirement.
+#[test]
+fn kv_cache_mode_kvarn4_v_requires_kvarn8_k() {
+    let err = resolve_kv_cache_mode(None, Some("kvarn4"), None)
+        .expect_err("kvarn4 V without kvarn8 K must be rejected");
+    assert!(
+        err.contains("requires --cache-type-k kvarn8"),
+        "error must name the requirement, got: {err}"
+    );
+}
+
+/// Legacy `--kv-cache-mode k8v4` shorthand (and its kvarn-k8v4 alias)
+/// resolves through the same construction path as the split flags.
+#[test]
+fn kv_cache_mode_legacy_k8v4_alias_maps_to_k8v4() {
+    for spelling in ["k8v4", "kvarn-k8v4"] {
+        let resolved = resolve_kv_cache_mode(None, None, Some(spelling)).unwrap();
+        assert_eq!(resolved.mode, KVCacheMode::KVarN8, "{spelling}");
+        assert_eq!(resolved.kvarn_v_bits, 4, "{spelling}");
+    }
+}
+
+/// Legacy kvarn8 stays v_bits 8 (k8v8 — today's production boots).
+#[test]
+fn kv_cache_mode_legacy_kvarn8_is_v8() {
+    let resolved = resolve_kv_cache_mode(None, None, Some("kvarn8")).unwrap();
+    assert_eq!(resolved.mode, KVCacheMode::KVarN8);
+    assert_eq!(resolved.kvarn_v_bits, 8);
+}
+
+/// Integration: the k8v4 width flows through `into_startup_config` to
+/// `ServerStartupConfig.kvarn_v_bits` — the field the worker hands the
+/// scheduler. Named mutation: dropping the `kvarn_v_bits` plumb in
+/// `into_startup_config` turns this red.
+#[test]
+fn into_startup_config_kvarn_v_bits_from_k8v4() {
+    let mut input = sample_input();
+    input.cache_type_k = Some("kvarn8".to_string());
+    input.cache_type_v = Some("kvarn4".to_string());
+
+    let startup = input
+        .into_startup_config()
+        .expect("kvarn8/kvarn4 is the k8v4 candidate pair");
+    assert_eq!(startup.kv_cache_mode, KVCacheMode::KVarN8);
+    assert_eq!(startup.kvarn_v_bits, 4);
+}
+
+/// Integration: default kvarn_v_bits is the inert 8.
+#[test]
+fn into_startup_config_kvarn_v_bits_default_is_8() {
+    let startup = sample_input()
+        .into_startup_config()
+        .expect("default input is valid");
+    assert_eq!(startup.kvarn_v_bits, 8);
 }
 
 /// Integration: split flags flow through `into_startup_config` to

@@ -472,13 +472,17 @@ impl ServerStartupInput {
         .map_err(|e| anyhow::anyhow!("--apc-hash: {e}"))?;
 
         // (B11): resolve the effective KV cache mode from split flags,
-        // legacy shorthand, or the default (FP16).
-        let kv_cache_mode = resolve_kv_cache_mode(
+        // legacy shorthand, or the default (FP16). The resolved config
+        // also carries the KVarN8 V width (k8v8 vs k8v4) — a width, not
+        // a mode (see ResolvedKvCacheConfig).
+        let resolved_kv = resolve_kv_cache_mode(
             self.cache_type_k.as_deref(),
             self.cache_type_v.as_deref(),
             self.kv_cache_mode_legacy.as_deref(),
         )
         .map_err(|e| anyhow::anyhow!("KV cache mode error: {e}"))?;
+        let kv_cache_mode = resolved_kv.mode;
+        let kvarn_v_bits = resolved_kv.kvarn_v_bits;
 
         // resolve the batch KV quantization config from the
         // new `--kv-bits` / `--kv-group-size` / `--kv-quant-scheme` /
@@ -614,6 +618,7 @@ impl ServerStartupInput {
             chat_template_kwargs,
             prompt_cache,
             kv_cache_mode,
+            kvarn_v_bits,
             batch_kv_quant,
             // lower the raw `usize` (0 = disabled) into a
             // semantic `Option<usize>` after `resolve_max_kv_size` has

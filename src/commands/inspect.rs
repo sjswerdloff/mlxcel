@@ -45,12 +45,16 @@ pub(crate) fn run_inspect(mut args: InspectArgs) -> Result<()> {
     // Translate the user-facing `--quant` label into the typed hint.
     let quant = parse_quant_hint(&args.quant)?;
 
+    // Memory-estimate preflight: only the int8 flag is consumed, so the
+    // resolved mode suffices (k8v4 vs k8v8 width does not change this
+    // estimator's granularity; real construction validates the width).
     let kv_cache_mode = resolve_kv_cache_mode(
         args.turbo.cache_type_k.as_deref(),
         args.turbo.cache_type_v.as_deref(),
         args.turbo.kv_cache_mode.as_deref(),
     )
-    .map_err(|e| anyhow!("{}", e))?;
+    .map_err(|e| anyhow!("{}", e))?
+    .mode;
     let kv_int8 = matches!(kv_cache_mode, KVCacheMode::Int8);
 
     let estimate = estimate_total_memory(&args.model, args.max_tokens, args.batch, quant, kv_int8);

@@ -216,7 +216,8 @@ fn default_kv_cache_mode_unchanged_without_opt_in() {
     let _ = recommend_kv_cache_mode(KvArchKind::Standard, "llama", KvContextRange::Long);
     // ... the default resolution is still fp16.
     let resolved = resolve_kv_cache_mode(None, None, None).unwrap();
-    assert_eq!(resolved, KVCacheMode::Fp16);
+    assert_eq!(resolved.mode, KVCacheMode::Fp16);
+    assert_eq!(resolved.kvarn_v_bits, 8, "default width is the inert 8");
 }
 
 #[test]

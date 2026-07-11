@@ -120,7 +120,7 @@ fn apply_to_environment_preserves_negative_inputs_for_runtime_clamping() {
 #[test]
 fn resolve_split_flags_fp16_k_turbo3_v_returns_turbo3_asym() {
     let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo3"), None)
-        .expect("fp16 + turbo3 split flags must resolve");
+        .expect("fp16 + turbo3 split flags must resolve").mode;
     assert_eq!(mode, KVCacheMode::Turbo3Asym);
 }
 
@@ -128,7 +128,7 @@ fn resolve_split_flags_fp16_k_turbo3_v_returns_turbo3_asym() {
 #[test]
 fn resolve_split_flags_fp16_k_turbo3_asym_v_returns_turbo3_asym() {
     let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo3-asym"), None)
-        .expect("fp16 + turbo3-asym split flags must resolve");
+        .expect("fp16 + turbo3-asym split flags must resolve").mode;
     assert_eq!(mode, KVCacheMode::Turbo3Asym);
 }
 
@@ -136,7 +136,7 @@ fn resolve_split_flags_fp16_k_turbo3_asym_v_returns_turbo3_asym() {
 #[test]
 fn resolve_split_flags_fp16_k_fp16_plus_turbo3_v_returns_turbo3_asym() {
     let mode = resolve_kv_cache_mode(Some("fp16"), Some("fp16+turbo3"), None)
-        .expect("fp16 + fp16+turbo3 split flags must resolve");
+        .expect("fp16 + fp16+turbo3 split flags must resolve").mode;
     assert_eq!(mode, KVCacheMode::Turbo3Asym);
 }
 
