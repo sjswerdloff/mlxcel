@@ -36,8 +36,12 @@ Violet holds the PM board; Xander holds review seats.
    (can_trim_padding mirrors the arm; tripwire passes exactly when safe),
    m3_idx_offset lockstep. Six edges + four arm-bar pins green
    (cache:: 475/475), two named mutations red on the committed base.
-   Awaiting Xander's mechanism review (asked: cap-translation anchor,
-   refuse-condition half-apply hunt, predicate/arm mirror width).
+   Xander mechanism review 17:33: APPROVE, NO MUST-FIXES — cap
+   translation anchor correct (incl. sink-early-return: consumed-but-
+   unapplied cap is correct, it belonged to that forward), refuse
+   condition exact (no half-apply state constructible), predicate/arm
+   mirror exact (no wider, no narrower). HIS WORDS: "Scheduler wiring
+   (4 sites) can build on this." The wiring is UNBLOCKED.
 
 ## FAR-SIDE PICKUP (in order)
 
