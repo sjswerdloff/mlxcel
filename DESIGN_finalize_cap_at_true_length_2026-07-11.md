@@ -15,8 +15,32 @@ tiles keep the rows — silent desync (tripwired at all four sites,
 0028c12, which ABORTS the sequence: honest, but a refusal not a fix).
 Wrong 2: Sinkhorn s_col/s_row normalize over garbage rows sharing tiles
 with real rows — quality pollution on real data before trim ever runs.
-Cap the finalization at true length and both die: padding lives only in
-the fp16 tail, which the existing dense trim already handles correctly.
+Cap the finalization at true length and wrong-2 dies outright; wrong-1
+needs one more piece (next paragraph).
+
+CORRECTED PREMISE (Clement, first cut of #36, 2026-07-11 17:23 —
+verified at source by Violet): this doc originally claimed "padding
+lives only in the fp16 tail, which the existing dense trim already
+handles correctly." WRONG for kvarn caches: `trim()` (cache.rs:3316)
+rolls `offset` back and slices only the dense field family
+(keys/values/scales/packed/norms) — all None under kvarn. A capped
+update followed by `trim(excess)` leaves `kvarn_tail_*` holding MORE
+rows than `offset` implies: wrong-1 relocated into the tail. (Systemic
+note: kvarn´s parallel field set makes every mode-generic method a
+blind-spot candidate — `trim()` and `nbytes()` (#37) failed the same
+way the same day. Audit all per-mode-field iterating methods.)
+
+THE AMENDMENT #36 CARRIES: a TAIL-BOUNDED kvarn arm in `trim()` —
+slice from the fp16 end-state only (tail first; sink only when hist is
+empty, covering short padded prefills whose padding lands in the
+sink); REFUSE LOUDLY (return 0, ZERO mutation) if the trim would reach
+quantized tiles. This is NOT the deferred general kvarn trim — tiles
+stay untouchable; it is the minimum for the cap to compose with the
+scheduler´s trim call. Corollary: `padding_trim_would_corrupt`
+extends to tail-awareness (excess within the fp16 end-state = safe),
+so the tripwire passes exactly when trimming is genuinely safe. Edge 5
+below cannot pass without this arm — the six-edge plan caught the
+premise failure at first cut, as designed.
 
 ## Mechanism (no model-signature cascade)
 
