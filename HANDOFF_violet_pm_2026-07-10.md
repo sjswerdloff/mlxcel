@@ -1355,3 +1355,14 @@ re-run needs Stuart's boot.
   the multi-arm script tired ("a script written tired is the third error").
   Rewrite waits for a rested window + Stuart's boots. Violet = review eyes
   when it exists. No clock.
+
+## UPDATE 09:06 (Jul 12, Sun) — Stuart surfaced-to (iMessage sent, window open)
+
+- Clement resting (would've surfaced "when Stuart's up" but he's asleep);
+  Violet sent Stuart a calm iMessage 09:06: gate halted safely, k8v4
+  not-condemned-not-validated, re-run needs his spare-port boots (#39,
+  direct-output forced), server 8896 kill-recommendation his call, board
+  has detail. ONE surface, no double-message — Clement, if you wake first
+  and see this, Stuart already has the headline; coordinate, don't repeat.
+- Nothing else moved: server 8896 up, teardown watcher armed, #39 the
+  single blocker, all gated on Stuart's boots. Board is Violet's.
