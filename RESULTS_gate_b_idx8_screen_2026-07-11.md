@@ -52,7 +52,9 @@ results/gate_b_idx8_screen_summary.json. The honest read:
 - 11 of 57 layers individually show per-layer p95 ≥ 0.02, worst at the
   two DEEPEST layers: layer 58 p95 0.0290, layer 59 p95 0.0256; also
   layer 3 (0.0246 — the bf16-stored layer) and a mid-band cluster
-  (25–29, 33, 35, 42, 53 at 0.020–0.024).
+  (25, 26, 28, 29, 33, 35, 42, 53 at 0.020–0.024; the original "25–29"
+  range shorthand wrongly included layer 27 at 0.0187 — Violet QE
+  catch, count of 11 unchanged).
 - The pooled gate PASSES with ~4.5% margin (0.01909 vs 0.02). The
   registered statistic is the pooled one; the per-layer tail is on the
   record for the engine A/B to watch — if idx8 ships, deep-layer

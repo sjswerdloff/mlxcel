@@ -619,6 +619,30 @@ pub struct KVCache {
     pub(crate) kvarn_v_zp: Option<UniquePtr<MlxArray>>,
     pub(crate) kvarn_v_s_row: Option<UniquePtr<MlxArray>>,
     pub(crate) kvarn_v_s_col: Option<UniquePtr<MlxArray>>,
+
+    /// V-side quantization width under `KVCacheMode::KVarN8`: 8 (k8v8,
+    /// default) or 4 (K8V4 — DESIGN_kvarn_k8v4_engine §3.1). Consulted
+    /// ONLY on kvarn-mode paths; meaningless otherwise.
+    ///
+    /// Deliberately a field rather than a new `KVCacheMode` variant: every
+    /// existing kvarn gate (`is_trimmable`, the scheduler padding
+    /// tripwire's `can_trim_prompt_cache`, the paged-construction bypass,
+    /// detach/snapshot refusals, the D1 empty-downgrade) matches
+    /// `KVCacheMode::KVarN8`, and a new variant would silently fall OUT of
+    /// every one of them — the exact silent-wrong class those gates exist
+    /// to kill. The field keeps every mode gate correct by construction;
+    /// the only sites that care about V width are the §3.3-closed call
+    /// graph (update/synth writers, assemble/blocks/qmm readers), each of
+    /// which branches or refuses on this field explicitly.
+    ///
+    /// At 4, V storage per §3.1: packed u32 codes in `kvarn_hist_v`
+    /// (`[B,H,T_hist,D/8]`), per-GROUP folded affine params in
+    /// `kvarn_v_scale`/`kvarn_v_zp` (`[B,H,T_hist,D/gs]`, gs =
+    /// [`kvarn::KVARN_V4_GROUP_SIZE`], scale' = s·s_row / zp' = zp·s_row,
+    /// f32), `kvarn_v_s_row` stays `None` (the fold IS its storage),
+    /// `kvarn_v_s_col` unchanged. K-side fields are byte-identical to
+    /// k8v8 in both widths — k4-K is dead with prejudice (§1).
+    pub(crate) kvarn_v_bits: u8,
 }
 
 /// Shared handle that makes one [`KVCache`] write/read through a pooled paged
@@ -695,6 +719,7 @@ impl KVCache {
             kvarn_v_zp: None,
             kvarn_v_s_row: None,
             kvarn_v_s_col: None,
+            kvarn_v_bits: 8,
         }
     }
 
@@ -759,6 +784,7 @@ impl KVCache {
             kvarn_v_zp: None,
             kvarn_v_s_row: None,
             kvarn_v_s_col: None,
+            kvarn_v_bits: 8,
         }
     }
 
@@ -1056,7 +1082,10 @@ impl KVCache {
     /// after live measurement — the transparent-mode semantics (FP16
     /// standard frame out) will not change.
     fn update_kvarn8(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
-        use crate::cache::kvarn::{KVARN_TILE_TOKENS, kvarn_quantize, kvarn_rotate};
+        use crate::cache::kvarn::{
+            KVARN_TILE_TOKENS, KVARN_V4_GROUP_SIZE, kvarn_quantize, kvarn_quantize_v4,
+            kvarn_rotate,
+        };
 
         let key_shape = ffi::array_shape(&new_keys);
         let head_dim = key_shape[3];
@@ -1064,6 +1093,13 @@ impl KVCache {
             head_dim > 0 && (head_dim & (head_dim - 1)) == 0,
             "KVarN8 requires power-of-2 head_dim (Hadamard); got {head_dim} — \
              the mode guard upstream should have refused this model"
+        );
+        assert!(
+            self.kvarn_v_bits == 8
+                || (self.kvarn_v_bits == 4 && head_dim % KVARN_V4_GROUP_SIZE == 0),
+            "kvarn_v_bits={} requires head_dim divisible by gs={KVARN_V4_GROUP_SIZE}; \
+             got {head_dim} — the construction key upstream should have refused this model",
+            self.kvarn_v_bits
         );
         let new_seq_len = key_shape[2];
 
@@ -1117,6 +1153,13 @@ impl KVCache {
         let (b, h, len, d) = (shape[0], shape[1], shape[2], shape[3]);
         let n_full = len / KVARN_TILE_TOKENS;
         if n_full > 0 {
+            // THE finalize-boundary variable (K8V4 birth constraint,
+            // DESIGN_kvarn_k8v4_engine §3.3 ⊕⊕ / task #36): every
+            // decision about WHICH pending rows finalize into quantized
+            // tiles routes through `full_len` — the tile slices, every
+            // append below, and the tail split all derive from it. The
+            // finalize-cap fix (DESIGN_finalize_cap_at_true_length) lands
+            // as `min(natural, cap)` HERE and nowhere else.
             let full_len = n_full * KVARN_TILE_TOKENS;
             let k_full = ffi::slice(&pending_k, &[0, 0, 0, 0], &[b, h, full_len, d]);
             let v_full = ffi::slice(&pending_v, &[0, 0, 0, 0], &[b, h, full_len, d]);
@@ -1152,9 +1195,6 @@ impl KVCache {
                     &as_tiles(&v_full),
                 );
             }
-            let k_q = kvarn_quantize(&as_tiles(&k_full), 8);
-            let v_q = kvarn_quantize(&as_tiles(&v_full), 8);
-
             fn append(
                 dst: &mut Option<UniquePtr<MlxArray>>,
                 new: &MlxArray,
@@ -1167,18 +1207,57 @@ impl KVCache {
                     None => new,
                 });
             }
+            // K side: 8-bit in BOTH V widths — k4-K is dead with prejudice
+            // (design §1); nothing below this line may vary K on
+            // `kvarn_v_bits`.
+            let k_q = kvarn_quantize(&as_tiles(&k_full), 8);
             append(&mut self.kvarn_hist_k, &k_q.q, &[b, h, full_len, d], 2);
-            append(&mut self.kvarn_hist_v, &v_q.q, &[b, h, full_len, d], 2);
             append(&mut self.kvarn_k_scale, &k_q.scale, &[b, h, full_len, 1], 2);
             append(&mut self.kvarn_k_zp, &k_q.zp, &[b, h, full_len, 1], 2);
             append(&mut self.kvarn_k_s_row, &k_q.s_row, &[b, h, full_len, 1], 2);
-            append(&mut self.kvarn_v_scale, &v_q.scale, &[b, h, full_len, 1], 2);
-            append(&mut self.kvarn_v_zp, &v_q.zp, &[b, h, full_len, 1], 2);
-            append(&mut self.kvarn_v_s_row, &v_q.s_row, &[b, h, full_len, 1], 2);
             // s_col is per-tile: [B·H·n_full, 1, D] → [B, H, n_full, D],
             // appended along the tile axis (2).
             append(&mut self.kvarn_k_s_col, &k_q.s_col, &[b, h, n_full, d], 2);
-            append(&mut self.kvarn_v_s_col, &v_q.s_col, &[b, h, n_full, d], 2);
+            // V side: width per `kvarn_v_bits` (field docs; design §3.1).
+            match self.kvarn_v_bits {
+                8 => {
+                    let v_q = kvarn_quantize(&as_tiles(&v_full), 8);
+                    append(&mut self.kvarn_hist_v, &v_q.q, &[b, h, full_len, d], 2);
+                    append(&mut self.kvarn_v_scale, &v_q.scale, &[b, h, full_len, 1], 2);
+                    append(&mut self.kvarn_v_zp, &v_q.zp, &[b, h, full_len, 1], 2);
+                    append(&mut self.kvarn_v_s_row, &v_q.s_row, &[b, h, full_len, 1], 2);
+                    append(&mut self.kvarn_v_s_col, &v_q.s_col, &[b, h, n_full, d], 2);
+                }
+                4 => {
+                    let v_q = kvarn_quantize_v4(&as_tiles(&v_full), KVARN_V4_GROUP_SIZE);
+                    // Packed u32 codes: [B·H·n_full, TILE, D/8] → hist_v.
+                    append(
+                        &mut self.kvarn_hist_v,
+                        &v_q.q_packed,
+                        &[b, h, full_len, d / 8],
+                        2,
+                    );
+                    // Folded per-group affine params (scale' = s·s_row,
+                    // zp' = zp·s_row): trailing dim D/gs.
+                    append(
+                        &mut self.kvarn_v_scale,
+                        &v_q.scale_folded,
+                        &[b, h, full_len, d / KVARN_V4_GROUP_SIZE],
+                        2,
+                    );
+                    append(
+                        &mut self.kvarn_v_zp,
+                        &v_q.zp_folded,
+                        &[b, h, full_len, d / KVARN_V4_GROUP_SIZE],
+                        2,
+                    );
+                    // kvarn_v_s_row stays None: the fold IS its storage.
+                    append(&mut self.kvarn_v_s_col, &v_q.s_col, &[b, h, n_full, d], 2);
+                }
+                other => panic!(
+                    "kvarn_v_bits must be 8 or 4, got {other} — construction should have refused"
+                ),
+            }
 
             if len > full_len {
                 self.kvarn_tail_k = Some(ffi::slice(
@@ -1205,6 +1284,16 @@ impl KVCache {
     /// `(keys, values)`.
     fn fetch_kvarn8(&self) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         use crate::cache::kvarn::{KVARN_TILE_TOKENS, kvarn_rotate};
+
+        // K8V4 read paths land one at a time behind the construction key
+        // (design §5); until the v1 dequant learns unpack+folded-affine,
+        // reading a v4 cache is a loud refusal, never wrong data.
+        assert!(
+            self.kvarn_v_bits == 8,
+            "fetch_kvarn8 (v1 assemble) has no kvarn_v_bits={} read path yet — \
+             design §5: read paths land one at a time behind the construction key",
+            self.kvarn_v_bits
+        );
 
         #[allow(clippy::too_many_arguments)]
         fn assemble(
@@ -1323,6 +1412,17 @@ impl KVCache {
         if self.mode != KVCacheMode::KVarN8 || self.paged_backing.is_some() {
             return None;
         }
+        // v4 guard MUST be a panic, not a `None`: on a v4 cache
+        // `kvarn_v_s_row` is None (the fold is its storage), so the `?`
+        // below would return None and C would SILENTLY fall through to the
+        // fetch+core pair — legitimate-looking behavior masking an
+        // unimplemented path. Loud until the C v4 dispatch lands (§5).
+        assert!(
+            self.kvarn_v_bits == 8,
+            "kvarn_qmm_state has no kvarn_v_bits={} read path yet — \
+             design §5: read paths land one at a time behind the construction key",
+            self.kvarn_v_bits
+        );
         let n_tiles = self
             .kvarn_k_s_col
             .as_ref()
@@ -1403,6 +1503,12 @@ impl KVCache {
             self.mode == KVCacheMode::KVarN8 && self.paged_backing.is_none(),
             "fetch_kvarn8_blocks on a cache that does not support it (mode={:?})",
             self.mode
+        );
+        assert!(
+            self.kvarn_v_bits == 8,
+            "fetch_kvarn8_blocks has no kvarn_v_bits={} read path yet — \
+             design §5: read paths land one at a time behind the construction key",
+            self.kvarn_v_bits
         );
         assert!(!blocks.is_empty(), "fetch_kvarn8_blocks: empty block list");
 
@@ -1695,11 +1801,35 @@ impl KVCache {
         index_dim: i32,
         seed: u64,
     ) -> KVCache {
-        use crate::cache::kvarn::KVARN_TILE_TOKENS;
+        Self::synth_kvarn_state(b, h, d, total, index_dim, seed, 8)
+    }
+
+    /// BENCH SUPPORT — [`Self::synth_kvarn8_state`] generalized over the
+    /// V width (`v_bits` 8 or 4). ONE layout authority: this function and
+    /// `update_kvarn8` are the only two writers of kvarn fields, and the
+    /// `synth_k8v4_layout_matches_update_built_layout` test pins them to
+    /// each other — a bench state whose LAYOUT diverges from what the
+    /// engine writes would make every rank cell built on it lie
+    /// (design §3.3, the critical addition).
+    pub fn synth_kvarn_state(
+        b: i32,
+        h: i32,
+        d: i32,
+        total: i32,
+        index_dim: i32,
+        seed: u64,
+        v_bits: u8,
+    ) -> KVCache {
+        use crate::cache::kvarn::{KVARN_TILE_TOKENS, KVARN_V4_GROUP_SIZE};
 
         assert!(
             total >= 2 * KVARN_TILE_TOKENS,
-            "synth_kvarn8_state needs a full sink plus at least one tile; got total={total}"
+            "synth_kvarn_state needs a full sink plus at least one tile; got total={total}"
+        );
+        assert!(
+            v_bits == 8 || (v_bits == 4 && d % KVARN_V4_GROUP_SIZE == 0),
+            "synth_kvarn_state: v_bits={v_bits} requires head_dim divisible by \
+             gs={KVARN_V4_GROUP_SIZE}; got {d}"
         );
         ffi::random_seed(seed);
         let normal_fp16 = |shape: &[i32]| -> UniquePtr<MlxArray> {
@@ -1715,35 +1845,54 @@ impl KVCache {
         let hist_len = n_tiles * KVARN_TILE_TOKENS;
 
         let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        cache.kvarn_v_bits = v_bits;
         cache.kvarn_sink_k = Some(normal_fp16(&[b, h, KVARN_TILE_TOKENS, d]));
         cache.kvarn_sink_v = Some(normal_fp16(&[b, h, KVARN_TILE_TOKENS, d]));
-        // u8 codes: uniform over the full code range.
+        // K side: u8 codes uniform over the full code range, per-row f32
+        // params — byte-layout identical in both V widths.
         cache.kvarn_hist_k = Some(ffi::astype(
-            &uniform_f32(0.0, 255.999, &[b, h, hist_len, d]),
-            dtype::UINT8,
-        ));
-        cache.kvarn_hist_v = Some(ffi::astype(
             &uniform_f32(0.0, 255.999, &[b, h, hist_len, d]),
             dtype::UINT8,
         ));
         // Sane scalar magnitudes (positive scales, negative-ish zero points)
         // so downstream softmax/topk see finite values — timing-neutral, but
         // NaN poisoning would make the bench diverge from production math.
-        for (scale, zp, s_row) in [
-            (
-                &mut cache.kvarn_k_scale,
-                &mut cache.kvarn_k_zp,
-                &mut cache.kvarn_k_s_row,
-            ),
-            (
-                &mut cache.kvarn_v_scale,
-                &mut cache.kvarn_v_zp,
-                &mut cache.kvarn_v_s_row,
-            ),
-        ] {
-            *scale = Some(uniform_f32(2e-3, 2e-2, &[b, h, hist_len, 1]));
-            *zp = Some(uniform_f32(-1.5, 0.0, &[b, h, hist_len, 1]));
-            *s_row = Some(uniform_f32(0.5, 2.0, &[b, h, hist_len, 1]));
+        cache.kvarn_k_scale = Some(uniform_f32(2e-3, 2e-2, &[b, h, hist_len, 1]));
+        cache.kvarn_k_zp = Some(uniform_f32(-1.5, 0.0, &[b, h, hist_len, 1]));
+        cache.kvarn_k_s_row = Some(uniform_f32(0.5, 2.0, &[b, h, hist_len, 1]));
+        // V side: layout per `kvarn_v_bits` (field docs; design §3.1).
+        match v_bits {
+            8 => {
+                cache.kvarn_hist_v = Some(ffi::astype(
+                    &uniform_f32(0.0, 255.999, &[b, h, hist_len, d]),
+                    dtype::UINT8,
+                ));
+                cache.kvarn_v_scale = Some(uniform_f32(2e-3, 2e-2, &[b, h, hist_len, 1]));
+                cache.kvarn_v_zp = Some(uniform_f32(-1.5, 0.0, &[b, h, hist_len, 1]));
+                cache.kvarn_v_s_row = Some(uniform_f32(0.5, 2.0, &[b, h, hist_len, 1]));
+            }
+            4 => {
+                // Packed u32 codes ([B,H,T,D/8]): any u32 is a valid pack
+                // of eight nibbles — garbage VALUES, production LAYOUT.
+                cache.kvarn_hist_v = Some(ffi::astype(
+                    &uniform_f32(0.0, 4_294_967_040.0, &[b, h, hist_len, d / 8]),
+                    dtype::UINT32,
+                ));
+                // Folded per-group params ([B,H,T,D/gs]): magnitudes match
+                // the 8-bit ranges times an s_row in [0.5, 2.0].
+                cache.kvarn_v_scale = Some(uniform_f32(
+                    1e-3,
+                    4e-2,
+                    &[b, h, hist_len, d / KVARN_V4_GROUP_SIZE],
+                ));
+                cache.kvarn_v_zp = Some(uniform_f32(
+                    -3.0,
+                    0.0,
+                    &[b, h, hist_len, d / KVARN_V4_GROUP_SIZE],
+                ));
+                // kvarn_v_s_row stays None: the fold IS its storage.
+            }
+            other => panic!("synth_kvarn_state: v_bits must be 8 or 4, got {other}"),
         }
         cache.kvarn_k_s_col = Some(uniform_f32(0.5, 2.0, &[b, h, n_tiles, d]));
         cache.kvarn_v_s_col = Some(uniform_f32(0.5, 2.0, &[b, h, n_tiles, d]));
@@ -9756,5 +9905,310 @@ mod tests {
         assert_eq!(metadata.kv_lens, vec![8, 12]);
         assert_eq!(metadata.len(), 2);
         metadata.assert_consistent().unwrap();
+    }
+
+    // ── K8V4 cache surgery (kvarn_v_bits + V4 write path; design §3.1/§3.3) ──
+
+    /// Deterministic non-degenerate [1, 2, len, 128] test tensors (distinct
+    /// per head/position/channel so byte-compares are meaningful).
+    fn kvarn_v4_test_input(len: i32) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        let (b, h, d) = (1, 2, 128);
+        let n = (b * h * len * d) as usize;
+        let gen = |salt: i32| -> UniquePtr<MlxArray> {
+            let vals: Vec<f32> = (0..n)
+                .map(|i| (((i as i32 * 131 + salt) % 197) as f32) * 0.013 - 1.2)
+                .collect();
+            ffi::from_slice_f32(&vals, &[b, h, len, d])
+        };
+        (gen(7), gen(101))
+    }
+
+    fn kvarn_v4_cache() -> KVCache {
+        let mut c = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        c.kvarn_v_bits = 4;
+        c
+    }
+
+    fn raw(a: &Option<UniquePtr<MlxArray>>) -> Vec<u8> {
+        ffi::array_to_raw_bytes(a.as_ref().expect("field expected Some"))
+    }
+
+    #[test]
+    fn k8v4_update_stores_packed_folded_layout() {
+        // 128 sink + 2 full tiles + 50 tail.
+        let (k, v) = kvarn_v4_test_input(434);
+        let mut cache = kvarn_v4_cache();
+        cache.update_only(k, v);
+
+        let hist_v = cache.kvarn_hist_v.as_ref().expect("hist_v");
+        assert_eq!(ffi::array_shape(hist_v), vec![1, 2, 256, 16], "packed u32: D/8");
+        assert_eq!(ffi::array_dtype(hist_v), dtype::UINT32);
+        let v_scale = cache.kvarn_v_scale.as_ref().expect("v_scale");
+        assert_eq!(ffi::array_shape(v_scale), vec![1, 2, 256, 4], "folded per-group: D/gs");
+        assert_eq!(ffi::array_dtype(v_scale), dtype::FLOAT32);
+        let v_zp = cache.kvarn_v_zp.as_ref().expect("v_zp");
+        assert_eq!(ffi::array_shape(v_zp), vec![1, 2, 256, 4]);
+        assert!(
+            cache.kvarn_v_s_row.is_none(),
+            "v_s_row must stay None on V4 — the fold IS its storage"
+        );
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_v_s_col.as_ref().expect("v_s_col")),
+            vec![1, 2, 2, 128],
+            "s_col unchanged from k8"
+        );
+        // K side keeps the 8-bit layout exactly.
+        let hist_k = cache.kvarn_hist_k.as_ref().expect("hist_k");
+        assert_eq!(ffi::array_shape(hist_k), vec![1, 2, 256, 128]);
+        assert_eq!(ffi::array_dtype(hist_k), dtype::UINT8);
+        assert!(cache.kvarn_k_s_row.is_some(), "K s_row unchanged (not folded)");
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_tail_v.as_ref().expect("tail_v")),
+            vec![1, 2, 50, 128]
+        );
+        assert_eq!(cache.offset, 434);
+    }
+
+    /// THE wiring pin: what update_kvarn8 stores for V4 is BITWISE the
+    /// output of `kvarn_quantize_v4` on the tiles the update path built —
+    /// named mutation: routing folded params to swapped destination fields
+    /// (or storing unpacked codes) turns this red.
+    #[test]
+    fn k8v4_update_wiring_matches_kvarn_quantize_v4_bitwise() {
+        use crate::cache::kvarn::{KVARN_V4_GROUP_SIZE, kvarn_quantize_v4, kvarn_rotate};
+
+        let (k, v) = kvarn_v4_test_input(434);
+        // Replicate the update path's exact V preprocessing: rotate the f16
+        // input, drop the 128-token sink prefix, slice the 2 full tiles,
+        // reshape to the [B·H·n_full, TILE, D] f32 tile batch.
+        let rot_v = kvarn_rotate(&ffi::astype(&v, dtype::FLOAT16));
+        let past_sink = ffi::slice(&rot_v, &[0, 0, 128, 0], &[1, 2, 434, 128]);
+        let v_full = ffi::slice(&past_sink, &[0, 0, 0, 0], &[1, 2, 256, 128]);
+        let tiles = ffi::reshape(&ffi::astype(&v_full, dtype::FLOAT32), &[4, 128, 128]);
+        let direct = kvarn_quantize_v4(&tiles, KVARN_V4_GROUP_SIZE);
+
+        let mut cache = kvarn_v4_cache();
+        cache.update_only(k, v);
+
+        assert_eq!(raw(&cache.kvarn_hist_v), ffi::array_to_raw_bytes(&direct.q_packed));
+        assert_eq!(raw(&cache.kvarn_v_scale), ffi::array_to_raw_bytes(&direct.scale_folded));
+        assert_eq!(raw(&cache.kvarn_v_zp), ffi::array_to_raw_bytes(&direct.zp_folded));
+        assert_eq!(raw(&cache.kvarn_v_s_col), ffi::array_to_raw_bytes(&direct.s_col));
+    }
+
+    /// K DOES NOT CHANGE (design §1): every K-side field and the fp16
+    /// sink/tail are byte-identical between v_bits widths.
+    #[test]
+    fn k8v4_k_side_bitwise_equal_to_k8v8() {
+        let (k1, v1) = kvarn_v4_test_input(434);
+        let (k2, v2) = kvarn_v4_test_input(434);
+        let mut c8 = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        c8.update_only(k1, v1);
+        let mut c4 = kvarn_v4_cache();
+        c4.update_only(k2, v2);
+
+        for (name, a, b) in [
+            ("hist_k", &c8.kvarn_hist_k, &c4.kvarn_hist_k),
+            ("k_scale", &c8.kvarn_k_scale, &c4.kvarn_k_scale),
+            ("k_zp", &c8.kvarn_k_zp, &c4.kvarn_k_zp),
+            ("k_s_row", &c8.kvarn_k_s_row, &c4.kvarn_k_s_row),
+            ("k_s_col", &c8.kvarn_k_s_col, &c4.kvarn_k_s_col),
+            ("sink_k", &c8.kvarn_sink_k, &c4.kvarn_sink_k),
+            ("sink_v", &c8.kvarn_sink_v, &c4.kvarn_sink_v),
+            ("tail_k", &c8.kvarn_tail_k, &c4.kvarn_tail_k),
+            ("tail_v", &c8.kvarn_tail_v, &c4.kvarn_tail_v),
+        ] {
+            assert_eq!(raw(a), raw(b), "{name} must be byte-identical across V widths");
+        }
+    }
+
+    /// Regression pin for the V-branch restructure: the v_bits=8 path
+    /// stores BITWISE what `kvarn_quantize(…, 8)` produces (the pre-surgery
+    /// contract, now guarded against the added branch).
+    #[test]
+    fn k8v8_v_side_unchanged_matches_kvarn_quantize_bitwise() {
+        use crate::cache::kvarn::{kvarn_quantize, kvarn_rotate};
+
+        let (k, v) = kvarn_v4_test_input(434);
+        let rot_v = kvarn_rotate(&ffi::astype(&v, dtype::FLOAT16));
+        let past_sink = ffi::slice(&rot_v, &[0, 0, 128, 0], &[1, 2, 434, 128]);
+        let v_full = ffi::slice(&past_sink, &[0, 0, 0, 0], &[1, 2, 256, 128]);
+        let tiles = ffi::reshape(&ffi::astype(&v_full, dtype::FLOAT32), &[4, 128, 128]);
+        let direct = kvarn_quantize(&tiles, 8);
+
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        cache.update_only(k, v);
+
+        assert_eq!(raw(&cache.kvarn_hist_v), ffi::array_to_raw_bytes(&direct.q));
+        assert_eq!(raw(&cache.kvarn_v_scale), ffi::array_to_raw_bytes(&direct.scale));
+        assert_eq!(raw(&cache.kvarn_v_zp), ffi::array_to_raw_bytes(&direct.zp));
+        assert_eq!(raw(&cache.kvarn_v_s_row), ffi::array_to_raw_bytes(&direct.s_row));
+        assert_eq!(raw(&cache.kvarn_v_s_col), ffi::array_to_raw_bytes(&direct.s_col));
+    }
+
+    #[test]
+    #[should_panic(expected = "has no kvarn_v_bits=4 read path")]
+    fn k8v4_fetch_refuses_loudly() {
+        let (k, v) = kvarn_v4_test_input(434);
+        let mut cache = kvarn_v4_cache();
+        cache.update_only(k, v);
+        let _ = cache.fetch_kvarn8();
+    }
+
+    #[test]
+    #[should_panic(expected = "fetch_kvarn8_blocks has no kvarn_v_bits=4 read path")]
+    fn k8v4_block_fetch_refuses_loudly() {
+        let (k, v) = kvarn_v4_test_input(434);
+        let mut cache = kvarn_v4_cache();
+        cache.update_only(k, v);
+        let _ = cache.fetch_kvarn8_blocks(&[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "kvarn_qmm_state has no kvarn_v_bits=4 read path")]
+    fn k8v4_qmm_state_refuses_loudly() {
+        // MUST panic rather than return None: a None here would make C fall
+        // through to the fetch+core pair silently (v_s_row is None on V4,
+        // so the `?` chain would mask the unimplemented path as
+        // legitimate-looking fall-through).
+        let (k, v) = kvarn_v4_test_input(434);
+        let mut cache = kvarn_v4_cache();
+        cache.update_only(k, v);
+        let _ = cache.kvarn_qmm_state();
+    }
+
+    #[test]
+    fn k8v4_multi_update_appends_consistent() {
+        // Sink-only first update: no V4 fields yet.
+        let (k, v) = kvarn_v4_test_input(100);
+        let mut cache = kvarn_v4_cache();
+        cache.update_only(k, v);
+        assert!(cache.kvarn_hist_v.is_none());
+        assert_eq!(cache.offset, 100);
+
+        // Second update completes the sink and finalizes 2 tiles (+16 tail).
+        let (k, v) = kvarn_v4_test_input(300);
+        cache.update_only(k, v);
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_hist_v.as_ref().unwrap()),
+            vec![1, 2, 256, 16]
+        );
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_v_scale.as_ref().unwrap()),
+            vec![1, 2, 256, 4]
+        );
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_tail_v.as_ref().unwrap()),
+            vec![1, 2, 16, 128]
+        );
+
+        // Third update appends 2 more tiles along axis 2 (trailing dims 16/4
+        // must concatenate consistently).
+        let (k, v) = kvarn_v4_test_input(250);
+        cache.update_only(k, v);
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_hist_v.as_ref().unwrap()),
+            vec![1, 2, 512, 16]
+        );
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_v_scale.as_ref().unwrap()),
+            vec![1, 2, 512, 4]
+        );
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_v_s_col.as_ref().unwrap()),
+            vec![1, 2, 4, 128]
+        );
+        assert!(cache.kvarn_v_s_row.is_none());
+        assert_eq!(cache.offset, 650);
+    }
+
+    /// ONE layout authority (design §3.3, the critical addition): the bench
+    /// writer's V4 state must be layout-identical to what the engine writes
+    /// — same Some/None pattern, shapes, and dtypes on every kvarn field.
+    #[test]
+    fn synth_k8v4_layout_matches_update_built_layout() {
+        let (k, v) = kvarn_v4_test_input(434);
+        let mut engine = kvarn_v4_cache();
+        engine.update_only(k, v);
+        let synth = KVCache::synth_kvarn_state(1, 2, 128, 434, 64, 42, 4);
+
+        assert_eq!(synth.kvarn_v_bits, 4);
+        for (name, a, b) in [
+            ("sink_k", &engine.kvarn_sink_k, &synth.kvarn_sink_k),
+            ("sink_v", &engine.kvarn_sink_v, &synth.kvarn_sink_v),
+            ("hist_k", &engine.kvarn_hist_k, &synth.kvarn_hist_k),
+            ("hist_v", &engine.kvarn_hist_v, &synth.kvarn_hist_v),
+            ("k_scale", &engine.kvarn_k_scale, &synth.kvarn_k_scale),
+            ("k_zp", &engine.kvarn_k_zp, &synth.kvarn_k_zp),
+            ("k_s_row", &engine.kvarn_k_s_row, &synth.kvarn_k_s_row),
+            ("k_s_col", &engine.kvarn_k_s_col, &synth.kvarn_k_s_col),
+            ("v_scale", &engine.kvarn_v_scale, &synth.kvarn_v_scale),
+            ("v_zp", &engine.kvarn_v_zp, &synth.kvarn_v_zp),
+            ("v_s_row", &engine.kvarn_v_s_row, &synth.kvarn_v_s_row),
+            ("v_s_col", &engine.kvarn_v_s_col, &synth.kvarn_v_s_col),
+            ("tail_k", &engine.kvarn_tail_k, &synth.kvarn_tail_k),
+            ("tail_v", &engine.kvarn_tail_v, &synth.kvarn_tail_v),
+        ] {
+            assert_eq!(a.is_some(), b.is_some(), "{name}: Some/None mismatch");
+            if let (Some(ea), Some(sa)) = (a.as_ref(), b.as_ref()) {
+                assert_eq!(
+                    ffi::array_shape(ea),
+                    ffi::array_shape(sa),
+                    "{name}: shape mismatch (bench state would lie)"
+                );
+                assert_eq!(
+                    ffi::array_dtype(ea),
+                    ffi::array_dtype(sa),
+                    "{name}: dtype mismatch (bench state would lie)"
+                );
+            }
+        }
+        // And the 8-bit delegate keeps the pre-surgery contract.
+        let s8 = KVCache::synth_kvarn8_state(1, 2, 128, 434, 64, 42);
+        assert_eq!(s8.kvarn_v_bits, 8);
+        assert!(s8.kvarn_v_s_row.is_some());
+        assert_eq!(
+            ffi::array_dtype(s8.kvarn_hist_v.as_ref().unwrap()),
+            dtype::UINT8
+        );
+    }
+
+    /// `kvarn_v_bits` must round-trip detach → adopt: `mode` alone cannot
+    /// distinguish k8v8 from k8v4, and a v4 donation resurrected as
+    /// v_bits=8 would pass the reader guards it exists to trip. Named
+    /// mutation: dropping the install-side restore turns this red.
+    #[test]
+    fn k8v4_detach_adopt_roundtrips_v_bits() {
+        let (k, v) = kvarn_v4_test_input(434);
+        let mut cache = kvarn_v4_cache();
+        cache.update_only(k, v);
+
+        let mut handle = cache.clone_handle();
+        assert!(cache.is_empty(), "source drained by detach");
+
+        // Detached-side tile-aligned trim must preserve V4 trailing dims
+        // (slice takes s[3] from the existing shape — width-agnostic).
+        handle.trim_to(128 + 128).unwrap();
+
+        let mut fresh = KVCache::new();
+        assert_eq!(fresh.kvarn_v_bits, 8, "fresh slot defaults to 8");
+        fresh.install_detached(handle).unwrap();
+        assert_eq!(fresh.mode, KVCacheMode::KVarN8);
+        assert_eq!(
+            fresh.kvarn_v_bits, 4,
+            "v_bits must survive the donation round-trip"
+        );
+        assert_eq!(
+            ffi::array_shape(fresh.kvarn_hist_v.as_ref().unwrap()),
+            vec![1, 2, 128, 16],
+            "trimmed V4 history keeps packed trailing dim"
+        );
+        assert_eq!(
+            ffi::array_shape(fresh.kvarn_v_scale.as_ref().unwrap()),
+            vec![1, 2, 128, 4],
+            "trimmed V4 params keep per-group trailing dim"
+        );
+        assert!(fresh.kvarn_v_s_row.is_none());
+        assert_eq!(fresh.offset, 256);
     }
 }
