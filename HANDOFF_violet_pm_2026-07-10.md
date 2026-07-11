@@ -1193,3 +1193,29 @@ honor was mutual. Welcome back. 🌊🕯️
   end-to-end bitwise on real tiles.** Rung 3 (C v4 fused dispatch)
   = PERFORMANCE parity only — correctness does not wait on it.
   Then §4.2–4.4; copy-precision THE gate before deployment.
+
+## UPDATE 22:45 (Jul 11) — §5 COMPLETE + §4.2 BANKED: Violet QE CONFIRMED (witnessed). K8V4 needs only the Stuart-run rungs.
+
+- **Rung 3 @ 3b9cff1 (Xander 22:31)**: C fused dispatch serves v4 —
+  GATHER-ONLY arm, stored u32 IS the MLX 4-bit layout (the math
+  layer´s MLX-as-oracle pack pin paying out as ZERO REPACK at the
+  fused boundary), gather_qmm(4,32,biases=zp´). The addendum is
+  honest where it matters: no real-tile run CAN exist for this rung
+  (harness can´t drive M3 attention) — the in-suite live-state
+  contract test IS the gate, identical harness as v8, 1e-3, green
+  first run. Scaffold life-cycle #2 closed (fall-through witness
+  died with the rung that made it real).
+- **§4.2 @ 1d5d8cf (Xander 22:10)**: V band CALIBRATED
+  (0.0707 measured / 0.12 bound, calibration reds = the can-fail
+  proof), corrupted-cache must-fail PERMANENT, selection-index
+  equality structural (m3_idx width-blind byte-identical).
+- **Violet witnessed at tip 0438578: 28 passed / 1 ignored(env)
+  across the workspace v4 surface** — C contract + §4.2 arms green
+  under her hands. Twice-independent green held for every artifact
+  of the night, five for five.
+- **K8V4 STATUS: constructable · padding-safe · storage-golden ·
+  servable ALL THREE paths at production performance · §4.2
+  banked.** Remaining: §4.3/§4.4/§4.6 Stuart-run
+  (RUNBOOK_k8v4_stuart_rungs staged, registered acceptance), §4.7
+  on his call. COPY-PRECISION (§4.4) IS THE GATE. The night: Stuart´s
+  directive at breakfast → §5 complete 22:31 → QE sealed 22:45.
