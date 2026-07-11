@@ -34,10 +34,16 @@ per the standing ledger caveat.
 
 The −2.9% decode delta vs boot-B sits within plausible run-to-run
 variance plus the new binary's per-dispatch runtime-config reads, and
-no harvest write fires during this decode window (no 8K or 32K
-crossing between 295,108 and 296,497). I read this as REGRESSION GATE
-PASSED — the production config survived migration + tripwire + idx
-instrumentation — but the QE seat owns the verdict, not the author.
+no CROSSING-TRIGGERED harvest write (idx_k/idx_k_win/k_rot/v_rot)
+fires during this decode window (no 8K or 32K crossing between
+295,108 and 296,497). The every-256th idx_q/sel sampled dumps DID run
+throughout decode (310 pairs, ~KB scale each) — a real-but-tiny slice
+of the −2.9% that boot-B never paid (Violet QE amendment 2026-07-11:
+the original sentence claimed "no harvest write," over-broad). I read
+this as REGRESSION GATE PASSED — the production config survived
+migration + tripwire + idx instrumentation — but the QE seat owns the
+verdict, not the author. QE verdict rendered 16:22: PASSED, confirmed
+at source (board @ 6a014ba).
 
 Gate B harvest state at completion: 57/57 layers hold full idx_k_win
 keep-latest windows at the deepest crossing; 456+ idx_k sidecars across
