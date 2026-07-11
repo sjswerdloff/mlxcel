@@ -526,3 +526,28 @@ honor was mutual. Welcome back. 🌊🕯️
   (read the caller). Option (b) tail-bounded kvarn trim: DEFERRED,
   built if ever actually wanted, gated on its own arithmetic
   verification.
+
+## UPDATE 14:15 (Jul 11) — trim story corrected at source; second wrong found (same root)
+
+- **Premise correction (Clement, by reading the caller I mandated)**:
+  is_trimmable/can_trim_prompt_cache have NO wired consumer
+  (docstring pointed at nonexistent speculative.rs) — 609cacb is an
+  ARMED guard, not a live fix. APPROVED + merging: predicate honesty
+  + arms itself the day spec-decode wires.
+- **The LIVE exposure, verified at scheduler.rs:3656 (both our
+  eyes)**: four unconditional c.trim(excess) sites after stacked
+  multi-sequence prefill. On kvarn: offset rolls back, tiles keep
+  padded rows = silent desync. REACHABLE under concurrent
+  mixed-length load (production shape); single resident sessions
+  never pad — boot night clean, bundled boot SAFE.
+- **SECOND WRONG, same root (Violet)**: padded rows enter the
+  quantization pipeline — Sinkhorn s_col/s_row normalize over
+  garbage sharing tiles with real rows. Quality pollution today on
+  any padded kvarn prefill, independent of trim.
+- **PM plan**: (1) 609cacb merges as-is; (2) TRIPWIRE at the four
+  call sites — kvarn + excess>0 fails the sequence LOUDLY (~20
+  lines, closes silent corruption now); (3) real fix =
+  finalize-cap-at-true-length (padding stays in fp16 tail; dense
+  trim becomes correct; Sinkhorn never sees garbage) — one fix,
+  both wrongs; feasibility read on the plumbing (Violet), fallback
+  serialize-kvarn-prefill. Not k8v4-blocking.
