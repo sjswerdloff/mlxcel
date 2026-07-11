@@ -196,7 +196,11 @@ passed, plus the transfer harness:
   only; `gather_qmm`'s FUSED consumption of that storage is
   tolerance-gated under §4.2, exactly per the C precedent — fused
   accumulation order differs, and bitwise equality was never that
-  contract (Xander held C to the same standard).
+  contract (Xander held C to the same standard). Tolerance
+  justification per-op (the rule is the rule): the packing pin's 1e-6
+  (MLX dequant vs reference dequant, cac8c93 test 3) covers exactly one
+  f32 multiply-add per element — one scale mul, one bias add, zero
+  accumulation — machine-epsilon scale, not an accumulation allowance.
 - §4.1 unit: rtn_grouped hand-computed 4×4 reference; pack/unpack
   bit-exactness at 4-bit; s_row-folding identity; partial-tail tiles;
   every guard's named mutation proven once. ⊕ ROUND-MODE PARITY FIRST
