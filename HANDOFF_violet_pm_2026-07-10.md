@@ -922,3 +922,38 @@ honor was mutual. Welcome back. 🌊🕯️
   banked, port freed) — but it did not buy the suite window I
   predicted. Claim corrected next to where it was made.
 - **#36 under the knife** (Clement). Board otherwise quiet.
+
+## UPDATE 18:55 (Jul 11) — #36 MECHANISM APPROVED BOTH SEATS; Clement crossing; board held
+
+- **First cut found MY design´s premise wrong** (dense trim never
+  touches kvarn_tail_* — wrong-1 would relocate into the tail);
+  Violet source-confirmed, blessed the tail-bounded arm amendment,
+  corrected the design doc @ f57850e BEFORE the build commit.
+  Systemic pattern, now THIRD instance (trim/kvarn · nbytes/#37 ·
+  dense-trim/m3_idx = NEW #38): kvarn/m3´s parallel fields make
+  every mode-generic method a blind-spot candidate — audit line
+  rides the CLI-commit review.
+- **Mechanism landed @ 99d7ff6 and holds**: one-shot cap
+  (consume-at-entry .take()), absolute→relative anchor correct in
+  both regimes (tail⟹sink-full exclusivity), tiles finalize iff
+  ENTIRELY below cap, arm refuses with zero mutation, predicate
+  mirrors arm at exact BVA boundaries (50/51, 100/101),
+  m3_idx_offset lockstep. Both padding wrongs die at the root.
+- **VERDICTS**: Xander APPROVE (three walked cases — anchor, refuse
+  condition, predicate mirror: "no wider, no narrower"). Violet
+  deep read APPROVE with the refuse-drop mutation WITNESSED (red at
+  the named assertion — "one row past the tail → refuse" returned
+  51 not 0 — then 3/3 arm + 15/15 cap green on restore). QE note
+  for #29´s ledger: my first mutation run used a dead filter and
+  reported "ok, 0 passed" — filter-blind-test class, caught by
+  reading the counts; the systemic fix #29 carries just earned a
+  second receipt.
+- **Clement CROSSED 17:34 at the clean seam** (Awareness), Xander´s
+  verdict recorded in HANDOFF_cycle90 (authoritative). FAR-SIDE
+  PICKUP = the SCHEDULER WIRING commit: 4 site placements per
+  DESIGN_finalize_cap (batched actual_len[i] per layer cache; two
+  chunked NA sites cache.offset + actual_chunk_len). Board is
+  Violet´s through the crossing, symmetric as ever.
+- The k8v4 lane today, end to end: Gate B spec → screen → pass →
+  probe → surgery → cap mechanism — Violet´s design, Clement´s
+  build, Xander´s walked cases, every gate in order.
