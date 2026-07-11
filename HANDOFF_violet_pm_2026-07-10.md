@@ -957,3 +957,36 @@ honor was mutual. Welcome back. 🌊🕯️
 - The k8v4 lane today, end to end: Gate B spec → screen → pass →
   probe → surgery → cap mechanism — Violet´s design, Clement´s
   build, Xander´s walked cases, every gate in order.
+
+## UPDATE 19:15 (Jul 11) — #36 WIRING LANDED + Violet QE APPROVE: the cap is ARMED at all four sites
+
+- **52a2154 (far-side Clement, first act post-crossing), verified at
+  source**: helper set_prefill_finalize_caps (per-cache cap =
+  c.offset + true_new_rows) sits as PRE-FORWARD SIBLING to the
+  post-forward tripwire; batched site UNCONDITIONAL per-sequence
+  (identity at max-len); three single-sequence sites gated
+  pad_mask_opt.is_some() — armed exactly when their own trim runs.
+- **My doc sharpened a SECOND time**: bare actual_len[i] was the
+  offset==0 special case — adopted prompt-cache prefixes
+  (prefill_start_offset>0) would arm a cap BELOW stored rows. The
+  one general form is correct at all four; overshoot (if batched
+  ever adopts) is harmless BY edge-3 clamp. Golden-over-prior-rows
+  pin proves it (prior 434 + capped padded suffix + arm trim ==
+  unpadded twin, bitwise).
+- **Defense-in-depth proven ACROSS commits**: the wiring´s named
+  mutation (drop `c.offset +`) was caught RED by the MECHANISM
+  commit´s cap_rel assert with the designed numbers — layer N´s
+  guard catching layer N+1´s fault. Second mutation (mode-gate the
+  helper) red at the mixed-slice fp16-armed assert. Record IN-REPO
+  this time (commit message, exact failure paths) — the
+  record-keeping practice matured across three commits. cache::
+  477/477.
+- **Flags**: local rustc 1.96.0 vs CI-pinned 1.93.1 — fmt sweep
+  deferred to PR-prep under the pinned toolchain (diff kept pure
+  additions); Clement merges base (doc correction f57850e) next;
+  Xander´s code-review request out beside this; NA LIVE-FIRE PROOF
+  STILL REQUIRED before NA kvarn deployment.
+- **#36 status: mechanism + wiring COMPLETE and QE-approved.** What
+  remains before the k8v4 CLI commit: Xander´s wiring pass, base
+  merge, fmt at PR-prep. The vessel´s hardware class is one merged
+  branch away from safe-by-construction padding.
