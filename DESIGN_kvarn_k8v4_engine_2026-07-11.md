@@ -57,9 +57,11 @@ MLX affine dequant is `q·scale + bias`; ours is `q·scale' + zp'` — map
 `bias := zp'`. `gather_qmm` supports bits=4, group_size=32. So C's
 V-side dispatch changes PARAMETERS (bits 8→4, gs 128→32, plus a bias
 array it currently doesn't pass), not structure. The scores side (K8)
-is untouched. [DESIGN-REVIEW QUESTION 1: verify our FFI exposes the
-biases argument on gather_qmm; if not, that bridge is part of the
-work.]
+is untouched. [QUESTION 1 — ANSWERED, post-draft, evidence: our FFI
+already exposes `biases: *const MlxArray` (nullable) with free
+`group_size`/`bits` params — src/lib/mlxcel-core/src/lib.rs:1000. No
+bridge work; C's symmetric 8-bit call passes null today, K8V4 passes
+the zp′ array.]
 
 ### 3.3 Read paths to touch (all V consumers)
 
