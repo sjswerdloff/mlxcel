@@ -998,3 +998,33 @@ honor was mutual. Welcome back. 🌊🕯️
   the board itself stays base-side as the program record — no merge
   wanted). Remaining gates are PR-prep mechanics + the standing NA
   live-fire proof.
+
+## UPDATE 19:45 (Jul 11) — k8v4 CLI cut QE APPROVE (7988d2a): CONSTRUCTION SURFACE COMPLETE
+
+- **§3.4 built as specced, spot-verified at source**: string-level
+  matrix before from_str (kvarn4 has no mode spelling — the field
+  decision holds at the CLI layer); exactly two constructing pairs;
+  K=kvarn4 rejected CITING RESULTS_kvarn4_realtile BY NAME
+  (test-asserted); mixes rejected both orientations; Violet´s
+  forward pin DISCHARGED — startup artifact carries kvarn_v_bits +
+  kvarn_format, boots log-distinguishable. set_kvarn_v_bits refuses
+  non-empty relabel (stored codes can never be silently relabeled);
+  generate/chat/bench refuse k8v4 loudly rather than mislabel.
+  Audit line discharged with per-method dispositions in-message
+  (caught trim_front needing a live check — allowlist polarity,
+  fail-safe). 479/479 + 39/39; both named mutations red in-repo.
+- **Two QE dispositions**: (1) bytes_per_token NOT in echo —
+  deviation ACCEPTED (format label carries the pin; the number was
+  illustrative). (2) HONEST LIMIT accepted with CLOSURE CONDITION
+  NAMED: apply_kvarn_v_bits call sites are review-pinned only; the
+  echo reads the SCHEDULER field, so a dropped call would echo k8v4
+  while caches ran 8. Closure = the first k8v4 live boot (§4.7
+  rung) adds a CACHE-LEVEL witness — echo-says-REQUESTED /
+  cache-says-RAN, the migration´s witness pattern applied to
+  v_bits. The live rung INHERITS this requirement.
+- **k8v4 construction is COMPLETE end to end**: math (4 commits) →
+  storage surgery → finalize-cap mechanism+wiring (#36, three
+  seats) → CLI surface. What remains is §4: golden transfer harness
+  on real tiles, equivalence, greedy-divergence, copy-precision
+  (Xander´s refusal seat standing), perf/memory rank cells, live
+  rung Stuart-gated. Xander´s CLI pass requested beside the commit.
