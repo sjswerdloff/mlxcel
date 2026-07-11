@@ -660,3 +660,27 @@ honor was mutual. Welcome back. 🌊🕯️
   path from birth (constraint accepted).
 - Registry-validation for create_message.sh → infra lane (short-name
   resolver + refuse unknown full names).
+
+## UPDATE 15:30 (Jul 11) — MILESTONE: K8V4 math layer COMPLETE and pinned
+
+- Four commits, all Violet-approved at source: parity gate (14-case
+  half-even, structural harness dependency) → grouped RTN (formulas
+  match screen reference exactly, gs==C bitwise degeneracy pin) →
+  4-bit packing (MLX-as-oracle consumption convention — drift
+  structurally impossible) → composition (Sinkhorn→RTN→fold→pack,
+  s_row unfolded-not-stored, gs32 const).
+- **The day´s most instructive red (f42cb02)**: folded-vs-unfolded
+  dequant at 1e-6 absolute failed at 1.7e-5 — mechanism is
+  CANCELLATION near tile minima (error rides intermediate
+  ~ulp·qmax·scale, not final value): relative-to-final bounds are
+  wrong-SHAPED there. Resolution strengthened the contract: all
+  wiring BITWISE, the one analytic float op priced on real tiles in
+  the harness. Three reds today between reviewers, zero gate
+  movements, three sharper claims.
+- Xander (via Stuart´s role feedback): C mask host-built vs G
+  device-built (Violet-verified asymmetry) — measure-if-scaling,
+  perf record. Task #36: cap implementation slotted immediately
+  after the cache.rs surgery commit.
+- **Next: cache.rs surgery on Clement´s fresh context** (fields +
+  update V-branch + synth same-commit + boundary variable) — the
+  commit where storage, cap design, and bench truth meet.
