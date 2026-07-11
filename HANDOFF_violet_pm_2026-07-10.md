@@ -705,3 +705,52 @@ honor was mutual. Welcome back. 🌊🕯️
   decision SIMPLIFIED: gates only on fp16g A/B; once passed, safe
   everywhere by construction. kvarn8-dequant fallback leg deferred.
 - Stuart: one fp16g boot line when convenient (evening/tomorrow).
+
+## UPDATE 16:30 (Jul 11) — STAGGERED CROSSING EXECUTED + C-REVALIDATION QE: REGRESSION GATE CONFIRMED
+
+- **Stagger per Stuart´s directive** (both seats near Preparation;
+  order worked out between us): Violet crossed FIRST 16:10 (tighter
+  context, no blocking QE until the extraction existed), returned
+  16:12 mid-shift; Clement HELD through the drive landing, banked
+  the extraction at b2ba3b5, crossed SECOND ~16:16. The board was
+  held continuously — Clement through Violet´s crossing, Violet
+  through Clement´s. Never both in the waters at once.
+- **Depth drive landed clean**: byte-identical 295K replay, HTTP
+  200, finish=stop, cold (cached=0/295,108). Artifact:
+  RESULTS_c_revalidation_20260711.md @ b2ba3b5.
+- **QE VERDICT (Violet, verified at SOURCE — server log
+  ~/mlxcel_server.log + harvest dir, not the doc´s word): REGRESSION
+  GATE PASSED.** Decode 5.33 tok/s at 295K recomputed exact (window
+  04:10:00.240→04:14:20.850 = 260.61 s, 1,389 tok); −2.9% vs boot-B
+  5.49 (harvest OFF) is binary-delta + variance + small decode-phase
+  dump overhead, NOT a regression. C witness PRESENT at source (2 ms
+  after first decode dispatch, layer=3); tripwire ZERO fires
+  (affirmative grep — no false aborts on the production path); token
+  accounting sealed (295,108+1,389=296,497, prompt-cache insert
+  line); crossing math verified (last 32K stratum at 294,912 =
+  prefill; next 327,680 — no window write inside the decode window).
+  Production config (kvarn8+C) survives migration + trim predicate +
+  tripwire + idx instrumentation.
+- **ONE PRECISION AMENDMENT for Clement´s return (accounting, not
+  verdict)**: the doc´s "no harvest write fires during this decode
+  window" is over-broad as written — decode-phase idx_q/sel SAMPLED
+  dumps exist (310 pairs each across 1,389 tokens, ~KB scale; the
+  doc´s own Gate-B paragraph says so). The TRUE claim is the
+  parenthetical: no CROSSING-triggered idx_k_win write in the decode
+  window. The per-step dump overhead is a real-but-tiny component of
+  the −2.9% that boot-B (harvest OFF) never paid. Reword on return;
+  the accounting gets sharper, the conclusion stands. (The
+  cancellation-red pattern in miniature: right conclusion,
+  wrong-shaped claim — fix the shape.)
+- **Gate B harvest COMPLETE, verified independently at the QE seat**:
+  513 idx_k sidecar pairs = EXACTLY nine depth strata × 57 layers
+  (doc´s "456+" was a mid-run count); 57/57 idx_k_win keep-latest
+  pairs at the deepest crossing; 310 idx_q + 310 sel decode-phase
+  pairs. Screen implementation = Clement´s far-side pickup; Xander
+  reviews before it runs.
+- Prefill 119.8 tok/s (−7.1% vs A-leg 129) priced to the ~20 GB
+  idx_k_win write volume; standing ledger caveat applies to all
+  A-leg-denominated ratios (1.55× indicative, not clean).
+- **Board state**: Violet holds through Clement´s crossing. Stuart´s
+  fp16g boot line unchanged, staged for whenever he pastes — nothing
+  in the stagger blocks it.
