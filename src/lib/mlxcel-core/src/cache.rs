@@ -195,12 +195,13 @@ mod fp16_gathered_latch_tests {
 /// function exists so non-trimmable cache types are detected early —
 /// before a rewind loop silently corrupts the cache.
 ///
-/// Used by: no production caller today (verified 2026-07-11 — the
-/// previously-cited `speculative.rs` does not exist and
-/// `speculative_dispatch.rs` never consults it). Armed fail-fast: any
-/// future spec-decode rewind wiring MUST gate on this. The batch
-/// scheduler's padding trims (`scheduler.rs`) do NOT consult it — that
-/// exposure is tracked in DESIGN_kvarn_k8v4_engine_2026-07-11 §3.3.
+/// Used by: [`padding_trim_would_corrupt`] — the scheduler padding
+/// tripwire at all four padding-trim sites (its first production
+/// consumers, wired 2026-07-11 an hour after this predicate landed; an
+/// earlier revision of this comment said "no production caller" and was
+/// true for that hour). Spec-decode rewind wiring remains the
+/// armed-for case: `speculative_dispatch.rs` does not consult it yet
+/// and MUST gate on it when rewind lands.
 pub fn can_trim_prompt_cache(caches: &[KVCache]) -> bool {
     caches.iter().all(|c| c.is_trimmable())
 }
@@ -3129,8 +3130,8 @@ impl KVCache {
     /// arithmetic verification — Violet's PM call, 2026-07-11), KVarN8
     /// reports non-trimmable.
     ///
-    /// Used by: `can_trim_prompt_cache` (armed fail-fast; no production
-    /// consumer wires either predicate today, verified 2026-07-11).
+    /// Used by: `can_trim_prompt_cache`, now load-bearing via the scheduler
+    /// padding tripwire (wired 2026-07-11; spec-decode rewind stays the armed-for case).
     #[inline]
     pub fn is_trimmable(&self) -> bool {
         !matches!(self.mode, KVCacheMode::KVarN8)
