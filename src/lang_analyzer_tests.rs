@@ -796,7 +796,7 @@ fn b8_cxx_generator_with_token_bias_caches_map() {
 // trimmable cache validation and last-token reservation
 // ============================================================================
 
-use mlxcel_core::cache::{KVCacheMode, can_trim_prompt_cache};
+use mlxcel_core::cache::{KVCacheMode, can_trim_prompt_cache, padding_trim_would_corrupt};
 use mlxcel_core::layers::KVCache;
 
 /// Default (Fp16) KVCache entries report `is_trimmable() == true`.
@@ -821,6 +821,32 @@ fn kvarn8_cache_is_not_trimmable() {
     assert!(!c.is_trimmable(), "KVarN8 must fail fast: trim() has no kvarn arm");
     // Guard the other direction: the fix must not blanket-false the predicate.
     assert!(KVCache::new().is_trimmable(), "Fp16 default stays trimmable");
+}
+
+/// The padding tripwire predicate: kvarn + positive excess = corruption;
+/// either alone = safe. Named mutations that must turn this red: drop the
+/// `excess > 0` conjunct (zero-excess case fails), or drop the negation on
+/// `can_trim_prompt_cache` (fp16 case fails).
+#[test]
+fn padding_trim_would_corrupt_contract() {
+    let kvarn = vec![KVCache::new_with_mode(KVCacheMode::KVarN8)];
+    let fp16 = vec![KVCache::new()];
+    assert!(
+        padding_trim_would_corrupt(&kvarn, 1),
+        "kvarn + padding = corruption"
+    );
+    assert!(
+        !padding_trim_would_corrupt(&kvarn, 0),
+        "no padding written, nothing to strip"
+    );
+    assert!(
+        !padding_trim_would_corrupt(&fp16, 127),
+        "fp16 trims padding correctly"
+    );
+    assert!(
+        !padding_trim_would_corrupt(&[], 5),
+        "no caches, nothing to corrupt"
+    );
 }
 
 /// One KVarN8 entry vetoes the whole slice — the `all()` wiring in

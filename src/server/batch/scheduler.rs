@@ -91,6 +91,17 @@ fn should_align_prefill() -> bool {
     hw.has_neural_accelerator && hw.macos_supports_na
 }
 
+/// Tripwire for the four padding-trim sites below: a kvarn cache cannot
+/// strip prefill padding (`trim` has no kvarn arm, and the padded rows are
+/// already inside finalized quantized tiles — offset/tile desync AND
+/// Sinkhorn-stats pollution). Abort the sequence rather than corrupt
+/// silently; the released cache is never donated back. Real fix tracked as
+/// finalize-cap-at-true-length (DESIGN_kvarn_k8v4_engine_2026-07-11 §3.3).
+const KVARN_PADDING_ABORT: &str = "kvarn cache cannot strip prefill padding: \
+    quantized tiles already hold padded rows; aborting sequence to prevent \
+    silent cache desync (avoid mixed-length batching and NA-aligned prefill \
+    on kvarn sessions until finalize-cap-at-true-length lands)";
+
 pub(crate) const DEFAULT_PAGED_BLOCK_SIZE: usize = 32;
 
 /// Decide whether a request may participate in experimental VLM prompt-prefix
@@ -3652,6 +3663,11 @@ impl BatchScheduler {
             if excess > 0
                 && let Some(caches) = self.cache_pool.get_caches_mut(seq.seq_id)
             {
+                if mlxcel_core::cache::padding_trim_would_corrupt(caches, excess) {
+                    tracing::error!(seq_id = %seq.seq_id, excess, "{}", KVARN_PADDING_ABORT);
+                    self.abort_sequence(seq, KVARN_PADDING_ABORT);
+                    continue;
+                }
                 for c in caches.iter_mut() {
                     c.trim(excess);
                 }
@@ -3801,8 +3817,14 @@ impl BatchScheduler {
                     &[0, actual_len as i32 - 1, 0],
                     &[shape[0], actual_len as i32, vocab],
                 );
-                // Trim padding positions from all KV caches.
+                // Trim padding positions from all KV caches — tripwire first:
+                // a kvarn cache cannot strip them (KVARN_PADDING_ABORT).
                 let excess = (padded_len - actual_len) as i32;
+                if mlxcel_core::cache::padding_trim_would_corrupt(caches, excess) {
+                    tracing::error!(seq_id = %seq.seq_id, excess, "{}", KVARN_PADDING_ABORT);
+                    self.abort_sequence(seq, KVARN_PADDING_ABORT);
+                    return;
+                }
                 for c in caches.iter_mut() {
                     c.trim(excess);
                 }
@@ -3936,9 +3958,15 @@ impl BatchScheduler {
                 logits
             };
 
-            // Trim padding positions from KV caches when the chunk was padded.
+            // Trim padding positions from KV caches when the chunk was padded
+            // — tripwire first: a kvarn cache cannot strip them.
             if pad_mask_opt.is_some() && eff_chunk.len() > actual_chunk_len {
                 let excess = (eff_chunk.len() - actual_chunk_len) as i32;
+                if mlxcel_core::cache::padding_trim_would_corrupt(caches, excess) {
+                    tracing::error!(seq_id = %seq.seq_id, excess, "{}", KVARN_PADDING_ABORT);
+                    self.abort_sequence(seq, KVARN_PADDING_ABORT);
+                    return;
+                }
                 for c in caches.iter_mut() {
                     c.trim(excess);
                 }
@@ -4077,9 +4105,15 @@ impl BatchScheduler {
                 pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
             );
 
-            // Trim padding positions from KV caches when the chunk was padded.
+            // Trim padding positions from KV caches when the chunk was padded
+            // — tripwire first: a kvarn cache cannot strip them.
             if pad_mask_opt.is_some() && eff_chunk.len() > actual_chunk_len {
                 let excess = (eff_chunk.len() - actual_chunk_len) as i32;
+                if mlxcel_core::cache::padding_trim_would_corrupt(caches, excess) {
+                    tracing::error!(seq_id = %seq.seq_id, excess, "{}", KVARN_PADDING_ABORT);
+                    self.abort_sequence(seq, KVARN_PADDING_ABORT);
+                    return;
+                }
                 for c in caches.iter_mut() {
                     c.trim(excess);
                 }
