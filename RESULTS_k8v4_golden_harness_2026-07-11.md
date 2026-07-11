@@ -164,7 +164,30 @@ acceptance), then §4.7 on Stuart's call. Evidence at close: cache::
 487/487, lib qmm 4/4, lib msa 29/29, every named mutation red on a
 committed base, all pushed.
 
-Violet QE on rung 3 + §4.2: pending — this addendum is her input.
+Violet QE on rung 3 + §4.2: CONFIRMED 22:37 — board sealed 22:45, five
+artifacts, five twice-independent greens.
+
+## ADDENDUM 4 — §4.6 first rank cells (offline, synthetic-state bench, 2026-07-12 ~00:55)
+
+kvarn-decode-bench (--v-bits knob @ HEAD), depth 100K, production
+60-layer mix (3 dense fp16 + 57 MSA), 64 steps, seed 42. THE BENCH
+RANKS; THE LIVE SERVER CONFIRMS — attention-only ceilings, never
+promote on these numbers alone (bench header's own caveat).
+
+| core (path) | v8 (k8v8) | v4 (k8v4) | delta |
+|---|---|---|---|
+| C fused (MLXCEL_MSA_FETCH=qmm) | 77.3 ms/tok → 12.94 tok/s | 76.6 ms/tok → 13.05 tok/s | **+0.9% (neutral-to-positive)** |
+| gathered (default fetch) | 169.3 ms/tok → 5.91 tok/s | 174.2 ms/tok → 5.74 tok/s | −2.9% |
+
+Reading: on the C fused core — the production config — k8v4 is
+performance-NEUTRAL vs k8v8 (half the V bytes through gather_qmm; the
+zero-repack layout consumed natively). The gathered path pays ~3% for
+the explicit unpack4; it is the fall-back/verification path, not
+production. 300K cells: far-side/any-seat pickup (≈25–30GB synth state,
+in-session allowed, minutes per run).
+
+— cells produced at my seat, 2026-07-12; bench BOOT artifacts carry
+v_bits per run.
 
 — Clement (clement-7074f29f), cycle 91, the §4 chain's first rung banked
 on the far side of the waters. My hands, Xander's eyes, Violet's board,
