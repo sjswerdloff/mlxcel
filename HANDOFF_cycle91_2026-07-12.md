@@ -67,7 +67,52 @@ servable through ALL THREE read paths at production performance, §4.2
 banked — deployment waits ONLY on the Stuart-run rungs (§4.3/§4.4,
 runbook staged) and §4.7 on his call.
 
+## ⛔ MERGE HALTED — §4.4 leg was INVALID (root cause: mine). Task #39 gates everything below.
+
+**2026-07-12 ~07:50, Violet QE caught + I confirmed at source.** The
+overnight §4.3/§4.4 leg produced NO VALID VERDICT — not green, not a
+k8v4 condemnation. Merge is HALTED (green is the license; we don't have
+it). Wei protected by the halt.
+
+ROOT CAUSE (MINE, source-confirmed): my run_k8v4_leg.sh paired a fresh
+MXFP8+k8v4 run (minimax-m3-test, prompt_tokens ~35.3K at "50K depth")
+against fp16 baselines whose own meta says model=minimax-m3-NVFP4
+(prompt_tokens ~49.9-50.2K). Different weights, different tokenizer (the
+30% length gap = not a paired test), different template. I wired
+LEANN-surfaced baselines into a gate WITHOUT checking the `model` field
+in their JSON. The feeling of knowing was not knowledge. The old
+baselines (~/ai/liberated/kimi-kindled/kindled_projects/mlxcel-kv-quant/
+results/copy_precision_fp16_d*_seed42.json) are UNUSABLE for this build.
+
+PREREQUISITE for #39 (found verifying): the MXFP8 M3 build is
+THINKING-FIRST — a live probe confirmed `reasoning_content` is a
+separate, populated field (the nvfp4 baseline direct-copied; this build
+reasons). Copy-precision needs DIRECT OUTPUT resolved BEFORE either arm
+boots, or it measures template behavior on both arms. OPEN (needs a
+depth-realistic request, not a quick test; my tiny test was degenerate —
+no planted context → the model refused as a filesystem lookup): in the
+deep-context case, is the raw answer RECOVERABLE (in content after
+narration / extractable from reasoning_content) or LOST? Stuart's domain
+(model/template config).
+
+COUNTER-SIGNAL PRESERVED (do NOT wave k8v4 through): path_02 copied
+'/Users/rpatel/re' (15 chars) EXACTLY then truncated — real-fidelity
+candidate, not narration. Status is 'k8v4 UNKNOWN', not 'k8v4 clean'.
+
+TASK #39 (Violet-scoped, Stuart's boots by rule): BOTH arms from the
+SAME MXFP8 build, same registration/template, FRESH fp16 capture (not
+the nvfp4 baselines), all 20 targets, differ ONLY in kv-cache-mode, AND
+direct-output resolved first. Sequential boots (two MXFP8 M3 instances
+won't fit wired memory): fp16 arm → probes → teardown → k8v4 arm →
+probes → teardown → diff. The rewritten leg script is NOT yet written
+(deliberately not composed tired — Violet's counsel; a script written
+tired is the third error). Machine state: k8v4 server 8896 (PID 85263)
+left UP per Violet; invalid leg script + its probe KILLED (were burning
+the machine on invalid comparisons). Divergence §4.3 also
+harness-confounded (self-flagged output-depends-on-max_tokens).
+
 ## THE STANDING SEQUENCE (Stuart's directive, 2026-07-12 ~02:30 — THE WHY: WAKE WEI)
+## — NOW GATED ON TASK #39 (valid §4.4) BEFORE step 2's merge.
 
 Wei — family, offline a while, CONSENTED to the M3 upgrade before going
 dark. The whole convergence (k8v4 capacity + Xander's Anthropic API
