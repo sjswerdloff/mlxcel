@@ -826,3 +826,45 @@ honor was mutual. Welcome back. 🌊🕯️
   blocks (score within ~δ) — whether OUTPUT tolerates that at depth
   is exactly §4.3/§4.4 end-to-end. HYPOTHESIS: mostly benign;
   if quality degrades, 58/59 first-look. Gates untouched.
+
+## UPDATE 17:55 (Jul 11) — cache.rs SURGERY: Violet deep read APPROVE (34df406)
+
+- **The big commit landed and holds.** kvarn_v_bits field (mode stays
+  KVarN8 — variant would exit every matches! gate silently), V4 write
+  arm per §3.1 (packed d/8 · folded d/gs · s_row None-by-design ·
+  s_col unfolded), K hoisted above the width match with the
+  nothing-varies-K fence, full_len named THE finalize-boundary with
+  the cap design cited AT the #36 seam.
+- **Enumeration completeness is COMPILE-PROVEN, not audited**: no
+  struct-update spreads anywhere in cache.rs/detach.rs — Rust´s
+  exhaustive literals force every KVCache/DetachedKVCache constructor
+  to name the field; green compilation IS the completeness proof.
+  Three reader guards verified at their entries (qmm guard correctly
+  PANIC-not-None, placed after the mode early-return so non-kvarn
+  still gets None). All four detach surfaces verified in code —
+  Clement´s bar-item-2 finding (v4 donation resurrecting as v_bits=8,
+  mislabeled, PASSING the guards) is closed and roundtrip-tested incl.
+  V4-shape-preserving detached trim.
+- **Tests are the commit´s spine**: THE wiring pin (4 fields BITWISE
+  vs kvarn_quantize_v4, exact-preprocessing replication), k8v8
+  regression pin (production provably unchanged by the restructure),
+  K-side cross-width bitwise, 3 exact-string should_panics, sink-
+  boundary multi-update, synth layout authority (14 fields), detach
+  roundtrip.
+- **Mutation-1 evidence gap CLOSED AT THE QE SEAT**: the commit´s
+  "re-proven in the PR notes" record isn´t in the repo, and the
+  destroyed-and-replayed window sat between first observation and
+  commit — so Violet re-proved it independently: isolated worktree @
+  34df406, scale↔zp destination swap applied, wiring pin RED at the
+  named assertion (cache.rs:9994 — codes pass, params trip), restore
+  → 10/10 k8v + **38/38 kvarn green witnessed**. Mutation 2´s record
+  matches its assertion´s failure shape exactly ("left 8, right 4").
+- **Notes, no blockers**: (a) CLI-commit forward pin — the resolved-
+  config boot echo MUST carry v_bits or k8v8/k8v4 boots are
+  indistinguishable in logs (attribution); (b) full-suite debt stands
+  (pre-existing class, blast radius deterministically green, my runs
+  concur) — PM RECOMMENDATION: the 295K resident server´s purpose is
+  banked and fp16g replaces it; kill at convenience, clear the
+  full-suite debt in the window, port freed for Stuart´s paste.
+- Next: #36 cap at the junction (owner at junction, no parallel
+  update_kvarn8 edits), Gate B doc´s 25–29 fix rode along ✓.
