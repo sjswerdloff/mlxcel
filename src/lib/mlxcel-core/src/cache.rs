@@ -10534,6 +10534,167 @@ mod tests {
         );
     }
 
+    // ── §4.2 equivalence for K8V4 (PROPOSAL §4.2, the registered
+    // contract kvarn8 passed) ────────────────────────────────────────
+
+    /// V-side band for the v4 roundtrip test. Provenance: calibration run
+    /// (landing commit) measured window rel_err 0.0707 at the first
+    /// tile-bearing chunk on this exact data — coherent with the
+    /// registered sweep recon p95 0.07845 at gs32/it4
+    /// (RESULTS_kvarn4_gs_sweep_2026-07-10; window-mean vs per-tile p95,
+    /// milder lcg data, fp16 sink/tail diluting). Band = ~1.7× measured:
+    /// loose enough for chunk-mix variation, tight enough that
+    /// scale-class corruption (×2 folded scales → rel O(0.5), the
+    /// must-fail arm below) and path breakage trip it. Per-tile QUALITY
+    /// gating stays with the screens and §4.4 — this is the window-mean
+    /// equivalence bound.
+    const K8V4_V_ROUNDTRIP_BAND: f32 = 0.12;
+
+    fn rel_err_f32(q: &MlxArray, r: &MlxArray) -> f32 {
+        let qf = ffi::astype(q, dtype::FLOAT32);
+        let rf = ffi::astype(r, dtype::FLOAT32);
+        let diff = ffi::subtract(&qf, &rf);
+        let num = ffi::sum_all(&ffi::multiply(&diff, &diff));
+        let den = ffi::sum_all(&ffi::multiply(&rf, &rf));
+        let rel = ffi::divide(&ffi::sqrt(&num), &ffi::sqrt(&den));
+        ffi::eval(&rel);
+        ffi::item_f32(&rel)
+    }
+
+    fn lcg_v4(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    /// §4.2 sibling of `kvarn8_cache_roundtrip_tracks_fp16_within_band`:
+    /// a v4 cache and an Fp16 cache fed IDENTICAL fp16 data through the
+    /// real update_and_fetch, compared per chunk. Same chunk schedule as
+    /// the k8 test (sink fill / tail growth / decode single / exact tile
+    /// boundary / fresh tail). K is 8-bit in BOTH widths — the k8 band
+    /// (0.02) applies to K unchanged. V is 4-bit gs32 — its band above.
+    /// Lower bound once tiles exist: quantization must be VISIBLE
+    /// (bit-exact would mean the v4 write path never ran).
+    #[test]
+    fn k8v4_cache_roundtrip_tracks_fp16_within_band() {
+        let (b, h, d) = (1i32, 2i32, 64i32);
+        let mut v4 = kvarn_v4_cache();
+        let mut fp16 = KVCache::new_with_mode(KVCacheMode::Fp16);
+
+        let mut total = 0i32;
+        for (i, &chunk) in [200i32, 100, 1, 83, 1].iter().enumerate() {
+            let n = (b * h * chunk * d) as usize;
+            let k_data = lcg_v4(n, 0x4C1E_A0 + i as u64);
+            let v_data = lcg_v4(n, 0x4B0_B0 + i as u64);
+            let shape = [b, h, chunk, d];
+            let mk = || {
+                (
+                    ffi::astype(&ffi::from_slice_f32(&k_data, &shape), dtype::FLOAT16),
+                    ffi::astype(&ffi::from_slice_f32(&v_data, &shape), dtype::FLOAT16),
+                )
+            };
+            let (k1, v1) = mk();
+            let (k2, v2) = mk();
+            let (qk, qv) = v4.update_and_fetch(k1, v1);
+            let (rk, rv) = fp16.update_and_fetch(k2, v2);
+            total += chunk;
+
+            let rel_k = rel_err_f32(&qk, &rk);
+            assert!(
+                rel_k < 0.02,
+                "K rel_err {rel_k} above the k8 band after chunk {i} (total={total})"
+            );
+            let rel_v = rel_err_f32(&qv, &rv);
+            assert!(
+                rel_v < K8V4_V_ROUNDTRIP_BAND,
+                "V rel_err {rel_v} above the v4 band after chunk {i} (total={total})"
+            );
+            if total > 2 * 128 {
+                assert!(
+                    rel_v > 1e-6,
+                    "V suspiciously exact after chunk {i} — is 4-bit quantization running?"
+                );
+            }
+        }
+    }
+
+    /// §4.2 must-fail arm (registered: "assert > threshold against a
+    /// deliberately corrupted cache — the test must be able to fail"):
+    /// doubling the stored FOLDED scales makes the dequant read wrong
+    /// data, and the same rel-err metric must blow past the band.
+    #[test]
+    fn k8v4_corrupted_cache_exceeds_band() {
+        let (b, h, d) = (1i32, 2i32, 64i32);
+        let mut v4 = kvarn_v4_cache();
+        let mut fp16 = KVCache::new_with_mode(KVCacheMode::Fp16);
+        let chunk = 428i32; // sink + 2 tiles + tail 44
+        let n = (b * h * chunk * d) as usize;
+        let k_data = lcg_v4(n, 0xC0FF_EE);
+        let v_data = lcg_v4(n, 0xBEEF_15);
+        let shape = [b, h, chunk, d];
+        let mk = || {
+            (
+                ffi::astype(&ffi::from_slice_f32(&k_data, &shape), dtype::FLOAT16),
+                ffi::astype(&ffi::from_slice_f32(&v_data, &shape), dtype::FLOAT16),
+            )
+        };
+        let (k1, v1) = mk();
+        let (k2, v2) = mk();
+        v4.update_only(k1, v1);
+        // The fp16 twin's window is captured at feed time — identical to
+        // what a later fetch would return.
+        let (_, rv) = fp16.update_and_fetch(k2, v2);
+
+        let two = ffi::full_f32(
+            &ffi::array_shape(v4.kvarn_v_scale.as_ref().unwrap()),
+            2.0,
+            dtype::FLOAT32,
+        );
+        let corrupted = ffi::multiply(v4.kvarn_v_scale.as_ref().unwrap(), &two);
+        v4.kvarn_v_scale = Some(corrupted);
+
+        let (_, qv) = v4.fetch_kvarn8();
+        let rel_v = rel_err_f32(&qv, &rv);
+        assert!(
+            rel_v > K8V4_V_ROUNDTRIP_BAND,
+            "corrupted cache rel_err {rel_v} did NOT exceed the band — the equivalence \
+             test could not have failed"
+        );
+    }
+
+    /// §4.2 selection-index equality (registered: "hard, exact"),
+    /// discharged STRUCTURALLY for v4: M3 selection reads ONLY the m3_idx
+    /// caches, and the idx path is width-blind — identical idx feeds
+    /// yield byte-identical returned windows and offsets across V widths.
+    #[test]
+    fn k8v4_m3_idx_byte_identical_across_widths() {
+        let (b, index_dim) = (1i32, 128i32);
+        let mut v4 = kvarn_v4_cache();
+        let mut v8 = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        for (i, &chunk) in [200i32, 1, 83].iter().enumerate() {
+            let n = (b * chunk * index_dim) as usize;
+            let data = lcg_v4(n, 0x1DE_A + i as u64);
+            let idx = ffi::astype(
+                &ffi::from_slice_f32(&data, &[b, 1, chunk, index_dim]),
+                dtype::FLOAT16,
+            );
+            let w4 = v4.m3_idx_k_update_and_fetch(&idx);
+            let w8 = v8.m3_idx_k_update_and_fetch(&idx);
+            assert_eq!(
+                ffi::array_to_raw_bytes(&w4),
+                ffi::array_to_raw_bytes(&w8),
+                "m3_idx window diverged across V widths at chunk {i}"
+            );
+            assert_eq!(v4.m3_idx_offset(), v8.m3_idx_offset());
+        }
+    }
+
     #[test]
     fn k8v4_multi_update_appends_consistent() {
         // Sink-only first update: no V4 fields yet.
