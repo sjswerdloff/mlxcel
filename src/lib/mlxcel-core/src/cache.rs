@@ -1573,6 +1573,17 @@ impl KVCache {
         // masked an UNIMPLEMENTED v1 path as plausible fall-through; that
         // rationale expired the commit v1 landed.)
         if self.kvarn_v_bits != 8 {
+            // Interim echo-vs-ran witness (Violet QE note, rung-1 board):
+            // a v4 + msa_fetch=qmm boot ECHOES qmm construction while
+            // SERVING via assemble/gathered — this one-shot line makes the
+            // fall-through greppable until rung 3 moots it.
+            static V4_QMM_FALLTHROUGH: std::sync::Once = std::sync::Once::new();
+            V4_QMM_FALLTHROUGH.call_once(|| {
+                tracing::info!(
+                    "v4 qmm fall-through: serving via assemble/gathered (C's v4 dispatch \
+                     is §5 rung 3; first fall-through this process)"
+                );
+            });
             return None;
         }
         let n_tiles = self
