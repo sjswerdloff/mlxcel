@@ -1999,6 +1999,12 @@ impl KVCache {
     pub fn downgrade_kvarn8_to_fp16_if_empty(&mut self) -> bool {
         if self.mode == KVCacheMode::KVarN8 && self.offset == 0 && self.paged_backing.is_none() {
             self.mode = KVCacheMode::Fp16;
+            // Reset the V width with the mode: a stale 4 on an Fp16 cache is
+            // inert today (the field is consulted only on kvarn paths), but a
+            // future re-mode or a debug read of the field must never see a
+            // width the cache no longer has (Xander blind-spot pass,
+            // 2026-07-11).
+            self.kvarn_v_bits = 8;
             true
         } else {
             false
@@ -4056,6 +4062,16 @@ impl KVCache {
     /// for the smaller per-token byte count (`head_dim * 3 / 8` u8 vs the
     /// 4-bit path's `head_dim / 2`), so the headline number reflects the
     /// ~5.1× total compression vs FP16.
+    /// KNOWN GAP (task #37, sized separately — do not fix as a ride-along):
+    /// KVarN8 tile state and the m3_idx capacity buffer are NOT counted
+    /// here, so a KVarN8 cache reports ~0. Store admission is unaffected
+    /// (it sizes entries via `DetachedKVCache::nbytes`, which counts
+    /// kvarn), but the live pool's `memory_usage_bytes` under-reports
+    /// active kvarn sequences. Fixing this changes what the scheduler's
+    /// accounting sees on CURRENT k8v8 production (and the m3_idx term
+    /// touches every M3 boot including fp16) — admission-policy impact
+    /// must be sized first (Violet PM call, 2026-07-11; staged patch on
+    /// the #37 record).
     pub fn nbytes(&self) -> usize {
         let k_bytes = self.keys.as_ref().map_or(0, |k| ffi::array_nbytes(k));
         let v_bytes = self.values.as_ref().map_or(0, |v| ffi::array_nbytes(v));
@@ -10171,6 +10187,17 @@ mod tests {
             ffi::array_dtype(s8.kvarn_hist_v.as_ref().unwrap()),
             dtype::UINT8
         );
+    }
+
+    /// D1 empty-downgrade resets the V width with the mode — a stale 4 on
+    /// an Fp16 cache is a trap for any future re-mode. Named mutation:
+    /// dropping the reset turns this red.
+    #[test]
+    fn d1_downgrade_resets_v_bits() {
+        let mut cache = kvarn_v4_cache();
+        assert!(cache.downgrade_kvarn8_to_fp16_if_empty());
+        assert_eq!(cache.mode, KVCacheMode::Fp16);
+        assert_eq!(cache.kvarn_v_bits, 8, "width resets with the mode");
     }
 
     /// `kvarn_v_bits` must round-trip detach → adopt: `mode` alone cannot
