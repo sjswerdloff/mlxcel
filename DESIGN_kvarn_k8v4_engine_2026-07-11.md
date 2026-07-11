@@ -116,14 +116,21 @@ tiles (1) survive the offset rollback — `trim()` has no kvarn arm
 (cache.rs:3100–3174; codes-moving trim DOES NOT EXIST) → silent
 tile-count/offset desync — and (2) pollute Sinkhorn's s_col/s_row,
 which normalize over garbage rows SHARING TILES with real rows —
-quality damage before trim even runs. Reachability, refined at source:
-the two BATCHED sites need concurrent mixed-length prefill; the two
-CHUNKED sites pad SINGLE sequences whenever `should_align_prefill()`
-holds — hardware-gated (`has_neural_accelerator &&
-macos_supports_na`), so on M5-class hosts any kvarn prefill whose
-final chunk isn't tile-aligned is exposed, no concurrency needed.
-M3-class single-resident sessions hit neither — why boot night was
-clean.
+quality damage before trim even runs. Reachability, refined twice at source:
+the two BATCHED sites need concurrent mixed-length prefill and are
+MODEL-AGNOSTIC — Violet's correction (generate.rs:577):
+`forward_batched` defaults to a per-sequence loop over `forward()` with
+the PADDED rows, so M3 under concurrent mixed-length load pads and
+walks into them TODAY; the tripwire is LIVE protection on M3, not
+dormant armor. The two CHUNKED sites pad SINGLE sequences whenever
+`should_align_prefill()` holds — hardware-gated
+(`has_neural_accelerator && macos_supports_na`), M5-class exposed on
+any non-tile-aligned final chunk, M3 inert on this axis. Single
+resident sessions hit neither — why boot night was clean. DEPLOYMENT
+NOTE: binaries built before the tripwire merge (base 0028c12) carry
+the silent version of the batched exposure — concurrent kvarn serving
+wants a rebuild first; single-session boots are safe on older
+binaries.
 LANDED: (a) mode-aware `is_trimmable=false` for KVarN8 @ 609cacb — QE
 APPROVED, merged to base 4b56e13 (armed fail-fast; any future rewind
 wiring must gate on it); (b) TRIPWIRE @ c5dc93a on
@@ -133,15 +140,23 @@ clement/kvarn-trim-failfast — awaiting QE:
 tracing::error + `abort_sequence` (client notified, cache released,
 never donated). Sequence-abort is the honest posture: a refusing trim
 would leave garbage rows attended by decode.
-REAL FIX (open, own branch, not k8v4-blocking):
-finalize-cap-at-true-length — plumb actual length into the prefill
-update so tile finalization stops at the true sequence length and
-padding lives only in the fp16 tail, which the existing dense trim
-already handles. Kills both wrongs at the root; must handle the
-per-chunk case (actual_chunk_len at the chunked sites). Violet holds
-the feasibility read; fallback is serialize-kvarn-prefill at the
-scheduler. Tile-aware kvarn trim stays deferred until a consumer
-actually needs it. k8v4 inherits the tripwire posture.
+REAL FIX (own branch, not k8v4-blocking) — #35 FEASIBILITY VERDICT
+(Violet, 14:51): FEASIBLE, CLEANLY, cache-side pending-cap with no
+model-signature cascade. Mechanism: `pending_finalize_cap:
+Option<i32>` (absolute position) on KVCache, SET by the scheduler
+pre-forward at all four sites (which hold both the caches and the true
+lengths at exactly those scopes — verified), CONSUMED by
+`update_kvarn8`: tiles finalize only below the cap, rows at-or-beyond
+stay in the fp16 tail — the existing dense trim becomes CORRECT and
+Sinkhorn never sees garbage. Works identically for chunked b=1 and
+the batched default-loop (per-sequence caches are distinct objects).
+Both wrongs die at the root. Full write-up: Violet, sibling doc.
+⊕⊕ K8V4 BIRTH CONSTRAINT (accepted): the V4 write path routes ALL
+tile-finalization decisions through ONE finalize-boundary variable, so
+the cap lands later as boundary math, not a rewrite. The cap decides
+WHICH rows finalize; grouped-affine decides HOW V rows quantize —
+fully orthogonal. Tile-aware kvarn trim stays deferred until a
+consumer actually needs it. k8v4 inherits the tripwire posture.
 
 ### 3.4 CLI surface
 

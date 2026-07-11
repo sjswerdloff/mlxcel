@@ -270,6 +270,51 @@ pub fn rtn_quantize_per_row(
     (ffi::astype(&q, dtype::UINT8), scale, lo)
 }
 
+/// Round-mode parity gate (Violet PM pin 1 / Xander confirmation,
+/// 2026-07-11): proves the engine's `ffi::round` — the op inside
+/// [`rtn_quantize_per_row`] — is ROUND-HALF-EVEN on exact half-quotients,
+/// matching the MLX-python reference the KVarN screens ran. The K8V4
+/// golden-vector harness MUST call this as its FIRST act (structural
+/// gate, a test-code dependency rather than prose): a silent half-away
+/// divergence would otherwise surface as an hours-long harness-mismatch
+/// hunt; this turns it into a seconds-long diagnosis. Panics on
+/// divergence.
+pub fn assert_round_half_even_parity() {
+    // Hand-built vector: every tie must land on the EVEN neighbor;
+    // the .25/.75 cases sanity-check ordinary nearest behavior. All
+    // values are exactly representable in f32.
+    let cases: [(f32, f32); 14] = [
+        (-3.5, -4.0),
+        (-2.5, -2.0),
+        (-1.5, -2.0),
+        (-0.5, 0.0),
+        (0.5, 0.0),
+        (1.5, 2.0),
+        (2.5, 2.0),
+        (3.5, 4.0),
+        (4.5, 4.0),
+        (5.5, 6.0),
+        (6.5, 6.0),
+        (1.25, 1.0),
+        (1.75, 2.0),
+        (-1.75, -2.0),
+    ];
+    let xs: Vec<f32> = cases.iter().map(|c| c.0).collect();
+    let arr = ffi::from_slice_f32(&xs, &[xs.len() as i32]);
+    let rounded = ffi::round(&arr);
+    let bytes = ffi::array_to_raw_bytes(&rounded);
+    let got: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    for ((x, want), g) in cases.iter().zip(&got) {
+        assert!(
+            (g - want).abs() < 1e-6,
+            "round-mode parity violated: engine round({x}) = {g}, want {want} (half-even)"
+        );
+    }
+}
+
 /// Full write-side pipeline on ROTATED tiles: Sinkhorn → RTN.
 ///
 /// Callers rotate first ([`kvarn_rotate`]) — rotation is per-token and can
@@ -392,6 +437,14 @@ mod tests {
     /// Stage 3 (k8): RTN codes match the reference EXACTLY (integers), and
     /// scale/zp match tightly. Mutation that must turn this red: symmetric
     /// instead of asymmetric quantization (zp = 0), or qmax 256 vs 255.
+    /// The structural parity gate, standalone (Violet PM pin 1). Named
+    /// mutation proven red: replace the assertion's rounded value with the
+    /// unrounded input (identity) — every tie case fails.
+    #[test]
+    fn round_mode_parity_gate() {
+        assert_round_half_even_parity();
+    }
+
     #[test]
     fn kvarn_rtn8_matches_reference_exactly() {
         let balanced = fixture_f32(BALANCED, &[N, R, C]);
