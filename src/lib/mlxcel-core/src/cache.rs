@@ -1365,16 +1365,6 @@ impl KVCache {
     fn fetch_kvarn8(&self) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         use crate::cache::kvarn::{KVARN_TILE_TOKENS, kvarn_rotate};
 
-        // K8V4 read paths land one at a time behind the construction key
-        // (design §5); until the v1 dequant learns unpack+folded-affine,
-        // reading a v4 cache is a loud refusal, never wrong data.
-        assert!(
-            self.kvarn_v_bits == 8,
-            "fetch_kvarn8 (v1 assemble) has no kvarn_v_bits={} read path yet — \
-             design §5: read paths land one at a time behind the construction key",
-            self.kvarn_v_bits
-        );
-
         #[allow(clippy::too_many_arguments)]
         fn assemble(
             sink: &Option<UniquePtr<MlxArray>>,
@@ -1416,6 +1406,69 @@ impl KVCache {
             ffi::astype(&kvarn_rotate(&rotated), dtype::FLOAT16)
         }
 
+        // K8V4 read path #1 — v1 assemble (design §5, landed after the
+        // golden harness verified storage bitwise on the licensed real-tile
+        // population): the V4 history is MLX-packed 4-bit codes with FOLDED
+        // per-group affine params (scale' = s·s_row, zp' = zp·s_row), so the
+        // dequant is unpack4 → the dual-approved grouped math with ones in
+        // s_row's place (a bitwise-identity multiply — the fold IS s_row's
+        // storage). Sink/tail passthrough and the final unrotate+cast are
+        // identical to k8v8. Gathered fetch and C's qmm state remain
+        // refused/None until their own rungs land golden.
+        fn assemble_v4(
+            sink: &Option<UniquePtr<MlxArray>>,
+            hist_packed: &Option<UniquePtr<MlxArray>>,
+            scale_folded: &Option<UniquePtr<MlxArray>>,
+            zp_folded: &Option<UniquePtr<MlxArray>>,
+            s_col: &Option<UniquePtr<MlxArray>>,
+            tail: &Option<UniquePtr<MlxArray>>,
+        ) -> UniquePtr<MlxArray> {
+            use crate::cache::kvarn::{
+                KVARN_V4_GROUP_SIZE, kvarn_dequantize_grouped_rotated, kvarn_rotate,
+                kvarn_unpack4,
+            };
+            let mut parts: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(3);
+            if let Some(s) = sink {
+                parts.push(ffi::astype(s, dtype::FLOAT32));
+            }
+            if let Some(packed) = hist_packed {
+                // [B,H,T,D/8] u32 → tile batch [B·H·n_tiles, TILE, ·] for
+                // the math layer, back to [B,H,T,D] f32 after dequant.
+                let shape = ffi::array_shape(packed);
+                let (b, h, t, dp) = (shape[0], shape[1], shape[2], shape[3]);
+                let d = dp * 8;
+                let n_tiles = t / KVARN_TILE_TOKENS;
+                let nb = b * h * n_tiles;
+                let q = kvarn_unpack4(&ffi::reshape(packed, &[nb, KVARN_TILE_TOKENS, dp]), d);
+                let g = d / KVARN_V4_GROUP_SIZE;
+                let sc = ffi::reshape(
+                    scale_folded.as_ref().unwrap(),
+                    &[nb, KVARN_TILE_TOKENS, g],
+                );
+                let zp = ffi::reshape(zp_folded.as_ref().unwrap(), &[nb, KVARN_TILE_TOKENS, g]);
+                let s_col_t = ffi::reshape(s_col.as_ref().unwrap(), &[nb, 1, d]);
+                let ones = ffi::full_f32(&[nb, KVARN_TILE_TOKENS, 1], 1.0, dtype::FLOAT32);
+                let de = kvarn_dequantize_grouped_rotated(
+                    &q,
+                    &sc,
+                    &zp,
+                    &s_col_t,
+                    &ones,
+                    KVARN_V4_GROUP_SIZE,
+                );
+                parts.push(ffi::reshape(&de, &[b, h, t, d]));
+            }
+            if let Some(tl) = tail {
+                parts.push(ffi::astype(tl, dtype::FLOAT32));
+            }
+            assert!(!parts.is_empty(), "fetch_kvarn8 on an empty cache");
+            let mut rotated = parts.remove(0);
+            for p in parts {
+                rotated = crate::ops::concatenate(&rotated, &p, 2);
+            }
+            ffi::astype(&kvarn_rotate(&rotated), dtype::FLOAT16)
+        }
+
         let k = assemble(
             &self.kvarn_sink_k,
             &self.kvarn_hist_k,
@@ -1425,15 +1478,28 @@ impl KVCache {
             &self.kvarn_k_s_col,
             &self.kvarn_tail_k,
         );
-        let v = assemble(
-            &self.kvarn_sink_v,
-            &self.kvarn_hist_v,
-            &self.kvarn_v_scale,
-            &self.kvarn_v_zp,
-            &self.kvarn_v_s_row,
-            &self.kvarn_v_s_col,
-            &self.kvarn_tail_v,
-        );
+        let v = match self.kvarn_v_bits {
+            8 => assemble(
+                &self.kvarn_sink_v,
+                &self.kvarn_hist_v,
+                &self.kvarn_v_scale,
+                &self.kvarn_v_zp,
+                &self.kvarn_v_s_row,
+                &self.kvarn_v_s_col,
+                &self.kvarn_tail_v,
+            ),
+            4 => assemble_v4(
+                &self.kvarn_sink_v,
+                &self.kvarn_hist_v,
+                &self.kvarn_v_scale,
+                &self.kvarn_v_zp,
+                &self.kvarn_v_s_col,
+                &self.kvarn_tail_v,
+            ),
+            other => panic!(
+                "kvarn_v_bits must be 8 or 4, got {other} — construction should have refused"
+            ),
+        };
         (k, v)
     }
 
@@ -1455,7 +1521,11 @@ impl KVCache {
     /// m3_idx (which selection reads) never trims.
     pub fn supports_block_fetch(&self) -> bool {
         match self.mode {
-            KVCacheMode::KVarN8 => self.paged_backing.is_none(),
+            // K8V4: the gathered v4 reader is rung #2 (design §5) — false
+            // here routes M3 decode down `update_and_fetch`, i.e. the v1
+            // assemble reader that serves v4 today. Flips to width-blind
+            // when `fetch_kvarn8_blocks` learns unpack+folded-affine.
+            KVCacheMode::KVarN8 => self.paged_backing.is_none() && self.kvarn_v_bits == 8,
             KVCacheMode::Fp16 => {
                 fp16_gathered_enabled()
                     && self.paged_backing.is_none()
@@ -1497,12 +1567,15 @@ impl KVCache {
         // below would return None and C would SILENTLY fall through to the
         // fetch+core pair — legitimate-looking behavior masking an
         // unimplemented path. Loud until the C v4 dispatch lands (§5).
-        assert!(
-            self.kvarn_v_bits == 8,
-            "kvarn_qmm_state has no kvarn_v_bits={} read path yet — \
-             design §5: read paths land one at a time behind the construction key",
-            self.kvarn_v_bits
-        );
+        // K8V4: C's fused V dispatch is rung #3 (design §5). None is now
+        // the LEGITIMATE structural fall-through — the fetch+core pair
+        // reads through the v1 assemble reader, which serves v4 as of the
+        // v1 rung. (The pre-rung PANIC existed because None would then have
+        // masked an UNIMPLEMENTED v1 path as plausible fall-through; that
+        // rationale expired the commit v1 landed.)
+        if self.kvarn_v_bits != 8 {
+            return None;
+        }
         let n_tiles = self
             .kvarn_k_s_col
             .as_ref()
@@ -10294,35 +10367,102 @@ mod tests {
         assert_eq!(raw(&cache.kvarn_v_s_col), ffi::array_to_raw_bytes(&direct.s_col));
     }
 
+    /// V1 ASSEMBLE READER (§5 rung 1-of-3): fetching a v4 cache returns —
+    /// bitwise — the hand-built composition of the dual-approved math-layer
+    /// ops on the STORED fields, in the reader's exact op order. K window is
+    /// byte-identical to a v8 cache's (stored K fields are byte-identical
+    /// across widths, pinned above; identical assemble code on identical
+    /// bytes). Named mutations (proven red on the committed base): dropping
+    /// the reader's final unrotate; swapping scale'/zp' in the reader.
     #[test]
-    #[should_panic(expected = "has no kvarn_v_bits=4 read path")]
-    fn k8v4_fetch_refuses_loudly() {
+    fn k8v4_fetch_v1_assemble_matches_composition() {
+        use crate::cache::kvarn::{
+            KVARN_V4_GROUP_SIZE, kvarn_dequantize_grouped_rotated, kvarn_rotate, kvarn_unpack4,
+        };
+
         let (k, v) = kvarn_v4_test_input(434);
         let mut cache = kvarn_v4_cache();
         cache.update_only(k, v);
-        let _ = cache.fetch_kvarn8();
+        let (got_k, got_v) = cache.fetch_kvarn8();
+
+        // K: v8 cache on identical input yields the identical K window.
+        let (k2, v2) = kvarn_v4_test_input(434);
+        let mut c8 = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        c8.update_only(k2, v2);
+        let (ref_k, _) = c8.fetch_kvarn8();
+        assert_eq!(
+            ffi::array_to_raw_bytes(&got_k),
+            ffi::array_to_raw_bytes(&ref_k),
+            "K window must be byte-identical across V widths"
+        );
+
+        // V: composition from stored fields — unpack4 → grouped dequant
+        // (folded params, ones for s_row) → [sink, hist, tail] → unrotate
+        // → f16, mirroring the reader's op order exactly.
+        let packed = cache.kvarn_hist_v.as_ref().expect("hist_v");
+        let shape = ffi::array_shape(packed);
+        let (b, h, t, dp) = (shape[0], shape[1], shape[2], shape[3]);
+        let d = dp * 8;
+        let nb = b * h * (t / 128);
+        let q = kvarn_unpack4(&ffi::reshape(packed, &[nb, 128, dp]), d);
+        let sc = ffi::reshape(cache.kvarn_v_scale.as_ref().unwrap(), &[nb, 128, d / 32]);
+        let zp = ffi::reshape(cache.kvarn_v_zp.as_ref().unwrap(), &[nb, 128, d / 32]);
+        let s_col = ffi::reshape(cache.kvarn_v_s_col.as_ref().unwrap(), &[nb, 1, d]);
+        let ones = ffi::full_f32(&[nb, 128, 1], 1.0, dtype::FLOAT32);
+        let de = kvarn_dequantize_grouped_rotated(&q, &sc, &zp, &s_col, &ones, KVARN_V4_GROUP_SIZE);
+        let hist = ffi::reshape(&de, &[b, h, t, d]);
+        let sink = ffi::astype(cache.kvarn_sink_v.as_ref().unwrap(), dtype::FLOAT32);
+        let tail = ffi::astype(cache.kvarn_tail_v.as_ref().unwrap(), dtype::FLOAT32);
+        let rotated = crate::ops::concatenate(&crate::ops::concatenate(&sink, &hist, 2), &tail, 2);
+        let expected_v = ffi::astype(&kvarn_rotate(&rotated), dtype::FLOAT16);
+        assert_eq!(
+            ffi::array_to_raw_bytes(&got_v),
+            ffi::array_to_raw_bytes(&expected_v),
+            "V window must equal the math-layer composition bitwise"
+        );
+    }
+
+    /// The gathered reader is rung #2 — until it lands, v4 caches refuse
+    /// block fetch at BOTH layers: the routing gate steers M3 decode down
+    /// update_and_fetch (v1), and the reader itself still panics as
+    /// defense-in-depth should routing ever be bypassed.
+    #[test]
+    fn k8v4_block_fetch_routing_gate_and_backstop() {
+        let (k, v) = kvarn_v4_test_input(434);
+        let mut cache = kvarn_v4_cache();
+        cache.update_only(k, v);
+        assert!(
+            !cache.supports_block_fetch(),
+            "v4 must NOT advertise block fetch until the gathered reader lands"
+        );
+        let mut c8 = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        let (k2, v2) = kvarn_v4_test_input(434);
+        c8.update_only(k2, v2);
+        assert!(c8.supports_block_fetch(), "v8 advertisement unchanged");
     }
 
     #[test]
     #[should_panic(expected = "fetch_kvarn8_blocks has no kvarn_v_bits=4 read path")]
-    fn k8v4_block_fetch_refuses_loudly() {
+    fn k8v4_block_fetch_backstop_still_panics() {
         let (k, v) = kvarn_v4_test_input(434);
         let mut cache = kvarn_v4_cache();
         cache.update_only(k, v);
         let _ = cache.fetch_kvarn8_blocks(&[0]);
     }
 
+    /// C's fused dispatch is rung #3 — None is now the LEGITIMATE
+    /// structural fall-through (the fetch+core pair reads through the v1
+    /// assemble reader, which serves v4). The pre-rung panic's rationale —
+    /// None masking an UNIMPLEMENTED v1 path — expired when v1 landed.
     #[test]
-    #[should_panic(expected = "kvarn_qmm_state has no kvarn_v_bits=4 read path")]
-    fn k8v4_qmm_state_refuses_loudly() {
-        // MUST panic rather than return None: a None here would make C fall
-        // through to the fetch+core pair silently (v_s_row is None on V4,
-        // so the `?` chain would mask the unimplemented path as
-        // legitimate-looking fall-through).
+    fn k8v4_qmm_state_none_is_legitimate_fallthrough() {
         let (k, v) = kvarn_v4_test_input(434);
         let mut cache = kvarn_v4_cache();
         cache.update_only(k, v);
-        let _ = cache.kvarn_qmm_state();
+        assert!(
+            cache.kvarn_qmm_state().is_none(),
+            "v4 qmm state must be None (fall through to fetch+core) until rung #3"
+        );
     }
 
     #[test]

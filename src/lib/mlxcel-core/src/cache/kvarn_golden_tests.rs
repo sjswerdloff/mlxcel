@@ -25,11 +25,14 @@
 //!
 //! ## Scope — what a green run gates (and what it does not)
 //!
-//! * GATES: the STORAGE roundtrip only — what `update_kvarn8` stores is
+//! * GATES: the STORAGE roundtrip — what `update_kvarn8` stores is
 //!   bit-for-bit what the math layer produces on the tiles the update
-//!   built (codes, folded params, s_col; K fields; sink/tail placement).
-//!   Read paths do not exist yet; this harness is the bridge they will
-//!   build against (§5 order).
+//!   built (codes, folded params, s_col; K fields; sink/tail placement) —
+//!   AND, since the v1 rung landed, the READ-BACK through the v1 assemble
+//!   reader (`fetch_kvarn8`): the fp16 standard-frame windows attention
+//!   receives equal, bitwise, the dual-approved math applied to the
+//!   reference outputs. Gathered fetch and C dispatch remain §5 rungs
+//!   2–3; they gate here as they land.
 //! * DOES NOT gate `gather_qmm`'s FUSED consumption of that storage —
 //!   tolerance-gated separately under §4.2 (coverage-mapping pin, Violet).
 //! * DOES NOT claim live-session bit-equality, BY CONSTRUCTION, for two
@@ -420,6 +423,60 @@ fn run_event(ev: &HarvestEvent, out: &mut Vec<Mismatch>) {
         &ffi::array_to_raw_bytes(&v_ref.s_col),
         out,
     );
+
+    // READ-BACK LEG (v1 assemble reader, §5 rung 1-of-3): fetch through
+    // the REAL reader and pin bitwise against compositions built from the
+    // REFERENCE chain outputs (not the stored fields), in the reader's
+    // exact op order. Green means: what attention receives from a v4
+    // cache is exactly the dual-approved math applied to the verified
+    // storage — on the same licensed tiles. Op ORDER matters bitwise
+    // (float multiplies are not reorderable), so each expected window
+    // mirrors its reader's sequence, not an algebraic equivalent.
+    let (got_k, got_v) = cache.fetch_kvarn8();
+    let n = ev.n_tiles;
+    let t = n * R;
+    let zero_sink = ffi::full_f32(&[1, 1, KVARN_TILE_TOKENS, C], 0.0, dtype::FLOAT32);
+
+    // K expected — engine assemble order: (q·scale + zp)·s_row in row
+    // space, then per-tile ·s_col, reshape, [sink, hist], unrotate, f16.
+    let qf = ffi::astype(&k_ref.q, dtype::FLOAT32);
+    let de_k = ffi::add(&ffi::multiply(&qf, &k_ref.scale), &k_ref.zp);
+    let de_k = ffi::multiply(&de_k, &k_ref.s_row);
+    let de_k = ffi::multiply(&de_k, &k_ref.s_col);
+    let hist_k = ffi::reshape(&de_k, &[1, 1, t, C]);
+    let rot_k = crate::ops::concatenate(&zero_sink, &hist_k, 2);
+    let expected_k = ffi::astype(&kvarn_rotate(&rot_k), dtype::FLOAT16);
+    compare_field(
+        ev.seq,
+        "fetch_kvarn8.k",
+        &ffi::array_to_raw_bytes(&got_k),
+        &ffi::array_to_raw_bytes(&expected_k),
+        out,
+    );
+
+    // V expected — the v4 reader's own call chain on the reference
+    // outputs: unpack4 → grouped dequant (folded params, ones for s_row)
+    // → reshape, [sink, hist], unrotate, f16.
+    let q_v = kvarn::kvarn_unpack4(&v_ref.q_packed, C);
+    let ones = ffi::full_f32(&[n, KVARN_TILE_TOKENS, 1], 1.0, dtype::FLOAT32);
+    let de_v = kvarn::kvarn_dequantize_grouped_rotated(
+        &q_v,
+        &v_ref.scale_folded,
+        &v_ref.zp_folded,
+        &v_ref.s_col,
+        &ones,
+        KVARN_V4_GROUP_SIZE,
+    );
+    let hist_v = ffi::reshape(&de_v, &[1, 1, t, C]);
+    let rot_v = crate::ops::concatenate(&zero_sink, &hist_v, 2);
+    let expected_v = ffi::astype(&kvarn_rotate(&rot_v), dtype::FLOAT16);
+    compare_field(
+        ev.seq,
+        "fetch_kvarn8.v",
+        &ffi::array_to_raw_bytes(&got_v),
+        &ffi::array_to_raw_bytes(&expected_v),
+        out,
+    );
 }
 
 /// THE GATING RUN (ignored: requires the harvest bank; see module docs
@@ -464,7 +521,7 @@ fn k8v4_golden_harness_real_tiles() {
     let off_max = events.iter().map(|e| e.offset).max().unwrap_or(0);
     println!(
         "golden harness: {} events / {} tiles per role, offsets {off_min}..{off_max}, \
-         9 stored fields + 4 structure pins per event, {} mismatches",
+         9 stored fields + 4 structure pins + 2 read-back windows per event, {} mismatches",
         events.len(),
         total_tiles,
         mismatches.len()
