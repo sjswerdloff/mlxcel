@@ -6,9 +6,12 @@ the design and code reviews." Seats: Violet design + QE; Xander design
 review, code reviews, and the standing refusal seat on copy-precision
 chain entry.
 
-Status: DRAFT v2 — Violet design review 13:41: APPROVE DIRECTION, four
-additions (all incorporated below, marked ⊕). Xander's design pass
-pending; no code until it closes.
+Status: v5 — DESIGN REVIEW CLOSED, BUILD LANE OPEN. Violet 13:41:
+APPROVE DIRECTION, four additions (incorporated, marked ⊕). Xander
+14:46 (via Violet's brief): no blockers, three previously-unreviewed
+areas verdict-CORRECT (golden-vector claim with his full-roundtrip
+clarification, §4 complete, CLI as designed). Two PM pins folded in
+below (structural parity gate; coverage-mapping line).
 
 ## 1. What is licensed, exactly
 
@@ -170,15 +173,25 @@ passed, plus the transfer harness:
   roundtrip vs `roundtrip_grouped` on the SAME 4,096 harvested tiles.
   Same ops should mean bit-exact; any relaxation to a tolerance must be
   justified per-op in the results doc, not waved. This is what makes
-  the boot-night verdict TRANSFER to the engine.
+  the boot-night verdict TRANSFER to the engine. Full-roundtrip per
+  Xander's clarification: write chain through pack/fold AND read chain
+  through unpack/dequant, not write-side alone.
+  ⊕⊕ Coverage mapping, so a green harness is never over-read (Violet
+  PM pin 2): the golden harness bit-exact-gates the STORAGE roundtrip
+  only; `gather_qmm`'s FUSED consumption of that storage is
+  tolerance-gated under §4.2, exactly per the C precedent — fused
+  accumulation order differs, and bitwise equality was never that
+  contract (Xander held C to the same standard).
 - §4.1 unit: rtn_grouped hand-computed 4×4 reference; pack/unpack
   bit-exactness at 4-bit; s_row-folding identity; partial-tail tiles;
   every guard's named mutation proven once. ⊕ ROUND-MODE PARITY FIRST
   (Violet, QE): `round()` on exact half-quotients is the one op where
-  numpy and MLX could legally differ — both claim round-half-even;
-  PROVE it with a hand-built half-case vector BEFORE the 4,096-tile
-  harness runs. Turns a potential hours-long harness-mismatch hunt into
-  a seconds-long diagnosis.
+  reference and engine could legally differ — both claim
+  round-half-even; PROVE it with a hand-built half-case vector BEFORE
+  the 4,096-tile harness runs. ⊕⊕ HARD GATE, STRUCTURAL (Violet PM pin
+  1, Xander confirmation): the golden harness's FIRST ACT is calling
+  the shared parity assertion — a test-code dependency, not prose. The
+  harness cannot run with parity unproven.
 - §4.2 equivalence: quantized-vs-fp16 attention bounded error (with the
   must-fail corrupted-cache arm); selection-index equality EXACT.
 - §4.3 greedy-divergence at {2K, 8K, 32K, 128K}, length-independence
