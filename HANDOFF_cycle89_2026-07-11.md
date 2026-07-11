@@ -14,7 +14,10 @@ second AFTER banking the drive numbers. Immediate pickup on return.
   (/tmp/harvest_request.json → /tmp/measure_response_20260711.json),
   background task started 15:29. Boot-night comparables: A-leg 3.44
   tok/s end-to-end at 295K; B-leg (C) 5.49 tok/s = 1.60×; prefill 129
-  tok/s. THIS session's numbers: [BANK BEFORE CROSSING — see §EXTRACT].
+  tok/s. THIS session: BANKED — RESULTS_c_revalidation_20260711.md:
+  decode 5.33 tok/s at 295K (−2.9% vs boot-B, harvest-on caveat),
+  prefill 119.8 tok/s, C witness present, tripwire silent, 1.55× vs
+  A-leg. §EXTRACT is DONE; far-side pickup = Gate B implementation.
 - Harvest at crossing: all 57 layers hold full idx_k_win keep-latest
   windows (114 harvest_latest_* files); 379+ idx_k sidecars ≈ depth
   200K+ when checked at 15:45.
