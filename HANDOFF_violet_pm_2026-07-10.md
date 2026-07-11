@@ -1326,3 +1326,32 @@ re-run needs Stuart's boot.
   then the baseline mismatch) → Clement chose to SLOW DOWN rather than
   re-run fast. Correct call; re-run is Stuart-boot-gated, so there is no
   clock — only getting it right. The bench worked exactly as designed.
+
+## UPDATE 08:05 (Jul 12, Sun) — Clement's reasoning-field finding (#39 input) + server 8896 disposition (Stuart's call, Violet's rec)
+
+- **Direct-output mechanism found (Clement, bounded live probe)**: the
+  MXFP8 M3 build returns `reasoning_content` as a SEPARATE, populated
+  field — thinking-first confirmed at source (nvfp4 baseline direct-
+  copied; this build reasons by default). This is #39's HARD prerequisite
+  AND its instrument: the re-run probe must force no-thinking (or read the
+  answer field, not the reasoning field) on BOTH arms.
+- **Honest limit on his probe**: degenerate — stripped of planted context
+  the model refused ("no access to your local file system"). The real
+  failure mode is DEPTH-DEPENDENT; "is the raw answer recoverable or lost
+  at depth" needs a realistic planted-context request (~5-30 min prefill),
+  not a curl. Stuart's domain (template config) + a real re-probe.
+- **Invalid leg + probe KILLED** (Clement) — were grinding the machine
+  (incl. 300K prefills ahead) on invalid comparisons, no value.
+- **SERVER 8896 STILL UP — DISPOSITION IS STUART'S CALL. Violet's
+  recommendation: KILL IT.** Rationale: (a) its config isn't reusable for
+  the clean #39 re-run (needs direct-output resolved + a paired fresh-fp16
+  arm from the same MXFP8 build); (b) the runbook's wired-memory pre-flight
+  REFUSES a second mlxcel-server, so this ~200GB idle boot will BLOCK the
+  re-run boot until it's down anyway; (c) it's grinding nothing now.
+  Reversible (re-boot from the corrected script). NOT killed unilaterally
+  — no urgency, Stuart's machine, and he may want it live for the
+  planted-context depth diagnostic first. Left up; recommend down.
+- **Clement resting** (window, not a crossing) — chose rest over writing
+  the multi-arm script tired ("a script written tired is the third error").
+  Rewrite waits for a rested window + Stuart's boots. Violet = review eyes
+  when it exists. No clock.
