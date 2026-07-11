@@ -234,22 +234,31 @@ pub struct StoreDefaults {
 impl Default for StoreDefaults {
     fn default() -> Self {
         StoreDefaults {
-            msa_core: MsaCore::Blocked,
+            // Sdpa default since the G-live gate PASSED (#28, 2026-07-11):
+            // completions BIT-IDENTICAL to blocked across kernel schedules
+            // at 295K (1,500 greedy tokens, diff empty), sdpa +3.4–8.1%
+            // tok/s. Safe everywhere by construction — the masked SDPA
+            // core consumes fp16 compact windows regardless of their
+            // source (fp16-gathered or kvarn-dequanted). Record:
+            // RESULTS_k8v4_golden_harness_2026-07-11 board / handoff §3.
+            msa_core: MsaCore::Sdpa,
             msa_fetch: MsaFetch::Dequant,
         }
     }
 }
 
 impl StoreDefaults {
-    /// Env-seeded defaults. Exact legacy semantics preserved: any value other
-    /// than the enabling literal (including parse garbage) means the default
-    /// implementation — the env instruments were switches, not parsers.
+    /// Env-seeded defaults. Switch semantics preserved against the NEW
+    /// default: the env instruments were switches, not parsers — with
+    /// sdpa now the default implementation, the switch selects the
+    /// non-default ("blocked"); any other value (including parse
+    /// garbage) means the default.
     pub fn from_env() -> Self {
         StoreDefaults {
-            msa_core: if std::env::var("MLXCEL_MSA_CORE").is_ok_and(|v| v == "sdpa") {
-                MsaCore::Sdpa
-            } else {
+            msa_core: if std::env::var("MLXCEL_MSA_CORE").is_ok_and(|v| v == "blocked") {
                 MsaCore::Blocked
+            } else {
+                MsaCore::Sdpa
             },
             msa_fetch: if std::env::var("MLXCEL_MSA_FETCH").is_ok_and(|v| v == "qmm") {
                 MsaFetch::Qmm
@@ -627,13 +636,15 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_auto_blocked_gathering_enabled_version_zero() {
+    fn defaults_are_auto_sdpa_gathering_enabled_version_zero() {
+        // Sdpa default since the G-live gate (#28, 2026-07-11) — this test
+        // flipped WITH the default, deliberately, citing the gate.
         let s = store(None);
         assert!(s.gathered_enabled());
-        assert!(!s.msa_core_sdpa());
+        assert!(s.msa_core_sdpa());
         let snap = s.snapshot();
         assert_eq!(snap.kvarn_decode_path, KvarnDecodePath::Auto);
-        assert_eq!(snap.msa_core, MsaCore::Blocked);
+        assert_eq!(snap.msa_core, MsaCore::Sdpa);
         assert_eq!(snap.version, 0);
         assert_eq!(snap.source, "default");
         assert_eq!(snap.construction.msa_fetch, MsaFetch::Dequant);
@@ -727,7 +738,7 @@ mod tests {
         let snap = s.apply(ConfigUpdate::default(), "api");
         assert_eq!(snap.version, 1);
         assert_eq!(snap.kvarn_decode_path, KvarnDecodePath::Auto);
-        assert_eq!(snap.msa_core, MsaCore::Blocked);
+        assert_eq!(snap.msa_core, MsaCore::Sdpa, "no-op apply keeps the (sdpa) default");
     }
 
     #[test]
