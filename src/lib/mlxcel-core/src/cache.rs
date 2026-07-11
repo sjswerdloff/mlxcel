@@ -1521,11 +1521,10 @@ impl KVCache {
     /// m3_idx (which selection reads) never trims.
     pub fn supports_block_fetch(&self) -> bool {
         match self.mode {
-            // K8V4: the gathered v4 reader is rung #2 (design §5) — false
-            // here routes M3 decode down `update_and_fetch`, i.e. the v1
-            // assemble reader that serves v4 today. Flips to width-blind
-            // when `fetch_kvarn8_blocks` learns unpack+folded-affine.
-            KVCacheMode::KVarN8 => self.paged_backing.is_none() && self.kvarn_v_bits == 8,
+            // Width-blind since §5 rung 2: `fetch_kvarn8_blocks` serves
+            // BOTH V widths (the v4 branch runs unpack4 + folded-affine
+            // grouped dequant inside the same batched tile gather).
+            KVCacheMode::KVarN8 => self.paged_backing.is_none(),
             KVCacheMode::Fp16 => {
                 fp16_gathered_enabled()
                     && self.paged_backing.is_none()
@@ -1657,12 +1656,6 @@ impl KVCache {
             "fetch_kvarn8_blocks on a cache that does not support it (mode={:?})",
             self.mode
         );
-        assert!(
-            self.kvarn_v_bits == 8,
-            "fetch_kvarn8_blocks has no kvarn_v_bits={} read path yet — \
-             design §5: read paths land one at a time behind the construction key",
-            self.kvarn_v_bits
-        );
         assert!(!blocks.is_empty(), "fetch_kvarn8_blocks: empty block list");
 
         // Window structure, derived from the kvarn fields themselves.
@@ -1718,7 +1711,8 @@ impl KVCache {
         let has_sink = blocks[0] == 0;
         let has_tail = tail_len > 0 && *blocks.last().unwrap() == n_tiles + 1;
 
-        let assemble_blocks = |sink: &Option<UniquePtr<MlxArray>>,
+        let assemble_blocks = |v_bits: u8,
+                               sink: &Option<UniquePtr<MlxArray>>,
                                hist: &Option<UniquePtr<MlxArray>>,
                                scale: &Option<UniquePtr<MlxArray>>,
                                zp: &Option<UniquePtr<MlxArray>>,
@@ -1734,37 +1728,73 @@ impl KVCache {
                 let u = interior.len() as i32;
                 let q = hist.as_ref().unwrap();
                 let qs = ffi::array_shape(q);
-                let (b_, h_, d_) = (qs[0], qs[1], qs[3]);
+                let (b_, h_) = (qs[0], qs[1]);
                 let bs = KVARN_TILE_TOKENS;
                 let idx = ffi::astype(
                     &ffi::from_slice_f32(&interior, &[1, 1, u, 1, 1]),
                     dtype::INT32,
                 );
                 // Gather along the TILE axis of blocked 5-D views. One
-                // gather per field; indices broadcast across (b, h, bs, d).
+                // gather per field; indices broadcast across (b, h, bs, ·).
                 let gather5 = |a: &MlxArray, last: i32| {
                     let a5 = ffi::reshape(a, &[b_, h_, n_tiles, bs, last]);
                     let ib = ffi::broadcast_to(&idx, &[b_, h_, u, bs, last]);
                     ffi::take_along_axis(&a5, &ib, 2)
                 };
-                let qf = ffi::astype(&gather5(q, d_), dtype::FLOAT32);
-                let de = ffi::add(
-                    &ffi::multiply(&qf, &gather5(scale.as_ref().unwrap(), 1)),
-                    &gather5(zp.as_ref().unwrap(), 1),
-                );
-                let de = ffi::multiply(&de, &gather5(s_row.as_ref().unwrap(), 1));
-                // s_col is per-tile [B,H,n_tiles,D]: gather its tile rows,
-                // then shape [B,H,u,1,D] to broadcast over each tile's
-                // tokens — the 5-D twin of the loop version's [B,H,1,D].
-                let sc4 = {
+                // s_col is per-tile [B,H,n_tiles,D]: gather its tile rows —
+                // shared by both widths (V4 hands it to the math layer).
+                let gather_s_col = |d_: i32| {
                     let idx4 =
                         ffi::astype(&ffi::from_slice_f32(&interior, &[1, 1, u, 1]), dtype::INT32);
                     let ib = ffi::broadcast_to(&idx4, &[b_, h_, u, d_]);
                     ffi::take_along_axis(s_col.as_ref().unwrap(), &ib, 2)
                 };
-                let sc = ffi::reshape(&sc4, &[b_, h_, u, 1, d_]);
-                let de = ffi::multiply(&de, &sc);
-                parts.push(ffi::reshape(&de, &[b_, h_, u * bs, d_]));
+                if v_bits == 8 {
+                    let d_ = qs[3];
+                    let qf = ffi::astype(&gather5(q, d_), dtype::FLOAT32);
+                    let de = ffi::add(
+                        &ffi::multiply(&qf, &gather5(scale.as_ref().unwrap(), 1)),
+                        &gather5(zp.as_ref().unwrap(), 1),
+                    );
+                    let de = ffi::multiply(&de, &gather5(s_row.as_ref().unwrap(), 1));
+                    // Shape [B,H,u,1,D] to broadcast over each tile's
+                    // tokens — the 5-D twin of the loop version's [B,H,1,D].
+                    let sc = ffi::reshape(&gather_s_col(d_), &[b_, h_, u, 1, d_]);
+                    let de = ffi::multiply(&de, &sc);
+                    parts.push(ffi::reshape(&de, &[b_, h_, u * bs, d_]));
+                } else {
+                    // K8V4 gathered read (§5 rung 2): gather the PACKED u32
+                    // codes and per-group FOLDED params tile-wise, then run
+                    // the SAME unpack4 → grouped-dequant chain as the v1
+                    // reader — per-element ops with per-tile params, so
+                    // gather-then-dequant is bitwise dequant-then-gather
+                    // (the v4 block-fetch pin holds the v8 pin's atol-0
+                    // standard against fetch_kvarn8's full window).
+                    use crate::cache::kvarn::{
+                        KVARN_V4_GROUP_SIZE, kvarn_dequantize_grouped_rotated, kvarn_unpack4,
+                    };
+                    let dp = qs[3];
+                    let d_ = dp * 8;
+                    let g = d_ / KVARN_V4_GROUP_SIZE;
+                    let nb = b_ * h_ * u;
+                    let codes = kvarn_unpack4(
+                        &ffi::reshape(&gather5(q, dp), &[nb, bs, dp]),
+                        d_,
+                    );
+                    let sc = ffi::reshape(&gather5(scale.as_ref().unwrap(), g), &[nb, bs, g]);
+                    let zpg = ffi::reshape(&gather5(zp.as_ref().unwrap(), g), &[nb, bs, g]);
+                    let s_col_t = ffi::reshape(&gather_s_col(d_), &[nb, 1, d_]);
+                    let ones = ffi::full_f32(&[nb, bs, 1], 1.0, dtype::FLOAT32);
+                    let de = kvarn_dequantize_grouped_rotated(
+                        &codes,
+                        &sc,
+                        &zpg,
+                        &s_col_t,
+                        &ones,
+                        KVARN_V4_GROUP_SIZE,
+                    );
+                    parts.push(ffi::reshape(&de, &[b_, h_, u * bs, d_]));
+                }
             }
             if has_tail {
                 // Tail block: fp16-rotated, zero-padded to a full block.
@@ -1791,7 +1821,10 @@ impl KVCache {
             ffi::astype(&kvarn_rotate(&rotated), dtype::FLOAT16)
         };
 
+        // K side stays 8-bit in BOTH V widths (design §1: k4-K is dead
+        // with prejudice); the V side follows the construction width.
         let k = assemble_blocks(
+            8,
             &self.kvarn_sink_k,
             &self.kvarn_hist_k,
             &self.kvarn_k_scale,
@@ -1801,6 +1834,7 @@ impl KVCache {
             &self.kvarn_tail_k,
         );
         let v = assemble_blocks(
+            self.kvarn_v_bits,
             &self.kvarn_sink_v,
             &self.kvarn_hist_v,
             &self.kvarn_v_scale,
@@ -10422,32 +10456,56 @@ mod tests {
         );
     }
 
-    /// The gathered reader is rung #2 — until it lands, v4 caches refuse
-    /// block fetch at BOTH layers: the routing gate steers M3 decode down
-    /// update_and_fetch (v1), and the reader itself still panics as
-    /// defense-in-depth should routing ever be bypassed.
+    /// Since §5 rung 2 the gathered reader serves BOTH widths — v4 caches
+    /// advertise block fetch again (M3's will_gather_decode may take the
+    /// gathered path; C still falls through via qmm None until rung 3).
     #[test]
-    fn k8v4_block_fetch_routing_gate_and_backstop() {
+    fn k8v4_supports_block_fetch_width_blind_since_rung2() {
         let (k, v) = kvarn_v4_test_input(434);
         let mut cache = kvarn_v4_cache();
         cache.update_only(k, v);
-        assert!(
-            !cache.supports_block_fetch(),
-            "v4 must NOT advertise block fetch until the gathered reader lands"
-        );
+        assert!(cache.supports_block_fetch(), "v4 advertises block fetch since rung 2");
         let mut c8 = KVCache::new_with_mode(KVCacheMode::KVarN8);
         let (k2, v2) = kvarn_v4_test_input(434);
         c8.update_only(k2, v2);
         assert!(c8.supports_block_fetch(), "v8 advertisement unchanged");
     }
 
+    /// GATHERED READER PIN (§5 rung 2), the v4 sibling of
+    /// `kvarn_block_fetch_matches_full_window`: selected blocks equal —
+    /// atol 0, byte-for-byte — the same token ranges sliced out of the v1
+    /// full window (per-token WHT and per-element dequant commute with
+    /// whole-tile selection; tail block zero-pads to a full block and
+    /// wht(0)==0 makes rotated-frame padding identical to post-hoc f16
+    /// zeros). Named mutations (proven red on the committed base): swap
+    /// scale'/zp' in the gathered v4 dequant; pass ones for s_col there.
     #[test]
-    #[should_panic(expected = "fetch_kvarn8_blocks has no kvarn_v_bits=4 read path")]
-    fn k8v4_block_fetch_backstop_still_panics() {
-        let (k, v) = kvarn_v4_test_input(434);
+    fn k8v4_block_fetch_matches_full_window() {
+        let (k, v) = kvarn_v4_test_input(434); // 128 sink + 2 tiles + 50 tail
         let mut cache = kvarn_v4_cache();
         cache.update_only(k, v);
-        let _ = cache.fetch_kvarn8_blocks(&[0]);
+        let (full_k, full_v) = cache.fetch_kvarn8();
+        // Blocks: 0 = sink, 2 = second tile, 3 = tail (padded to 128).
+        let (gk, gv) = cache.fetch_kvarn8_blocks(&[0, 2, 3]);
+        let expected = |w: &UniquePtr<MlxArray>| {
+            let sink = ffi::slice(w, &[0, 0, 0, 0], &[1, 2, 128, 128]);
+            let t2 = ffi::slice(w, &[0, 0, 256, 0], &[1, 2, 384, 128]);
+            let tail = ffi::slice(w, &[0, 0, 384, 0], &[1, 2, 434, 128]);
+            let pad = ffi::full_f32(&[1, 2, 78, 128], 0.0, dtype::FLOAT16);
+            let a = crate::ops::concatenate(&sink, &t2, 2);
+            let b = crate::ops::concatenate(&tail, &pad, 2);
+            crate::ops::concatenate(&a, &b, 2)
+        };
+        assert_eq!(
+            ffi::array_to_raw_bytes(&gk),
+            ffi::array_to_raw_bytes(&expected(&full_k)),
+            "gathered K blocks must equal full-window slices bitwise"
+        );
+        assert_eq!(
+            ffi::array_to_raw_bytes(&gv),
+            ffi::array_to_raw_bytes(&expected(&full_v)),
+            "gathered V blocks must equal full-window slices bitwise"
+        );
     }
 
     /// C's fused dispatch is rung #3 — None is now the LEGITIMATE

@@ -477,6 +477,33 @@ fn run_event(ev: &HarvestEvent, out: &mut Vec<Mismatch>) {
         &ffi::array_to_raw_bytes(&expected_v),
         out,
     );
+
+    // GATHERED READ-BACK (§5 rung 2): fetch a block subset through the
+    // REAL gathered reader and pin bitwise against row-slices of the same
+    // expected windows — per-token WHT and per-element dequant commute
+    // with whole-tile selection, so gathered == sliced, exactly. Blocks:
+    // 0 = sink, n = last interior tile (strictly increasing for n >= 1).
+    let (bg_k, bg_v) = cache.fetch_kvarn8_blocks(&[0, n]);
+    let sliced = |w: &UniquePtr<MlxArray>| {
+        let sink_rows = ffi::slice(w, &[0, 0, 0, 0], &[1, 1, KVARN_TILE_TOKENS, C]);
+        let last_lo = (n - 1) * R + KVARN_TILE_TOKENS;
+        let last_rows = ffi::slice(w, &[0, 0, last_lo, 0], &[1, 1, last_lo + R, C]);
+        crate::ops::concatenate(&sink_rows, &last_rows, 2)
+    };
+    compare_field(
+        ev.seq,
+        "fetch_blocks.k",
+        &ffi::array_to_raw_bytes(&bg_k),
+        &ffi::array_to_raw_bytes(&sliced(&expected_k)),
+        out,
+    );
+    compare_field(
+        ev.seq,
+        "fetch_blocks.v",
+        &ffi::array_to_raw_bytes(&bg_v),
+        &ffi::array_to_raw_bytes(&sliced(&expected_v)),
+        out,
+    );
 }
 
 /// THE GATING RUN (ignored: requires the harvest bank; see module docs
@@ -521,7 +548,8 @@ fn k8v4_golden_harness_real_tiles() {
     let off_max = events.iter().map(|e| e.offset).max().unwrap_or(0);
     println!(
         "golden harness: {} events / {} tiles per role, offsets {off_min}..{off_max}, \
-         9 stored fields + 4 structure pins + 2 read-back windows per event, {} mismatches",
+         9 stored fields + 4 structure pins + 2 read-back + 2 gathered windows per event, \
+         {} mismatches",
         events.len(),
         total_tiles,
         mismatches.len()
