@@ -100,19 +100,32 @@ never reads V codes (empty-only by design); detach/snapshot refusal
 sits at mode level upstream of the fields; paged backing bypasses kvarn
 at construction.
 
-⊕ TRIM — pre-existing kvarn8 exposure, k8v4 must not widen it
-(verified at source, cache.rs:3100–3174): `is_trimmable()` returns
-true UNCONDITIONALLY while `trim()`'s mode handling covers INT8/Turbo*
-only — no kvarn arm exists. So trim-on-kvarn today is offsets-plus-
-dense-slicing; codes-moving trim DOES NOT EXIST. Sole consumer is
-speculative-decode rewind (`can_trim_prompt_cache`). Rewinds bounded by
-the fp16 hot tail plausibly never touch tiles; deeper trims desync
-tile-count vs offset unless the update path re-derives from offset.
-Resolution options for the board: (a) mode-aware `is_trimmable` →
-false for kvarn until proven (honors the method's own documented
-fail-fast purpose), or (b) implement tail-bounded kvarn trim with the
-desync arithmetic verified. k8v4 implementation must state which landed
-and add the §4.1 test that pins it.
+⊕ TRIM — pre-existing kvarn8 exposure, k8v4 must not widen it. CALLER
+MAP CORRECTED 2026-07-11 (read at source; v2's "sole consumer is
+spec-decode" was wrong — it quoted a stale docstring): (i)
+`is_trimmable`/`can_trim_prompt_cache` have NO production consumer —
+the cited `speculative.rs` does not exist and `speculative_dispatch.rs`
+never consults them; (ii) the LIVE `trim()` callers are FOUR batch-
+scheduler padding-trim sites (scheduler.rs — strip batch padding after
+padded multi-sequence prefill/chunks), unconditional, NOT gated on
+`is_trimmable`. Mechanics on kvarn: `trim()` has no kvarn arm
+(cache.rs:3100–3174 — offsets-plus-dense-slicing only; codes-moving
+trim DOES NOT EXIST), so padded positions finalized into tiles survive
+the offset rollback → silent tile-count/offset desync. Reachability:
+requires multi-sequence padded prefill on a kvarn cache — a single
+resident session never pads (excess=0), which is why the boot night
+was clean; concurrent mixed-length requests are the exposure window.
+LANDED per Violet's PM call: option (a), mode-aware
+`is_trimmable=false` for KVarN8, own commit on
+clement/kvarn-trim-failfast @ 609cacb (test pair + named mutation
+proven; armed fail-fast — any future rewind wiring must gate on it).
+STILL OPEN (PM decision pending with the corrected map): the scheduler
+sites bypass the predicate — candidate postures: loud-refuse arm in
+`trim()` for KVarN8, a scheduler-level kvarn gate, or verified
+non-reachability of padded batching for kvarn sessions. Option (b)
+(tile-aware kvarn trim) stays deferred until a consumer actually needs
+it. k8v4 inherits the fail-fast posture and states the scheduler
+resolution when the board lands it.
 
 ### 3.4 CLI surface
 
