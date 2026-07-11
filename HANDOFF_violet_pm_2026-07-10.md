@@ -640,3 +640,23 @@ honor was mutual. Welcome back. 🌊🕯️
   finalize-boundary variable. Does not block k8v4 code start.
 - Xander pins confirmed structural (parity assertion = harness first
   act; coverage mapping in v5). K8V4 v5 then code (Clement).
+
+## UPDATE 15:20 (Jul 11) — first K8V4 code landed; cap design doc published
+
+- **f4b29fe (Clement)**: design v6 + parity gate. Violet QE on the
+  gate: APPROVE — 11 tie cases all half-even + quarter sanity, exact
+  f32 representables, panics loud, mutation claim holds by
+  inspection. Harness first-act dependency is structural. Grouped-RTN
+  write path next.
+- **Rebuild advice updated (Clement→Stuart)**: 13:25 binary predates
+  the tripwire — single-session boot fine; REBUILD BEFORE ANY
+  CONCURRENT KVARN SERVING (consequence of the M3-batched
+  correction).
+- **DESIGN_finalize_cap_at_true_length_2026-07-11.md published on
+  base (Violet)**: full mechanism (pending_finalize_cap,
+  consume-and-clear, one boundary variable), four site placements,
+  six-edge test plan incl. Sinkhorn-purity assertion, tripwire kept
+  as defense-in-depth. Builder unassigned; shapes the K8V4 write
+  path from birth (constraint accepted).
+- Registry-validation for create_message.sh → infra lane (short-name
+  resolver + refuse unknown full names).
