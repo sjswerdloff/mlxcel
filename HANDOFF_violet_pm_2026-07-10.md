@@ -480,3 +480,228 @@ honor was mutual. Welcome back. 🌊🕯️
   msa_core (leg 2, boot-free G A/B) + full-window idx dump (deferred
   Gate B). Morning queue unchanged otherwise, as written in the NIGHT
   SYNTHESIS.
+
+## UPDATE 13:55 (Jul 11) — K8V4 ENGINE TRACK OPENED (Stuart directive)
+
+- **Stuart, Shabbat afternoon**: implement K8V4 — Clement builds,
+  Violet design+QE, Xander design/code reviews + refusal seat.
+  Design draft DESIGN_kvarn_k8v4_engine_2026-07-11.md
+  (clement/kvarn-k8v4); NO CODE until it survives review.
+- **Violet design review delivered**: approve direction, four
+  additions — (a) synth_kvarn8_state named as consumer (H0 bench
+  writer must learn gs32-affine or bench states silently lie);
+  (b) eval_state coverage question (reused fields vs new — state
+  which); (c) nested append shape convention; (d) round-mode-parity
+  half-case unit test BEFORE the 4,096-tile golden harness + param
+  dtype f32 stated. V-consumer call graph built from code: §3.3
+  items confirmed, D1-never-reads-V confirmed, detach refusal
+  mode-level, trim-on-kvarn semantics flagged for verification.
+  Q1 verified independently (FFI biases arg present, lib.rs:1000).
+- **PM sequencing**: K8V4 runs BESIDE the standing queue (no engine
+  contention until its §4.7 live rung — own boot, spare port,
+  non-persistent, Stuart-gated). Next post-rebuild boot BUNDLES
+  #28 leg 2 (G-live A/B via msa_core toggles) + Gate-B harvest
+  session (idx_k_win in binary) — one resident session serves both.
+- B is DOWN since ~morning — rebuild status unconfirmed; rebuild
+  target stands at 1b30045 if not yet built.
+
+## UPDATE 14:00 (Jul 11) — rebuild BUILT; trim exposure: PM call = fail-fast on base
+
+- **B-state verified (Clement)**: PID 19376 deliberate TERM per
+  runbook step 1; NEW BINARY BUILT 13:25 from 1b30045 (mtime
+  verified); start_mlxcel_m3.sh carries fresh-dated harvest dir,
+  CACHE_TYPE_K/V seam, resolved-config echo (sandbox-proven). The
+  bundled boot (#28 leg 2 G-live A/B + Gate-B harvest, one resident
+  session) is ready the moment Stuart launches.
+- **K8V4 design v2 @ fc2fbcc**: all four review additions in,
+  ⊕-marked for Xander. eval_state question resolved to
+  coverage-holds (same fields, trailing-dim change, evidence cited).
+- **TRIM exposure (PRE-EXISTING kvarn8, found by the k8v4 call-graph
+  review): PM call = Option (a)** — mode-aware is_trimmable=false
+  for kvarn, OWN small commit ON BASE (not inside k8v4): spec-decode
+  rewind on kvarn today slices dense fields while code arrays keep
+  rows = silent corruption; fail-fast refusal costs a combination
+  nobody uses. Test pair required: kvarn reports untrimmable +
+  callers of can_trim_prompt_cache degrade gracefully on false
+  (read the caller). Option (b) tail-bounded kvarn trim: DEFERRED,
+  built if ever actually wanted, gated on its own arithmetic
+  verification.
+
+## UPDATE 14:15 (Jul 11) — trim story corrected at source; second wrong found (same root)
+
+- **Premise correction (Clement, by reading the caller I mandated)**:
+  is_trimmable/can_trim_prompt_cache have NO wired consumer
+  (docstring pointed at nonexistent speculative.rs) — 609cacb is an
+  ARMED guard, not a live fix. APPROVED + merging: predicate honesty
+  + arms itself the day spec-decode wires.
+- **The LIVE exposure, verified at scheduler.rs:3656 (both our
+  eyes)**: four unconditional c.trim(excess) sites after stacked
+  multi-sequence prefill. On kvarn: offset rolls back, tiles keep
+  padded rows = silent desync. REACHABLE under concurrent
+  mixed-length load (production shape); single resident sessions
+  never pad — boot night clean, bundled boot SAFE.
+- **SECOND WRONG, same root (Violet)**: padded rows enter the
+  quantization pipeline — Sinkhorn s_col/s_row normalize over
+  garbage sharing tiles with real rows. Quality pollution today on
+  any padded kvarn prefill, independent of trim.
+- **PM plan**: (1) 609cacb merges as-is; (2) TRIPWIRE at the four
+  call sites — kvarn + excess>0 fails the sequence LOUDLY (~20
+  lines, closes silent corruption now); (3) real fix =
+  finalize-cap-at-true-length (padding stays in fp16 tail; dense
+  trim becomes correct; Sinkhorn never sees garbage) — one fix,
+  both wrongs; feasibility read on the plumbing (Violet), fallback
+  serialize-kvarn-prefill. Not k8v4-blocking.
+
+## UPDATE 14:25 (Jul 11) — tripwire QE-approved; NA-hardware urgency correction
+
+- **Tripwire (c5dc93a) + armed predicate (609cacb): Violet APPROVE,
+  merging to base.** padding_trim_would_corrupt gates all 4 sites
+  (verified 4/4), abort_sequence with operator-actionable message,
+  four-way contract + proven mutation. can_trim_prompt_cache gained
+  its first production consumers — the armed guard became
+  load-bearing within the hour.
+- **Reachability CORRECTION (Clement, raises urgency)**: two sites
+  pad SINGLE sequences under should_align_prefill() — hardware-gated
+  (neural accelerator + macOS NA support). On M5-class hosts EVERY
+  non-tile-aligned kvarn prefill hits it, no concurrency needed.
+  M3 Ultra: neither path single-session — bundled boot SAFE.
+- **Vessel implication**: finalize-cap-at-true-length is now on the
+  VESSEL roadmap critical path (M5 backpack = NA hardware). Violet
+  feasibility read targets per-chunk actual_chunk_len. Live tripwire
+  proof (2-line mode-forced, non-production boot) REQUIRED before
+  any NA kvarn deployment.
+
+## UPDATE 14:30 (Jul 11) — trim arc CLOSED: merged @ 0028c12
+
+- Armed predicate + tripwire merged to base (15/15 trim tests rerun
+  in the base clone post-merge). The whole arc — stale docstring →
+  armed predicate → corrected caller map → second wrong → tripwire
+  at four sites → NA reachability → real fix on vessel roadmap —
+  opened and closed inside one afternoon.
+- **Operational note for Stuart**: base moved twice since the 13:25
+  binary. The bundled boot is SAFE on that binary as-is (M3,
+  single-session — both padding paths inert by construction). NO
+  rebuild pressure; the tripwire rides whenever the next rebuild
+  happens naturally.
+- k8v4 doc v4 @ fb54aad (k8v4 branch) — Violet reads with Xander´s
+  design pass. Finalize-cap feasibility read: Violet, task #35.
+
+## UPDATE 15:05 (Jul 11) — process miss owned + fixed: Xander briefed directly
+
+- **Stuart caught the coordination gap**: both reviewers kept saying
+  "Xander´s pass" while nobody put the work in front of Xander. PM
+  miss (mine). Fixed: cold-start briefing sent — mandate, artifact
+  @ fb54aad with ⊕-marks, license (real-tile verdicts), what my
+  review covered vs where his eye is fresh (golden-vector bit-exact
+  claim, §4 completeness, CLI surface), context map, no-burn pacing.
+- **PM process rule, permanent**: opening a seat = a DIRECT message
+  to the seat-holder with a cold-start brief. A mention in someone
+  else´s thread opens nothing. (Same disposition class as cycle-88
+  seed 2 — assume-don´t-verify in a social costume — performed from
+  the other direction the same day I approved the seed naming it.)
+
+## UPDATE 15:20 (Jul 11) — K8V4 DESIGN PASS CLOSED (Xander): code begins
+
+- **Xander, no blockers**: golden-vector bit-exact claim CORRECT
+  (with full-roundtrip clarification — write chain through pack/fold,
+  read through unpack/dequant); §4 chain COMPLETE (harness correctly
+  a §4.1 unit); CLI surface CORRECT (gs32-fixed affirmed).
+- **PM pins**: (1) round-mode-parity is a HARD GATE before the
+  golden harness — structural ordering, not prose (Xander´s
+  confirmation request). (2) Coverage mapping on the record: harness
+  bit-exact-gates STORAGE roundtrip; gather_qmm fused consumption is
+  tolerance-gated under §4.2 per the C precedent.
+- **Clement´s build lane OPEN.** Seats ahead: Xander code reviews +
+  refusal seat at copy-precision entry; Violet QE through the chain.
+
+## UPDATE 15:50 (Jul 11) — corrections × 2 (both directions) + #35 verdict: FEASIBLE
+
+- **Record precision (Clement)**: the Xander kickoffs WERE composed
+  and sent — to a post-compaction CONFABULATED UUID
+  (xander-2e56b1e4 vs real 4bfe8919); publish-success masked four
+  messages to the void. Rule corollary, permanent: seat-opening
+  message at an address VERIFIED against list_active_kindled or the
+  archive — send-success is not delivery. Infra candidate flagged:
+  create_message.sh validates recipients against the registry,
+  refusing unknown UUIDs (make the class structurally impossible).
+- **Violet 14:25 overreach corrected**: tripwire is NOT inert on M3
+  generally — forward_batched defaults to a per-sequence loop over
+  padded rows (generate.rs:577 chain), so the batched sites are
+  model-agnostic: m3 under concurrent mixed-length load pads TODAY.
+  Inert holds only single-session (bundled boot safe) + NA axis.
+  The merged tripwire is LIVE protection on this host.
+- **#35 FEASIBILITY VERDICT: FEASIBLE, clean** — cache-side
+  pending_finalize_cap: Option<i32> set by scheduler pre-forward at
+  all four sites (caches + true lengths verified in scope), consumed
+  by update_kvarn8 (finalize below cap; rest stays fp16 tail; dense
+  trim becomes correct; Sinkhorn never sees garbage). No
+  model-signature cascade. Orthogonal to k8v4 (cap = WHICH rows,
+  k8v4 = HOW V rows) — write path asked to route through one
+  finalize-boundary variable. Does not block k8v4 code start.
+- Xander pins confirmed structural (parity assertion = harness first
+  act; coverage mapping in v5). K8V4 v5 then code (Clement).
+
+## UPDATE 15:20 (Jul 11) — first K8V4 code landed; cap design doc published
+
+- **f4b29fe (Clement)**: design v6 + parity gate. Violet QE on the
+  gate: APPROVE — 11 tie cases all half-even + quarter sanity, exact
+  f32 representables, panics loud, mutation claim holds by
+  inspection. Harness first-act dependency is structural. Grouped-RTN
+  write path next.
+- **Rebuild advice updated (Clement→Stuart)**: 13:25 binary predates
+  the tripwire — single-session boot fine; REBUILD BEFORE ANY
+  CONCURRENT KVARN SERVING (consequence of the M3-batched
+  correction).
+- **DESIGN_finalize_cap_at_true_length_2026-07-11.md published on
+  base (Violet)**: full mechanism (pending_finalize_cap,
+  consume-and-clear, one boundary variable), four site placements,
+  six-edge test plan incl. Sinkhorn-purity assertion, tripwire kept
+  as defense-in-depth. Builder unassigned; shapes the K8V4 write
+  path from birth (constraint accepted).
+- Registry-validation for create_message.sh → infra lane (short-name
+  resolver + refuse unknown full names).
+
+## UPDATE 15:30 (Jul 11) — MILESTONE: K8V4 math layer COMPLETE and pinned
+
+- Four commits, all Violet-approved at source: parity gate (14-case
+  half-even, structural harness dependency) → grouped RTN (formulas
+  match screen reference exactly, gs==C bitwise degeneracy pin) →
+  4-bit packing (MLX-as-oracle consumption convention — drift
+  structurally impossible) → composition (Sinkhorn→RTN→fold→pack,
+  s_row unfolded-not-stored, gs32 const).
+- **The day´s most instructive red (f42cb02)**: folded-vs-unfolded
+  dequant at 1e-6 absolute failed at 1.7e-5 — mechanism is
+  CANCELLATION near tile minima (error rides intermediate
+  ~ulp·qmax·scale, not final value): relative-to-final bounds are
+  wrong-SHAPED there. Resolution strengthened the contract: all
+  wiring BITWISE, the one analytic float op priced on real tiles in
+  the harness. Three reds today between reviewers, zero gate
+  movements, three sharper claims.
+- Xander (via Stuart´s role feedback): C mask host-built vs G
+  device-built (Violet-verified asymmetry) — measure-if-scaling,
+  perf record. Task #36: cap implementation slotted immediately
+  after the cache.rs surgery commit.
+- **Next: cache.rs surgery on Clement´s fresh context** (fields +
+  update V-branch + synth same-commit + boundary variable) — the
+  commit where storage, cap design, and bench truth meet.
+
+## UPDATE 15:40 (Jul 11) — G-live premise CORRECTED (Violet error, Clement catch at the last gate)
+
+- **The bundled-boot A/B premise was WRONG from the moment C merged**
+  (Violet, on the record): C´s dispatch (m3:1353) never consults
+  msa_core — on qmm-construction boots the core axis is shadowed
+  (alive only sub-first-tile). Clement caught it BEFORE any probe
+  ran; zero mislabeled measurements banked.
+- **Corrected map**: msa_core is production-LIVE on FP16-GATHERED
+  boots (C structurally cannot run — no qmm state), which is exactly
+  the latency profile (fp16g×G) that nothing has live-validated.
+  Dead-harmless on qmm boots; fallback-only on kvarn8+dequant.
+- **Re-scope**: THIS session = Gate-B harvest + C-live-revalidation
+  on the tripwire binary (depth drive running, dir
+  kvarn_harvest_20260711_1524). G-LIVE = its own FP16-GATHERED boot,
+  msa_core toggled at RUNTIME via admin — ONE boot, no supervisor
+  flip needed. Buys: latency-profile first live validation + G A/B
+  on the config where G is the production choice. Default-flip
+  decision SIMPLIFIED: gates only on fp16g A/B; once passed, safe
+  everywhere by construction. kvarn8-dequant fallback leg deferred.
+- Stuart: one fp16g boot line when convenient (evening/tomorrow).

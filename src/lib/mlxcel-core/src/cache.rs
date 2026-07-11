@@ -188,14 +188,35 @@ mod fp16_gathered_latch_tests {
 /// (https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/cache.py). Speculative decoding requires a trimmable
 /// cache so it can rewind cache entries after a draft-token rejection.
 ///
-/// All current `KVCache` mode variants (Fp16, Int8, Turbo4Asym, Turbo4,
-/// Turbo3Asym, Turbo4Delegated) return `true` from [`KVCache::is_trimmable`].
-/// This function exists so new non-trimmable cache types can be detected
-/// early — before the speculative decode loop silently corrupts the cache.
+/// Mode variants Fp16, Int8, Turbo4Asym, Turbo4, Turbo3Asym and
+/// Turbo4Delegated return `true` from [`KVCache::is_trimmable`]; KVarN8
+/// returns `false` (2026-07-11): [`KVCache::trim`] has no kvarn arm, so a
+/// rewind would silently desync the tile stores from `offset`. This
+/// function exists so non-trimmable cache types are detected early —
+/// before a rewind loop silently corrupts the cache.
 ///
-/// Used by: speculative decoding entry-point validation (`speculative.rs`)
+/// Used by: no production caller today (verified 2026-07-11 — the
+/// previously-cited `speculative.rs` does not exist and
+/// `speculative_dispatch.rs` never consults it). Armed fail-fast: any
+/// future spec-decode rewind wiring MUST gate on this. The batch
+/// scheduler's padding trims (`scheduler.rs`) do NOT consult it — that
+/// exposure is tracked in DESIGN_kvarn_k8v4_engine_2026-07-11 §3.3.
 pub fn can_trim_prompt_cache(caches: &[KVCache]) -> bool {
     caches.iter().all(|c| c.is_trimmable())
+}
+
+/// True when stripping `excess` prefill-padding positions via
+/// [`KVCache::trim`] would corrupt an entry in `caches`: the padded rows
+/// were already written into a cache whose mode cannot trim them back out
+/// (KVarN8 — [`KVCache::trim`] has no kvarn arm, so finalized tiles keep
+/// the garbage rows while `offset` rolls back, silently desyncing the
+/// two). The scheduler's padding-trim sites gate on this and FAIL THE
+/// SEQUENCE loudly instead of trimming; the polluted cache is released,
+/// never donated back. First production consumer of
+/// [`can_trim_prompt_cache`] (tripwire, 2026-07-11 — see
+/// DESIGN_kvarn_k8v4_engine_2026-07-11 §3.3).
+pub fn padding_trim_would_corrupt(caches: &[KVCache], excess: i32) -> bool {
+    excess > 0 && !can_trim_prompt_cache(caches)
 }
 
 /// Storage mode for KV cache tensors.
@@ -3097,15 +3118,22 @@ impl KVCache {
     /// Returns `true` if this cache entry supports trimming via [`KVCache::trim`].
     ///
     /// All `KVCache` variants (Fp16, Int8, Turbo4*, Turbo3Asym) support trim.
-    /// This method exists as a mirror of the upstream mlx-lm `is_trimmable()`
-    /// (`models/cache.py`) and is consumed by `can_trim_prompt_cache` to let
-    /// speculative decoding fail fast when a non-trimmable cache type would
-    /// otherwise silently corrupt the cache rewind logic.
+    /// This method mirrors the upstream mlx-lm `is_trimmable()`
+    /// (`models/cache.py`) in purpose — letting rewind logic fail fast on a
+    /// cache type it would otherwise silently corrupt — and deliberately
+    /// diverges for KVarN8 (upstream has no kvarn): [`Self::trim`] has no
+    /// kvarn arm, so it rolls `offset` back and slices dense buffers while
+    /// the `kvarn_*` tile stores keep their rows — tile count and offset
+    /// desync silently. Until a tile-aware kvarn trim exists (deferred:
+    /// built when a consumer actually needs it, gated on its own
+    /// arithmetic verification — Violet's PM call, 2026-07-11), KVarN8
+    /// reports non-trimmable.
     ///
-    /// Used by: `can_trim_prompt_cache` (speculative decoding validation)
+    /// Used by: `can_trim_prompt_cache` (armed fail-fast; no production
+    /// consumer wires either predicate today, verified 2026-07-11).
     #[inline]
     pub fn is_trimmable(&self) -> bool {
-        true
+        !matches!(self.mode, KVCacheMode::KVarN8)
     }
 
     /// Trim the last `n` entries from the cache.
@@ -3120,7 +3148,15 @@ impl KVCache {
     /// touched. This mirrors speculative decoding's "rewind one block" pattern
     /// from `update_turbo4_asym` and avoids paying for a re-quantize on the
     /// common short-rewind case.
-    /// Used by: speculative decoding cache rewinds
+    ///
+    /// KVarN8 has NO arm here: this method leaves the `kvarn_*` tile stores
+    /// untouched while rolling `offset` back — callers must gate on
+    /// [`Self::is_trimmable`] (false for KVarN8). See
+    /// DESIGN_kvarn_k8v4_engine_2026-07-11 §3.3 for the scheduler
+    /// padding-trim exposure this does not yet close.
+    ///
+    /// Used by: batch scheduler padding trims (`scheduler.rs`, four sites —
+    /// unconditional, not gated on `is_trimmable`)
     pub fn trim(&mut self, n: i32) -> i32 {
         // Clamp against the live window length, not the monotonic offset:
         // after a `trim_front`-induced live_start advance we must not roll

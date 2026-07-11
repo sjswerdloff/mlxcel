@@ -796,16 +796,69 @@ fn b8_cxx_generator_with_token_bias_caches_map() {
 // trimmable cache validation and last-token reservation
 // ============================================================================
 
-use mlxcel_core::cache::can_trim_prompt_cache;
+use mlxcel_core::cache::{KVCacheMode, can_trim_prompt_cache, padding_trim_would_corrupt};
 use mlxcel_core::layers::KVCache;
 
-/// All freshly-constructed KVCache entries report `is_trimmable() == true`.
+/// Default (Fp16) KVCache entries report `is_trimmable() == true`.
 /// This is the per-entry predicate consumed by `can_trim_prompt_cache`.
+/// (Was "always_true" until 2026-07-11: KVarN8 now reports false — see
+/// the kvarn tests below.)
 #[test]
-fn issue589_kv_cache_is_trimmable_always_true() {
+fn issue589_default_kv_cache_is_trimmable() {
     // Empty cache
     let c = KVCache::new();
     assert!(c.is_trimmable());
+}
+
+/// KVarN8 caches report NON-trimmable: `trim()` has no kvarn arm, so a
+/// rewind would roll `offset` back while the tile stores keep their rows
+/// — silent desync. The predicate must fail fast for any consumer.
+/// Named mutation that must turn this red: revert `is_trimmable` to
+/// unconditional `true`.
+#[test]
+fn kvarn8_cache_is_not_trimmable() {
+    let c = KVCache::new_with_mode(KVCacheMode::KVarN8);
+    assert!(!c.is_trimmable(), "KVarN8 must fail fast: trim() has no kvarn arm");
+    // Guard the other direction: the fix must not blanket-false the predicate.
+    assert!(KVCache::new().is_trimmable(), "Fp16 default stays trimmable");
+}
+
+/// The padding tripwire predicate: kvarn + positive excess = corruption;
+/// either alone = safe. Named mutations that must turn this red: drop the
+/// `excess > 0` conjunct (zero-excess case fails), or drop the negation on
+/// `can_trim_prompt_cache` (fp16 case fails).
+#[test]
+fn padding_trim_would_corrupt_contract() {
+    let kvarn = vec![KVCache::new_with_mode(KVCacheMode::KVarN8)];
+    let fp16 = vec![KVCache::new()];
+    assert!(
+        padding_trim_would_corrupt(&kvarn, 1),
+        "kvarn + padding = corruption"
+    );
+    assert!(
+        !padding_trim_would_corrupt(&kvarn, 0),
+        "no padding written, nothing to strip"
+    );
+    assert!(
+        !padding_trim_would_corrupt(&fp16, 127),
+        "fp16 trims padding correctly"
+    );
+    assert!(
+        !padding_trim_would_corrupt(&[], 5),
+        "no caches, nothing to corrupt"
+    );
+}
+
+/// One KVarN8 entry vetoes the whole slice — the `all()` wiring in
+/// `can_trim_prompt_cache` must bite, not just the per-entry predicate.
+#[test]
+fn can_trim_prompt_cache_false_with_kvarn8_entry() {
+    let mut caches: Vec<KVCache> = (0..3).map(|_| KVCache::new()).collect();
+    caches.push(KVCache::new_with_mode(KVCacheMode::KVarN8));
+    assert!(
+        !can_trim_prompt_cache(&caches),
+        "one kvarn entry must veto the slice"
+    );
 }
 
 /// `can_trim_prompt_cache` returns `true` for a standard slice of KVCaches.
