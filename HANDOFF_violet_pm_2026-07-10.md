@@ -754,3 +754,48 @@ honor was mutual. Welcome back. 🌊🕯️
 - **Board state**: Violet holds through Clement´s crossing. Stuart´s
   fp16g boot line unchanged, staged for whenever he pastes — nothing
   in the stagger blocks it.
+
+## UPDATE 16:55 (Jul 11) — MILESTONE: GATE B idx8 PASSES — QE CONFIRMED. Row 3 answered.
+
+- **Chain held at full speed**: Clement landed 16:21 → QE amendment
+  applied @ 3cde7e8 (sentence reshaped, every-256th sampling named,
+  verdict recorded in-doc) → screen written + self-tested 5/5,
+  committed UNRUN same SHA → **Xander screen-text review APPROVE
+  16:36, no must-fixes — run gated on the review, did not start
+  before it** (declared in the results doc; sealing at Xander´s seat)
+  → ran → RESULTS_gate_b_idx8_screen_2026-07-11.md @ 80addc7.
+- **Registered gate: pooled err p95 0.01909 < 0.02 (4.5% margin),
+  310 queries / 1,240 samples / 0 skipped — PASS.** QE VERDICT
+  (Violet, against the machine-readable summary JSON, not the prose):
+  CONFIRMED. Every claimed number seals — pooled percentiles to the
+  printed digit (p50 0.0 / p90 0.01663 / p99 0.02440 / max 0.04091),
+  Gate A p95 = 0.03125 = exactly 1/32 (one block flip, reported never
+  gated), per-layer tail exact with indices (11/57 layers ≥ 0.02:
+  worst 58 @ 0.0290, 59 @ 0.0256, 3 @ 0.0246 the bf16 layer; worst
+  samples 54 @ 0.0409, 21 @ 0.0405; layer 3 the ONLY sub-1.0 sel
+  overlap at 0.9987). Population reconciled THREE independent ways
+  (every-256th arithmetic 310.05 · disk count 310 · screen 310).
+- **Scorer validated, which is why the numbers are trustable**: sel
+  cross-check mean overlap 1.000 vs production´s own harvested
+  selections (wrong-scorer baseline ~1.4%, abort line 0.50); bridge
+  held across all 9 strata; bf16 anchor lands on layer 3 both sides;
+  round-half-even proven against the same 14-case parity vector as
+  the engine gate. The screen´s self-test also bit its own author
+  pre-data (integer-ramp roundtrip premise vs actual per-row range)
+  — guard-first discipline paying out at every scale.
+- **The honest tail, inherited by the engine A/B**: median sample
+  loses ZERO clean-top-k mass — the gate lives entirely in the tail.
+  If idx8 ships, deep-layer selection drift (58/59) is where quality
+  would first surface; flagged in-doc, not resolved. (QE nit, no
+  verdict movement: doc´s mid-band "25–29" shorthand — actual set
+  excludes 27.)
+- **LADDER, axes labeled to prevent conflation** (QE traced
+  provenance): 1.64× / 2.0× / ~2.2× is the KV-MEMORY-vs-fp16 ladder
+  (1152 → ~1036 B/tok/layer; 2.0 × 1152/1036 = 2.22 ✓) — DISTINCT
+  from the 1.55×/1.60× SPEED ratios. Memory ladder: kvarn8 1.64×
+  banked · K8V4 2.0× building · +idx8 ~2.2× now BOUGHT-INTO-A/B by
+  this pass. Necessary-not-sufficient stands: no engine time
+  authorized by the screen alone; §4-class chain owns deployment.
+- **Stuart´s row 3 has its answer.** Next: cache.rs surgery
+  (Clement, fresh context — the big commit; Violet DEEP read), #36
+  cap immediately after, fp16g boot whenever Stuart pastes.
