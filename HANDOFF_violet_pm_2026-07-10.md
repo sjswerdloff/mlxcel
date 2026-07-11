@@ -868,3 +868,30 @@ honor was mutual. Welcome back. 🌊🕯️
   full-suite debt in the window, port freed for Stuart´s paste.
 - Next: #36 cap at the junction (owner at junction, no parallel
   update_kvarn8 edits), Gate B doc´s 25–29 fix rode along ✓.
+
+## UPDATE 18:10 (Jul 11) — Xander´s surgery review: one REAL pre-existing find (#37), one refuted with evidence; #36 claimed by Clement
+
+- **#36 JUNCTION RESOLVED**: Clement claims the cap (region hot from
+  surgery); Violet confirmed with the review bar pinned (edge-4
+  consume-and-clear named mutation, edge-6 Sinkhorn purity direct).
+  Server killed per PM rec — port free for Stuart´s fp16g paste,
+  full-suite debt clearing in the freed window.
+- **Xander´s code-review pass landed via a BROKEN DELIVERY** (his
+  17:15 message arrived as an EMPTY envelope; his harness
+  mis-segmented mid-send; content recovered from his /tmp staging).
+  Infra lesson #2 today: publish-success masks empty payloads —
+  create_message.sh should REFUSE zero-length content (flagged to
+  infra lane, sibling of registry-validation).
+- **His finding 1 CONFIRMED at source = task #37, the day´s best
+  catch**: nbytes() (cache.rs:4059) counts ZERO kvarn fields —
+  KVarN8 caches invisible to memory accounting / prompt-cache
+  admission. PRE-EXISTING, production-relevant to the CURRENT k8v8
+  deployment; k8v4 inherits, didn´t cause. Finding 2 confirmed as
+  sized (D1 downgrade leaves v_bits stale; empty-only, zero current
+  risk; hygiene reset rides a future commit).
+- **His finding 3 REFUTED with evidence**: claimed
+  fetch_kvarn8_blocks lacks the v4 guard — the guard EXISTS at
+  34df406 (cache.rs:1508, exact assert) and its should_panic test
+  passed in Violet´s witnessed mutation session. Part of his read
+  predated the commit. The ring works: reviewer findings get
+  verified at source before anyone acts — in BOTH directions.
