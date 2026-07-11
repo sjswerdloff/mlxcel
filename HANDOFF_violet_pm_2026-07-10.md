@@ -1065,3 +1065,48 @@ honor was mutual. Welcome back. 🌊🕯️
   the config where it is production-live (C structurally absent).
   Default-flip decision gates ONLY on this; passing ⇒ safe
   everywhere by construction (the 15:40 reframe paying out).
+
+## UPDATE 20:15 (Jul 11) — G-LIVE GATE: **PASS** (Violet verdict). Default flip to sdpa CLEARED.
+
+- **Both legs landed clean, SAME-SHAPED windows** (leg A´s prompt-
+  cache donation was REJECTED — OversizedEntry 38.0 GiB vs 32 GiB
+  capacity — so leg B ran cold too: 28 min of wall time bought a
+  cleaner A/B than the protocol staged; Clement´s mid-flight catch,
+  integrity read confirmed at the QE seat).
+- **TIMING at 295K, denominators clean (both cold, harvest-free)**:
+  blocked 1,500 tok / 302.75 s = **4.96 tok/s**; sdpa 1,500 /
+  280.05 s = **5.36 tok/s**. Honest bracket: sdpa **+3.4% to
+  +8.1%** (the two first-dispatch witnesses sit in different spans
+  — whether leg B´s window excludes the 68-token per-token prefill
+  tail that leg A´s includes is unresolved from the log; direction
+  ROBUST under either accounting).
+- **QUALITY: completions BIT-IDENTICAL across cores** — 1,500
+  greedy tokens at 295K depth, zero divergence (diff empty).
+  Stronger than the tolerance gate the C precedent required.
+- **WITNESSES: both cores, echo-vs-ran sealed**: blocked
+  first-dispatch 07:23:41 (leg A, header core=blocked; v=0); toggle
+  applied+logged 07:30:01 (v=1, source=api, construction frozen);
+  **G fused-SDPA first-dispatch 07:58:41** (leg B, header
+  core=sdpa; v=1). The migration´s instrumentation did exactly its
+  production job, first time live.
+- **GATE CRITERION MET: sdpa ≥ blocked, no quality flag → PASS.
+  Default flip to sdpa is CLEARED** — and by the 15:40 reframe,
+  safe everywhere by construction (dead-harmless on qmm boots,
+  fallback-only on kvarn8+dequant). The flip itself is a one-line
+  default change + note — any window.
+- **Teardown EXECUTED in order** (PID 90892 verified-then-killed
+  post-completion; log intact, denominators safe). Capacity fixed
+  32→64 GiB (68,719,476,736 digit-verified, overridable form).
+  **Archaeology CLOSED, better story than mangling**: Stuart´s "43
+  GB" = 44,359,738,368 lives in start_TEST_mlxcel_m3.sh:54 — same
+  digits as production´s 32 GiB with the leading 3 bumped to 4. The
+  fp16-doesn´t-fit lesson was learned ONCE, on the test port, and
+  never propagated — TWO SIBLING SCRIPTS asserting one load-bearing
+  constant, the drift-door class, on the record beside today´s
+  mode-generic-method audit (same shape: duplicated authority,
+  no propagation check). Leg-B donation 15.7 MiB smaller than
+  leg A´s at identical token count — consistent-with leg A´s
+  cached=128 adoption changing which blocks its donation owned
+  (~114-128 tokens´ state at this geometry); hypothesis only, not
+  gate-relevant. #28 live confirmation sweep COMPLETE (boot-night
+  kvarn A/B + revalidation + fp16g A/B).
