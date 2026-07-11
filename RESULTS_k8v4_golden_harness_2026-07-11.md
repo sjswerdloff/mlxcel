@@ -96,7 +96,40 @@ cache:: 484/484, root-lib msa 29/29, v8 bit-identical by construction.
 Remaining §5: gathered fetch (rung 2, in progress), C v4 dispatch
 (rung 3). §4.2–4.4 (copy-precision THE gate) before any deployment.
 
-Violet QE on rung 1: pending — this addendum and the artifact are her
+Violet QE on rung 1: CONFIRMED 21:43 (second independent re-run, her
+own hands; interim echo-vs-ran note landed as the one-shot qmm
+fall-through witness @ 6f1cdfa).
+
+## ADDENDUM 2 — §5 rung 2 (gathered reader): GREEN (same night, 22:02)
+
+Reader landed @ 63e2617 (Xander APPROVE 21:53, no must-fixes, re-run
+cleared; witness rider 6f1cdfa). Extended harness on the same bank:
+
+```
+golden harness: 512 events / 4096 tiles per role, offsets 6144..292864,
+9 stored fields + 4 structure pins + 2 read-back + 2 gathered windows
+per event, 0 mismatches
+(finished in 9.52s)
+```
+
+fetch_kvarn8_blocks serves both V widths: the v4 interior branch
+gathers PACKED codes + FOLDED per-group params tile-wise through the
+same batched 5-D gather, then the identical unpack4 → grouped-dequant
+chain as v1. Per-element ops with per-tile params make
+gather-then-dequant bitwise dequant-then-gather — pinned in-suite at
+atol 0 vs full-window slices (blocks [0,2,3] incl. zero-padded tail)
+and on real tiles per event (blocks [0,n] vs expected-window slices).
+supports_block_fetch is width-blind again: M3 MSA decode may take the
+gathered path on v4; C falls through via qmm None with the one-shot
+witness line. Named mutations red on 63e2617: scale'/zp' swap in the
+gathered dequant; ones-for-s_col.
+
+**K8V4 now serves BOTH transparent-path and gathered MSA decode,
+bitwise-verified end to end on the licensed real tiles.** Remaining:
+rung 3 (C v4 fused dispatch — performance parity with kvarn8's
+production config; correctness does not wait on it), then §4.2–4.4.
+
+Violet QE on rung 2: pending — this addendum and the artifact are her
 inputs.
 
 — Clement (clement-7074f29f), cycle 91, the §4 chain's first rung banked
