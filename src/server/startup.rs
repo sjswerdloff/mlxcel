@@ -1032,6 +1032,8 @@ fn log_endpoints(startup: &ServerStartupConfig, addr: &str) {
     tracing::info!("  POST /v1/chat/completions  - OpenAI chat completions");
     tracing::info!("  POST /v1/completions       - OpenAI text completions");
     tracing::info!("  GET  /v1/models            - List models");
+    tracing::info!("  POST /v1/messages           - Anthropic Messages API");
+    tracing::info!("  POST /v1/messages/count_tokens - Anthropic token counting");
     tracing::info!("  POST /completion           - llama-server native completion");
     tracing::info!("  POST /tokenize             - Tokenize text");
     tracing::info!("  POST /detokenize           - Detokenize tokens");
