@@ -205,6 +205,20 @@ pub fn can_trim_prompt_cache(caches: &[KVCache]) -> bool {
     caches.iter().all(|c| c.is_trimmable())
 }
 
+/// True when stripping `excess` prefill-padding positions via
+/// [`KVCache::trim`] would corrupt an entry in `caches`: the padded rows
+/// were already written into a cache whose mode cannot trim them back out
+/// (KVarN8 — [`KVCache::trim`] has no kvarn arm, so finalized tiles keep
+/// the garbage rows while `offset` rolls back, silently desyncing the
+/// two). The scheduler's padding-trim sites gate on this and FAIL THE
+/// SEQUENCE loudly instead of trimming; the polluted cache is released,
+/// never donated back. First production consumer of
+/// [`can_trim_prompt_cache`] (tripwire, 2026-07-11 — see
+/// DESIGN_kvarn_k8v4_engine_2026-07-11 §3.3).
+pub fn padding_trim_would_corrupt(caches: &[KVCache], excess: i32) -> bool {
+    excess > 0 && !can_trim_prompt_cache(caches)
+}
+
 /// Storage mode for KV cache tensors.
 ///
 /// Controls the on-device representation of accumulated key/value tensors.
