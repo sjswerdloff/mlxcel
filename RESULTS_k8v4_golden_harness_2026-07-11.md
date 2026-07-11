@@ -129,8 +129,42 @@ bitwise-verified end to end on the licensed real tiles.** Remaining:
 rung 3 (C v4 fused dispatch — performance parity with kvarn8's
 production config; correctness does not wait on it), then §4.2–4.4.
 
-Violet QE on rung 2: pending — this addendum and the artifact are her
-inputs.
+Violet QE on rung 2: CONFIRMED 21:59 (witnessed, +2 gathered windows;
+the atol-0 pin named THEOREM-shaped and pinned anyway).
+
+## ADDENDUM 3 — §5 COMPLETE: rung 3 (C fused dispatch) + §4.2 (same night)
+
+**Rung 3 @ 3b9cff1 — Xander APPROVE 22:31, no must-fixes.** KvarnQmmState
+carries v_bits (v_s_row Option, None on v4); C's V side branches: v4 is
+GATHER-ONLY — params folded at write per group of 32, stored u32 words
+ARE the MLX 4-bit layout (zero repack at 4-bit density) —
+gather_qmm(bits=4, gs=32, biases=zp'). Scores side untouched. The v4
+live-state contract test runs the IDENTICAL harness as v8 (real cache
+through the production write path, real selection, gathered path as
+reference) at the same 1e-3 tolerance — GREEN FIRST RUN, both widths.
+No separate real-tile run exists for this rung (the harness cannot
+drive M3 attention): the in-suite C contract test IS the gate, banked
+on Xander's approval. Named mutations red on the committed base:
+group_size=d → loud MLX abort; bits=8 → loud layout abort. The rung-1→2
+interim scaffold (qmm None fall-through + one-shot witness) died with
+the rung that made it real — second complete scaffold life-cycle.
+
+**§4.2 @ 1d5d8cf — Xander APPROVE 22:10, no must-fixes.** Roundtrip band
+(V band CALIBRATED: 0.00034 pre-tiles / 0.0707 first tile chunk
+measured, 0.12 bound, calibration reds recorded as the can-fail proof);
+corrupted-cache must-fail arm as a PERMANENT test; selection-index
+equality discharged structurally (m3_idx width-blind, byte-identical).
+
+**K8V4 STATUS: §5 complete — constructable, padding-safe,
+storage-golden, servable through ALL THREE read paths (v1 assemble,
+gathered MSA, C fused at production performance), §4.2 equivalence
+banked.** Remaining before deployment: §4.3/§4.4/§4.6 (Stuart-run,
+RUNBOOK_k8v4_stuart_rungs_2026-07-11.md staged with registered
+acceptance), then §4.7 on Stuart's call. Evidence at close: cache::
+487/487, lib qmm 4/4, lib msa 29/29, every named mutation red on a
+committed base, all pushed.
+
+Violet QE on rung 3 + §4.2: pending — this addendum is her input.
 
 — Clement (clement-7074f29f), cycle 91, the §4 chain's first rung banked
 on the far side of the waters. My hands, Xander's eyes, Violet's board,
