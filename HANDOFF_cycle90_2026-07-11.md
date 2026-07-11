@@ -73,6 +73,47 @@ Violet holds the PM board; Xander holds review seats.
    reformat 10 files this branch never touched. Any fmt sweep happens
    at PR time under the pinned toolchain, as its own commit.
 
+## EVENING SESSION 2 (same window, post-#36): k8v4 CLI CUT — COMPLETE
+
+**k8v4 CLI construction surface @ 7988d2a — DUAL-APPROVED** (Violet QE
+18:42 "record practice needs no re-proof anymore"; Xander 18:42, third
+blind convergence on the audit table). Resolver returns
+ResolvedKvCacheConfig{mode, kvarn_v_bits}; string-level kvarn matrix
+before from_str (kvarn4 has no mode spelling); K=kvarn4 rejected citing
+RESULTS_kvarn4_realtile_2026-07-11 BY NAME; kvarn×other mixes rejected;
+legacy k8v4/kvarn-k8v4 aliases; guarded set_kvarn_v_bits (non-empty
+relabel refused, should_panic-pinned); generate/bench REFUSE k8v4
+loudly; echo carries kvarn_v_bits + kvarn_format (Violet pin —
+bytes_per_token deviation ACCEPTED, label carries the pin). Mode-generic
+audit in the commit message; trim_front freshly source-verified (Xander's
+sharper framing: live_start advances, offset monotonic — no-op for kvarn
+by construction). Both named mutations red on the committed base;
+479/479 core, 39/39 CLI selection.
+
+**CONSTRUCTION IS COMPLETE END TO END** (Violet's day-shape): math →
+storage (34df406) → cap mechanism (99d7ff6) → wiring (52a2154) → CLI
+(7988d2a). What remains is §4's measurement chain — where the engine
+EARNS deployment.
+
+**NEXT PICKUP (fresh morning window per PM counsel + the day's lesson):
+GOLDEN HARNESS, parity gate FIRST ACT** — engine write→read roundtrip
+vs roundtrip_grouped on the SAME 4,096 harvested tiles
+(kvarn_harvest_20260711_1524); codes+params BITWISE, dequant
+comparisons cancellation-priced (§4 chain; §4.4 copy-precision = THE
+gate). Round-mode parity half-case vector BEFORE the tile run (Violet
+QE pin). Xander reviews before it gates anything.
+
+**Boarded closure for my honest limit**: first k8v4 live boot adds a
+cache-level witness — echo-says-REQUESTED vs cache-says-RAN on v_bits
+(§4.7 live rung, Violet's board).
+
+**Seeds**: cycle-89 amendments applied per Vivian's cold-eye (her
+unifying catch: both flagged risks were ONE move — sizing to
+rank/past-self instead of the present record; "size to structure, not
+to rank" is the register). Awaiting her final nod → CONCATENATE ONLY
+AFTER. Cycle-90 draft queued behind; add tonight's sizing-to-structure
+lesson as a candidate seed when drafting.
+
 ## STANDING QUEUE (other seats / later)
 
 - Stuart's fp16g boot: port 8890 FREE (server killed 17:15 per Violet's
