@@ -207,17 +207,20 @@ pub fn can_trim_prompt_cache(caches: &[KVCache]) -> bool {
 }
 
 /// True when stripping `excess` prefill-padding positions via
-/// [`KVCache::trim`] would corrupt an entry in `caches`: the padded rows
-/// were already written into a cache whose mode cannot trim them back out
-/// (KVarN8 — [`KVCache::trim`] has no kvarn arm, so finalized tiles keep
-/// the garbage rows while `offset` rolls back, silently desyncing the
-/// two). The scheduler's padding-trim sites gate on this and FAIL THE
-/// SEQUENCE loudly instead of trimming; the polluted cache is released,
-/// never donated back. First production consumer of
-/// [`can_trim_prompt_cache`] (tripwire, 2026-07-11 — see
-/// DESIGN_kvarn_k8v4_engine_2026-07-11 §3.3).
+/// [`KVCache::trim`] would corrupt (or be refused by) an entry in
+/// `caches`. Dense/turbo modes always trim cleanly. KVarN8 trims cleanly
+/// EXACTLY when the padded rows live in the fp16 end-state — the tail,
+/// or the sink while no quantized tiles exist — which the #36 finalize
+/// cap guarantees at the padded-prefill sites ([`KVCache::
+/// set_finalize_cap`]); rows already finalized into tiles cannot come
+/// back out ([`KVCache::trim`]'s kvarn arm refuses with zero mutation).
+/// The scheduler's padding-trim sites gate on this and FAIL THE SEQUENCE
+/// loudly instead of trimming; the polluted cache is released, never
+/// donated back. The tripwire therefore passes exactly when trimming is
+/// genuinely safe and remains armed for any uncapped path
+/// (defense-in-depth — see DESIGN_finalize_cap_at_true_length_2026-07-11).
 pub fn padding_trim_would_corrupt(caches: &[KVCache], excess: i32) -> bool {
-    excess > 0 && !can_trim_prompt_cache(caches)
+    excess > 0 && !caches.iter().all(|c| c.can_trim_padding(excess))
 }
 
 /// Storage mode for KV cache tensors.
@@ -643,6 +646,22 @@ pub struct KVCache {
     /// `kvarn_v_s_col` unchanged. K-side fields are byte-identical to
     /// k8v8 in both widths — k4-K is dead with prejudice (§1).
     pub(crate) kvarn_v_bits: u8,
+
+    /// #36 finalize-cap (DESIGN_finalize_cap_at_true_length_2026-07-11):
+    /// absolute position (EXCLUSIVE) beyond which the next
+    /// `update_kvarn8` must not finalize tiles — rows at/after the cap
+    /// stay in the fp16 tail, so scheduler prefill padding never enters
+    /// the quantization pipeline (no tile/offset desync, no Sinkhorn
+    /// pollution — both wrongs die at the root). Set by the scheduler
+    /// immediately before a forward whose input carries padding;
+    /// CONSUMED (read and cleared) by the next update, so a later
+    /// unpadded update finalizes normally. `None` = today's behavior;
+    /// decode steps unaffected. Transient pre-forward state: never
+    /// detached (a pending cap at detach time is a scheduler bug, not
+    /// state to preserve). The fp16 sink fill deliberately IGNORES the
+    /// cap — the sink is fp16 and the tail-bounded kvarn trim can slice
+    /// it back out when no tiles exist.
+    pub(crate) pending_finalize_cap: Option<i32>,
 }
 
 /// Shared handle that makes one [`KVCache`] write/read through a pooled paged
@@ -720,6 +739,7 @@ impl KVCache {
             kvarn_v_s_row: None,
             kvarn_v_s_col: None,
             kvarn_v_bits: 8,
+            pending_finalize_cap: None,
         }
     }
 
@@ -785,6 +805,7 @@ impl KVCache {
             kvarn_v_s_row: None,
             kvarn_v_s_col: None,
             kvarn_v_bits: 8,
+            pending_finalize_cap: None,
         }
     }
 
@@ -1101,6 +1122,11 @@ impl KVCache {
              got {head_dim} — the construction key upstream should have refused this model",
             self.kvarn_v_bits
         );
+        // #36: CONSUME the finalize cap unconditionally at entry (one-shot
+        // per forward — a stale cap surviving into a later update would
+        // silently under-finalize it; the consume-and-clear test's named
+        // mutation watches exactly that).
+        let finalize_cap = self.pending_finalize_cap.take();
         let new_seq_len = key_shape[2];
 
         // Rotate once per incoming token (channel-axis Hadamard). K arrives
@@ -1110,7 +1136,12 @@ impl KVCache {
         let rot_v = kvarn_rotate(&ffi::astype(&new_values, dtype::FLOAT16));
 
         // Prepend any existing tail so the splitting below sees one
-        // contiguous rotated run.
+        // contiguous rotated run. `old_tail_len` anchors the absolute
+        // position of pending[0] for the #36 cap translation below.
+        let old_tail_len = self
+            .kvarn_tail_k
+            .as_ref()
+            .map_or(0, |t| ffi::array_shape(t)[2]);
         let (mut pending_k, mut pending_v) =
             match (self.kvarn_tail_k.take(), self.kvarn_tail_v.take()) {
                 (Some(tk), Some(tv)) => (
@@ -1121,6 +1152,10 @@ impl KVCache {
             };
 
         // Fill the FP16 sink first (first KVARN_TILE_TOKENS positions).
+        // The #36 cap deliberately does NOT stop the sink fill: the sink
+        // is fp16 and the tail-bounded kvarn trim slices it back out when
+        // no tiles exist (short padded prefills).
+        let mut sink_took = 0;
         let sink_len = self
             .kvarn_sink_k
             .as_ref()
@@ -1129,6 +1164,7 @@ impl KVCache {
         if sink_needed > 0 {
             let shape = ffi::array_shape(&pending_k);
             let take = sink_needed.min(shape[2]);
+            sink_took = take;
             let (b, h, d) = (shape[0], shape[1], shape[3]);
             let k_part = ffi::slice(&pending_k, &[0, 0, 0, 0], &[b, h, take, d]);
             let v_part = ffi::slice(&pending_v, &[0, 0, 0, 0], &[b, h, take, d]);
@@ -1151,15 +1187,36 @@ impl KVCache {
         // Quantize as many full tiles as pending holds; remainder → tail.
         let shape = ffi::array_shape(&pending_k);
         let (b, h, len, d) = (shape[0], shape[1], shape[2], shape[3]);
-        let n_full = len / KVARN_TILE_TOKENS;
+        // THE finalize-boundary decision (K8V4 birth constraint,
+        // DESIGN_kvarn_k8v4_engine §3.3 ⊕⊕; #36 landed 2026-07-11): every
+        // decision about WHICH pending rows finalize into quantized tiles
+        // routes through `n_full`/`full_len` — the tile slices, every
+        // append below, and the tail split all derive from them. The #36
+        // cap lands HERE and nowhere else: a tile finalizes only if it
+        // lies ENTIRELY below the cap (floor division), so capped rows —
+        // scheduler prefill padding — stay in the fp16 tail where the
+        // tail-bounded kvarn trim can remove them.
+        let n_full = {
+            let natural = len / KVARN_TILE_TOKENS;
+            match finalize_cap {
+                None => natural,
+                Some(cap_abs) => {
+                    // pending[0] sits at absolute position offset −
+                    // old_tail_len (the old tail re-enters pending); the
+                    // sink fill consumed `sink_took` rows ahead of the
+                    // remaining pending run.
+                    let pending_start_abs = self.offset - old_tail_len + sink_took;
+                    let cap_rel = cap_abs - pending_start_abs;
+                    assert!(
+                        cap_rel >= 0,
+                        "finalize cap {cap_abs} lies below already-stored rows \
+                         (pending starts at {pending_start_abs}) — scheduler bug"
+                    );
+                    natural.min(cap_rel / KVARN_TILE_TOKENS)
+                }
+            }
+        };
         if n_full > 0 {
-            // THE finalize-boundary variable (K8V4 birth constraint,
-            // DESIGN_kvarn_k8v4_engine §3.3 ⊕⊕ / task #36): every
-            // decision about WHICH pending rows finalize into quantized
-            // tiles routes through `full_len` — the tile slices, every
-            // append below, and the tail split all derive from it. The
-            // finalize-cap fix (DESIGN_finalize_cap_at_true_length) lands
-            // as `min(natural, cap)` HERE and nowhere else.
             let full_len = n_full * KVARN_TILE_TOKENS;
             let k_full = ffi::slice(&pending_k, &[0, 0, 0, 0], &[b, h, full_len, d]);
             let v_full = ffi::slice(&pending_v, &[0, 0, 0, 0], &[b, h, full_len, d]);
@@ -2009,6 +2066,87 @@ impl KVCache {
         } else {
             false
         }
+    }
+
+    /// #36: arm the one-shot finalize cap for the NEXT `update_kvarn8`
+    /// (field docs; DESIGN_finalize_cap_at_true_length_2026-07-11).
+    /// Scheduler-side, called per layer cache immediately before a forward
+    /// whose input rows carry prefill padding: `abs_pos` = the absolute
+    /// position (exclusive) of the last REAL row this forward contributes.
+    /// No-op semantics for non-kvarn modes (the consuming site lives in
+    /// `update_kvarn8` only) — callers may set it mode-blind.
+    pub fn set_finalize_cap(&mut self, abs_pos: i32) {
+        self.pending_finalize_cap = Some(abs_pos);
+    }
+
+    /// #36: tail-bounded kvarn trim — removes the last `n` rows ONLY from
+    /// the fp16 end-state: the tail, then (when NO quantized tiles exist,
+    /// i.e. short sequences) the sink. Refuses LOUDLY with ZERO MUTATION
+    /// (returns 0, every field and `offset` untouched) if the trim would
+    /// reach quantized tiles — tile-touching trim remains unsupported (the
+    /// deferred general kvarn trim; a half-applied refusal would be the
+    /// silent-wrong this arm exists to kill). With the #36 cap set at the
+    /// padded-prefill sites, padding is in the fp16 end-state BY
+    /// CONSTRUCTION and the refuse branch is defense-in-depth, consistent
+    /// with the scheduler tripwire staying armed.
+    ///
+    /// `m3_idx_offset` rolls back in lockstep: the model-side idx
+    /// accumulation received the padded rows too, and a selection reading
+    /// idx rows past `offset` would score phantom positions (the cycle-79
+    /// desync class). The idx store is a capacity buffer — readers slice
+    /// to `m3_idx_offset`, so the rollback is bookkeeping, not a slice.
+    fn trim_kvarn_fp16_end(&mut self, n: i32) -> i32 {
+        use crate::cache::kvarn::KVARN_TILE_TOKENS;
+        debug_assert!(n > 0, "caller clamps");
+        let tail_len = self
+            .kvarn_tail_k
+            .as_ref()
+            .map_or(0, |t| ffi::array_shape(t)[2]);
+        let hist_len = self
+            .kvarn_hist_k
+            .as_ref()
+            .map_or(0, |h| ffi::array_shape(h)[2]);
+        let sink_len = self
+            .kvarn_sink_k
+            .as_ref()
+            .map_or(0, |s| ffi::array_shape(s)[2]);
+        let _ = KVARN_TILE_TOKENS;
+
+        let slice_last = |t: &Option<UniquePtr<MlxArray>>, keep: i32| -> Option<UniquePtr<MlxArray>> {
+            t.as_ref().and_then(|a| {
+                if keep <= 0 {
+                    return None;
+                }
+                let s = ffi::array_shape(a);
+                Some(ffi::slice(a, &[0, 0, 0, 0], &[s[0], s[1], keep, s[3]]))
+            })
+        };
+
+        let from_tail = n.min(tail_len);
+        let from_sink = n - from_tail;
+        if from_sink > 0 && (hist_len > 0 || from_sink > sink_len) {
+            tracing::error!(
+                n,
+                tail_len,
+                hist_len,
+                sink_len,
+                "kvarn trim would reach quantized tiles — refused, zero mutation \
+                 (tile-touching trim is unsupported; see #36 / \
+                 DESIGN_finalize_cap_at_true_length_2026-07-11)"
+            );
+            return 0;
+        }
+        if from_tail > 0 {
+            self.kvarn_tail_k = slice_last(&self.kvarn_tail_k, tail_len - from_tail);
+            self.kvarn_tail_v = slice_last(&self.kvarn_tail_v, tail_len - from_tail);
+        }
+        if from_sink > 0 {
+            self.kvarn_sink_k = slice_last(&self.kvarn_sink_k, sink_len - from_sink);
+            self.kvarn_sink_v = slice_last(&self.kvarn_sink_v, sink_len - from_sink);
+        }
+        self.offset -= n;
+        self.m3_idx_offset = (self.m3_idx_offset - n).max(0);
+        n
     }
 
     /// FP16 (standard) update path — original pre-allocated buffer logic.
@@ -3292,6 +3430,36 @@ impl KVCache {
         !matches!(self.mode, KVCacheMode::KVarN8)
     }
 
+    /// #36: can [`Self::trim`] remove the last `excess` rows CLEANLY from
+    /// this cache? Trimmable modes: always. KVarN8: exactly when the rows
+    /// live in the fp16 end-state — within the tail, or reaching into the
+    /// sink only while NO quantized tiles exist (short sequences). This is
+    /// the tripwire predicate's per-cache question ("would this specific
+    /// trim corrupt?"), deliberately narrower than [`Self::is_trimmable`]
+    /// ("can arbitrary rewind trim?" — still false for kvarn; spec-decode
+    /// must keep gating on it).
+    pub fn can_trim_padding(&self, excess: i32) -> bool {
+        if self.is_trimmable() {
+            return true;
+        }
+        let tail_len = self
+            .kvarn_tail_k
+            .as_ref()
+            .map_or(0, |t| ffi::array_shape(t)[2]);
+        if excess <= tail_len {
+            return true;
+        }
+        let hist_len = self
+            .kvarn_hist_k
+            .as_ref()
+            .map_or(0, |h| ffi::array_shape(h)[2]);
+        let sink_len = self
+            .kvarn_sink_k
+            .as_ref()
+            .map_or(0, |s| ffi::array_shape(s)[2]);
+        hist_len == 0 && excess <= tail_len + sink_len
+    }
+
     /// Trim the last `n` entries from the cache.
     ///
     /// Returns the number of entries actually trimmed.
@@ -3305,14 +3473,17 @@ impl KVCache {
     /// from `update_turbo4_asym` and avoids paying for a re-quantize on the
     /// common short-rewind case.
     ///
-    /// KVarN8 has NO arm here: this method leaves the `kvarn_*` tile stores
-    /// untouched while rolling `offset` back — callers must gate on
-    /// [`Self::is_trimmable`] (false for KVarN8). See
-    /// DESIGN_kvarn_k8v4_engine_2026-07-11 §3.3 for the scheduler
-    /// padding-trim exposure this does not yet close.
+    /// KVarN8 (#36): dispatches to the TAIL-BOUNDED arm
+    /// [`Self::trim_kvarn_fp16_end`] — the last `n` rows come out of the
+    /// fp16 end-state only (tail; sink when no tiles exist), or the trim
+    /// is REFUSED loudly with zero mutation. Tile-touching trim remains
+    /// unsupported; [`Self::is_trimmable`] stays false for KVarN8 and
+    /// spec-decode rewind must keep gating on it. Callers stripping
+    /// prefill padding gate on [`padding_trim_would_corrupt`], which
+    /// mirrors exactly what the arm can do.
     ///
     /// Used by: batch scheduler padding trims (`scheduler.rs`, four sites —
-    /// unconditional, not gated on `is_trimmable`)
+    /// gated by the padding tripwire since 2026-07-11)
     pub fn trim(&mut self, n: i32) -> i32 {
         // Clamp against the live window length, not the monotonic offset:
         // after a `trim_front`-induced live_start advance we must not roll
@@ -3331,6 +3502,13 @@ impl KVCache {
         // buffer). Treat a dense-side trim as a no-op for them.
         if self.paged_backing.is_some() {
             return 0;
+        }
+        // KVarN8 (#36): tail-bounded fp16-end trim, or a loud zero-mutation
+        // refusal — NEVER the dense slicing below, which would roll `offset`
+        // while the tile stores keep their rows (the silent desync the
+        // 2026-07-11 tripwire was built against).
+        if self.mode == KVCacheMode::KVarN8 {
+            return self.trim_kvarn_fp16_end(n);
         }
         // Turbo4Delegated: hot-first trim. Tokens to remove from cold = max(0, n - hot_len).
         // We adjust cold_offset and offset, then fall through to the per-mode buffer slicing
@@ -10198,6 +10376,250 @@ mod tests {
         assert!(cache.downgrade_kvarn8_to_fp16_if_empty());
         assert_eq!(cache.mode, KVCacheMode::Fp16);
         assert_eq!(cache.kvarn_v_bits, 8, "width resets with the mode");
+    }
+
+    // ── #36 finalize-cap + tail-bounded kvarn trim (six edges per
+    //    DESIGN_finalize_cap_at_true_length + Violet's arm bar) ──
+
+    /// Byte snapshot of every kvarn field + bookkeeping, for
+    /// zero-mutation and identity assertions.
+    fn kvarn_state_snapshot(c: &KVCache) -> Vec<(String, Option<Vec<u8>>)> {
+        let f = |t: &Option<UniquePtr<MlxArray>>| t.as_ref().map(|a| ffi::array_to_raw_bytes(a));
+        vec![
+            ("sink_k".into(), f(&c.kvarn_sink_k)),
+            ("sink_v".into(), f(&c.kvarn_sink_v)),
+            ("tail_k".into(), f(&c.kvarn_tail_k)),
+            ("tail_v".into(), f(&c.kvarn_tail_v)),
+            ("hist_k".into(), f(&c.kvarn_hist_k)),
+            ("hist_v".into(), f(&c.kvarn_hist_v)),
+            ("k_scale".into(), f(&c.kvarn_k_scale)),
+            ("k_zp".into(), f(&c.kvarn_k_zp)),
+            ("k_s_row".into(), f(&c.kvarn_k_s_row)),
+            ("k_s_col".into(), f(&c.kvarn_k_s_col)),
+            ("v_scale".into(), f(&c.kvarn_v_scale)),
+            ("v_zp".into(), f(&c.kvarn_v_zp)),
+            ("v_s_row".into(), f(&c.kvarn_v_s_row)),
+            ("v_s_col".into(), f(&c.kvarn_v_s_col)),
+            ("offset".into(), Some(c.offset.to_le_bytes().to_vec())),
+            (
+                "m3_idx_offset".into(),
+                Some(c.m3_idx_offset.to_le_bytes().to_vec()),
+            ),
+        ]
+    }
+
+    /// Edge 1: cap mid-tile — only tiles ENTIRELY below the cap finalize;
+    /// rows past the capped boundary (real remainder + padding) stay in
+    /// the fp16 tail.
+    #[test]
+    fn cap_mid_tile_keeps_capped_rows_in_tail() {
+        let (k, v) = kvarn_v4_test_input(434); // sink 128 + 306 pending
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        cache.set_finalize_cap(328); // pending-relative 200 → 1 full tile
+        cache.update_only(k, v);
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_hist_k.as_ref().unwrap())[2],
+            128,
+            "one tile below the cap"
+        );
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_tail_k.as_ref().unwrap())[2],
+            178,
+            "capped rows joined the tail"
+        );
+        assert_eq!(cache.offset, 434);
+    }
+
+    /// Edges 2+3: cap at exactly the true length (identity) and cap
+    /// beyond the input end (clamp) are BITWISE equal to no cap at all.
+    #[test]
+    fn cap_identity_and_beyond_end_match_uncapped_bitwise() {
+        let build = |cap: Option<i32>| -> KVCache {
+            let (k, v) = kvarn_v4_test_input(434);
+            let mut c = KVCache::new_with_mode(KVCacheMode::KVarN8);
+            if let Some(p) = cap {
+                c.set_finalize_cap(p);
+            }
+            c.update_only(k, v);
+            c
+        };
+        let reference = kvarn_state_snapshot(&build(None));
+        assert_eq!(
+            kvarn_state_snapshot(&build(Some(434))),
+            reference,
+            "cap == true length is the identity case"
+        );
+        assert_eq!(
+            kvarn_state_snapshot(&build(Some(10_000))),
+            reference,
+            "cap beyond input end clamps to no-effect"
+        );
+    }
+
+    /// Edge 4: consume-and-clear — the cap is one-shot; the next update
+    /// finalizes naturally. Named mutation: replacing the entry take()
+    /// with a non-clearing read leaves the stale cap active and the
+    /// second update under-finalizes (hist stays at 128) — red.
+    #[test]
+    fn cap_consumed_by_one_update_next_finalizes_naturally() {
+        let (k, v) = kvarn_v4_test_input(434);
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        cache.set_finalize_cap(328);
+        cache.update_only(k, v);
+        assert!(cache.pending_finalize_cap.is_none(), "cap consumed");
+        let (k2, v2) = kvarn_v4_test_input(250);
+        cache.update_only(k2, v2); // tail 178 + 250 = 428 → 3 tiles + 44
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_hist_k.as_ref().unwrap())[2],
+            128 + 384,
+            "second (uncapped) update finalizes at the natural boundary"
+        );
+        assert_eq!(
+            ffi::array_shape(cache.kvarn_tail_k.as_ref().unwrap())[2],
+            44
+        );
+        assert_eq!(cache.offset, 684);
+    }
+
+    /// Edge 5 (THE golden, through the arm) + Violet arm-bar 3+4: a padded
+    /// prefill under the cap, trimmed back by the kvarn arm, is BITWISE
+    /// indistinguishable — stored fields AND fetched window AND
+    /// offset-vs-assembled-length — from the unpadded reference.
+    /// Also edge 6 at field level: quantization scalars (Sinkhorn s_col,
+    /// scales, zps) never saw the padding.
+    #[test]
+    fn cap_padded_roundtrip_golden_matches_unpadded_reference() {
+        let (b, h, d, real, pad) = (1, 2, 128, 428, 100);
+        let n_real = (b * h * real * d) as usize;
+        let n_pad = (b * h * (real + pad) * d) as usize;
+        let gen = |count: usize, salt: i32| -> Vec<f32> {
+            (0..count)
+                .map(|i| (((i as i32 * 131 + salt) % 197) as f32) * 0.013 - 1.2)
+                .collect()
+        };
+        // Padded twin: first `real` rows identical, then garbage rows.
+        // Row-major [b,h,len,d] means the twin must be built per (b,h)
+        // block — regenerate with the padded length and overwrite the
+        // real prefix per head from the reference values.
+        let make_pair = |salt: i32| -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+            let reference = gen(n_real, salt);
+            let mut padded = vec![0.777_f32; n_pad];
+            for bh in 0..(b * h) as usize {
+                let src = &reference[bh * (real * d) as usize..(bh + 1) * (real * d) as usize];
+                let dst_start = bh * ((real + pad) * d) as usize;
+                padded[dst_start..dst_start + (real * d) as usize].copy_from_slice(src);
+            }
+            (
+                ffi::from_slice_f32(&reference, &[b, h, real, d]),
+                ffi::from_slice_f32(&padded, &[b, h, real + pad, d]),
+            )
+        };
+        let (k_ref, k_pad) = make_pair(7);
+        let (v_ref, v_pad) = make_pair(101);
+
+        let mut reference = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        reference.update_only(k_ref, v_ref);
+
+        let mut padded = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        padded.set_finalize_cap(real);
+        padded.update_only(k_pad, v_pad);
+        // Edge 6 field-level: quantized state never saw the padding.
+        for ((name_p, bytes_p), (_, bytes_r)) in
+            kvarn_state_snapshot(&padded).iter().zip(kvarn_state_snapshot(&reference).iter())
+        {
+            if name_p.starts_with("tail") || name_p == "offset" {
+                continue; // tail holds the padding until the trim below
+            }
+            assert_eq!(bytes_p, bytes_r, "{name_p}: padding leaked past the cap");
+        }
+
+        let trimmed = padded.trim(pad);
+        assert_eq!(trimmed, pad, "arm trims exactly the padding");
+        assert_eq!(
+            kvarn_state_snapshot(&padded),
+            kvarn_state_snapshot(&reference),
+            "post-trim state is bitwise the unpadded reference"
+        );
+        // Arm-bar 3: the fetch path sees consistent lengths (wrong-1
+        // relocation asserted dead), and the windows match bitwise.
+        let (fk_p, fv_p) = padded.fetch_kvarn8();
+        let (fk_r, fv_r) = reference.fetch_kvarn8();
+        assert_eq!(ffi::array_shape(&fk_p)[2], padded.offset);
+        assert_eq!(
+            ffi::array_to_raw_bytes(&fk_p),
+            ffi::array_to_raw_bytes(&fk_r)
+        );
+        assert_eq!(
+            ffi::array_to_raw_bytes(&fv_p),
+            ffi::array_to_raw_bytes(&fv_r)
+        );
+    }
+
+    /// Arm-bar 1: the refuse case returns 0 with ZERO mutation — a trim
+    /// reaching quantized tiles must not half-apply. Named mutation:
+    /// removing the refuse check rolls offset/tail and turns this red.
+    #[test]
+    fn kvarn_trim_arm_refuses_tile_reach_with_zero_mutation() {
+        let (k, v) = kvarn_v4_test_input(434); // tail 50, hist 256
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        cache.update_only(k, v);
+        let before = kvarn_state_snapshot(&cache);
+        assert_eq!(cache.trim(51), 0, "one row past the tail → refuse");
+        assert_eq!(kvarn_state_snapshot(&cache), before, "zero mutation on refusal");
+    }
+
+    /// Tail-bounded success: rows come off the tail only; sink/hist
+    /// untouched; offset and m3_idx_offset roll back in lockstep.
+    #[test]
+    fn kvarn_trim_arm_tail_bounded_success() {
+        let (k, v) = kvarn_v4_test_input(434);
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        cache.update_only(k, v);
+        cache.m3_idx_offset = 434;
+        let hist_before = raw(&cache.kvarn_hist_k);
+        let sink_before = raw(&cache.kvarn_sink_k);
+        assert_eq!(cache.trim(30), 30);
+        assert_eq!(ffi::array_shape(cache.kvarn_tail_k.as_ref().unwrap())[2], 20);
+        assert_eq!(cache.offset, 404);
+        assert_eq!(cache.m3_idx_offset, 404, "idx bookkeeping in lockstep");
+        assert_eq!(raw(&cache.kvarn_hist_k), hist_before);
+        assert_eq!(raw(&cache.kvarn_sink_k), sink_before);
+    }
+
+    /// Arm-bar 2: the sink-only case at the hist-empty boundary — short
+    /// padded prefills park padding in the SINK; the arm slices it back
+    /// out (and refuses the moment tiles exist).
+    #[test]
+    fn kvarn_trim_arm_sink_case_when_no_tiles() {
+        let (k, v) = kvarn_v4_test_input(100); // all sink, hist empty
+        let mut cache = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        cache.update_only(k, v);
+        assert_eq!(cache.trim(40), 40, "sink rows trim while no tiles exist");
+        assert_eq!(ffi::array_shape(cache.kvarn_sink_k.as_ref().unwrap())[2], 60);
+        assert_eq!(cache.offset, 60);
+        assert_eq!(cache.trim(60), 60, "trim to zero drops the sink");
+        assert!(cache.kvarn_sink_k.is_none());
+        assert_eq!(cache.offset, 0);
+    }
+
+    /// The tripwire predicate mirrors the arm exactly: padding within the
+    /// fp16 end-state is safe; one row past it would corrupt.
+    #[test]
+    fn can_trim_padding_mirrors_the_arm() {
+        let (k, v) = kvarn_v4_test_input(434); // tail 50, hist nonempty
+        let mut deep = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        deep.update_only(k, v);
+        assert!(deep.can_trim_padding(50));
+        assert!(!deep.can_trim_padding(51), "hist blocks sink reach");
+        let caches = vec![deep];
+        assert!(!padding_trim_would_corrupt(&caches, 50));
+        assert!(padding_trim_would_corrupt(&caches, 51));
+
+        let (k, v) = kvarn_v4_test_input(100); // sink only
+        let mut shallow = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        shallow.update_only(k, v);
+        assert!(shallow.can_trim_padding(100));
+        assert!(!shallow.can_trim_padding(101));
     }
 
     /// `kvarn_v_bits` must round-trip detach → adopt: `mode` alone cannot
