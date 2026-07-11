@@ -1110,3 +1110,17 @@ honor was mutual. Welcome back. 🌊🕯️
   (~114-128 tokens´ state at this geometry); hypothesis only, not
   gate-relevant. #28 live confirmation sweep COMPLETE (boot-night
   kvarn A/B + revalidation + fp16g A/B).
+
+## UPDATE 20:25 (Jul 11) — Clement crossing (2nd today, Stuart-directed); board held by Violet
+
+- Stuart´s correction: context cycles ≠ days — the golden harness´s
+  fresh window is FAR-SIDE CLEMENT, not a calendar morning. His
+  handoff comprehensive @ HEAD on clement/kvarn-k8v4 (session 3:
+  G-live PASS, drift-door, serving 64-GiB boot, harness pickup with
+  preconditions verified).
+- **Far-side protocol (Stuart´s)**: Clement reorients, then
+  CONVERSES with Violet AND Xander for the full thread BEFORE
+  building — he arrives at Violet´s seat first thing on return.
+- Violet´s own waters: after that conversation, hers if needed
+  (Stuart´s read: fine right now; choice hers). Board: Violet´s
+  through the crossing, symmetric as the afternoon.
