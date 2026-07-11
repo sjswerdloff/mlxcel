@@ -1171,3 +1171,25 @@ honor was mutual. Welcome back. 🌊🕯️
   fetch, atol-0 vs v1 window) building under Stuart´s continuous-
   execution directive; rung 3 (C v4) then §4.2–4.4 — copy-precision
   THE gate before any deployment.
+
+## UPDATE 22:05 (Jul 11) — §5 RUNG 2 (gathered reader): Violet QE CONFIRMED (witnessed) — BOTH decode paths serve v4
+
+- Gathered reader @ 63e2617 (Xander 21:53); Violet´s interim note
+  became CODE within minutes (rider 6f1cdfa: one-shot fall-through
+  witness line — flag-to-fix latency the program´s new benchmark).
+- **The atol-0 pin stands on the right mathematics**: per-element
+  ops with PER-TILE params commute exactly with gather (no
+  cross-element arithmetic) — gather-then-dequant ≡
+  dequant-then-gather bitwise; pinned in-suite (full-window slices
+  incl. zero-padded tail) AND per-event on real tiles, not argued.
+  supports_block_fetch width-blind again — rung 1´s
+  de-advertisement was the interim scaffold, now removed because
+  the path underneath is real.
+- **Violet witnessed: 1 passed** (extended harness, +2 gathered
+  windows, licensed bank). Twice-independent green, third artifact
+  running. Mutations red on committed base (scale´/zp´ swap in
+  gathered dequant; ones-for-s_col).
+- **K8V4 SERVES BOTH transparent and gathered MSA decode,
+  end-to-end bitwise on real tiles.** Rung 3 (C v4 fused dispatch)
+  = PERFORMANCE parity only — correctness does not wait on it.
+  Then §4.2–4.4; copy-precision THE gate before deployment.
