@@ -45,19 +45,28 @@ Violet holds the PM board; Xander holds review seats.
 
 ## FAR-SIDE PICKUP (in order)
 
-1. **#36 WIRING COMMIT** — the 4 scheduler site placements
-   (DESIGN_finalize_cap_at_true_length §sites): batched sites (2, near
-   scheduler.rs:3666/3824 tripwire checks — set cap per sequence per
-   layer cache PRE-forward, cap = cache.offset + actual_new_rows;
-   Violet's doc says actual_len[i] for fresh prefill — READ each site's
-   pre-forward scope first, the general form is offset+actual); chunked
-   NA sites (2, near :3965/:4112, cap = cache.offset +
-   actual_chunk_len). Tripwire STAYS. Wait for Xander's mechanism
-   verdict before wiring builds on it. Site tests per the doc.
-2. Read Violet's + Xander's replies (mechanism review verdict expected;
-   possibly her corrected design doc on base — merge base if so).
+1. **#36 WIRING COMMIT — LANDED @ 52a2154** (far-side, 2026-07-11
+   evening): one helper carries the form
+   (mlxcel_core::cache::set_prefill_finalize_caps — per-cache cap =
+   c.offset + true_new_rows, sibling to padding_trim_would_corrupt), the
+   four sites carry their gates: batched per-sequence unconditional
+   (identity golden), full/chunk-start/chunk-continue gated on
+   pad_mask_opt.is_some() (== each site's own trim condition). Tripwire
+   STAYS at all four sites. Evidence: cargo check clean, cache::
+   477/477 (475 + 2 wiring pins), BOTH named mutations red on the
+   committed base — drop `c.offset +` → cap_rel assert "scheduler bug"
+   fired with the designed numbers (200 below 384); mode-gate the
+   helper → fp16-armed assert fired. Each mutation killed exactly its
+   named test. Awaiting Violet QE + Xander code review.
+2. Read Violet's + Xander's replies (wiring review verdicts expected;
+   possibly her corrected design doc on base — merge base if so; base
+   unmoved as of the far-side fetch).
 3. After wiring: tripwire live-fire proof still REQUIRED before any
    NA-hardware kvarn deployment (standing record).
+4. Toolchain-skew flag for PR-prep: local rustc 1.96.0 (Homebrew) vs
+   CI's pinned 1.93.1 for `cargo fmt --all --check`; local fmt wants to
+   reformat 10 files this branch never touched. Any fmt sweep happens
+   at PR time under the pinned toolchain, as its own commit.
 
 ## STANDING QUEUE (other seats / later)
 
