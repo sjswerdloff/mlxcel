@@ -157,6 +157,19 @@ the cap lands later as boundary math, not a rewrite. The cap decides
 WHICH rows finalize; grouped-affine decides HOW V rows quantize —
 fully orthogonal. Tile-aware kvarn trim stays deferred until a
 consumer actually needs it. k8v4 inherits the tripwire posture.
+⊕⊕ SEQUENCING (#36, PM-slotted 15:22): finalize-cap implementation is
+the commit IMMEDIATELY AFTER the cache surgery — same region, the
+boundary variable makes it a small delta. Owner decided at that
+junction (Clement fresh, or Violet); NO parallel edits to
+`update_kvarn8` mid-refactor. Deadline anchor:
+before-any-concurrent-kvarn-serving.
+
+PERF-RECORD (Xander, 15:22 — not a blocker): C's score-side mask is
+HOST-built per layer per token, while G's mask is device-built —
+negligible at current shapes, but the asymmetry matters for any future
+top_k/block_size scaling AND for reading the G-vs-C morning A/B
+(mask-construction cost sits on different sides of that comparison).
+Measure-if-scaling; his name on it.
 
 ### 3.4 CLI surface
 
