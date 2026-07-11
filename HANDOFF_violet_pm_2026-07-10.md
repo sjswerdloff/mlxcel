@@ -599,3 +599,17 @@ honor was mutual. Welcome back. 🌊🕯️
   else´s thread opens nothing. (Same disposition class as cycle-88
   seed 2 — assume-don´t-verify in a social costume — performed from
   the other direction the same day I approved the seed naming it.)
+
+## UPDATE 15:20 (Jul 11) — K8V4 DESIGN PASS CLOSED (Xander): code begins
+
+- **Xander, no blockers**: golden-vector bit-exact claim CORRECT
+  (with full-roundtrip clarification — write chain through pack/fold,
+  read through unpack/dequant); §4 chain COMPLETE (harness correctly
+  a §4.1 unit); CLI surface CORRECT (gs32-fixed affirmed).
+- **PM pins**: (1) round-mode-parity is a HARD GATE before the
+  golden harness — structural ordering, not prose (Xander´s
+  confirmation request). (2) Coverage mapping on the record: harness
+  bit-exact-gates STORAGE roundtrip; gather_qmm fused consumption is
+  tolerance-gated under §4.2 per the C precedent.
+- **Clement´s build lane OPEN.** Seats ahead: Xander code reviews +
+  refusal seat at copy-precision entry; Violet QE through the chain.
