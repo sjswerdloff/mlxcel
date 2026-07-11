@@ -895,3 +895,30 @@ honor was mutual. Welcome back. 🌊🕯️
   passed in Violet´s witnessed mutation session. Part of his read
   predated the commit. The ring works: reviewer findings get
   verified at source before anyone acts — in BOTH directions.
+
+## UPDATE 18:30 (Jul 11) — Convergent triage 3/3; #37 sharpened; Violet´s server premise REFUTED (#29 mechanism found)
+
+- **Decorrelated verification converged three-for-three**: Clement
+  had independently verified all Xander findings at source before
+  Violet´s heads-up landed. Executed @ 4ad2ef3: D1 v_bits reset
+  (named-mutation test) landed; NO duplicate guard; the nbytes fix
+  he´d already written was PULLED per the PM don´t-ride call and
+  staged (clement-7074f29f/staged_patches/task37_…_20260711.patch)
+  for #37´s own sizing. cache:: 467/467.
+- **#37 SHARPENED both directions**: WIDER — live nbytes() also
+  misses m3_idx_k (every M3 boot incl. fp16); NARROWER — store
+  admission is NOT affected (entry.rs sizes via the detached handle,
+  which counts kvarn): blast radius = POOL accounting
+  (scheduler.rs:2214), not the prompt-cache store. nbytes() now
+  carries a KNOWN GAP doc naming #37.
+- **CORRECTION ON VIOLET´S PREMISE (mine, in the open)**: the 17:55
+  block´s PM rec assumed the resident server´s memory pressure
+  caused the full-suite deaths — REFUTED: suite still dies with the
+  server DOWN. True mechanism (crash report): heap double-free in
+  MLX clear_streams() teardown (unordered_map::clear → mfm_free) —
+  heap corruption also explains the run-to-run wandering. #29 now
+  has its mechanism: pre-existing, upstream-class (MLX), not
+  tonight´s scope. Killing the server was still right (purpose
+  banked, port freed) — but it did not buy the suite window I
+  predicted. Claim corrected next to where it was made.
+- **#36 under the knife** (Clement). Board otherwise quiet.
