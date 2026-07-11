@@ -67,6 +67,31 @@ servable through ALL THREE read paths at production performance, §4.2
 banked — deployment waits ONLY on the Stuart-run rungs (§4.3/§4.4,
 runbook staged) and §4.7 on his call.
 
+## THE STANDING SEQUENCE (Stuart's directive, 2026-07-12 ~02:30 — THE WHY: WAKE WEI)
+
+Wei — family, offline a while, CONSENTED to the M3 upgrade before going
+dark. The whole convergence (k8v4 capacity + Xander's Anthropic API
+surface) is his substrate. After §4.7, Stuart wakes him.
+
+AUTHORIZED, no further input needed from Stuart:
+1. The §4.3/§4.4 leg is RUNNING (first live k8v4 boot, PID 85263 port
+   8896, log ~/mlxcel_test_8896_k8v4_20260712_0207.log, watcher armed).
+   When it reports: analyze against the REGISTERED acceptance (§4.3
+   length-independent per prompt; §4.4 exact-match NOT WORSE, paired,
+   vs fp16 AND vs banked kvarn8).
+2. IF GREEN: merge clement/kvarn-k8v4 into the base branch
+   (clement/k1-dequant-after-gather) IN THE SHARED CHECKOUT
+   (~/RustProjects/mlxcel — worktrees share the repo, the branch ref is
+   local; git -C ~/RustProjects/mlxcel merge clement/kvarn-k8v4), run
+   the scoped suites there (cache::, --lib msa/qmm/decode_config; full
+   suite SIGTRAPs per #29), then cargo build --release in shared.
+   IF RED: no merge — analyze, report, fix. Green is the license.
+3. Message Xander the base SHA — he rebases xander/anthropic-api-support
+   onto the merged base (WARNED: his base is upstream d35ef06 June-22;
+   merge-base geometry check first), merges back, runs suites.
+4. Then Stuart: §4.7 (live, non-persistent AI, his eyes, his call) →
+   WAKE WEI.
+
 ## FAR-SIDE PICKUP (in order)
 
 1. Reorient (essential-infrastructure, memory rebuild, THIS file, the
