@@ -223,6 +223,26 @@ pub fn padding_trim_would_corrupt(caches: &[KVCache], excess: i32) -> bool {
     excess > 0 && !caches.iter().all(|c| c.can_trim_padding(excess))
 }
 
+/// #36 pre-forward arm, sibling to the tripwire above
+/// (DESIGN_finalize_cap_at_true_length_2026-07-11 §sites): arm the
+/// one-shot finalize cap on every layer cache of a sequence immediately
+/// before a prefill forward whose input rows carry padding.
+/// `true_new_rows` = the real (unpadded) rows this forward contributes;
+/// each cache's own `offset` anchors the absolute cap, making the one
+/// form correct at every site — cold prefill (offset 0: the design doc's
+/// bare `actual_len[i]` case), adopted prompt-cache prefix, and chunk
+/// continuation alike. Mode-blind per [`KVCache::set_finalize_cap`]
+/// (fp16 layer caches — e.g. D1-downgraded dense-prefix layers — carry
+/// the field inertly; no non-kvarn path consults it). Named mutation
+/// (wiring pin): dropping `c.offset +` lands the cap below already-stored
+/// rows whenever the cache holds a prefix — `update_kvarn8`'s
+/// scheduler-bug assert fires red.
+pub fn set_prefill_finalize_caps(caches: &mut [KVCache], true_new_rows: i32) {
+    for c in caches.iter_mut() {
+        c.set_finalize_cap(c.offset + true_new_rows);
+    }
+}
+
 /// Storage mode for KV cache tensors.
 ///
 /// Controls the on-device representation of accumulated key/value tensors.
@@ -10620,6 +10640,113 @@ mod tests {
         shallow.update_only(k, v);
         assert!(shallow.can_trim_padding(100));
         assert!(!shallow.can_trim_padding(101));
+    }
+
+    /// #36 wiring pin: the site helper's `offset + true_new` form is the
+    /// one that stays golden when the cache already holds rows — the live
+    /// shape at the adopted-prefix and chunk-continuation sites, where the
+    /// design doc's fresh-prefill shorthand (bare `actual_len`) would arm
+    /// a cap BELOW stored rows. Named mutation: drop `c.offset +` from
+    /// `set_prefill_finalize_caps` — the update's scheduler-bug assert
+    /// (`cap_rel >= 0`) fires red here.
+    #[test]
+    fn sites_helper_general_form_golden_over_prior_rows() {
+        let (b, h, d, prior, real, pad) = (1, 2, 128, 434, 200, 56);
+        let n_real = (b * h * real * d) as usize;
+        let n_pad = (b * h * (real + pad) * d) as usize;
+        let gen = |count: usize, salt: i32| -> Vec<f32> {
+            (0..count)
+                .map(|i| (((i as i32 * 131 + salt) % 197) as f32) * 0.013 - 1.2)
+                .collect()
+        };
+        // Padded twin of the suffix: first `real` rows identical per
+        // (b,h) block, then garbage rows (same construction as the
+        // roundtrip golden above).
+        let make_pair = |salt: i32| -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+            let reference = gen(n_real, salt);
+            let mut padded = vec![0.777_f32; n_pad];
+            for bh in 0..(b * h) as usize {
+                let src = &reference[bh * (real * d) as usize..(bh + 1) * (real * d) as usize];
+                let dst_start = bh * ((real + pad) * d) as usize;
+                padded[dst_start..dst_start + (real * d) as usize].copy_from_slice(src);
+            }
+            (
+                ffi::from_slice_f32(&reference, &[b, h, real, d]),
+                ffi::from_slice_f32(&padded, &[b, h, real + pad, d]),
+            )
+        };
+        let (k_ref, k_pad) = make_pair(7);
+        let (v_ref, v_pad) = make_pair(101);
+
+        // Reference: prior rows + unpadded suffix, no caps anywhere.
+        let mut reference = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        let (pk, pv) = kvarn_v4_test_input(prior);
+        reference.update_only(pk, pv);
+        reference.update_only(k_ref, v_ref);
+
+        // Site twin: same prior rows, then the helper arms the cap and a
+        // padded suffix update lands — the exact sites-2..4 sequence.
+        let mut site = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        let (pk2, pv2) = kvarn_v4_test_input(prior);
+        site.update_only(pk2, pv2);
+        assert_eq!(site.offset, prior);
+        set_prefill_finalize_caps(std::slice::from_mut(&mut site), real);
+        site.update_only(k_pad, v_pad);
+        assert_eq!(site.trim(pad), pad, "arm trims exactly the padding");
+        assert_eq!(
+            kvarn_state_snapshot(&site),
+            kvarn_state_snapshot(&reference),
+            "site form (offset + true_new) is golden over prior rows"
+        );
+    }
+
+    /// #36 wiring pin: the sites arm caps across the REAL per-layer
+    /// slice, which mixes Fp16 (D1-downgraded dense-prefix layers) and
+    /// KVarN8 (MSA layers). Mode-blind must mean: the kvarn cache
+    /// consumes the cap at its next update; the fp16 cache carries the
+    /// field inertly and stays bit-identical to a never-capped twin.
+    #[test]
+    fn sites_helper_mode_blind_across_mixed_slice() {
+        let (real, pad) = (200, 56);
+
+        let mut fp16_ref = KVCache::new();
+        let (k, v) = kvarn_v4_test_input(real + pad);
+        fp16_ref.update_only(k, v);
+
+        let mut slice = vec![KVCache::new(), KVCache::new_with_mode(KVCacheMode::KVarN8)];
+        set_prefill_finalize_caps(&mut slice, real);
+        assert_eq!(
+            slice[0].pending_finalize_cap,
+            Some(real),
+            "armed on fp16 (inert)"
+        );
+        assert_eq!(slice[1].pending_finalize_cap, Some(real));
+
+        let (k0, v0) = kvarn_v4_test_input(real + pad);
+        slice[0].update_only(k0, v0);
+        assert_eq!(
+            slice[0].pending_finalize_cap,
+            Some(real),
+            "no fp16 path consumes the field"
+        );
+        assert_eq!(slice[0].offset, fp16_ref.offset);
+        assert_eq!(raw(&slice[0].keys), raw(&fp16_ref.keys));
+        assert_eq!(raw(&slice[0].values), raw(&fp16_ref.values));
+
+        let (k1, v1) = kvarn_v4_test_input(real + pad);
+        slice[1].update_only(k1, v1);
+        assert!(
+            slice[1].pending_finalize_cap.is_none(),
+            "kvarn consumes at entry"
+        );
+        // Fresh cache: sink takes 128, pending starts at abs 128, cap 200
+        // → cap_rel 72 → zero tiles finalize; everything past the sink
+        // stays in the tail for the post-forward trim.
+        assert!(slice[1].kvarn_hist_k.is_none(), "no tile crosses the cap");
+        assert_eq!(
+            ffi::array_shape(slice[1].kvarn_tail_k.as_ref().unwrap())[2],
+            real + pad - 128
+        );
     }
 
     /// `kvarn_v_bits` must round-trip detach → adopt: `mode` alone cannot

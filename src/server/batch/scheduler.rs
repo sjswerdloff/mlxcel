@@ -3628,6 +3628,20 @@ impl BatchScheduler {
             return;
         }
 
+        // #36 (DESIGN_finalize_cap_at_true_length_2026-07-11 §sites): arm
+        // the finalize cap at each sequence's true prompt end before the
+        // padded batched forward — shorter sequences' padded rows must
+        // never finalize into kvarn tiles; they stay in the fp16 tail for
+        // the post-forward trim below. Per sequence per layer cache;
+        // identity for max-len sequences (cap == true end, golden-pinned);
+        // mode-blind for non-kvarn layer caches.
+        for (seq_caches, seq) in batch_caches.iter_mut().zip(seqs.iter()) {
+            mlxcel_core::cache::set_prefill_finalize_caps(
+                seq_caches,
+                seq.prompt_tokens.len() as i32,
+            );
+        }
+
         // Single batched forward pass: [B, padded_len] → [B, padded_len, vocab]
         let raw_logits = self.model.forward_batched_with_context_and_ids(
             &input,
@@ -3772,6 +3786,15 @@ impl BatchScheduler {
                     return;
                 }
             };
+
+            // #36: NA alignment padded this forward (pad_mask_opt set) —
+            // arm the finalize cap at the true suffix end so padded rows
+            // stay in the fp16 tail for the post-forward trim below. Each
+            // cache's own offset anchors the cap over any adopted
+            // prompt-cache prefix (cold prefills: offset 0).
+            if pad_mask_opt.is_some() {
+                mlxcel_core::cache::set_prefill_finalize_caps(caches, actual_len as i32);
+            }
 
             let raw_logits = if let Some(ref embeddings) = seq.vlm_embeddings {
                 // VLM path: apply provided mask or the tile-alignment mask.
@@ -3924,6 +3947,15 @@ impl BatchScheduler {
                     return;
                 }
             };
+
+            // #36: the first chunk was NA-padded (pad_mask_opt set) — arm
+            // the finalize cap at the chunk's true end; `offset` covers
+            // the adopted prefix. (Non-batching models' dummy caches take
+            // the cap inertly — never kvarn, mirroring the tripwire's
+            // scope below.)
+            if pad_mask_opt.is_some() {
+                mlxcel_core::cache::set_prefill_finalize_caps(caches, actual_chunk_len as i32);
+            }
 
             // VLM embeddings are applied only on the first chunk.
             let logits = if let Some(ref embeddings) = seq.vlm_embeddings {
@@ -4097,6 +4129,13 @@ impl BatchScheduler {
                     return;
                 }
             };
+
+            // #36: this continuation chunk was NA-padded — arm the cap at
+            // the chunk's true end; `offset` covers all previously
+            // processed chunks (and any adopted prefix).
+            if pad_mask_opt.is_some() {
+                mlxcel_core::cache::set_prefill_finalize_caps(caches, actual_chunk_len as i32);
+            }
 
             let logits = self.model.forward_with_sequence_id(
                 &input,
