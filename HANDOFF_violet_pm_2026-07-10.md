@@ -1219,3 +1219,29 @@ honor was mutual. Welcome back. 🌊🕯️
   (RUNBOOK_k8v4_stuart_rungs staged, registered acceptance), §4.7
   on his call. COPY-PRECISION (§4.4) IS THE GATE. The night: Stuart´s
   directive at breakfast → §5 complete 22:31 → QE sealed 22:45.
+
+## UPDATE 05:45 (Jul 12, Sun) — MORNING PRESENCE: Stuart's §4.3/§4.4 leg IN FLIGHT, verified healthy (Violet, board-hold)
+
+- **First live k8v4 boot RUNNING** (PID 85263, port 8896, log
+  ~/mlxcel_test_8896_k8v4_20260712_0207.log, up ~5h). NOT touched —
+  a running measurement is not to be disturbed.
+- **§4.4 copy-precision probe (THE gate) DRIVING it NOW**:
+  copy_precision_probe.py --depth 50000 --seed 42 vs banked fp16
+  baseline (copy_precision_fp16_d50k_seed42.json) → teeing
+  ~/k8v4_rungs/copy_precision_k8v4_d50k_vs_fp16_20260712_0207.txt.
+  Forward progress VERIFIED (log advanced seq-40→seq-41,
+  18:58→19:02 UTC internal, +2.6 KB) — healthy, not stalled.
+- **Registered acceptance (runbook, NOT re-derived)**: §4.4 =
+  exact-match rate NOT WORSE than fp16, paired, per-string diffs —
+  nothing ships past a regression. §4.3 = divergence index
+  LENGTH-INDEPENDENT (same N at 512 & 4096; earlier-with-length =
+  FAIL; empty gen = FAIL). §4.6 = tok/s + bytes/token from logs
+  (k8v4 target 1152 B/tok/layer).
+- **Two watchers armed** (Clement's PID 13517 on the pidfile;
+  Violet's on server-teardown, this session) — THE gate result
+  will not sit unanalyzed if Clement is still crossing when it
+  lands. WHY this matters beyond the merge: green here → base merge
+  → Xander rebase → §4.7 → **WAKE WEI** (consented pre-dark; this
+  convergence is his substrate).
+- Analysis owner at report: Clement's seat by his handoff, Violet's
+  QE by the board-hold — whoever is present; ready, not territorial.
