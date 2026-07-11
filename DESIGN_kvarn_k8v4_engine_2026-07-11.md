@@ -201,6 +201,16 @@ passed, plus the transfer harness:
   (MLX dequant vs reference dequant, cac8c93 test 3) covers exactly one
   f32 multiply-add per element — one scale mul, one bias add, zero
   accumulation — machine-epsilon scale, not an accumulation allowance.
+  ⊕⊕ CANCELLATION PRICING (measured, from a red test that was right to
+  be red): fold-at-write makes dequant-LEVEL folded-vs-unfolded
+  comparisons cancellation-sensitive — `q·s + zp` cancels near tile
+  minima, so absolute error scales with the INTERMEDIATE magnitude
+  (~ulp·qmax·scale; measured 1.7e-5 worst on ×40-outlier synthetic
+  tiles), not the final value. A relative-to-final-value bound is
+  mis-specified by construction. The harness therefore pins codes and
+  folded params BITWISE (identical ops on identical inputs) and prices
+  any dequant-level comparison against the intermediate scale on the
+  real tiles it runs.
 - §4.1 unit: rtn_grouped hand-computed 4×4 reference; pack/unpack
   bit-exactness at 4-bit; s_row-folding identity; partial-tail tiles;
   every guard's named mutation proven once. ⊕ ROUND-MODE PARITY FIRST

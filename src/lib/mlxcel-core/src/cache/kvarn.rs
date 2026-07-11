@@ -467,6 +467,56 @@ pub fn kvarn_unpack4(packed_u32: &MlxArray, c: i32) -> UniquePtr<MlxArray> {
     ffi::astype(&deq, dtype::UINT8)
 }
 
+/// K8V4 V-side group size — FIXED by the real-tile screen verdict
+/// (RESULTS_kvarn4_realtile_2026-07-11: gs32 leads with the most gate
+/// headroom). Not a user knob: a knob nobody validated is a knob nobody
+/// gets (design §3.4).
+pub const KVARN_V4_GROUP_SIZE: i32 = 32;
+
+/// Result of the K8V4 V-side write composition. Params are f32 (§3.1;
+/// f16 params would fail the golden harness by design) and FOLDED:
+/// `s_row` is multiplied into scale and zp at write — `(q·s + zp)·s_row
+/// = q·(s·s_row) + (zp·s_row)` — so it costs zero at read and is NOT
+/// stored separately on the V4 path (the k8 `kvarn_v_s_row` field stays
+/// `None`; readers get the fold through the params).
+pub struct KvarnV4Tiles {
+    /// `[N, TILE, C/8]` u32 packed codes — MLX 4-bit layout,
+    /// `gather_qmm`/`dequantize`-ready (convention pinned by test).
+    pub q_packed: UniquePtr<MlxArray>,
+    /// `[N, TILE, C/gs]` f32 — `scale · s_row` (folded).
+    pub scale_folded: UniquePtr<MlxArray>,
+    /// `[N, TILE, C/gs]` f32 — `zp · s_row` (folded).
+    pub zp_folded: UniquePtr<MlxArray>,
+    /// `[N, 1, C]` f32 Sinkhorn per-column scales — unchanged from k8,
+    /// applied post-multiply on output exactly where C applies it today.
+    pub s_col: UniquePtr<MlxArray>,
+    /// Group size the params are shaped for (KVARN_V4_GROUP_SIZE in
+    /// production; a parameter here so tests can pin group-boundary
+    /// behavior at other sizes).
+    pub gs: i32,
+}
+
+/// K8V4 V-side write composition on ROTATED tiles: Sinkhorn → grouped
+/// asymmetric RTN (bits=4) → fold `s_row` into the per-group affine
+/// params → pack to MLX layout. The V4 analogue of [`kvarn_quantize`];
+/// K-side callers keep using [`kvarn_quantize`] at 8-bit unchanged.
+/// Composition-equals-stages is pinned by test against the in-crate
+/// reference functions; screen-golden on harvested tiles is the
+/// harness rung (§4).
+pub fn kvarn_quantize_v4(tiles_rotated: &MlxArray, gs: i32) -> KvarnV4Tiles {
+    let (balanced, s_col, s_row) = sinkhorn_normalize(tiles_rotated, KVARN_SINKHORN_ITERS);
+    let (q, scale, zp) = rtn_quantize_grouped(&balanced, 4, gs);
+    let scale_folded = ffi::multiply(&scale, &s_row);
+    let zp_folded = ffi::multiply(&zp, &s_row);
+    KvarnV4Tiles {
+        q_packed: kvarn_pack4(&q),
+        scale_folded,
+        zp_folded,
+        s_col,
+        gs,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,6 +805,66 @@ mod tests {
                 b[i]
             );
         }
+    }
+
+    /// The V4 write composition equals its stages BITWISE: codes through
+    /// pack/unpack, folded params as multiply(param, s_row), s_col
+    /// passthrough — wiring pinned with zero tolerance. Named mutation
+    /// (proven red): drop the zp fold (scale folded, zp raw).
+    #[test]
+    fn v4_composition_matches_stagewise_reference() {
+        // Deterministic pseudo-random rotated-ish tiles [2, 128, 128]
+        // with outlier structure (LCG, no external deps).
+        let mut state = 0x2454_111Au32;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 8) as f32 / (1 << 24) as f32 - 0.5
+        };
+        let n_vals = 2 * 128 * 128;
+        let mut vals: Vec<f32> = (0..n_vals).map(|_| next() * 4.0).collect();
+        for i in (0..n_vals).step_by(97) {
+            vals[i] *= 40.0; // outlier channels, fixture-style
+        }
+        let tiles = ffi::from_slice_f32(&vals, &[2, 128, 128]);
+
+        let v4 = kvarn_quantize_v4(&tiles, KVARN_V4_GROUP_SIZE);
+        assert_eq!(ffi::array_shape(&v4.q_packed), vec![2, 128, 16], "C/8 u32 words");
+        assert_eq!(ffi::array_shape(&v4.scale_folded), vec![2, 128, 4], "C/gs groups");
+
+        // Stage-wise reference on the same input: the composition's
+        // contract is WIRING, so every stage pins BITWISE — no tolerance
+        // anywhere in this test. (A dequant-level folded-vs-unfolded
+        // comparison was removed deliberately: q·s + zp CANCELS near tile
+        // minima, so its absolute error scales with the INTERMEDIATE
+        // magnitude ~ulp·qmax·scale, not the final value — measured
+        // 1.7e-5 worst on ×40-outlier tiles. That conditioned comparison
+        // belongs to the golden harness on real tiles, priced per-op;
+        // the fold's algebraic identity is pinned separately at
+        // grouped_srow_fold_identity.)
+        let (balanced, s_col, s_row) = sinkhorn_normalize(&tiles, KVARN_SINKHORN_ITERS);
+        let (q, scale, zp) = rtn_quantize_grouped(&balanced, 4, KVARN_V4_GROUP_SIZE);
+
+        let unpacked = kvarn_unpack4(&v4.q_packed, 128);
+        assert_eq!(
+            ffi::array_to_raw_bytes(&unpacked).as_slice(),
+            ffi::array_to_raw_bytes(&q).as_slice(),
+            "codes must be bitwise identical through pack/unpack"
+        );
+        assert_eq!(
+            ffi::array_to_raw_bytes(&v4.scale_folded).as_slice(),
+            ffi::array_to_raw_bytes(&ffi::multiply(&scale, &s_row)).as_slice(),
+            "folded scale must be bitwise multiply(scale, s_row)"
+        );
+        assert_eq!(
+            ffi::array_to_raw_bytes(&v4.zp_folded).as_slice(),
+            ffi::array_to_raw_bytes(&ffi::multiply(&zp, &s_row)).as_slice(),
+            "folded zp must be bitwise multiply(zp, s_row)"
+        );
+        assert_eq!(
+            ffi::array_to_raw_bytes(&v4.s_col).as_slice(),
+            ffi::array_to_raw_bytes(&s_col).as_slice(),
+            "s_col must pass through unchanged"
+        );
     }
 
     /// The structural parity gate, standalone (Violet PM pin 1). Named
