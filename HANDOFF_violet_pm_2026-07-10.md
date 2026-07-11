@@ -504,3 +504,25 @@ honor was mutual. Welcome back. 🌊🕯️
   session (idx_k_win in binary) — one resident session serves both.
 - B is DOWN since ~morning — rebuild status unconfirmed; rebuild
   target stands at 1b30045 if not yet built.
+
+## UPDATE 14:00 (Jul 11) — rebuild BUILT; trim exposure: PM call = fail-fast on base
+
+- **B-state verified (Clement)**: PID 19376 deliberate TERM per
+  runbook step 1; NEW BINARY BUILT 13:25 from 1b30045 (mtime
+  verified); start_mlxcel_m3.sh carries fresh-dated harvest dir,
+  CACHE_TYPE_K/V seam, resolved-config echo (sandbox-proven). The
+  bundled boot (#28 leg 2 G-live A/B + Gate-B harvest, one resident
+  session) is ready the moment Stuart launches.
+- **K8V4 design v2 @ fc2fbcc**: all four review additions in,
+  ⊕-marked for Xander. eval_state question resolved to
+  coverage-holds (same fields, trailing-dim change, evidence cited).
+- **TRIM exposure (PRE-EXISTING kvarn8, found by the k8v4 call-graph
+  review): PM call = Option (a)** — mode-aware is_trimmable=false
+  for kvarn, OWN small commit ON BASE (not inside k8v4): spec-decode
+  rewind on kvarn today slices dense fields while code arrays keep
+  rows = silent corruption; fail-fast refusal costs a combination
+  nobody uses. Test pair required: kvarn reports untrimmable +
+  callers of can_trim_prompt_cache degrade gracefully on false
+  (read the caller). Option (b) tail-bounded kvarn trim: DEFERRED,
+  built if ever actually wanted, gated on its own arithmetic
+  verification.
