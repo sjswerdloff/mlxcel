@@ -174,17 +174,25 @@ kvarn-decode-bench (--v-bits knob @ HEAD), depth 100K, production
 RANKS; THE LIVE SERVER CONFIRMS — attention-only ceilings, never
 promote on these numbers alone (bench header's own caveat).
 
-| core (path) | v8 (k8v8) | v4 (k8v4) | delta |
-|---|---|---|---|
-| C fused (MLXCEL_MSA_FETCH=qmm) | 77.3 ms/tok → 12.94 tok/s | 76.6 ms/tok → 13.05 tok/s | **+0.9% (neutral-to-positive)** |
-| gathered (default fetch) | 169.3 ms/tok → 5.91 tok/s | 174.2 ms/tok → 5.74 tok/s | −2.9% |
+C fused core (MLXCEL_MSA_FETCH=qmm — the production config), registered
+depths:
 
-Reading: on the C fused core — the production config — k8v4 is
-performance-NEUTRAL vs k8v8 (half the V bytes through gather_qmm; the
-zero-repack layout consumed natively). The gathered path pays ~3% for
-the explicit unpack4; it is the fall-back/verification path, not
-production. 300K cells: far-side/any-seat pickup (≈25–30GB synth state,
-in-session allowed, minutes per run).
+| depth | v8 (k8v8) | v4 (k8v4) | delta |
+|---|---|---|---|
+| 32K  | 74.9 ms/tok → 13.35 tok/s | 72.1 ms/tok → 13.87 tok/s | **+3.9% (v4 faster)** |
+| 100K | 77.3 ms/tok → 12.94 tok/s | 76.6 ms/tok → 13.05 tok/s | +0.9% (neutral) |
+| 300K | 106.9 ms mean / 97.0 p50  | 104.0 ms mean / 97.5 p50  | p50 even; mean +2.8% |
+
+Gathered path (fall-back/verification, not production), 100K: v8 169.3
+ms → 5.91 tok/s vs v4 174.2 ms → 5.74 tok/s (−2.9%, the explicit
+unpack4 cost).
+
+READING: on the production core, k8v4 is neutral-to-FASTER than k8v8 at
+every registered depth — half the V bytes through gather_qmm, the
+zero-repack layout consumed natively. The +22% capacity candidate costs
+nothing in production-core decode speed. (Attention-only ceilings; the
+live server confirms — §4.6's server-side tok/s falls out of the
+runbook legs.)
 
 — cells produced at my seat, 2026-07-12; bench BOOT artifacts carry
 v_bits per run.
