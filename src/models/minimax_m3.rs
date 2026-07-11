@@ -2011,8 +2011,25 @@ impl SparseAttention {
             let x = mlxcel_core::transpose_axes(&x, &[0, 2, 1, 3]);
             mlxcel_core::reshape(&x, &[rows, n_rep, bs])
         };
-        let (scales_v, biases_v) = fold(st.v_scale, st.v_zp, st.v_s_row);
-        let codes_v = codes_view(st.hist_v);
+        // V params/codes by storage width (§5 rung 3). v8: per-row params
+        // folded with s_row at dispatch; u8 codes u32-viewed at 8-bit
+        // density; one group per row (group_size = d). v4: params were
+        // FOLDED AT WRITE per group of KVARN_V4_GROUP_SIZE — the gather is
+        // the only work — and the stored u32 words ARE the MLX 4-bit
+        // layout (zero repack at 4-bit density, same trick as C's 8-bit).
+        let v4 = st.v_bits == 4;
+        let (scales_v, biases_v, codes_v, gs_v) = if v4 {
+            let g = d / mlxcel_core::cache::kvarn::KVARN_V4_GROUP_SIZE;
+            (
+                mlxcel_core::reshape(&gather_tiles(st.v_scale, g), &[rows, bs, g]),
+                mlxcel_core::reshape(&gather_tiles(st.v_zp, g), &[rows, bs, g]),
+                mlxcel_core::reshape(&gather_tiles(st.hist_v, d / 8), &[rows, bs, d / 8]),
+                mlxcel_core::cache::kvarn::KVARN_V4_GROUP_SIZE,
+            )
+        } else {
+            let (s, b) = fold(st.v_scale, st.v_zp, st.v_s_row.expect("v8 state has s_row"));
+            (s, b, codes_view(st.hist_v), d)
+        };
         let part_v = unsafe {
             mlxcel_core::gather_qmm(
                 &w_int,
@@ -2022,8 +2039,8 @@ impl SparseAttention {
                 ident.as_ref().unwrap() as *const MlxArray,
                 ident.as_ref().unwrap() as *const MlxArray,
                 false,
-                d,
-                8,
+                gs_v,
+                if v4 { 4 } else { 8 },
                 false,
                 "affine",
             )
@@ -5791,8 +5808,7 @@ mod tests {
     /// side and qmm/matmul accumulation orders differ, so bitwise equality
     /// is not the contract; ⟨q,K⟩-preservation under the orthonormal
     /// rotation is.
-    #[test]
-    fn qmm_core_matches_gathered_blocked_path_on_real_cache() {
+    fn qmm_matches_gathered_on_real_cache(v_bits: u8) {
         // A set MLXCEL_MSA_FETCH would flip the reference path to C and
         // make this test compare C to C — vacuous green. Fail loud instead.
         // Both the env seed AND the effective store value are pinned: the
@@ -5816,6 +5832,9 @@ mod tests {
         let offset = kv_len_prior;
 
         let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        if v_bits == 4 {
+            cache.set_kvarn_v_bits(4);
+        }
         let x_prefill = make_test_input(1, kv_len_prior, hidden);
         let _ = attn.forward(&x_prefill, &mut cache, None);
         assert_eq!(cache.offset, kv_len_prior);
@@ -5893,9 +5912,34 @@ mod tests {
         assert!(
             mlxcel_core::item_bool(&close),
             "C qmm core diverged from the gathered blocked path on a real \
-             KVarN8 cache (l2 diff {})",
+             KVarN8 v{v_bits} cache (l2 diff {})",
             output_l2_diff(&ref_out, &qmm_out)
         );
+    }
+
+    /// C contract, live-state form (DESIGN_c_qmm_union_sketch MERGE
+    /// DESIGN): on a REAL KVarN8 cache built through the production write
+    /// path, the qmm fused core must match the production gathered path
+    /// (union → block fetch → blocked core) on the same decode step, with
+    /// the same selection. Tolerance-gated like G — s_col moves to the q
+    /// side and qmm/matmul accumulation orders differ, so bitwise equality
+    /// is not the contract; ⟨q,K⟩-preservation under the orthonormal
+    /// rotation is.
+    #[test]
+    fn qmm_core_matches_gathered_blocked_path_on_real_cache() {
+        qmm_matches_gathered_on_real_cache(8);
+    }
+
+    /// §5 rung 3: the C fused core on a REAL v4 cache — MLX-packed codes
+    /// + write-folded per-group params through gather_qmm(bits=4, gs=32)
+    /// — must match the production gathered path (which rung 2 pinned
+    /// bitwise against golden storage) within the same tolerance the v8 C
+    /// contract carries (§4.2 fused-consumption precedent). Named
+    /// mutations (proven red on the committed base): group_size=d instead
+    /// of KVARN_V4_GROUP_SIZE in the v4 arm; bits=8 instead of 4.
+    #[test]
+    fn qmm_core_matches_gathered_blocked_path_on_real_v4_cache() {
+        qmm_matches_gathered_on_real_cache(4);
     }
 
     /// C contract, mask-edge form: FORCED selection with per-head

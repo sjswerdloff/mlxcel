@@ -434,14 +434,21 @@ pub(crate) const TURBO_DEFAULT_SEED: u32 = 0x7B4_70404; // "TUR" 0x474 + B2 issu
 ///   tail_*  [B, H, tail_len, D] fp16 rotated — None iff tail_len == 0
 pub struct KvarnQmmState<'a> {
     pub hist_k: &'a MlxArray,
+    /// v8: u8 codes `[B,H,T,D]`. v4 (§5 rung 3): MLX-packed u32
+    /// `[B,H,T,D/8]` — already `gather_qmm`-layout, zero repack.
     pub hist_v: &'a MlxArray,
     pub k_scale: &'a MlxArray,
     pub k_zp: &'a MlxArray,
     pub k_s_row: &'a MlxArray,
     pub k_s_col: &'a MlxArray,
+    /// v8: per-row `[B,H,T,1]` (fold with s_row at dispatch). v4:
+    /// per-GROUP FOLDED `[B,H,T,D/32]` — `scale·s_row` stored at write.
     pub v_scale: &'a MlxArray,
+    /// v8: per-row `[B,H,T,1]`. v4: per-group folded `zp·s_row`
+    /// `[B,H,T,D/32]`.
     pub v_zp: &'a MlxArray,
-    pub v_s_row: &'a MlxArray,
+    /// `None` on v4 — the fold IS s_row's storage (design §3.1).
+    pub v_s_row: Option<&'a MlxArray>,
     pub v_s_col: &'a MlxArray,
     pub sink_k: &'a MlxArray,
     pub sink_v: &'a MlxArray,
@@ -449,6 +456,9 @@ pub struct KvarnQmmState<'a> {
     pub tail_v: Option<&'a MlxArray>,
     pub n_tiles: i32,
     pub tail_len: i32,
+    /// V storage width (8 or 4) — the C core branches its V-side
+    /// gather_qmm parameters (bits, group_size, param shapes) on this.
+    pub v_bits: u8,
 }
 
 /// KV Cache for attention layers.
@@ -1566,26 +1576,12 @@ impl KVCache {
         // below would return None and C would SILENTLY fall through to the
         // fetch+core pair — legitimate-looking behavior masking an
         // unimplemented path. Loud until the C v4 dispatch lands (§5).
-        // K8V4: C's fused V dispatch is rung #3 (design §5). None is now
-        // the LEGITIMATE structural fall-through — the fetch+core pair
-        // reads through the v1 assemble reader, which serves v4 as of the
-        // v1 rung. (The pre-rung PANIC existed because None would then have
-        // masked an UNIMPLEMENTED v1 path as plausible fall-through; that
-        // rationale expired the commit v1 landed.)
-        if self.kvarn_v_bits != 8 {
-            // Interim echo-vs-ran witness (Violet QE note, rung-1 board):
-            // a v4 + msa_fetch=qmm boot ECHOES qmm construction while
-            // SERVING via assemble/gathered — this one-shot line makes the
-            // fall-through greppable until rung 3 moots it.
-            static V4_QMM_FALLTHROUGH: std::sync::Once = std::sync::Once::new();
-            V4_QMM_FALLTHROUGH.call_once(|| {
-                tracing::info!(
-                    "v4 qmm fall-through: serving via assemble/gathered (C's v4 dispatch \
-                     is §5 rung 3; first fall-through this process)"
-                );
-            });
-            return None;
-        }
+        // Width-blind since §5 rung 3: the state carries `v_bits` and the
+        // C core branches its V-side gather_qmm parameters on it. (The
+        // rung-1→2 interim here — None fall-through with a one-shot
+        // witness — died with the rung that made it real, like the
+        // block-fetch de-advertisement before it: scaffolds live exactly
+        // as long as the path underneath them is unreal.)
         let n_tiles = self
             .kvarn_k_s_col
             .as_ref()
@@ -1612,7 +1608,11 @@ impl KVCache {
             k_s_col: self.kvarn_k_s_col.as_deref()?,
             v_scale: self.kvarn_v_scale.as_deref()?,
             v_zp: self.kvarn_v_zp.as_deref()?,
-            v_s_row: self.kvarn_v_s_row.as_deref()?,
+            v_s_row: if self.kvarn_v_bits == 8 {
+                Some(self.kvarn_v_s_row.as_deref()?)
+            } else {
+                None // v4: the fold IS s_row's storage
+            },
             v_s_col: self.kvarn_v_s_col.as_deref()?,
             sink_k,
             sink_v,
@@ -1620,6 +1620,7 @@ impl KVCache {
             tail_v,
             n_tiles,
             tail_len,
+            v_bits: self.kvarn_v_bits,
         })
     }
 
@@ -10519,19 +10520,23 @@ mod tests {
         );
     }
 
-    /// C's fused dispatch is rung #3 — None is now the LEGITIMATE
-    /// structural fall-through (the fetch+core pair reads through the v1
-    /// assemble reader, which serves v4). The pre-rung panic's rationale —
-    /// None masking an UNIMPLEMENTED v1 path — expired when v1 landed.
+    /// Since §5 rung 3 the qmm state serves BOTH widths: the v4 state
+    /// carries the packed codes, the per-group FOLDED params, v_bits=4,
+    /// and v_s_row=None (the fold IS s_row's storage). Shapes pin the
+    /// storage contract the C core consumes.
     #[test]
-    fn k8v4_qmm_state_none_is_legitimate_fallthrough() {
+    fn k8v4_qmm_state_serves_v4_shape() {
         let (k, v) = kvarn_v4_test_input(434);
         let mut cache = kvarn_v4_cache();
         cache.update_only(k, v);
-        assert!(
-            cache.kvarn_qmm_state().is_none(),
-            "v4 qmm state must be None (fall through to fetch+core) until rung #3"
-        );
+        let st = cache.kvarn_qmm_state().expect("v4 cache with tiles is qmm-servable");
+        assert_eq!(st.v_bits, 4);
+        assert!(st.v_s_row.is_none(), "v4 state must not carry s_row — folded at write");
+        assert_eq!(ffi::array_shape(st.hist_v), vec![1, 2, 256, 16], "packed u32 codes D/8");
+        assert_eq!(ffi::array_dtype(st.hist_v), dtype::UINT32);
+        assert_eq!(ffi::array_shape(st.v_scale), vec![1, 2, 256, 4], "folded per-group D/32");
+        assert_eq!(ffi::array_shape(st.v_zp), vec![1, 2, 256, 4]);
+        assert_eq!(st.n_tiles, 2);
     }
 
     // ── §4.2 equivalence for K8V4 (PROPOSAL §4.2, the registered
