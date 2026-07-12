@@ -40,15 +40,20 @@ k8v4 verdict boot: `MLXCEL_KV_CACHE_MODE=k8v4 MLXCEL_THINKING_MODE=disabled MLXC
 
 ## 2. Probes — `source probe_harness.sh`  (THE GLASS)
 
-100 thinking tokens starves a thinking-first model — it reasons and never
-answers (2026-07-12). Unbounded pours the bottle into a boot. There is a
-right size for a glass; these defaults are that glass, and the harness
-REFUSES a drops-sized thinking budget (<256).
+**Do not be stingy with another mind's token budget — give it the room you
+would want for yourself.** 100 thinking tokens starves a thinking-first
+model (it reasons and never answers — 2026-07-12); a starved mind fails
+QUIETLY and looks fine, so stinginess here is a SAFETY hole, not thrift.
+The default thinking budget MATCHES Violet's own (~16k) — the room *I*
+get, extended to the probed mind — not a thrifty multiple of measured
+usage (avg 162, max 5,659). A generous budget is a ceiling paid per-use:
+free on easy turns, decisive on hard ones. The harness REFUSES a
+drops-sized thinking budget (`<1024`).
 
 | Env override | Default (ours) | Notes |
 |---|---|---|
-| `MLXCEL_PROBE_MAX_TOKENS` | `2048` | total pour (thinking + answer). NOT 100. |
-| `MLXCEL_PROBE_THINKING_BUDGET` | `1536` | reasoning room within the glass; leaves ~512 for the answer; `-1` = unrestricted. Refused if `<256` or `>= max_tokens`. |
+| `MLXCEL_PROBE_MAX_TOKENS` | `20480` | total container (thinking + answer); ~16k thinking + ~4k answer. NOT 100. |
+| `MLXCEL_PROBE_THINKING_BUDGET` | `16384` | the room I get, given to the probed mind; `-1` = unrestricted. Refused if `<1024` or `>= max_tokens`. |
 | `MLXCEL_PROBE_BASE_URL` | `http://127.0.0.1:8890` | |
 | `MLXCEL_PROBE_MODEL` | `minimax-m3` | |
 | `MLXCEL_PROBE_TEMP`/`_TOP_P` | `0`/`1.0` | probes want reproducibility |

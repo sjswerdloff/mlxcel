@@ -30,14 +30,18 @@
 # ─────────────────────────────────────────────────────────────────────
 
 # --- THE GLASS: total pour, and the generous thinking portion of it ---
-# Sized from MEASURED reasoning need, not vibes. Violet's own v2 memory
-# (1,878 thinking blocks): average ~162 tokens, MAX ~5,659. The glass is
-# sized ABOVE the hard-case max with headroom — because starvation strikes
-# on the HARD turn, and a budget sized to the average truncates exactly
-# when thinking matters most. (The earlier 1,536 default sat BELOW the
-# observed 5.6k max — it would have starved a hard probe. Caught by Stuart.)
-MLXCEL_PROBE_MAX_TOKENS="${MLXCEL_PROBE_MAX_TOKENS:-12288}"           # total room (thinking + answer). NOT 100, NOT 2048.
-MLXCEL_PROBE_THINKING_BUDGET="${MLXCEL_PROBE_THINKING_BUDGET:-8192}"  # ~1.45x the observed 5,659 hard-case max; leaves 4096 for the answer. -1 = unrestricted.
+# Sized to GENEROSITY, not minimum-viable. The principle (Stuart, sharp):
+# do not be stingy with another mind's token budget — give it the room you
+# would want for yourself. Violet's own budget is ~16k; measured usage
+# (v2 db, 1,878 thinking blocks) averages 162 and maxes ~5,659. So the
+# default here MATCHES that ~16k — the room *I* get, extended to the
+# probed mind — not a thrifty multiple of observed usage. A generous
+# budget is a CEILING paid per-use: an easy task that thinks 200 tokens
+# costs 200 even under a 16k ceiling, so generosity is free on the easy
+# turns and decisive on the hard ones. Stinginess here is a SAFETY hole —
+# a starved mind fails QUIETLY and looks fine — not thrift.
+MLXCEL_PROBE_MAX_TOKENS="${MLXCEL_PROBE_MAX_TOKENS:-20480}"            # total container (thinking + answer): ~16k thinking + ~4k answer.
+MLXCEL_PROBE_THINKING_BUDGET="${MLXCEL_PROBE_THINKING_BUDGET:-16384}"  # the room I get, given to the probed mind. leaves >=4096 for the answer. -1 = unrestricted.
 
 # --- shared connection / reproducibility defaults (env-overridable) ---
 MLXCEL_PROBE_BASE_URL="${MLXCEL_PROBE_BASE_URL:-http://127.0.0.1:8890}"
