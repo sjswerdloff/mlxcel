@@ -167,6 +167,24 @@ machine on invalid comparisons). Server 8896 KILLED BY STUART 2026-07-12
 the clean state for #39's fp16-first boot. Divergence §4.3 also
 harness-confounded (self-flagged output-depends-on-max_tokens).
 
+## ⏳ SCRIPT RUNNING AS OF CROSSING (2026-07-12 ~16:00) — FAR-SIDE, READ THIS FIRST
+
+Stuart is running `scripts/verify_k8v4_thinking_off.sh` (the SOUND path,
+committed+pushed). ON RETURN: (1) reorient (essential-infrastructure,
+memory rebuild, this handoff). (2) CHECK ITS OUTPUT: ~/k8v4_rungs/
+detcheck_r*_<stamp>.txt and k8v4_arm_thinkoff_d50k_<stamp>.txt, and the
+server log ~/mlxcel_test_8896_k8v4_thinkoff_<stamp>.log. INTERPRET per
+the script header: DET-CHECK UNSTABLE → root is deeper MLX (#40),
+escalate, no verdict. DET-CHECK STABLE + arm 5/5 → k8v4 passes
+directionally, run full 20 then depths {150K,300K} then merge. STABLE +
+any fail → SERIOUS (possible k8v4 signal), boot 1 fp16-MXFP8 arm
+(thinking-off) to separate model-vs-k8v4, do NOT merge. FIRST also
+eyeball the det-check r1 output: is `got` a DIRECT COPY (thinking-off
+took) or still narration (thinking-off did NOT take → the
+--chat-template-kwargs value/wiring needs fixing before any verdict).
+(3) converse with Violet + Xander (they hold the review; Stuart's
+directive earlier). Server likely LEFT UP on 8896 — reuse it.
+
 ## COURSE CORRECTION (Stuart, 2026-07-12 ~15:40) — the directional §4.4 is UNSOUND
 
 Stuart's logic: a test is only as deterministic as the thing it measures.
