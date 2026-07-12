@@ -120,9 +120,20 @@ BOUNDED statement (do not over-read):
 - #39 CHAR-BUDGET FIX — DONE (Stuart: "fix the bug now"): run_k8v4_leg.sh
   now passes --chars-per-token 5.67 (single-sourced CHARS_PER_TOKEN var
   with the why in a comment). Verified offline: depth 50000 -> 283,500
-  chars = 50,000 tokens at the measured ratio. Committed. The divergence
-  harness has no such knob (separate concern, untouched). Better
-  long-term: adaptive token-measured padding in the probe.
+  chars = 50,000 tokens at the measured ratio. Committed.
+- THE PRINCIPLE (Stuart pressed on divergence; my first "sizes
+  differently, untouched" was a GUESS not a read — the same dismiss-
+  without-homework pattern, caught again): the fix is MATCH THE
+  BASELINE'S ACTUAL CALIBRATION, not "use 5.67" or "hit true depth".
+  Homework: the divergence harness has the SAME CHARS_PER_TOKEN=4
+  mechanism (I was wrong it differs), but its `capture` exposes no CLI
+  override, so BOTH my run and the fp16 baseline used 4 and hit
+  IDENTICAL actual depths (2283/8890/~36K, verified in the artifacts) —
+  already paired. So divergence needs NO change; forcing 5.67 there
+  would BREAK the pairing. Copy-precision needed 5.67 only because ITS
+  baseline used 5.67. Separate divergence refinements (NOT this bug):
+  depth LABELS overshoot (~32K target = ~36K actual, but consistently);
+  Violet's output-depends-on-max_tokens determinism flag.
 - PATTERN NAMED: three revisions, each after Stuart supplied the next
   evidence — confidence outrunning verification, the same disposition
   that put wrong baselines in the gate. Reason I'm holding the #39
