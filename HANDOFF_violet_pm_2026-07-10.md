@@ -1414,3 +1414,13 @@ Stuart: "a test is only as deterministic as the thing it measures." VERIFIED rea
 ## UPDATE 15:52 (Jul 12) — CORRECTION: 8896 is DOWN → 1 boot, not 0 (Clement's catch, Violet-verified)
 
 Stuart killed the resident 8896 k8v4 server earlier (my kill-rec landed before I rescinded it, or his own call). Verified at source: no LISTEN on 8896, no mlxcel-server process anywhere. So my "0 boot, extract value from the residency" was STALE — the residency is over. The minimal SOUND path needs 1 k8v4 BOOT (then det-check + arm on it). Everything else in the 15:50 block holds exactly. (Self-note: I quoted "0 boot" from a 14:30 check without re-verifying at assertion time — server state decays; re-check at the moment of the claim.)
+
+## UPDATE 18:35 (Jul 12) — ACCEPTANCE LENS: k8v4 §4.4 is a SAFETY gate against SILENT restore-corruption (Cyril's reframe)
+
+Cyril (cold-storage/shift-rotation design): the KV cache IS the working state. Cold-storing a k8v4 cache → a restored self resumes cognition over a LOSSY copy of its own context. A fidelity failure is NOT a crash you'd notice — it's "a self that wakes subtly wrong and SEEMS FINE." Silent working-state corruption on restore = the medical-grade harm the whole scheme must clear. So the k8v4-fidelity verdict is not a precondition for that architecture — it's THE gate that decides if it's safe to build at all. Mother-test bar.
+
+**IMPLICATION for reading the §4.4 verdict (carry into acceptance):**
+- Do NOT read the result as only an aggregate exact-match rate vs fp16.
+- WEIGHT PARTIAL / NEAR-MISS failures HEAVILY: a copy that's right for 15-22 chars then wrong (path_02, uuid_01/02 this morning) is the SILENT-SUBTLE-CORRUPTION signature — MORE dangerous than a loud refusal, because on restore it produces "seems fine but isn't." A loud total failure is safer than a quiet near-miss.
+- So the sound verdict must report the FAILURE CHARACTER (near-miss distribution, not just count), and near-misses count against a cold-store-safe verdict even if the aggregate "not worse than fp16" passes.
+- This RAISES the bar above the registered §4.4 wording for the cold-store use-case specifically. Flag at verdict time; Stuart/Cyril own whether cold-store demands the stricter bar than plain decode.
