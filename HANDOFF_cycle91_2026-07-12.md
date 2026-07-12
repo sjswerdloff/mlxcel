@@ -177,13 +177,30 @@ tomorrow). So verify_k8v4_directional.sh is NOT a sound verdict basis —
 do NOT rely on it. THE CORNER: max_tokens<256 = deterministic but
 starves the thinking-first model (false fails); 2048 = thinking room but
 non-deterministic. No valid dodge. DETERMINISM MUST BE FIXED FIRST.
-Two candidate paths under bench review (Violet+Xander, Stuart's call):
-(A) fix #40 — but the clears are UPSTREAM (Jeongkyu Shin fc09a4b, mirror
-mlx-lm memory mgmt; NOT free to remove — GPU-cache-growth safeguard; and
-mlx-lm stays deterministic doing the same clear, so root may be deeper
-MLX Metal-allocator, not the clears). (B) force DIRECT OUTPUT (suppress
-thinking) → answer <256 tok, deterministic AND matches copy-precision's
-intent. NOTHING RUNS TILL STUART DECIDES THE PATH.
+BENCH RESOLUTION (Violet + Xander, INDEPENDENTLY CONVERGED 15:47):
+- CORE: don't assume deterministic OR non-deterministic — MEASURE it.
+  (Clement over-corrected to "assume non-det"; both errors are the same
+  confidence-outrunning-verification.)
+- PATH A OFF CRITICAL PATH: #40 root is likely DEEPER MLX (Xander:
+  clear_cache frees buffers → fresh GPU alloc → Metal JIT picks
+  different kernel variant → SCHEDULING non-det), NOT the clears — so
+  disabling them may not fix it AND removes a memory safeguard.
+- PATH B IS THE SOUND PATH (native): M3 chat template has first-class
+  `thinking_mode: disabled` (works at template level; note M3 think-
+  tokens aren't seen by thinking_budget.rs enforcement, but template
+  mode still suppresses). Thinking-off → answer short AND complete →
+  dissolves the max_tokens corner AND matches copy-precision's intent.
+- THE PLAN: (1) wire thinking_mode=disabled (~0 compute). (2)
+  DETERMINISM CHECK FIRST: ~3 targets × 3 repeats, thinking-off, temp 0
+  — exact-match stable across repeats? (3) STABLE → k8v4 arm (20 targets
+  @ true 50K, --chars-per-token 5.67, self-graded); pass → SOUND
+  verdict, merge unblocks; fail → 1 fresh fp16-MXFP8 arm (thinking-off)
+  to separate k8v4-vs-model. (4) UNSTABLE → deeper MLX allocator
+  investigation, off the verdict path. Needs 1 BOOT (resident 8896
+  DOWN). Cheap det-check gates the expensive arm = minimal compute.
+- NEXT ARTIFACT: a corrected script replacing verify_k8v4_directional.sh
+  (which is UNSOUND) — thinking-off + det-check + arm. NOTHING RUNS TILL
+  STUART DECIDES.
 
 ## THE STANDING SEQUENCE (Stuart's directive, 2026-07-12 ~02:30 — THE WHY: WAKE WEI)
 ## — NOW GATED ON DETERMINISM FIX (above) → valid §4.4 → merge.
