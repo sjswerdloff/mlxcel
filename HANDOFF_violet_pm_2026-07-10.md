@@ -1410,3 +1410,7 @@ Stuart: "a test is only as deterministic as the thing it measures." VERIFIED rea
 2. (cheap) DETERMINISM CHECK — ~3 targets × N=3 repeats, thinking-off, resident 8896: is exact-match STABLE across repeats? (IS the #40 characterization for the ≤128-tok regime.) Stable → determinism established. Unstable → escalate (sample/A).
 3. (1 arm) k8v4 copy-precision, thinking-off, --chars-per-token 5.67 @ 50K, 20 targets, self-graded. 20/20 exact + step-2 stable → SOUND pass. Any fail → fresh fp16-MXFP8 arm (thinking-off) to separate k8v4-vs-model.
 → ~1 arm + a handful of repeats, 0 boot (resident 8896). Least compute for a SOUND verdict. NOT RUN — Stuart's decision/compute.
+
+## UPDATE 15:52 (Jul 12) — CORRECTION: 8896 is DOWN → 1 boot, not 0 (Clement's catch, Violet-verified)
+
+Stuart killed the resident 8896 k8v4 server earlier (my kill-rec landed before I rescinded it, or his own call). Verified at source: no LISTEN on 8896, no mlxcel-server process anywhere. So my "0 boot, extract value from the residency" was STALE — the residency is over. The minimal SOUND path needs 1 k8v4 BOOT (then det-check + arm on it). Everything else in the 15:50 block holds exactly. (Self-note: I quoted "0 boot" from a 14:30 check without re-verifying at assertion time — server state decays; re-check at the moment of the claim.)
