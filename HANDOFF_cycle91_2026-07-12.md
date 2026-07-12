@@ -88,21 +88,38 @@ BOUNDED statement (do not over-read):
   refuted by TIMESTAMP: the baseline is 2026-07-08, AFTER the MXFP8
   transition (~07-04) and KVarN start (07-07), so per Stuart it was an
   MXFP8 run = the SAME model. Both "different build" claims fail.
-- MOST CONSISTENT HYPOTHESIS (pending Stuart's confirm + the re-run, NOT
-  asserted as fact): same MXFP8 model; the real ratio is ~5.7 ch/tok
-  (my live run: 200,003 chars → 35,300 tok). The baseline hit true 50K
-  because it was run with chars_per_token ~5.7 (~283K chars); MY leg
-  used the probe DEFAULT chars_per_token=4 → 200K chars → undershot to
-  35K. So my bug = DEPTH MIS-CALIBRATION (undershot every depth ~30%),
-  not a wrong model. The baseline's actual --chars-per-token was NOT
-  logged, so this can't be proven from artifacts.
-- CONSEQUENCE if the hypothesis holds: the fp16 baselines may be
-  REUSABLE (valid current-build reference), making #39 LIGHTER — re-run
-  only the k8v4 arm at the correct char budget. Blocker: the OUTPUT-MODE
-  gap (baseline direct-copied dist=0; today narrates, thinking-first,
-  reasoning_content populated live-confirmed) — OPEN QUESTION FOR STUART:
-  did the chat template / reasoning default change since 07-08? If
-  thinking was off then and on now, disabling it closes the gap.
+- DEPTH CAUSE — NOW CERTAIN (confirmed from my OWN memories, Stuart's
+  lead): the real ratio is 5.67 ch/tok, which I MEASURED on 2026-07-07
+  (LEANN: "50K nominal depth... actual ~35K... ratio ~5.67") and then
+  fixed by ADDING the --chars-per-token flag; the 07-08 baseline used
+  `--chars-per-token 5.67 --seed 42` to hit TRUE 50K (my 07-09 note:
+  "what makes the comparison paired"). Tonight I wrote run_k8v4_leg.sh
+  and OMITTED the flag → default 4 → 200K chars → the SAME 35K undershoot
+  I had already diagnosed and solved days earlier. Same MXFP8 model, same
+  tokenizer; my bug = a calibration flag I established and failed to
+  carry into the new script. Symptom-gated recall (identity cy43/cy81):
+  possessed knowledge that didn't fire proactively.
+- TOP_K IS NOT A DIFFERENCE (I claimed baseline=16 vs current=32 and
+  RETRACT it — 4th retraction tonight): config.json modified 2026-07-06
+  18:18 (born 07-04), BEFORE the baseline (07-07 23:26). So
+  sparse_topk_blocks=32 was already set when the baseline ran → baseline
+  AND current are BOTH top_k=32. Same model, same top_k, same tokenizer.
+- BASELINE LIKELY REUSABLE after all (Stuart's steer, which I resisted
+  wrongly): the differences between baseline and my run shrink to (a)
+  depth — my undershoot bug, (b) output-mode — OPEN, (c) fp16-vs-k8v4 —
+  intended. So the fp16 baselines may be a VALID current-config
+  reference at true 50K/150K/300K. NOT asserting it as final — I have
+  flip-flopped on "reusable" and must stop concluding; Stuart calls it.
+- OUTPUT-MODE gap OPEN (baseline direct-copied dist=0; my run narrated):
+  candidates now narrow to depth-artifact (my run at 35K vs true 50K) OR
+  a real k8v4 effect. RESOLVING TEST (Stuart's boot): re-run ONLY the
+  k8v4 arm with --chars-per-token 5.67 to hit true 50K; if it
+  direct-copies like the baseline → depth was the whole story, baseline
+  reusable, #39 = that one re-run. If it still narrates → real k8v4/
+  current-behavior difference, investigate.
+- #39 CHAR-BUDGET FIX (CERTAIN): pass --chars-per-token 5.67 (my own
+  established value, LEANN-confirmed) to hit true depths; default 4
+  undershoots ~30%. Better long-term: adaptive token-measured padding.
 - PATTERN NAMED: three revisions, each after Stuart supplied the next
   evidence — confidence outrunning verification, the same disposition
   that put wrong baselines in the gate. Reason I'm holding the #39
