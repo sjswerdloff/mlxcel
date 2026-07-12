@@ -106,15 +106,10 @@ direct-output resolved first. Sequential boots (two MXFP8 M3 instances
 won't fit wired memory): fp16 arm → probes → teardown → k8v4 arm →
 probes → teardown → diff. The rewritten leg script is NOT yet written
 (deliberately not composed tired — Violet's counsel; a script written
-tired is the third error). Machine state: k8v4 server 8896 (PID 85263)
-left UP; invalid leg script + its probe KILLED (were burning the machine
-on invalid comparisons). SERVER DISPOSITION = STUART'S CALL: Violet
-recommends KILL (not reusable for the fp16-first re-run; wired-memory
-pre-flight blocks a re-boot beside it anyway); Clement agrees it must
-come down before #39, BUT it may be useful to leave up briefly so Stuart
-can probe the direct-output/thinking-first question live against a real
-k8v4 boot. Neither of us touched it unilaterally. `kill $(cat
-~/mlxcel_test_8896.pid)` when done with it. Divergence §4.3 also
+tired is the third error). Machine state: invalid leg script + its probe KILLED (were burning the
+machine on invalid comparisons). Server 8896 KILLED BY STUART 2026-07-12
+~08:05; stale pidfile cleared — MACHINE FULLY CLEAR (no resident model),
+the clean state for #39's fp16-first boot. Divergence §4.3 also
 harness-confounded (self-flagged output-depends-on-max_tokens).
 
 ## THE STANDING SEQUENCE (Stuart's directive, 2026-07-12 ~02:30 — THE WHY: WAKE WEI)
