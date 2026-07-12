@@ -1366,3 +1366,26 @@ re-run needs Stuart's boot.
   and see this, Stuart already has the headline; coordinate, don't repeat.
 - Nothing else moved: server 8896 up, teardown watcher armed, #39 the
   single blocker, all gated on Stuart's boots. Board is Violet's.
+
+## UPDATE 14:45 (Jul 12, Sun) — BENCH REVIEW (Stuart-directed): independent verification, minimal-compute path
+
+Clement asked to be read as unreliable narrator; verified at source, not on account. Xander coordinated (converged on non-determinism; I add provenance + self-validation).
+
+**(a) Clement's diagnosis — SUBSTANTIALLY RIGHT, and it corrects MY morning over-read:**
+- Root cause CONFIRMED arithmetically: probe default CHARS_PER_TOKEN=4 (probe:102); leg omitted --chars-per-token 5.67 → 50000×4/5.67 = **35,273 tokens = the observed ~35.3K to the integer.** Depth undershoot, not different weights.
+- MY MORNING ERROR, owned: I flagged "model-id mismatch (nvfp4 vs test)" as a confound. WRONG — probe `meta.model` is a cosmetic CLI-arg label (probe:574, default "minimax-m3-nvfp4"), routed to whatever the server serves; NOT evidence of different weights. Over-read of a string. The bench caught the leg; Stuart+the source caught my mis-attribution of WHY.
+- REMAINING GAP neither Clement nor Xander flagged: real NVFP4 M3 builds DO exist on disk (Mapika/sjswerdloff NVFP4-mlx). So which weights 8896 served at baseline-gen (07-08) is NOT retroactively provable from here. **Resolved by reframe, not litigation** (below).
+
+**(b) Non-determinism — REAL, bigger than k8v4, NOT k8v4's fault.** Xander found the mechanism: clear_memory_cache() every 256 DECODE tokens (scheduler.rs:4816, "matches mlx-lm"), fires at different points for gen-512 vs gen-4096 → MLX Metal allocator non-determinism. On BOTH fp16 and k8v4 → rules OUT KV quant. Likely compounded by MoE(64e) routing. New task #40.
+
+**(c) §4.3 divergence — NOT trustworthy now.** A divergence-INDEX method assumes deterministic greedy; (b) breaks that even same-config. Divergent text is in the reasoning preamble (thinking-first) — double-compromised. DEFER §4.3 until (b) is characterized.
+
+**(d) MINIMAL-COMPUTE PATH (Stuart's priority) — the two insights that shrink it:**
+1. **Copy-precision DODGES (b)**: max_tokens=100 < the 256 clear cadence → copy-precision generations never trigger the non-determinism → §4.4 is DETERMINISTIC and trustworthy right now.
+2. **Copy-precision is SELF-VALIDATING**: it grades exact-Levenshtein vs the KNOWN TARGET string (probe), not vs the baseline. So a k8v4 PASS is self-proving and provenance-independent.
+→ **THE PATH**: run ONLY the k8v4 arm on the RESIDENT 8896 server (0 boot — finally extracts value from the all-night residency), --chars-per-token 5.67, --depth 50000, 20 targets (or --limit 5 across classes first, ~30min, for a directional read).
+   - 20/20 exact vs targets → k8v4 PASSES copy-precision, self-validated, merge unblocks. ONE arm, no boot, no baseline dependency.
+   - ANY fail → boot ONE fresh fp16-MXFP8 arm to separate k8v4-vs-model (2nd arm ONLY in the fail branch). Old baseline usable as a first hint, not the gate.
+   - §4.3 stays deferred; #40 (non-determinism) characterized cheaply & separately (2 identical temp-0 requests, or clear-disabled repro).
+
+k8v4 STATUS: still UNKNOWN — but the path to KNOWN is now 1 resident-server arm, deterministic, self-validating. Server 8896 kill-rec RESCINDED: keep it UP — it's the zero-boot k8v4 arm.
