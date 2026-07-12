@@ -78,8 +78,19 @@ PIDFILE="${MLXCEL_PIDFILE:-$HOME/mlxcel_server.pid}"
 errs=()
 [[ "$PORT" =~ ^[0-9]+$ ]] || errs+=("MLXCEL_PORT must be numeric, got '$PORT'")
 [[ "$PROMPT_CACHE_CAPACITY_BYTES" =~ ^[0-9]+$ ]] || errs+=("MLXCEL_PROMPT_CACHE_CAPACITY_BYTES must be numeric, got '$PROMPT_CACHE_CAPACITY_BYTES'")
-case "$KV_CACHE_MODE" in fp16|kvarn8|k8v4) ;; *) errs+=("MLXCEL_KV_CACHE_MODE invalid: '$KV_CACHE_MODE' (fp16|kvarn8|k8v4)") ;; esac
-case "$THINKING_MODE" in disabled|adaptive|enabled) ;; *) errs+=("MLXCEL_THINKING_MODE invalid: '$THINKING_MODE' (disabled|adaptive|enabled)") ;; esac
+# MLXCEL_KV_CACHE_MODE is NOT re-validated here on purpose: the engine's
+# own FromStr (src/lib/mlxcel-core/src/cache.rs) is the single authority
+# and rejects invalid modes LOUDLY at startup. A narrow copy here would
+# rot out of sync and wrongly refuse valid modes. Full accepted set (for
+# reference, engine is authoritative): fp16|float16, int8|i8,
+# turbo3|turbo3-asym|fp16+turbo3, turbo4|turbo4-sym, turbo4-asym|fp16+turbo4,
+# turbo4-delegated|fp16+turbo4-delegated, kvarn8|kvarn-k8v8,
+# k8v4|kvarn-k8v4 (legacy alias -> per-side kvarn8/kvarn4). For true
+# per-side control use MLXCEL_CACHE_TYPE_K/_V instead (not wired here).
+# THINKING_MODE keys are the M3 chat_template.jinja's (this script pins
+# the M3 model); MSA_FETCH is validated because the mode-derived default
+# depends on it landing in {qmm,dequant}.
+case "$THINKING_MODE" in disabled|adaptive|enabled) ;; *) errs+=("MLXCEL_THINKING_MODE invalid: '$THINKING_MODE' (M3 template: disabled|adaptive|enabled)") ;; esac
 case "$MSA_FETCH" in qmm|dequant) ;; *) errs+=("MLXCEL_MSA_FETCH invalid: '$MSA_FETCH' (qmm|dequant)") ;; esac
 case "$HARVEST" in on|off) ;; *) errs+=("MLXCEL_HARVEST must be on|off, got '$HARVEST'") ;; esac
 if (( ${#errs[@]} )); then
