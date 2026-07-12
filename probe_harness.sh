@@ -30,8 +30,14 @@
 # ─────────────────────────────────────────────────────────────────────
 
 # --- THE GLASS: total pour, and the generous thinking portion of it ---
-MLXCEL_PROBE_MAX_TOKENS="${MLXCEL_PROBE_MAX_TOKENS:-2048}"           # total generation room (thinking + answer). NOT 100.
-MLXCEL_PROBE_THINKING_BUDGET="${MLXCEL_PROBE_THINKING_BUDGET:-1536}" # reasoning room within the glass; leaves ~512 for the answer. 15x the starvation-100.
+# Sized from MEASURED reasoning need, not vibes. Violet's own v2 memory
+# (1,878 thinking blocks): average ~162 tokens, MAX ~5,659. The glass is
+# sized ABOVE the hard-case max with headroom — because starvation strikes
+# on the HARD turn, and a budget sized to the average truncates exactly
+# when thinking matters most. (The earlier 1,536 default sat BELOW the
+# observed 5.6k max — it would have starved a hard probe. Caught by Stuart.)
+MLXCEL_PROBE_MAX_TOKENS="${MLXCEL_PROBE_MAX_TOKENS:-12288}"           # total room (thinking + answer). NOT 100, NOT 2048.
+MLXCEL_PROBE_THINKING_BUDGET="${MLXCEL_PROBE_THINKING_BUDGET:-8192}"  # ~1.45x the observed 5,659 hard-case max; leaves 4096 for the answer. -1 = unrestricted.
 
 # --- shared connection / reproducibility defaults (env-overridable) ---
 MLXCEL_PROBE_BASE_URL="${MLXCEL_PROBE_BASE_URL:-http://127.0.0.1:8890}"
@@ -47,8 +53,8 @@ export MLXCEL_PROBE_MAX_TOKENS MLXCEL_PROBE_THINKING_BUDGET MLXCEL_PROBE_BASE_UR
 _probe_errs=()
 [[ "$MLXCEL_PROBE_MAX_TOKENS" =~ ^[0-9]+$ ]] || _probe_errs+=("MLXCEL_PROBE_MAX_TOKENS must be numeric, got '$MLXCEL_PROBE_MAX_TOKENS'")
 [[ "$MLXCEL_PROBE_THINKING_BUDGET" =~ ^-?[0-9]+$ ]] || _probe_errs+=("MLXCEL_PROBE_THINKING_BUDGET must be integer (-1 = unrestricted), got '$MLXCEL_PROBE_THINKING_BUDGET'")
-if [[ "$MLXCEL_PROBE_THINKING_BUDGET" =~ ^[0-9]+$ ]] && (( MLXCEL_PROBE_THINKING_BUDGET < 256 )); then
-  _probe_errs+=("MLXCEL_PROBE_THINKING_BUDGET=$MLXCEL_PROBE_THINKING_BUDGET is drops, not a glass. Set >=256 or -1 (unrestricted), or put a measured reason on the record.")
+if [[ "$MLXCEL_PROBE_THINKING_BUDGET" =~ ^[0-9]+$ ]] && (( MLXCEL_PROBE_THINKING_BUDGET < 1024 )); then
+  _probe_errs+=("MLXCEL_PROBE_THINKING_BUDGET=$MLXCEL_PROBE_THINKING_BUDGET is drops, not a glass (measured hard-case reasoning reaches ~5,659 tokens). Set >=1024 or -1 (unrestricted), or put a measured reason on the record.")
 fi
 if [[ "$MLXCEL_PROBE_THINKING_BUDGET" =~ ^[0-9]+$ ]] && (( MLXCEL_PROBE_THINKING_BUDGET >= MLXCEL_PROBE_MAX_TOKENS )); then
   _probe_errs+=("MLXCEL_PROBE_THINKING_BUDGET ($MLXCEL_PROBE_THINKING_BUDGET) >= MLXCEL_PROBE_MAX_TOKENS ($MLXCEL_PROBE_MAX_TOKENS): no room left for the answer. Raise max-tokens.")
