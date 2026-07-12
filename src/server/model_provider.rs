@@ -245,6 +245,7 @@ impl ModelProvider {
                 config.reasoning_budget,
                 prompt_cache_store,
                 config.kv_cache_mode,
+                config.kvarn_v_bits,
                 config.batch_kv_quant,
                 // forward the --max-kv-size cap to the scheduler.
                 config.max_kv_size,
@@ -404,6 +405,7 @@ impl ModelProvider {
             reasoning_budget,
             None,
             mlxcel_core::cache::KVCacheMode::Fp16,
+            8, // kvarn_v_bits: inert beside the Fp16 mode above
             mlxcel_core::cache::BatchKvQuantConfig::default(),
             None,  // max_kv_size: unbounded
             None,  // kv_cache_budget: unbounded
@@ -440,6 +442,7 @@ impl ModelProvider {
         reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
         prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
         kv_cache_mode: mlxcel_core::cache::KVCacheMode,
+        kvarn_v_bits: u8,
         batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
         // maximum KV cache size for plain (non-sliding) caches.
         // `None` preserves the legacy unbounded behaviour.
@@ -474,6 +477,7 @@ impl ModelProvider {
             reasoning_budget,
             prompt_cache_store,
             kv_cache_mode,
+            kvarn_v_bits,
             batch_kv_quant,
             max_kv_size,
             kv_cache_budget,
@@ -517,6 +521,7 @@ impl ModelProvider {
         reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
         prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
         kv_cache_mode: mlxcel_core::cache::KVCacheMode,
+        kvarn_v_bits: u8,
         batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
         max_kv_size: Option<usize>,
         kv_cache_budget: Option<crate::memory_estimate::PagedBudgetDirective>,
@@ -559,6 +564,7 @@ impl ModelProvider {
             reasoning_budget,
             prompt_cache: prompt_cache_store.clone(),
             kv_cache_mode,
+            kvarn_v_bits,
             batch_kv_quant,
             // cap plain KVCache growth when configured.
             max_kv_size,
@@ -653,6 +659,7 @@ impl ModelProvider {
             reasoning_budget: None,
             prompt_cache: None,
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
+            kvarn_v_bits: 8, // inert width beside the Fp16 mode above
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
             max_kv_size: None,              // unbounded in minimal test path
             kv_cache_budget: None,          // unbounded in minimal test path

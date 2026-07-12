@@ -70,12 +70,16 @@ fn run_serve_memory_preflight(args: &crate::ServeArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Memory-estimate preflight: only the int8 flag is consumed, so the
+    // resolved mode suffices (k8v4 vs k8v8 width does not change this
+    // estimator's granularity; real construction validates the width).
     let kv_cache_mode = resolve_kv_cache_mode(
         args.turbo.cache_type_k.as_deref(),
         args.turbo.cache_type_v.as_deref(),
         args.turbo.kv_cache_mode.as_deref(),
     )
-    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    .map_err(|e| anyhow::anyhow!("{}", e))?
+    .mode;
     let kv_int8 = matches!(kv_cache_mode, KVCacheMode::Int8);
 
     let ctx_len = serve_preflight_ctx_len(args);

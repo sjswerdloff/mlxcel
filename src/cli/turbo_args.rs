@@ -65,6 +65,12 @@ pub struct TurboKvCacheArgs {
     ///                      tail + packed turbo cold body. Targets >= 97% of
     ///                      FP16 decode speed at 4K and >= 95% at 16K on
     ///                      M5 Max.
+    ///   kvarn8             KVarN 8-bit tiles (Hadamard + Sinkhorn + RTN8;
+    ///                      power-of-2 head_dim only). Pair with
+    ///                      --cache-type-v kvarn8 (k8v8) or kvarn4 (k8v4).
+    ///                      kvarn4 on the K side is rejected at startup:
+    ///                      4-bit K corrupts MSA block selection (see
+    ///                      RESULTS_kvarn4_realtile_2026-07-11).
     ///
     /// When only one of --cache-type-k / --cache-type-v is specified, the
     /// other side defaults to fp16. Takes precedence over --kv-cache-mode
@@ -82,9 +88,14 @@ pub struct TurboKvCacheArgs {
 
     /// V-side KV cache quantization type.
     ///
-    /// Accepts the same value set as --cache-type-k. When only one of
-    /// --cache-type-k / --cache-type-v is specified, the other side defaults
-    /// to fp16. Takes precedence over --kv-cache-mode when both are supplied.
+    /// Accepts the same value set as --cache-type-k, plus:
+    ///   kvarn4             KVarN 4-bit V tiles (group size fixed at 32, not
+    ///                      user-tunable). Requires --cache-type-k kvarn8;
+    ///                      the pair resolves to k8v4.
+    ///
+    /// When only one of --cache-type-k / --cache-type-v is specified, the
+    /// other side defaults to fp16. Takes precedence over --kv-cache-mode
+    /// when both are supplied.
     ///
     /// Also read from LLAMA_ARG_CACHE_TYPE_V.
     #[arg(
@@ -98,9 +109,10 @@ pub struct TurboKvCacheArgs {
     ///
     /// Sets both K and V to the same mode. Accepted values: fp16 (default),
     /// int8, kvarn8 (alias kvarn-k8v8 — Hadamard+Sinkhorn+8-bit RTN tiles,
-    /// power-of-2 head_dim only), fp16+turbo4 (alias turbo4-asym),
-    /// fp16+turbo3 (alias turbo3-asym / turbo3), turbo4 (alias turbo4-sym),
-    /// turbo4-delegated.
+    /// power-of-2 head_dim only), k8v4 (alias kvarn-k8v4 — kvarn8 K + 4-bit
+    /// V tiles, equivalent to --cache-type-k kvarn8 --cache-type-v kvarn4),
+    /// fp16+turbo4 (alias turbo4-asym), fp16+turbo3 (alias turbo3-asym /
+    /// turbo3), turbo4 (alias turbo4-sym), turbo4-delegated.
     ///
     /// When --cache-type-k or --cache-type-v are also supplied, the split
     /// flags win and this flag is ignored (with a warning).
@@ -185,23 +197,107 @@ impl TurboKvCacheArgs {
 // (Comment kept in non-doc form for code-archeology only; the user-facing
 // help text intentionally omits closed-repo issue numbers.)
 
-/// Supported K/V combinations and their corresponding `KVCacheMode`.
+/// Resolved KV-cache configuration from the CLI surface.
 ///
-/// | K      | V                    | Mode              |
-/// |--------|----------------------|-------------------|
-/// | fp16   | fp16                 | `Fp16`            |
-/// | int8   | int8                 | `Int8`            |
-/// | fp16   | turbo4 / turbo4-asym | `Turbo4Asym`      |
-/// | turbo4 | turbo4               | `Turbo4`          |
-/// | fp16   | turbo4-delegated     | `Turbo4Delegated` |
-/// | fp16   | turbo3 / turbo3-asym | `Turbo3Asym`      |
+/// Carries the combined [`KVCacheMode`] plus the KVarN8 V-side width:
+/// the k8v8/k8v4 split lives on `KVCache::kvarn_v_bits`, deliberately
+/// NOT a `KVCacheMode` variant — a new variant would silently exit
+/// every `matches!(mode, KVarN8)` gate in the cache layer (K8V4 design
+/// §3.1; the surgery commit's audit table enumerates those gates).
+/// `kvarn_v_bits` is always 8 for non-kvarn modes (inert — no non-kvarn
+/// path consults it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedKvCacheConfig {
+    pub mode: KVCacheMode,
+    pub kvarn_v_bits: u8,
+}
+
+impl ResolvedKvCacheConfig {
+    fn mode_only(mode: KVCacheMode) -> Self {
+        Self {
+            mode,
+            kvarn_v_bits: 8,
+        }
+    }
+}
+
+/// kvarn spellings accepted on the per-side flags. `kvarn4` carries no
+/// alias and no group-size knob: gs is fixed at 32 by the screen
+/// verdict — a knob nobody validated is a knob nobody gets (design
+/// §3.4).
+fn kvarn_side_value(s: &str) -> Option<&'static str> {
+    match s {
+        "kvarn8" | "kvarn-k8v8" => Some("kvarn8"),
+        "kvarn4" => Some("kvarn4"),
+        _ => None,
+    }
+}
+
+/// The kvarn combination matrix (design §3.4). Exactly two pairs
+/// construct; everything else is rejected at startup with a registered,
+/// citable reason.
+fn resolve_kvarn_pair(
+    k_str: &str,
+    v_str: &str,
+    k_kvarn: Option<&'static str>,
+    v_kvarn: Option<&'static str>,
+) -> Result<ResolvedKvCacheConfig, String> {
+    match (k_kvarn, v_kvarn) {
+        // K-side kvarn4 is dead with prejudice: real-tile evaluation
+        // measured 17–21% top-32 MSA selection flips from 4-bit K on
+        // the index path. The operator hitting this rejection deserves
+        // the record, not a shrug — the reason cites the registered
+        // verdict by name.
+        (Some("kvarn4"), _) => Err(
+            "--cache-type-k kvarn4 is rejected: 4-bit K corrupts MSA block \
+             selection (17–21% top-32 flips on real tiles; see \
+             RESULTS_kvarn4_realtile_2026-07-11). K stays kvarn8; the \
+             validated pairs are kvarn8/kvarn8 (k8v8) and kvarn8/kvarn4 \
+             (k8v4)."
+                .to_string(),
+        ),
+        (Some("kvarn8"), Some("kvarn8")) => Ok(ResolvedKvCacheConfig {
+            mode: KVCacheMode::KVarN8,
+            kvarn_v_bits: 8,
+        }),
+        (Some("kvarn8"), Some("kvarn4")) => Ok(ResolvedKvCacheConfig {
+            mode: KVCacheMode::KVarN8,
+            kvarn_v_bits: 4,
+        }),
+        // kvarn on one side with anything else (fp16/int8/turbo*) on the
+        // other: unvalidated — rejected rather than silently coerced.
+        _ => Err(format!(
+            "unsupported --cache-type-k={k_str} / --cache-type-v={v_str} \
+             combination: kvarn does not mix with other cache types \
+             (unvalidated); supported kvarn pairs:\n  \
+             kvarn8 / kvarn8  -> k8v8\n  \
+             kvarn8 / kvarn4  -> k8v4\n\
+             (--cache-type-v kvarn4 requires --cache-type-k kvarn8)"
+        )),
+    }
+}
+
+/// Supported K/V combinations and their corresponding resolved config.
 ///
-/// Any other combination returns an error with a description of valid pairs.
+/// | K      | V                    | Mode              | v_bits |
+/// |--------|----------------------|-------------------|--------|
+/// | fp16   | fp16                 | `Fp16`            | 8      |
+/// | int8   | int8                 | `Int8`            | 8      |
+/// | fp16   | turbo4 / turbo4-asym | `Turbo4Asym`      | 8      |
+/// | turbo4 | turbo4               | `Turbo4`          | 8      |
+/// | fp16   | turbo4-delegated     | `Turbo4Delegated` | 8      |
+/// | fp16   | turbo3 / turbo3-asym | `Turbo3Asym`      | 8      |
+/// | kvarn8 | kvarn8               | `KVarN8`          | 8      |
+/// | kvarn8 | kvarn4               | `KVarN8`          | 4      |
+///
+/// Any other combination returns an error with a description of valid
+/// pairs; K=kvarn4 is rejected with the registered reason
+/// (`RESULTS_kvarn4_realtile_2026-07-11`).
 pub fn resolve_kv_cache_mode(
     cache_type_k: Option<&str>,
     cache_type_v: Option<&str>,
     kv_cache_mode_legacy: Option<&str>,
-) -> Result<KVCacheMode, String> {
+) -> Result<ResolvedKvCacheConfig, String> {
     let have_split = cache_type_k.is_some() || cache_type_v.is_some();
     let have_legacy = kv_cache_mode_legacy.is_some();
 
@@ -217,6 +313,15 @@ pub fn resolve_kv_cache_mode(
         let k_str = cache_type_k.unwrap_or("fp16");
         let v_str = cache_type_v.unwrap_or("fp16");
 
+        // kvarn values route through the kvarn matrix BEFORE the
+        // KVCacheMode parse: `kvarn4` is a width, not a mode, so it has
+        // no `KVCacheMode` spelling at all (see ResolvedKvCacheConfig).
+        let k_kvarn = kvarn_side_value(k_str);
+        let v_kvarn = kvarn_side_value(v_str);
+        if k_kvarn.is_some() || v_kvarn.is_some() {
+            return resolve_kvarn_pair(k_str, v_str, k_kvarn, v_kvarn);
+        }
+
         let k_mode = k_str
             .parse::<KVCacheMode>()
             .map_err(|_| format!("unrecognised --cache-type-k value \"{k_str}\""))?;
@@ -224,17 +329,28 @@ pub fn resolve_kv_cache_mode(
             .parse::<KVCacheMode>()
             .map_err(|_| format!("unrecognised --cache-type-v value \"{v_str}\""))?;
 
-        return map_kv_modes_to_cache_mode(k_mode, v_mode);
+        return map_kv_modes_to_cache_mode(k_mode, v_mode).map(ResolvedKvCacheConfig::mode_only);
     }
 
     if let Some(legacy) = kv_cache_mode_legacy {
+        // k8v4 shorthand (design §3.4): launch scripts and supervisors
+        // grep one token. Resolves through the same construction path as
+        // the split flags — mode KVarN8, V width 4 — NOT through
+        // `KVCacheMode::from_str` (the enum cannot carry the width).
+        if matches!(legacy, "k8v4" | "kvarn-k8v4") {
+            return Ok(ResolvedKvCacheConfig {
+                mode: KVCacheMode::KVarN8,
+                kvarn_v_bits: 4,
+            });
+        }
         return legacy
             .parse::<KVCacheMode>()
+            .map(ResolvedKvCacheConfig::mode_only)
             .map_err(|_| format!("unrecognised --kv-cache-mode value \"{legacy}\""));
     }
 
     // Default: FP16 (bit-exact baseline).
-    Ok(KVCacheMode::Fp16)
+    Ok(ResolvedKvCacheConfig::mode_only(KVCacheMode::Fp16))
 }
 
 /// Map a (K-mode, V-mode) pair to the combined `KVCacheMode`.

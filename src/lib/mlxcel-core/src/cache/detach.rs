@@ -161,6 +161,12 @@ pub struct DetachedKVCache {
     pub(super) kvarn_v_zp: Option<UniquePtr<MlxArray>>,
     pub(super) kvarn_v_s_row: Option<UniquePtr<MlxArray>>,
     pub(super) kvarn_v_s_col: Option<UniquePtr<MlxArray>>,
+    /// V width of the kvarn tile state (see `KVCache::kvarn_v_bits`). MUST
+    /// round-trip: `mode` alone cannot distinguish k8v8 from k8v4 (both are
+    /// `KVarN8`), and a v4 donation re-installed into a fresh slot without
+    /// this field would resurrect as v_bits=8 — packed-u32 V codes silently
+    /// mislabeled as u8, passing the reader guards they exist to trip.
+    pub(super) kvarn_v_bits: u8,
 }
 
 impl DetachedKVCache {
@@ -229,6 +235,7 @@ impl DetachedKVCache {
             kvarn_v_zp: None,
             kvarn_v_s_row: None,
             kvarn_v_s_col: None,
+            kvarn_v_bits: self.kvarn_v_bits,
         })
     }
 
@@ -734,6 +741,9 @@ impl KVCache {
             kvarn_v_zp: self.kvarn_v_zp.take(),
             kvarn_v_s_row: self.kvarn_v_s_row.take(),
             kvarn_v_s_col: self.kvarn_v_s_col.take(),
+            // Copied, not reset: like `mode`, the source slot keeps its
+            // width for reuse under the same boot construction.
+            kvarn_v_bits: self.kvarn_v_bits,
         };
         // Clear turbo_params on the source so the next quantize call rebuilds
         // it from scratch (required if the slot is reused with a different
@@ -799,6 +809,7 @@ impl KVCache {
         self.kvarn_v_zp = detached.kvarn_v_zp;
         self.kvarn_v_s_row = detached.kvarn_v_s_row;
         self.kvarn_v_s_col = detached.kvarn_v_s_col;
+        self.kvarn_v_bits = detached.kvarn_v_bits;
         // turbo_params is rebuilt lazily on the next quantize call, but if we
         // can already see the V head_dim from v_packed we may as well prebuild
         // so dequantize-only consumers (which don't go through update_*) still

@@ -149,6 +149,30 @@ pub(crate) fn resolve_effective_kv_cache_mode(
     }
 }
 
+/// k8v4: apply the resolved KVarN8 V width to caches whose mode just
+/// resolved to `KVarN8` — the width rides the same application step as
+/// the mode it qualifies (K8V4 design §3.1; the split is a
+/// `KVCache::kvarn_v_bits` field, deliberately not a mode variant).
+/// Non-kvarn caches are untouched: their `kvarn_v_bits` stays the inert
+/// default 8, and a D1 empty-downgrade later resets any kvarn cache it
+/// downgrades. `v_bits == 8` is the no-op fast path (today's k8v8
+/// behavior, byte-identical).
+///
+/// Kept as one pure function on the caches slice (same pattern as
+/// [`mlxcel_core::cache::set_prefill_finalize_caps`]) so the rule is
+/// pinned by unit tests against real caches — the scheduler prefill
+/// paths themselves need a live model.
+pub(crate) fn apply_kvarn_v_bits(caches: &mut [mlxcel_core::cache::KVCache], v_bits: u8) {
+    if v_bits == 8 {
+        return;
+    }
+    for cache in caches.iter_mut() {
+        if cache.mode == KVCacheMode::KVarN8 {
+            cache.set_kvarn_v_bits(v_bits);
+        }
+    }
+}
+
 /// Floor a raw longest-prefix cache match to the model's prefill-alignment
 /// quantum (see [`LanguageModel::prefill_alignment`]).
 ///
@@ -298,6 +322,11 @@ pub struct BatchScheduler {
     ///
     /// Defaults to [`KVCacheMode::Fp16`] (bit-exact baseline).
     kv_cache_mode: KVCacheMode,
+
+    /// KVarN8 V-side width (8 = k8v8, 4 = k8v4), applied to each new
+    /// sequence's KVarN8 layer caches alongside the mode. Inert for
+    /// every other mode. Defaults to 8.
+    kvarn_v_bits: u8,
 
     /// server-wide batch KV quantization configuration.
     ///
@@ -949,6 +978,7 @@ impl BatchScheduler {
             prompt_cache: None,
             prompt_cache_seq_ctx: std::collections::HashMap::new(),
             kv_cache_mode: KVCacheMode::Fp16,
+            kvarn_v_bits: 8,
             batch_kv_quant: BatchKvQuantConfig::default(),
             max_kv_size: None,
             // multimodal prefix-cache sharing stays off until the operator
@@ -983,6 +1013,18 @@ impl BatchScheduler {
     /// reserved, preserving the cross-tenant isolation contract.
     pub fn with_kv_cache_mode(mut self, mode: KVCacheMode) -> Self {
         self.kv_cache_mode = mode;
+        self
+    }
+
+    /// Attach the KVarN8 V-side width (8 = k8v8, 4 = k8v4).
+    ///
+    /// Inert unless the resolved mode is `KVarN8`: the width is applied
+    /// to each new sequence's KVarN8 layer caches in
+    /// [`apply_kvarn_v_bits`] as part of `apply_kv_cache_mode_to`. The
+    /// k8v8/k8v4 split is a `KVCache::kvarn_v_bits` field, deliberately
+    /// not a mode variant (K8V4 design §3.1).
+    pub fn with_kvarn_v_bits(mut self, v_bits: u8) -> Self {
+        self.kvarn_v_bits = v_bits;
         self
     }
 
@@ -2145,6 +2187,16 @@ impl BatchScheduler {
             } else {
                 "n/a"
             },
+            // k8v4 forward pin (Violet, 2026-07-11): the V width in the
+            // SAME artifact, so k8v8 and k8v4 boots are log-distinguishable
+            // — a k8v4 boot whose caches silently ran v_bits=8 would
+            // otherwise be invisible until memory accounting disagreed.
+            kvarn_v_bits = self.kvarn_v_bits,
+            kvarn_format = if effective_mode == KVCacheMode::KVarN8 {
+                if self.kvarn_v_bits == 4 { "k8v4" } else { "k8v8" }
+            } else {
+                "n/a"
+            },
             "KV cache quantization as resolved by the server (non-Fp16 modes bypass the shared paged pool: sequences get dense per-layer caches converted to the mode after make_caches)"
         );
 
@@ -2273,6 +2325,9 @@ impl BatchScheduler {
             for (cache, mode) in caches.iter_mut().zip(layer_modes) {
                 cache.mode = mode;
             }
+            // k8v4: width rides the mode application (no-op for v_bits=8;
+            // the table cannot produce KVarN8 today — future-proof rule).
+            apply_kvarn_v_bits(caches, self.kvarn_v_bits);
             return;
         }
 
@@ -2288,6 +2343,8 @@ impl BatchScheduler {
         for (cache, mode) in caches.iter_mut().zip(layer_modes) {
             cache.mode = mode;
         }
+        // k8v4: width rides the mode application (no-op for v_bits=8).
+        apply_kvarn_v_bits(caches, self.kvarn_v_bits);
     }
 
     /// Prepare Turbo4Delegated cache state before a sequence enters decode.
@@ -3628,6 +3685,20 @@ impl BatchScheduler {
             return;
         }
 
+        // #36 (DESIGN_finalize_cap_at_true_length_2026-07-11 §sites): arm
+        // the finalize cap at each sequence's true prompt end before the
+        // padded batched forward — shorter sequences' padded rows must
+        // never finalize into kvarn tiles; they stay in the fp16 tail for
+        // the post-forward trim below. Per sequence per layer cache;
+        // identity for max-len sequences (cap == true end, golden-pinned);
+        // mode-blind for non-kvarn layer caches.
+        for (seq_caches, seq) in batch_caches.iter_mut().zip(seqs.iter()) {
+            mlxcel_core::cache::set_prefill_finalize_caps(
+                seq_caches,
+                seq.prompt_tokens.len() as i32,
+            );
+        }
+
         // Single batched forward pass: [B, padded_len] → [B, padded_len, vocab]
         let raw_logits = self.model.forward_batched_with_context_and_ids(
             &input,
@@ -3772,6 +3843,15 @@ impl BatchScheduler {
                     return;
                 }
             };
+
+            // #36: NA alignment padded this forward (pad_mask_opt set) —
+            // arm the finalize cap at the true suffix end so padded rows
+            // stay in the fp16 tail for the post-forward trim below. Each
+            // cache's own offset anchors the cap over any adopted
+            // prompt-cache prefix (cold prefills: offset 0).
+            if pad_mask_opt.is_some() {
+                mlxcel_core::cache::set_prefill_finalize_caps(caches, actual_len as i32);
+            }
 
             let raw_logits = if let Some(ref embeddings) = seq.vlm_embeddings {
                 // VLM path: apply provided mask or the tile-alignment mask.
@@ -3924,6 +4004,15 @@ impl BatchScheduler {
                     return;
                 }
             };
+
+            // #36: the first chunk was NA-padded (pad_mask_opt set) — arm
+            // the finalize cap at the chunk's true end; `offset` covers
+            // the adopted prefix. (Non-batching models' dummy caches take
+            // the cap inertly — never kvarn, mirroring the tripwire's
+            // scope below.)
+            if pad_mask_opt.is_some() {
+                mlxcel_core::cache::set_prefill_finalize_caps(caches, actual_chunk_len as i32);
+            }
 
             // VLM embeddings are applied only on the first chunk.
             let logits = if let Some(ref embeddings) = seq.vlm_embeddings {
@@ -4097,6 +4186,13 @@ impl BatchScheduler {
                     return;
                 }
             };
+
+            // #36: this continuation chunk was NA-padded — arm the cap at
+            // the chunk's true end; `offset` covers all previously
+            // processed chunks (and any adopted prefix).
+            if pad_mask_opt.is_some() {
+                mlxcel_core::cache::set_prefill_finalize_caps(caches, actual_chunk_len as i32);
+            }
 
             let logits = self.model.forward_with_sequence_id(
                 &input,

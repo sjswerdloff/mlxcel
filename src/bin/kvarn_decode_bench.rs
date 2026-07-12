@@ -78,6 +78,13 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     dense_prefix: usize,
 
+    /// V storage width for kvarn-synthesized states: 8 (k8v8) or 4
+    /// (k8v4, gs32 — §4.6 rank cells for the k8v4 column). All three
+    /// read paths serve v4 since §5 completed; the BOOT line carries the
+    /// width so no run ever benches one width under the other's label.
+    #[arg(long, default_value_t = 8)]
+    v_bits: u8,
+
     /// Cache mode synthesized for the dense-prefix layers: "fp16" (the D1
     /// layer-selective state a live session reaches via the first-touch
     /// downgrade) or "kvarn8" (pre-D1 behavior: the O(T) full-window
@@ -186,11 +193,16 @@ fn main() {
         unsafe { std::env::set_var("MLXCEL_FP16_GATHERED", "1") };
     }
 
+    assert!(
+        args.v_bits == 8 || args.v_bits == 4,
+        "--v-bits must be 8 (k8v8) or 4 (k8v4); got {}",
+        args.v_bits
+    );
     // Fail-loud boot artifact: every parameter that shapes the measurement,
     // so no captured number can be mis-attributed to the wrong config.
     println!(
         "kvarn-decode-bench BOOT: depth={} steps={} warmup={} layers={} dense_prefix={} \
-         dense_cache={} cache_mode={} seed={} profile={}",
+         dense_cache={} cache_mode={} v_bits={} seed={} profile={}",
         args.depth,
         args.steps,
         args.warmup,
@@ -198,6 +210,7 @@ fn main() {
         args.dense_prefix,
         args.dense_cache,
         args.cache_mode,
+        args.v_bits,
         args.seed,
         args.profile
     );
@@ -295,13 +308,14 @@ fn main() {
                 layer_seed,
             )
         } else {
-            KVCache::synth_kvarn8_state(
+            KVCache::synth_kvarn_state(
                 1,
                 args.kv_heads,
                 args.head_dim,
                 args.depth,
                 args.index_dim,
                 layer_seed,
+                args.v_bits,
             )
         });
         if (i + 1) % 10 == 0 {

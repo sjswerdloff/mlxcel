@@ -305,6 +305,11 @@ pub struct ServerStartupConfig {
     /// Unsupported K/V combinations are rejected at startup.
     pub kv_cache_mode: mlxcel_core::cache::KVCacheMode,
 
+    /// KVarN8 V-side width (8 = k8v8, 4 = k8v4), resolved alongside
+    /// [`Self::kv_cache_mode`]; inert for non-kvarn modes. See
+    /// `ServerConfig::kvarn_v_bits`.
+    pub kvarn_v_bits: u8,
+
     /// resolved batch KV cache quantization configuration
     /// (uniform `mx.quantize` or TurboQuant variant) for the
     /// continuous-batching path.
@@ -474,6 +479,7 @@ impl Default for ServerStartupConfig {
             chat_template_kwargs: None,
             prompt_cache: super::prompt_cache::PromptCacheConfig::default(),
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
+            kvarn_v_bits: 8,
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
             max_kv_size: None,
             kv_cache_budget: None,
@@ -866,6 +872,8 @@ pub(super) fn build_server_config(
         // (B11): wire the resolved KV cache mode through so the
         // model worker can apply it when constructing per-sequence generators.
         kv_cache_mode: startup.kv_cache_mode,
+        // k8v4: the KVarN8 V width rides beside the mode it qualifies.
+        kvarn_v_bits: startup.kvarn_v_bits,
         // wire the resolved batch KV quant config through so
         // the continuous-batching scheduler can apply per-layer modes
         // (with the last-layer skip) at sequence allocation time.

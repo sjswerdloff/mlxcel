@@ -280,12 +280,22 @@ fn main() -> Result<()> {
     // pre-set MLX_MAX_OPS_PER_BUFFER (manual sweep override) always wins.
     mlxcel_core::hardware::apply_metal_ops_per_buffer_default();
 
-    let kv_cache_mode = resolve_kv_cache_mode(
+    let resolved_kv = resolve_kv_cache_mode(
         args.turbo.cache_type_k.as_deref(),
         args.turbo.cache_type_v.as_deref(),
         args.turbo.kv_cache_mode.as_deref(),
     )
     .map_err(|err| anyhow::anyhow!("{err}"))?;
+    // k8v4 construction lives on the server path (scheduler-applied
+    // kvarn_v_bits); this bench's CxxGenerator has no width plumbing.
+    // Refuse loudly rather than silently benching k8v8 under a k8v4 label.
+    if resolved_kv.kvarn_v_bits != 8 {
+        anyhow::bail!(
+            "k8v4 is not supported by bench_decode (server-only construction); \
+             use kvarn8/k8v8 here"
+        );
+    }
+    let kv_cache_mode = resolved_kv.mode;
 
     // Keep `--turbo-boundary-v` semantics identical to `mlxcel generate`.
     // This must happen before any generator/cache construction.

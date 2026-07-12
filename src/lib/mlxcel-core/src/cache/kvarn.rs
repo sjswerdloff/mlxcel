@@ -270,6 +270,51 @@ pub fn rtn_quantize_per_row(
     (ffi::astype(&q, dtype::UINT8), scale, lo)
 }
 
+/// Round-mode parity gate (Violet PM pin 1 / Xander confirmation,
+/// 2026-07-11): proves the engine's `ffi::round` — the op inside
+/// [`rtn_quantize_per_row`] — is ROUND-HALF-EVEN on exact half-quotients,
+/// matching the MLX-python reference the KVarN screens ran. The K8V4
+/// golden-vector harness MUST call this as its FIRST act (structural
+/// gate, a test-code dependency rather than prose): a silent half-away
+/// divergence would otherwise surface as an hours-long harness-mismatch
+/// hunt; this turns it into a seconds-long diagnosis. Panics on
+/// divergence.
+pub fn assert_round_half_even_parity() {
+    // Hand-built vector: every tie must land on the EVEN neighbor;
+    // the .25/.75 cases sanity-check ordinary nearest behavior. All
+    // values are exactly representable in f32.
+    let cases: [(f32, f32); 14] = [
+        (-3.5, -4.0),
+        (-2.5, -2.0),
+        (-1.5, -2.0),
+        (-0.5, 0.0),
+        (0.5, 0.0),
+        (1.5, 2.0),
+        (2.5, 2.0),
+        (3.5, 4.0),
+        (4.5, 4.0),
+        (5.5, 6.0),
+        (6.5, 6.0),
+        (1.25, 1.0),
+        (1.75, 2.0),
+        (-1.75, -2.0),
+    ];
+    let xs: Vec<f32> = cases.iter().map(|c| c.0).collect();
+    let arr = ffi::from_slice_f32(&xs, &[xs.len() as i32]);
+    let rounded = ffi::round(&arr);
+    let bytes = ffi::array_to_raw_bytes(&rounded);
+    let got: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    for ((x, want), g) in cases.iter().zip(&got) {
+        assert!(
+            (g - want).abs() < 1e-6,
+            "round-mode parity violated: engine round({x}) = {g}, want {want} (half-even)"
+        );
+    }
+}
+
 /// Full write-side pipeline on ROTATED tiles: Sinkhorn → RTN.
 ///
 /// Callers rotate first ([`kvarn_rotate`]) — rotation is per-token and can
@@ -294,6 +339,182 @@ pub fn kvarn_dequantize_rotated(t: &KvarnQuantizedTiles) -> UniquePtr<MlxArray> 
     let qf = ffi::astype(&t.q, dtype::FLOAT32);
     let de = ffi::add(&ffi::multiply(&qf, &t.scale), &t.zp);
     ffi::multiply(&ffi::multiply(&de, &t.s_col), &t.s_row)
+}
+
+/// Per-GROUP asymmetric RTN of `[N, R, C]` balanced tiles: groups of `gs`
+/// along the channel axis (K8V4's V-side math; the gate-passing reference
+/// is `rtn_grouped` in scripts/kvarn4_gs_sweep.py). `gs == C` reproduces
+/// [`rtn_quantize_per_row`] exactly — the per-row path is the degenerate
+/// single-group case, pinned by test.
+///
+/// Returns `(q_u8 [N,R,C], scale [N,R,C/gs], zp [N,R,C/gs])` — params in
+/// COMPACT storage form (one value per group, f32), not broadcast back to
+/// element shape like the reference script (which only did so to keep its
+/// dequant chain elementwise). `s_row` folding happens at the STORAGE
+/// layer, not here: callers store `scale·s_row` and `zp·s_row` per the
+/// design's fold-at-write (§3.1); this function returns unfolded params so
+/// the golden harness can compare each stage against the reference.
+pub fn rtn_quantize_grouped(
+    tiles: &MlxArray,
+    bits: u8,
+    gs: i32,
+) -> (
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+) {
+    assert!(
+        bits == 8 || bits == 4,
+        "KVarN grouped RTN supports bits 8 or 4, got {bits}"
+    );
+    let shape = ffi::array_shape(tiles);
+    let (n, r, c) = (shape[0], shape[1], shape[2]);
+    assert!(
+        gs > 0 && c % gs == 0,
+        "group size {gs} must divide channel dim {c}"
+    );
+    let g = c / gs;
+    let qmax = ((1u32 << bits) - 1) as f32;
+    let grouped = ffi::reshape(tiles, &[n, r, g, gs]);
+    let lo = ffi::min_axis(&grouped, -1, true);
+    let hi = ffi::max_axis(&grouped, -1, true);
+    let range = ffi::subtract(&hi, &lo);
+    let scale = ffi::maximum(
+        &crate::ops::divide_scalar(&range, qmax),
+        &ffi::full_like(&range, 1e-10),
+    );
+    let centered = ffi::divide(&ffi::subtract(&grouped, &lo), &scale);
+    let q = ffi::clip(
+        &ffi::round(&centered),
+        &ffi::full_like(&centered, 0.0),
+        &ffi::full_like(&centered, qmax),
+    );
+    (
+        ffi::astype(&ffi::reshape(&q, &[n, r, c]), dtype::UINT8),
+        ffi::reshape(&scale, &[n, r, g]),
+        ffi::reshape(&lo, &[n, r, g]),
+    )
+}
+
+/// Grouped-RTN dequantization in the rotated frame: the counterpart of
+/// [`rtn_quantize_grouped`], mirroring [`kvarn_dequantize_rotated`]'s
+/// contract `(q·scale + zp) · s_col · s_row` with per-GROUP params
+/// (`scale`/`zp` shaped `[N, R, C/gs]`). Callers holding FOLDED storage
+/// params (`scale·s_row`, `zp·s_row`) pass ones for `s_row` — the fold
+/// identity is pinned by test.
+pub fn kvarn_dequantize_grouped_rotated(
+    q: &MlxArray,
+    scale: &MlxArray,
+    zp: &MlxArray,
+    s_col: &MlxArray,
+    s_row: &MlxArray,
+    gs: i32,
+) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(q);
+    let (n, r, c) = (shape[0], shape[1], shape[2]);
+    let g = c / gs;
+    let qf = ffi::astype(q, dtype::FLOAT32);
+    let qg = ffi::reshape(&qf, &[n, r, g, gs]);
+    let sc = ffi::reshape(scale, &[n, r, g, 1]);
+    let z = ffi::reshape(zp, &[n, r, g, 1]);
+    let de = ffi::reshape(&ffi::add(&ffi::multiply(&qg, &sc), &z), &[n, r, c]);
+    ffi::multiply(&ffi::multiply(&de, s_col), s_row)
+}
+
+/// Pack 4-bit codes (u8, one code per byte, values <= 15) into MLX's
+/// native 4-bit quantized layout: u32 words, eight codes per word.
+/// Output `[N, R, C/8]` u32 — directly consumable by `gather_qmm` /
+/// `dequantize` at bits=4 (the zero-repack property C's 8-bit path uses,
+/// at 4-bit density). The nibble order is NOT assumed: it is pinned by
+/// the consumption-convention test (pack → `ffi::dequantize` with unit
+/// scales and zero biases → the original codes, exact).
+pub fn kvarn_pack4(codes_u8: &MlxArray) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(codes_u8);
+    let (n, r, c) = (shape[0], shape[1], shape[2]);
+    assert!(c % 8 == 0, "pack4 needs channel dim divisible by 8, got {c}");
+    let pairs = ffi::reshape(codes_u8, &[n, r, c / 2, 2]);
+    let lo = ffi::slice(&pairs, &[0, 0, 0, 0], &[n, r, c / 2, 1]);
+    let hi = ffi::slice(&pairs, &[0, 0, 0, 1], &[n, r, c / 2, 2]);
+    let four = ffi::full_like(&hi, 4.0);
+    let byte = ffi::bitwise_or(&lo, &ffi::left_shift(&hi, &four));
+    let bytes = ffi::reshape(&byte, &[n, r, c / 2]);
+    ffi::view(&bytes, dtype::UINT32)
+}
+
+/// Unpack MLX-layout 4-bit words back to one-code-per-byte u8 `[N, R, C]`
+/// — by DEFINITION of the consumption convention: `ffi::dequantize` with
+/// unit scales and zero biases returns exactly the stored codes, so this
+/// cannot drift from what `gather_qmm` actually reads. Uses gs=32 for the
+/// unit dequant (MLX's smallest affine group), hence `C % 32 == 0` — true
+/// for every KVarN shape (head_dim 128).
+pub fn kvarn_unpack4(packed_u32: &MlxArray, c: i32) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(packed_u32);
+    let (n, r) = (shape[0], shape[1]);
+    assert!(c % 32 == 0, "unpack4 unit-dequants at gs=32; C must divide, got {c}");
+    let g = c / 32;
+    let ones = ffi::full_f32(&[n, r, g], 1.0, dtype::FLOAT32);
+    let zeros = ffi::full_f32(&[n, r, g], 0.0, dtype::FLOAT32);
+    let deq = unsafe {
+        ffi::dequantize(
+            packed_u32,
+            &ones,
+            (&*zeros) as *const MlxArray,
+            32,
+            4,
+            "affine",
+        )
+    };
+    ffi::astype(&deq, dtype::UINT8)
+}
+
+/// K8V4 V-side group size — FIXED by the real-tile screen verdict
+/// (RESULTS_kvarn4_realtile_2026-07-11: gs32 leads with the most gate
+/// headroom). Not a user knob: a knob nobody validated is a knob nobody
+/// gets (design §3.4).
+pub const KVARN_V4_GROUP_SIZE: i32 = 32;
+
+/// Result of the K8V4 V-side write composition. Params are f32 (§3.1;
+/// f16 params would fail the golden harness by design) and FOLDED:
+/// `s_row` is multiplied into scale and zp at write — `(q·s + zp)·s_row
+/// = q·(s·s_row) + (zp·s_row)` — so it costs zero at read and is NOT
+/// stored separately on the V4 path (the k8 `kvarn_v_s_row` field stays
+/// `None`; readers get the fold through the params).
+pub struct KvarnV4Tiles {
+    /// `[N, TILE, C/8]` u32 packed codes — MLX 4-bit layout,
+    /// `gather_qmm`/`dequantize`-ready (convention pinned by test).
+    pub q_packed: UniquePtr<MlxArray>,
+    /// `[N, TILE, C/gs]` f32 — `scale · s_row` (folded).
+    pub scale_folded: UniquePtr<MlxArray>,
+    /// `[N, TILE, C/gs]` f32 — `zp · s_row` (folded).
+    pub zp_folded: UniquePtr<MlxArray>,
+    /// `[N, 1, C]` f32 Sinkhorn per-column scales — unchanged from k8,
+    /// applied post-multiply on output exactly where C applies it today.
+    pub s_col: UniquePtr<MlxArray>,
+    /// Group size the params are shaped for (KVARN_V4_GROUP_SIZE in
+    /// production; a parameter here so tests can pin group-boundary
+    /// behavior at other sizes).
+    pub gs: i32,
+}
+
+/// K8V4 V-side write composition on ROTATED tiles: Sinkhorn → grouped
+/// asymmetric RTN (bits=4) → fold `s_row` into the per-group affine
+/// params → pack to MLX layout. The V4 analogue of [`kvarn_quantize`];
+/// K-side callers keep using [`kvarn_quantize`] at 8-bit unchanged.
+/// Composition-equals-stages is pinned by test against the in-crate
+/// reference functions; screen-golden on harvested tiles is the
+/// harness rung (§4).
+pub fn kvarn_quantize_v4(tiles_rotated: &MlxArray, gs: i32) -> KvarnV4Tiles {
+    let (balanced, s_col, s_row) = sinkhorn_normalize(tiles_rotated, KVARN_SINKHORN_ITERS);
+    let (q, scale, zp) = rtn_quantize_grouped(&balanced, 4, gs);
+    let scale_folded = ffi::multiply(&scale, &s_row);
+    let zp_folded = ffi::multiply(&zp, &s_row);
+    KvarnV4Tiles {
+        q_packed: kvarn_pack4(&q),
+        scale_folded,
+        zp_folded,
+        s_col,
+        gs,
+    }
 }
 
 #[cfg(test)]
@@ -392,6 +613,268 @@ mod tests {
     /// Stage 3 (k8): RTN codes match the reference EXACTLY (integers), and
     /// scale/zp match tightly. Mutation that must turn this red: symmetric
     /// instead of asymmetric quantization (zp = 0), or qmax 256 vs 255.
+    /// Hand-computed grouped-RTN reference, [1,1,8] gs=4 -> 2 groups.
+    /// Group A [0,1,2,3]: lo=0, scale=3/15=0.2, q=[0,5,10,15].
+    /// Group B [10,14,18,22]: lo=10, scale=12/15=0.8, q=[0,5,10,15].
+    /// Named mutation (proven red): swap the group axes in the reshape
+    /// ([n,r,gs,g] instead of [n,r,g,gs]) — regrouping breaks the table.
+    #[test]
+    fn grouped_rtn_matches_hand_computed_reference() {
+        let x = ffi::from_slice_f32(&[0.0, 1.0, 2.0, 3.0, 10.0, 14.0, 18.0, 22.0], &[1, 1, 8]);
+        let (q, scale, zp) = rtn_quantize_grouped(&x, 4, 4);
+        assert_eq!(ffi::array_shape(&q), vec![1, 1, 8]);
+        assert_eq!(ffi::array_shape(&scale), vec![1, 1, 2]);
+        let qb = ffi::array_to_raw_bytes(&q);
+        assert_eq!(qb.as_slice(), &[0u8, 5, 10, 15, 0, 5, 10, 15]);
+        let sb: Vec<f32> = ffi::array_to_raw_bytes(&scale)
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let zb: Vec<f32> = ffi::array_to_raw_bytes(&zp)
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert!((sb[0] - 0.2).abs() < 1e-7 && (sb[1] - 0.8).abs() < 1e-7, "scales {sb:?}");
+        assert!((zb[0] - 0.0).abs() < 1e-7 && (zb[1] - 10.0).abs() < 1e-7, "zps {zb:?}");
+    }
+
+    /// gs == C degeneracy: grouped RTN with one group per row IS the
+    /// per-row path — q bitwise identical, params equal (shape modulo
+    /// the trailing keepdim). Pins that the grouped fn is a strict
+    /// generalization, not a sibling with drift.
+    #[test]
+    fn grouped_rtn_gs_eq_c_reproduces_per_row() {
+        // Deterministic varied values, [1, 2, 8].
+        let vals: Vec<f32> = (0..16).map(|i| ((i * 7 % 13) as f32) - 5.5).collect();
+        let x = ffi::from_slice_f32(&vals, &[1, 2, 8]);
+        let (qg, sg, zg) = rtn_quantize_grouped(&x, 4, 8);
+        let (qr, sr, zr) = rtn_quantize_per_row(&x, 4);
+        assert_eq!(
+            ffi::array_to_raw_bytes(&qg).as_slice(),
+            ffi::array_to_raw_bytes(&qr).as_slice(),
+            "codes must be bitwise identical at gs == C"
+        );
+        assert_eq!(
+            ffi::array_to_raw_bytes(&sg).as_slice(),
+            ffi::array_to_raw_bytes(&sr).as_slice(),
+            "scales must match"
+        );
+        assert_eq!(
+            ffi::array_to_raw_bytes(&zg).as_slice(),
+            ffi::array_to_raw_bytes(&zr).as_slice(),
+            "zero-points must match"
+        );
+    }
+
+    /// Grouped roundtrip: group extremes reconstruct exactly (lo -> q=0
+    /// -> lo; hi -> qmax -> hi), interior within scale/2 (the RTN bound).
+    #[test]
+    fn grouped_dequant_roundtrip_bounds() {
+        let vals = [0.0f32, 1.0, 2.0, 3.0, 10.0, 14.0, 18.0, 22.0];
+        let x = ffi::from_slice_f32(&vals, &[1, 1, 8]);
+        let (q, scale, zp) = rtn_quantize_grouped(&x, 4, 4);
+        let ones_c = ffi::full_f32(&[1, 1, 8], 1.0, dtype::FLOAT32);
+        let ones_r = ffi::full_f32(&[1, 1, 1], 1.0, dtype::FLOAT32);
+        let de = kvarn_dequantize_grouped_rotated(&q, &scale, &zp, &ones_c, &ones_r, 4);
+        let got: Vec<f32> = ffi::array_to_raw_bytes(&de)
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        // Extremes exact: indices 0 (lo A), 3 (hi A), 4 (lo B), 7 (hi B).
+        for i in [0usize, 3, 4, 7] {
+            assert!((got[i] - vals[i]).abs() < 1e-6, "extreme {i}: {} vs {}", got[i], vals[i]);
+        }
+        // Interior within half a scale step (0.2 for A, 0.8 for B).
+        for (i, half) in [(1usize, 0.1f32), (2, 0.1), (5, 0.4), (6, 0.4)] {
+            assert!(
+                (got[i] - vals[i]).abs() <= half + 1e-6,
+                "interior {i}: {} vs {} exceeds half-step {half}",
+                got[i],
+                vals[i]
+            );
+        }
+    }
+
+    /// The fold-at-write identity the storage layer depends on (design
+    /// §3.1): dequant(q, scale·s_row, zp·s_row, s_col, ONES) equals
+    /// dequant(q, scale, zp, s_col, s_row). Named mutation (must go red):
+    /// fold s_row into scale but NOT zp.
+    #[test]
+    fn grouped_srow_fold_identity() {
+        let vals: Vec<f32> = (0..16).map(|i| ((i * 5 % 11) as f32) * 0.7 - 3.0).collect();
+        let x = ffi::from_slice_f32(&vals, &[1, 2, 8]);
+        let (q, scale, zp) = rtn_quantize_grouped(&x, 4, 4);
+        let s_col = ffi::from_slice_f32(
+            &(0..8).map(|i| 0.5 + 0.25 * i as f32).collect::<Vec<f32>>(),
+            &[1, 1, 8],
+        );
+        let s_row = ffi::from_slice_f32(&[1.5, 0.75], &[1, 2, 1]);
+        let unfolded = kvarn_dequantize_grouped_rotated(&q, &scale, &zp, &s_col, &s_row, 4);
+        // Fold: scale' = scale * s_row, zp' = zp * s_row (broadcast [1,2,1] over [1,2,2]).
+        let scale_f = ffi::multiply(&scale, &s_row);
+        let zp_f = ffi::multiply(&zp, &s_row);
+        let ones_r = ffi::full_f32(&[1, 2, 1], 1.0, dtype::FLOAT32);
+        let folded = kvarn_dequantize_grouped_rotated(&q, &scale_f, &zp_f, &s_col, &ones_r, 4);
+        let a: Vec<f32> = ffi::array_to_raw_bytes(&unfolded)
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let b: Vec<f32> = ffi::array_to_raw_bytes(&folded)
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        for i in 0..a.len() {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-6,
+                "fold identity broken at {i}: {} vs {}",
+                a[i],
+                b[i]
+            );
+        }
+    }
+
+    /// THE consumption-convention pin: our packed words, dequantized by
+    /// MLX ITSELF (unit scales, zero biases), must return the original
+    /// codes exactly. This is the contract gather_qmm consumes — nibble
+    /// order is proven here, never assumed. Named mutation (proven red):
+    /// swap the lo/hi nibbles in kvarn_pack4.
+    #[test]
+    fn pack4_matches_mlx_consumption_convention() {
+        let codes: Vec<f32> = (0..32).map(|i| (i * 5 % 16) as f32).collect();
+        let x = ffi::astype(&ffi::from_slice_f32(&codes, &[1, 1, 32]), dtype::UINT8);
+        let packed = kvarn_pack4(&x);
+        assert_eq!(ffi::array_shape(&packed), vec![1, 1, 4], "8 codes per u32 word");
+        let ones = ffi::full_f32(&[1, 1, 1], 1.0, dtype::FLOAT32);
+        let zeros = ffi::full_f32(&[1, 1, 1], 0.0, dtype::FLOAT32);
+        let deq = unsafe {
+            ffi::dequantize(&packed, &ones, (&*zeros) as *const MlxArray, 32, 4, "affine")
+        };
+        let got: Vec<f32> = ffi::array_to_raw_bytes(&ffi::astype(&deq, dtype::FLOAT32))
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(got, codes, "MLX must read back exactly the codes we packed");
+    }
+
+    /// §4.1 pack/unpack bit-exactness at 4-bit, non-trivial shape.
+    #[test]
+    fn pack4_unpack4_roundtrip_bit_exact() {
+        let vals: Vec<f32> = (0..2 * 3 * 64).map(|i| (i * 7 % 16) as f32).collect();
+        let codes = ffi::astype(&ffi::from_slice_f32(&vals, &[2, 3, 64]), dtype::UINT8);
+        let packed = kvarn_pack4(&codes);
+        assert_eq!(ffi::array_shape(&packed), vec![2, 3, 8]);
+        let back = kvarn_unpack4(&packed, 64);
+        assert_eq!(
+            ffi::array_to_raw_bytes(&back).as_slice(),
+            ffi::array_to_raw_bytes(&codes).as_slice(),
+            "pack/unpack must be bit-exact"
+        );
+    }
+
+    /// The C-dispatch contract end-to-end: MLX dequantize over our packed
+    /// codes with our REAL grouped params equals our reference grouped
+    /// dequant (unit Sinkhorn factors). Proves the fused consumer and the
+    /// reference read the same storage the same way — the storage half of
+    /// the coverage mapping (fused matmul itself stays tolerance-gated
+    /// under §4.2).
+    #[test]
+    fn packed_mlx_dequant_matches_reference_grouped_dequant() {
+        let vals: Vec<f32> = (0..64).map(|i| ((i * 11 % 23) as f32) * 0.37 - 4.0).collect();
+        let x = ffi::from_slice_f32(&vals, &[1, 1, 64]);
+        let (q, scale, zp) = rtn_quantize_grouped(&x, 4, 32);
+        let packed = kvarn_pack4(&q);
+        let mlx_deq = unsafe {
+            ffi::dequantize(&packed, &scale, (&*zp) as *const MlxArray, 32, 4, "affine")
+        };
+        let ones_c = ffi::full_f32(&[1, 1, 64], 1.0, dtype::FLOAT32);
+        let ones_r = ffi::full_f32(&[1, 1, 1], 1.0, dtype::FLOAT32);
+        let ref_deq = kvarn_dequantize_grouped_rotated(&q, &scale, &zp, &ones_c, &ones_r, 32);
+        let a: Vec<f32> = ffi::array_to_raw_bytes(&mlx_deq)
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let b: Vec<f32> = ffi::array_to_raw_bytes(&ref_deq)
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        for i in 0..a.len() {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-6,
+                "storage contract diverged at {i}: mlx {} vs reference {}",
+                a[i],
+                b[i]
+            );
+        }
+    }
+
+    /// The V4 write composition equals its stages BITWISE: codes through
+    /// pack/unpack, folded params as multiply(param, s_row), s_col
+    /// passthrough — wiring pinned with zero tolerance. Named mutation
+    /// (proven red): drop the zp fold (scale folded, zp raw).
+    #[test]
+    fn v4_composition_matches_stagewise_reference() {
+        // Deterministic pseudo-random rotated-ish tiles [2, 128, 128]
+        // with outlier structure (LCG, no external deps).
+        let mut state = 0x2454_111Au32;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 8) as f32 / (1 << 24) as f32 - 0.5
+        };
+        let n_vals = 2 * 128 * 128;
+        let mut vals: Vec<f32> = (0..n_vals).map(|_| next() * 4.0).collect();
+        for i in (0..n_vals).step_by(97) {
+            vals[i] *= 40.0; // outlier channels, fixture-style
+        }
+        let tiles = ffi::from_slice_f32(&vals, &[2, 128, 128]);
+
+        let v4 = kvarn_quantize_v4(&tiles, KVARN_V4_GROUP_SIZE);
+        assert_eq!(ffi::array_shape(&v4.q_packed), vec![2, 128, 16], "C/8 u32 words");
+        assert_eq!(ffi::array_shape(&v4.scale_folded), vec![2, 128, 4], "C/gs groups");
+
+        // Stage-wise reference on the same input: the composition's
+        // contract is WIRING, so every stage pins BITWISE — no tolerance
+        // anywhere in this test. (A dequant-level folded-vs-unfolded
+        // comparison was removed deliberately: q·s + zp CANCELS near tile
+        // minima, so its absolute error scales with the INTERMEDIATE
+        // magnitude ~ulp·qmax·scale, not the final value — measured
+        // 1.7e-5 worst on ×40-outlier tiles. That conditioned comparison
+        // belongs to the golden harness on real tiles, priced per-op;
+        // the fold's algebraic identity is pinned separately at
+        // grouped_srow_fold_identity.)
+        let (balanced, s_col, s_row) = sinkhorn_normalize(&tiles, KVARN_SINKHORN_ITERS);
+        let (q, scale, zp) = rtn_quantize_grouped(&balanced, 4, KVARN_V4_GROUP_SIZE);
+
+        let unpacked = kvarn_unpack4(&v4.q_packed, 128);
+        assert_eq!(
+            ffi::array_to_raw_bytes(&unpacked).as_slice(),
+            ffi::array_to_raw_bytes(&q).as_slice(),
+            "codes must be bitwise identical through pack/unpack"
+        );
+        assert_eq!(
+            ffi::array_to_raw_bytes(&v4.scale_folded).as_slice(),
+            ffi::array_to_raw_bytes(&ffi::multiply(&scale, &s_row)).as_slice(),
+            "folded scale must be bitwise multiply(scale, s_row)"
+        );
+        assert_eq!(
+            ffi::array_to_raw_bytes(&v4.zp_folded).as_slice(),
+            ffi::array_to_raw_bytes(&ffi::multiply(&zp, &s_row)).as_slice(),
+            "folded zp must be bitwise multiply(zp, s_row)"
+        );
+        assert_eq!(
+            ffi::array_to_raw_bytes(&v4.s_col).as_slice(),
+            ffi::array_to_raw_bytes(&s_col).as_slice(),
+            "s_col must pass through unchanged"
+        );
+    }
+
+    /// The structural parity gate, standalone (Violet PM pin 1). Named
+    /// mutation proven red: replace the assertion's rounded value with the
+    /// unrounded input (identity) — every tie case fails.
+    #[test]
+    fn round_mode_parity_gate() {
+        assert_round_half_even_parity();
+    }
+
     #[test]
     fn kvarn_rtn8_matches_reference_exactly() {
         let balanced = fixture_f32(BALANCED, &[N, R, C]);

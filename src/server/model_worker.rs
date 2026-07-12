@@ -88,6 +88,9 @@ pub(crate) struct WorkerSchedulerConfig {
     /// applies it to each new sequence's per-layer cache and picks the
     /// Turbo4-aware paged layout.
     pub kv_cache_mode: mlxcel_core::cache::KVCacheMode,
+    /// KVarN8 V-side width (8 = k8v8, 4 = k8v4) applied by the scheduler
+    /// to each new sequence's KVarN8 layer caches; inert otherwise.
+    pub kvarn_v_bits: u8,
     /// continuous-batching KV quantization configuration.
     ///
     /// When enabled (`bits > 0`), the scheduler resolves per-layer
@@ -474,6 +477,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             .with_reasoning_budget(sched_config.reasoning_budget, thinking_ids)
             .with_prompt_cache(sched_config.prompt_cache)
             .with_kv_cache_mode(sched_config.kv_cache_mode)
+            .with_kvarn_v_bits(sched_config.kvarn_v_bits)
             .with_batch_kv_quant(sched_config.batch_kv_quant)
             // cap plain KVCache growth to --max-kv-size when set.
             .with_max_kv_size(sched_config.max_kv_size)

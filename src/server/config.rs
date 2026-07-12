@@ -385,6 +385,16 @@ pub struct ServerConfig {
     /// sequence in the batch sees the same KV quantization policy.
     pub kv_cache_mode: mlxcel_core::cache::KVCacheMode,
 
+    /// KVarN8 V-side quantization width: 8 (k8v8) or 4 (k8v4).
+    ///
+    /// Resolved alongside [`Self::kv_cache_mode`] (see
+    /// `ResolvedKvCacheConfig` in `cli::turbo_args`); inert unless the
+    /// mode is `KVarN8`. The scheduler applies it to each new sequence's
+    /// KVarN8 layer caches so the k8v8/k8v4 split — a `KVCache::
+    /// kvarn_v_bits` field, deliberately not a mode variant — reaches
+    /// construction.
+    pub kvarn_v_bits: u8,
+
     /// batch KV cache quantization configuration for the
     /// continuous-batching scheduler.
     ///
@@ -538,6 +548,7 @@ impl Default for ServerConfig {
             chat_template_kwargs: None,
             prompt_cache: crate::server::prompt_cache::PromptCacheConfig::default(),
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
+            kvarn_v_bits: 8,
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
             max_kv_size: None,
             kv_cache_budget: None,

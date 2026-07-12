@@ -1460,3 +1460,29 @@ fn effective_kv_cache_mode_enabled_batch_quant_takes_precedence() {
         "enabled batch_kv_quant (uniform/8 => Int8) must win over the legacy flag"
     );
 }
+
+
+// ── k8v4: apply_kvarn_v_bits (K8V4 design §3.4 construction) ────────
+
+/// The width lands ONLY on KVarN8 caches in the mixed per-layer slice
+/// (Fp16 D1 dense-prefix + KVarN8 MSA layers — the live M3 shape).
+/// Named mutation: dropping the mode condition in `apply_kvarn_v_bits`
+/// sets the width via the guarded setter on the Fp16 cache too — red.
+#[test]
+fn apply_kvarn_v_bits_targets_kvarn_caches_only() {
+    use mlxcel_core::cache::{KVCache, KVCacheMode};
+    let mut caches = vec![KVCache::new(), KVCache::new_with_mode(KVCacheMode::KVarN8)];
+    crate::server::batch::scheduler::apply_kvarn_v_bits(&mut caches, 4);
+    assert_eq!(caches[0].kvarn_v_bits(), 8, "fp16 cache untouched");
+    assert_eq!(caches[1].kvarn_v_bits(), 4, "kvarn cache takes the width");
+}
+
+/// v_bits == 8 is the no-op fast path — today's k8v8 behavior,
+/// byte-identical (no cache is touched at all).
+#[test]
+fn apply_kvarn_v_bits_v8_is_noop() {
+    use mlxcel_core::cache::{KVCache, KVCacheMode};
+    let mut caches = vec![KVCache::new_with_mode(KVCacheMode::KVarN8)];
+    crate::server::batch::scheduler::apply_kvarn_v_bits(&mut caches, 8);
+    assert_eq!(caches[0].kvarn_v_bits(), 8);
+}
