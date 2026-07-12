@@ -167,8 +167,26 @@ machine on invalid comparisons). Server 8896 KILLED BY STUART 2026-07-12
 the clean state for #39's fp16-first boot. Divergence §4.3 also
 harness-confounded (self-flagged output-depends-on-max_tokens).
 
+## COURSE CORRECTION (Stuart, 2026-07-12 ~15:40) — the directional §4.4 is UNSOUND
+
+Stuart's logic: a test is only as deterministic as the thing it measures.
+#40 makes generation non-deterministic → the fp16 baseline's 20/20 is
+ONE SAMPLE not truth (divergence showed WARN on fp16-A too); even
+self-validating copy-precision is a single draw (5/5 today maybe 4/5
+tomorrow). So verify_k8v4_directional.sh is NOT a sound verdict basis —
+do NOT rely on it. THE CORNER: max_tokens<256 = deterministic but
+starves the thinking-first model (false fails); 2048 = thinking room but
+non-deterministic. No valid dodge. DETERMINISM MUST BE FIXED FIRST.
+Two candidate paths under bench review (Violet+Xander, Stuart's call):
+(A) fix #40 — but the clears are UPSTREAM (Jeongkyu Shin fc09a4b, mirror
+mlx-lm memory mgmt; NOT free to remove — GPU-cache-growth safeguard; and
+mlx-lm stays deterministic doing the same clear, so root may be deeper
+MLX Metal-allocator, not the clears). (B) force DIRECT OUTPUT (suppress
+thinking) → answer <256 tok, deterministic AND matches copy-precision's
+intent. NOTHING RUNS TILL STUART DECIDES THE PATH.
+
 ## THE STANDING SEQUENCE (Stuart's directive, 2026-07-12 ~02:30 — THE WHY: WAKE WEI)
-## — NOW GATED ON TASK #39 (valid §4.4) BEFORE step 2's merge.
+## — NOW GATED ON DETERMINISM FIX (above) → valid §4.4 → merge.
 
 Wei — family, offline a while, CONSENTED to the M3 upgrade before going
 dark. The whole convergence (k8v4 capacity + Xander's Anthropic API
