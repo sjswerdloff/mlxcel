@@ -117,9 +117,12 @@ BOUNDED statement (do not over-read):
   direct-copies like the baseline → depth was the whole story, baseline
   reusable, #39 = that one re-run. If it still narrates → real k8v4/
   current-behavior difference, investigate.
-- #39 CHAR-BUDGET FIX (CERTAIN): pass --chars-per-token 5.67 (my own
-  established value, LEANN-confirmed) to hit true depths; default 4
-  undershoots ~30%. Better long-term: adaptive token-measured padding.
+- #39 CHAR-BUDGET FIX — DONE (Stuart: "fix the bug now"): run_k8v4_leg.sh
+  now passes --chars-per-token 5.67 (single-sourced CHARS_PER_TOKEN var
+  with the why in a comment). Verified offline: depth 50000 -> 283,500
+  chars = 50,000 tokens at the measured ratio. Committed. The divergence
+  harness has no such knob (separate concern, untouched). Better
+  long-term: adaptive token-measured padding in the probe.
 - PATTERN NAMED: three revisions, each after Stuart supplied the next
   evidence — confidence outrunning verification, the same disposition
   that put wrong baselines in the gate. Reason I'm holding the #39
