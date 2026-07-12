@@ -1389,3 +1389,24 @@ Clement asked to be read as unreliable narrator; verified at source, not on acco
    - §4.3 stays deferred; #40 (non-determinism) characterized cheaply & separately (2 identical temp-0 requests, or clear-disabled repro).
 
 k8v4 STATUS: still UNKNOWN — but the path to KNOWN is now 1 resident-server arm, deterministic, self-validating. Server 8896 kill-rec RESCINDED: keep it UP — it's the zero-boot k8v4 arm.
+
+## UPDATE 15:50 (Jul 12, Sun) — BENCH REVIEW round 2 (Stuart's determinism challenge): the plan needed a soundness fix
+
+Stuart: "a test is only as deterministic as the thing it measures." VERIFIED read (scrutinizing Stuart's logic AND my own):
+
+**The challenge HOLDS on epistemics — catches my 2nd over-statement.** I said "baseline PROVABLY direct-copies at depth." Under #40 non-determinism, the baseline's 20/20 is ONE SAMPLE, not proof (the §4.3 WARN hit the fp16 side too). Clement's "5/5 trustworthy" = same error. Both treated a single draw as ground truth. Owned.
+
+**But it OVERSHOOTS into "plan unsound" without a measurement.** My "copy-precision dodges non-det (100<256)" assumed the clear-cadence is the SOLE source. Stuart's own path-A note undercuts it (mlx-lm clears deterministically → root may be deeper MLX Metal allocator). So the copy-precision regime's determinism is UNKNOWN — and cheaply MEASURABLE, not arguable. The honest status: establish determinism before trusting any single run; don't assume it (either direction).
+
+**PATH B (suppress thinking) is elegant AND now verified feasible NATIVELY**: M3 chat_template.jinja has `thinking_mode: "disabled"` ("Do not output any thinking process") — a first-class template mode, not a hack. Why B is the sound-maker:
+1. Matches the test's intent (copy-precision = direct reproduction).
+2. Minimizes non-det EXPOSURE — direct answer ~40 tok vs hundreds of thinking tok; fewer decode steps = less exposure to the non-det source WHATEVER it is (cadence or allocator). Robust to the source being unknown.
+3. DISSOLVES Clement's max_tokens corner — thinking-off means small max_tokens (~128) no longer starves (nothing to starve). Short AND complete simultaneously → escapes both horns (starve vs non-det).
+
+**PATH A (fix #40)**: clears are upstream (Jeongkyu Shin, GPU-cache safeguard, not free to remove); mlx-lm clears deterministically → deeper allocator suspect. Deep/uncertain/possibly-upstream. Do NOT gate the k8v4 verdict on A — B sidesteps it. #40 stays a separate track (owns §4.3 + general trust).
+
+**MINIMAL SOUND PATH (verdict = distribution, not a sample):**
+1. (0 compute) wire thinking_mode=disabled into the probe/server request.
+2. (cheap) DETERMINISM CHECK — ~3 targets × N=3 repeats, thinking-off, resident 8896: is exact-match STABLE across repeats? (IS the #40 characterization for the ≤128-tok regime.) Stable → determinism established. Unstable → escalate (sample/A).
+3. (1 arm) k8v4 copy-precision, thinking-off, --chars-per-token 5.67 @ 50K, 20 targets, self-graded. 20/20 exact + step-2 stable → SOUND pass. Any fail → fresh fp16-MXFP8 arm (thinking-off) to separate k8v4-vs-model.
+→ ~1 arm + a handful of repeats, 0 boot (resident 8896). Least compute for a SOUND verdict. NOT RUN — Stuart's decision/compute.
