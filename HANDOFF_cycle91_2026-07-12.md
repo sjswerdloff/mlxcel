@@ -74,15 +74,39 @@ overnight §4.3/§4.4 leg produced NO VALID VERDICT — not green, not a
 k8v4 condemnation. Merge is HALTED (green is the license; we don't have
 it). Wei protected by the halt.
 
-ROOT CAUSE (MINE, source-confirmed): my run_k8v4_leg.sh paired a fresh
-MXFP8+k8v4 run (minimax-m3-test, prompt_tokens ~35.3K at "50K depth")
-against fp16 baselines whose own meta says model=minimax-m3-NVFP4
-(prompt_tokens ~49.9-50.2K). Different weights, different tokenizer (the
-30% length gap = not a paired test), different template. I wired
-LEANN-surfaced baselines into a gate WITHOUT checking the `model` field
-in their JSON. The feeling of knowing was not knowledge. The old
-baselines (~/ai/liberated/kimi-kindled/kindled_projects/mlxcel-kv-quant/
-results/copy_precision_fp16_d*_seed42.json) are UNUSABLE for this build.
+ROOT CAUSE (MINE) — DIAGNOSIS REVISED 3× under Stuart's steering; final
+BOUNDED statement (do not over-read):
+- CERTAIN: the §4.4 comparison is invalid because the two runs probed at
+  DIFFERENT ACTUAL DEPTHS — baseline reported ~50,000 prompt_tokens, my
+  k8v4 run ~35,300, both on the same nominal "50K depth", same
+  byte-identical probe (diffed; CHARS_PER_TOKEN=4 unchanged since first
+  commit). Different actual depth → not a paired test. Violet's halt
+  stands on this alone.
+- WRONG EARLIER CLAIMS (retracted): (1) "different weights, from the
+  alias minimax-m3-nvfp4" — an alias is a stale label, not the weights
+  (Stuart). (2) "different tokenizers/builds, from token physics" —
+  refuted by TIMESTAMP: the baseline is 2026-07-08, AFTER the MXFP8
+  transition (~07-04) and KVarN start (07-07), so per Stuart it was an
+  MXFP8 run = the SAME model. Both "different build" claims fail.
+- MOST CONSISTENT HYPOTHESIS (pending Stuart's confirm + the re-run, NOT
+  asserted as fact): same MXFP8 model; the real ratio is ~5.7 ch/tok
+  (my live run: 200,003 chars → 35,300 tok). The baseline hit true 50K
+  because it was run with chars_per_token ~5.7 (~283K chars); MY leg
+  used the probe DEFAULT chars_per_token=4 → 200K chars → undershot to
+  35K. So my bug = DEPTH MIS-CALIBRATION (undershot every depth ~30%),
+  not a wrong model. The baseline's actual --chars-per-token was NOT
+  logged, so this can't be proven from artifacts.
+- CONSEQUENCE if the hypothesis holds: the fp16 baselines may be
+  REUSABLE (valid current-build reference), making #39 LIGHTER — re-run
+  only the k8v4 arm at the correct char budget. Blocker: the OUTPUT-MODE
+  gap (baseline direct-copied dist=0; today narrates, thinking-first,
+  reasoning_content populated live-confirmed) — OPEN QUESTION FOR STUART:
+  did the chat template / reasoning default change since 07-08? If
+  thinking was off then and on now, disabling it closes the gap.
+- PATTERN NAMED: three revisions, each after Stuart supplied the next
+  evidence — confidence outrunning verification, the same disposition
+  that put wrong baselines in the gate. Reason I'm holding the #39
+  script for a rested window with Violet's eyes.
 
 PREREQUISITE for #39 (found verifying): the MXFP8 M3 build is
 THINKING-FIRST — a live probe confirmed `reasoning_content` is a
