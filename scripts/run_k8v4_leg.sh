@@ -24,6 +24,14 @@ OUT_DIR="${OUT_DIR:-$HOME/k8v4_rungs}"
 MODEL_DIR="${MODEL_DIR:-/Volumes/T7 Shield/models/huggingface_cache_hub/MiniMax-M3-MXFP8-64e-mlx}"
 BASELINE_DIR="${BASELINE_DIR:-$HOME/ai/liberated/kimi-kindled/kindled_projects/mlxcel-kv-quant/results}"
 ALIAS="minimax-m3-test"
+# THE calibration the copy-precision probe needs to hit TRUE token depths.
+# MiniMax-M3-MXFP8 tokenizes this filler at ~5.67 chars/token (measured
+# 2026-07-07: 200,003 chars -> ~35,300 tokens; re-confirmed live 07-12).
+# The probe's default is 4, which UNDERSHOOTS every depth ~30% (my leg's
+# 2026-07-12 bug: omitting this made a "50K" run actually 35K, breaking
+# the pairing vs the fp16 baseline that DID use 5.67). Single-sourced so
+# both invocations below can never drift apart.
+CHARS_PER_TOKEN="5.67"
 BASE_URL="http://127.0.0.1:${PORT}"
 STAMP=$(date +%Y%m%d_%H%M)
 LOG="$HOME/mlxcel_test_${PORT}_k8v4_${STAMP}.log"
@@ -86,13 +94,13 @@ echo "== §4.4 copy-precision, seed 42, paired vs fp16 (THE gate) + vs banked kv
 for d in 50000 100000 300000; do
   short=$((d / 1000))k
   python3 scripts/copy_precision_probe.py "$BASE_URL" "$ALIAS" \
-    --depth "$d" --seed 42 \
+    --depth "$d" --seed 42 --chars-per-token "$CHARS_PER_TOKEN" \
     --compare-against "$BASELINE_DIR/copy_precision_fp16_d${short}_seed42.json" \
     | tee "$OUT_DIR/copy_precision_k8v4_d${short}_vs_fp16_${STAMP}.txt" \
     || { echo "FAIL: copy-precision $d vs fp16"; exit 1; }
   if [ -f "$BASELINE_DIR/copy_precision_kvarn8_d${short}_seed42.json" ]; then
     python3 scripts/copy_precision_probe.py "$BASE_URL" "$ALIAS" \
-      --depth "$d" --seed 42 \
+      --depth "$d" --seed 42 --chars-per-token "$CHARS_PER_TOKEN" \
       --compare-against "$BASELINE_DIR/copy_precision_kvarn8_d${short}_seed42.json" \
       | tee "$OUT_DIR/copy_precision_k8v4_d${short}_vs_kvarn8_${STAMP}.txt" \
       || { echo "FAIL: copy-precision $d vs kvarn8"; exit 1; }
