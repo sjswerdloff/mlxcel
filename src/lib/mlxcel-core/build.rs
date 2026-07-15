@@ -53,9 +53,13 @@ fn main() {
         .file("../mlx-cpp/turbo/turbo4_delegated_sdpa.cpp")
         // Fused paged-attention decode kernel launcher (epic #116 Phase 6,
         // #123). Reads scattered KV blocks out of the global pool via a block
-        // table with no separate gather copy; the gather-then-SDPA path stays
+        // table with no separate gather copy; the gather-then-SdPA path stays
         // the correctness reference and fallback.
         .file("../mlx-cpp/turbo/paged_attention.cpp")
+        // MSA KV-outer block-sparse decode attention (Phase 1 + Phase 2).
+        // Two-phase kernel: per-block partial attention with inverted index,
+        // then global softmax reduction.
+        .file("../mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp")
         .include(&mlx_include)
         .include("cpp")
         .include("../mlx-cpp/turbo")
@@ -168,6 +172,9 @@ fn main() {
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.h");
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.cpp");
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.metal");
+    // MSA KV-outer block-sparse decode attention.
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/minimax_sparse_kv_outer.h");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp");
     println!("cargo:rerun-if-env-changed=MLX_CUDA_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_METAL");
     println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_ACCELERATE");

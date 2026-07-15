@@ -2119,14 +2119,9 @@ impl SparseAttention {
 
     /// KV-outer block-sparse attention for MSA decode.
     ///
-    /// Alternative execution pattern: instead of iterating over queries and
-    /// gathering scattered KV blocks (Q-outer), this builds an inverted index
-    /// mapping each KV block to the queries that attend to it, then calls the
-    /// KV-outer Metal kernel which assigns a threadgroup to each KV block,
-    /// loads it into SRAM exactly once, and iterates over the queries.
-    ///
-    /// Phase 1: per-KV-block partial attention (max, sum_exp, weighted V)
-    /// Phase 2: global softmax reduction across all partial blocks per query
+    /// Two-phase kernel: Phase 1 loads each KV block into SRAM once and
+    /// processes all queries that attend to it (via inverted index). Phase 2
+    /// merges partials into the final output.
     ///
     /// Only called when MLXCEL_KV_OUTER=1 and decode (b==1, l==1).
     fn sparse_decode_attention_kv_outer(
@@ -2140,66 +2135,76 @@ impl SparseAttention {
         let b = 1i32;
         let l = 1i32;
         let h_kv = self.num_kv_heads;
-        let h_q = self.num_heads;
         let d = self.head_dim;
         let bs = self.block_size;
         let num_key_blocks = (kv_len + bs - 1) / bs;
 
-        // Build inverted index: for each KV block, which queries attend to it.
-        // selected: [b, h_kv, l, top_k] — absolute block indices per (head, token).
-        // inverted_index: [b, h_kv, num_key_blocks, max_queries_per_block] — query positions per block.
-        // query_counts: [b, h_kv, num_key_blocks] — how many queries per block.
-        let sel_bytes = mlxcel_core::array_to_raw_bytes(&mlxcel_core::astype(selected, mlxcel_core::dtype::INT32));
+        // Sync selection to host and compute sorted unique union.
+        let sel_i32 = mlxcel_core::astype(selected, mlxcel_core::dtype::INT32);
+        let sel_bytes = mlxcel_core::array_to_raw_bytes(&sel_i32);
         let sel_raw: Vec<i32> = sel_bytes
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        let mut union = sel_raw.clone();
+        union.sort_unstable();
+        union.dedup();
 
-        // Count queries per block per head
-        let mut counts = vec![0i32; (h_kv * num_key_blocks) as usize];
+        // Remap: absolute block index -> compact slot in the fetched array.
+        let mut table = vec![-1i32; num_key_blocks as usize];
+        for (slot, &blk) in union.iter().enumerate() {
+            table[blk as usize] = slot as i32;
+        }
+
+        // Build inverted index using compact positions.
+        // inverted_index: [b, h_kv, n_selected, max_qpb] — query positions per block.
+        // query_counts: [b, h_kv, n_selected] — how many queries per block.
+        let n_selected = union.len() as i32;
+        let mut counts = vec![0i32; (h_kv * n_selected) as usize];
         for h in 0..h_kv as usize {
             for j in 0..self.top_k as usize {
-                let blk = sel_raw[h * self.top_k as usize + j] as usize;
-                if blk < num_key_blocks as usize {
-                    counts[h * num_key_blocks as usize + blk] += 1;
+                let abs_blk = sel_raw[h * self.top_k as usize + j] as usize;
+                if abs_blk < num_key_blocks as usize {
+                    let compact = table[abs_blk] as usize;
+                    if compact < n_selected as usize {
+                        counts[h * n_selected as usize + compact] += 1;
+                    }
                 }
             }
         }
 
-        // Max queries per block (for padding)
         let max_qpb = *counts.iter().max().unwrap_or(&1).max(&1);
 
-        // Build inverted index
-        let mut inv_index = vec![0i32; (h_kv * num_key_blocks * max_qpb) as usize];
-        let mut counts_tmp = vec![0i32; (h_kv * num_key_blocks) as usize];
+        let mut inv_index = vec![0i32; (h_kv * n_selected * max_qpb) as usize];
+        let mut counts_tmp = vec![0i32; (h_kv * n_selected) as usize];
         for h in 0..h_kv as usize {
-            // For decode (l==1), the query position is offset
+            // For decode (l=1), the query position within L is 0 (not the absolute offset).
             let q_pos = offset;
             for j in 0..self.top_k as usize {
-                let blk = sel_raw[h * self.top_k as usize + j] as usize;
-                if blk < num_key_blocks as usize {
-                    let idx = h * num_key_blocks as usize + blk;
-                    let slot = counts_tmp[idx] as usize;
-                    if slot < max_qpb as usize {
-                        inv_index[idx * max_qpb as usize + slot] = q_pos;
+                let abs_blk = sel_raw[h * self.top_k as usize + j] as usize;
+                if abs_blk < num_key_blocks as usize {
+                    let compact = table[abs_blk] as usize;
+                    if compact < n_selected as usize {
+                        let idx = h * n_selected as usize + compact;
+                        let slot = counts_tmp[idx] as usize;
+                        if slot < max_qpb as usize {
+                            inv_index[idx * max_qpb as usize + slot] = q_pos;
+                        }
+                        counts_tmp[idx] += 1;
                     }
-                    counts_tmp[idx] += 1;
                 }
             }
         }
 
-        // Reshape K/V to blocked form: [b, h_kv, num_key_blocks, bs, d]
-        // This requires the cache to have the full window materialized.
-        // For now, use fetch_kvarn8 to get the full window and reshape.
-        let (k_full, v_full) = cache.fetch_kvarn8();
-        let k_blocked = mlxcel_core::reshape(&k_full, &[b, h_kv, num_key_blocks, bs, d]);
-        let v_blocked = mlxcel_core::reshape(&v_full, &[b, h_kv, num_key_blocks, bs, d]);
+        // Fetch only the union blocks and reshape to blocked form.
+        let (k_full, v_full) = cache.fetch_msa_blocks(&union);
+        let k_blocked = mlxcel_core::reshape(&k_full, &[b, h_kv, n_selected, bs, d]);
+        let v_blocked = mlxcel_core::reshape(&v_full, &[b, h_kv, n_selected, bs, d]);
 
-        // Convert to MLX arrays for the kernel
-        let inv_index_arr = mlxcel_core::from_slice_i32(&inv_index, &[b, h_kv, num_key_blocks, max_qpb]);
-        let counts_arr = mlxcel_core::from_slice_i32(&counts, &[b, h_kv, num_key_blocks]);
+        let inv_index_arr = mlxcel_core::from_slice_i32(&inv_index, &[b, h_kv, n_selected, max_qpb]);
+        let counts_arr = mlxcel_core::from_slice_i32(&counts, &[b, h_kv, n_selected]);
 
-        // Call KV-outer Phase 1
+        // Phase 1: per-block partial attention.
         let scale = 1.0 / (d as f32).sqrt();
         let mut partials = mlxcel_core::turbo_minimax_sparse_kv_outer_sdpa(
             q,
@@ -2212,18 +2217,17 @@ impl SparseAttention {
             max_qpb,
         );
 
-        // Extract partials
         let partial_m = mlxcel_core::kv_outer_partials_take_m(partials.pin_mut());
         let partial_l = mlxcel_core::kv_outer_partials_take_l(partials.pin_mut());
         let partial_v = mlxcel_core::kv_outer_partials_take_v(partials.pin_mut());
 
-        // Call KV-outer Phase 2 (global reduction)
+        // Phase 2: global softmax reduction.
         let out = mlxcel_core::turbo_minimax_sparse_kv_outer_reduction(
             q,
             &partial_m,
             &partial_l,
             &partial_v,
-            num_key_blocks,
+            n_selected,
         );
 
         out

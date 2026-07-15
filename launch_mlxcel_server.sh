@@ -134,6 +134,7 @@ fi
 # =====================================================================
 CHAT_TEMPLATE_KWARGS="{\"thinking_mode\":\"$THINKING_MODE\"}"
 export MLXCEL_MSA_FETCH="$MSA_FETCH"
+export MLXCEL_KV_OUTER=1
 if [[ "$HARVEST" == "on" ]]; then
   export MLXCEL_KVARN_HARVEST="$HOME/kvarn_harvest_$(date +%Y%m%d_%H%M%S)"
   mkdir -p "$MLXCEL_KVARN_HARVEST"
@@ -154,6 +155,7 @@ LOG="$LOG_DIR/mlxcel_${KV_CACHE_MODE}_p${PORT}_$(date +%Y%m%d_%H%M%S).log"
   echo "  kv-cache-mode         = $KV_CACHE_MODE"
   echo "  thinking-mode         = $THINKING_MODE   (chat-template-kwargs=$CHAT_TEMPLATE_KWARGS)"
   echo "  msa-fetch             = $MSA_FETCH   (MLXCEL_MSA_FETCH, boot-frozen, $_msa_source)"
+  echo "  kv-outer              = 1   (MLXCEL_KV_OUTER, block-sparse decode attention)"
   echo "  prompt-cache-capacity = $PROMPT_CACHE_CAPACITY_BYTES bytes   [binary intrinsic default is 2 GiB — NOT used]"
   echo "  prompt-cache-ttl      = $PROMPT_CACHE_TTL_SECONDS s   [0 = disabled; eviction only on compaction or LRU under memory pressure]"
   echo "  prefill-chunk-size    = $PREFILL_CHUNK_SIZE"
@@ -179,7 +181,7 @@ cd "$(dirname "$BIN")"
   --top-p "$TOP_P" \
   --prefill-chunk-size "$PREFILL_CHUNK_SIZE" \
   --prompt-cache-capacity-bytes "$PROMPT_CACHE_CAPACITY_BYTES" \
-  --prompt-cache-ttl-seconds "$PROMPT_CACHE_TTL_SECONDS" \
+  --prompt-cache-ttl "$PROMPT_CACHE_TTL_SECONDS" \
   --kv-cache-mode "$KV_CACHE_MODE" \
   --timeout "$DECODE_HANG_TIMEOUT" \
   --chat-template-kwargs "$CHAT_TEMPLATE_KWARGS" \

@@ -93,6 +93,9 @@ mod paged_turbo_tests;
 #[cfg(test)]
 #[path = "cache/sparse_v_tests.rs"]
 mod sparse_v_tests;
+#[cfg(test)]
+#[path = "cache/kv_outer_tests.rs"]
+mod kv_outer_tests;
 pub mod turbo;
 #[cfg(test)]
 #[path = "cache/turbo_tests.rs"]

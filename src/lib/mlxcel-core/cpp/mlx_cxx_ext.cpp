@@ -264,10 +264,10 @@ std::unique_ptr<MlxArray> steel_outputs_take_hot(Turbo4DelegatedSteelOutputs& o)
 }
 
 // KV-Stationary Block-Sparse Attention Phase 1 (KV-outer).
-// Implementation in `src/lib/mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp`;
-// we forward the call here so the new symbol shows up in the cxx-bridge ABI.
+// Implementation in `src/lib/mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp`.
 // Each threadgroup loads ONE KV block into SRAM exactly once, then iterates
 // over the inverted index to pull in only the queries that require this block.
+// Returns partials (max, sum_exp, weighted-V) for Phase 2 reduction.
 std::unique_ptr<KvOuterPartials> turbo_minimax_sparse_kv_outer_sdpa(
     const MlxArray& q,
     const MlxArray& k_blocked,
@@ -277,7 +277,7 @@ std::unique_ptr<KvOuterPartials> turbo_minimax_sparse_kv_outer_sdpa(
     float scale,
     int32_t block_size,
     int32_t max_queries_per_block) {
-    auto out = mlxcel::turbo::minimax_sparse_kv_outer_sdpa(
+    auto partials = mlxcel::turbo::minimax_sparse_kv_outer_sdpa(
         q.inner,
         k_blocked.inner,
         v_blocked.inner,
@@ -286,12 +286,10 @@ std::unique_ptr<KvOuterPartials> turbo_minimax_sparse_kv_outer_sdpa(
         scale,
         block_size,
         max_queries_per_block);
-    // The C++ function returns a tuple of arrays; we need to pack them into
-    // the KvOuterPartials struct for the cxx bridge.
-    // Note: This is a placeholder — the actual C++ function needs to return
-    // a struct or we need to adapt the return type.
     auto result = std::make_unique<KvOuterPartials>();
-    // TODO: Pack the returned arrays into the struct
+    result->partial_m = std::make_unique<MlxArray>(std::move(*partials.partial_m));
+    result->partial_l = std::make_unique<MlxArray>(std::move(*partials.partial_l));
+    result->partial_v = std::make_unique<MlxArray>(std::move(*partials.partial_v));
     return result;
 }
 
@@ -311,7 +309,7 @@ std::unique_ptr<MlxArray> turbo_minimax_sparse_kv_outer_reduction(
         partial_l.inner,
         partial_v.inner,
         num_key_blocks);
-    return std::make_unique<MlxArray>(std::move(out));
+    return std::make_unique<MlxArray>(std::move(*out));
 }
 
 // KV-outer partials takers. Same pattern as steel_outputs_take_*.
