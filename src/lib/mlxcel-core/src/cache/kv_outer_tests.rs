@@ -1223,3 +1223,99 @@ fn kv_outer_zero_query_blocks() {
         "zero-query: head 0 (block 0) and head 1 (block 1) should differ, RMS = {rms_h01:.6e}"
     );
 }
+
+/// Adversarial test: distinct KV-head V signatures catch cross-KV mixing.
+///
+/// Each KV head's V is filled with a distinct constant (kv_head 0 → 1.0,
+/// kv_head 1 → 0.0). If the kernel mixes KV heads, heads in group 0 would
+/// show contamination from 0.0 and heads in group 1 from 1.0.
+///
+/// With softmax weights summing to 1, expected output is exactly the V constant.
+#[test]
+fn kv_outer_adversarial_distinct_kv_signatures() {
+    let b = 1i32;
+    let hq = 8i32;
+    let hkv = 2i32; // nrep = 4
+    let dim = 32i32;
+    let block_size = 4i32;
+    let top_k = 2i32;
+    let total_kv_len = 8i32; // 2 blocks
+    let num_key_blocks = total_kv_len / block_size;
+    let n_rep = hq / hkv;
+    let offset = 7i32;
+    let scale = 1.0 / (dim as f32).sqrt();
+
+    let q = synth_tensor(&[b, hq, 1, dim], 42);
+    let k = synth_tensor(&[b, hkv, total_kv_len, dim], 43);
+
+    // V: kv_head 0 → all 1.0, kv_head 1 → all 0.0.
+    let v_tokens_per_head = (total_kv_len * dim) as usize;
+    let mut v_data = vec![0.0f32; (b * hkv * total_kv_len * dim) as usize];
+    // Fill kv_head 0's tokens with 1.0.
+    for i in 0..v_tokens_per_head {
+        v_data[i] = 1.0;
+    }
+    // kv_head 1 stays 0.0.
+    let v = ffi::from_slice_f32(&v_data, &[b, hkv, total_kv_len, dim]);
+
+    let k_blocked = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
+    ffi::eval(&k_blocked);
+    ffi::eval(&v_blocked);
+
+    let n_selected = top_k;
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
+    );
+    let block_ids_arr = ffi::astype(
+        &ffi::from_slice_f32(&[0.0, 1.0], &[n_selected]),
+        dtype::INT32,
+    );
+
+    let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
+        &q, &k_blocked, &v_blocked, &inv_index_arr, &counts_arr, &block_ids_arr,
+        scale, block_size, 1,
+    );
+    let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
+    let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
+    let partial_v = ffi::kv_outer_partials_take_v(partials.pin_mut());
+
+    let out = ffi::turbo_minimax_sparse_kv_outer_reduction(
+        &q, &partial_m, &partial_l, &partial_v, n_selected,
+    );
+
+    let out_flat = flatten_fp32(&out);
+    let head_size = dim as usize;
+
+    // Heads 0-3 (kv_head 0): output should be ≈ 1.0 (V=1.0, softmax weights sum to 1).
+    for h in 0..(n_rep as usize) {
+        let head_out = &out_flat[h * head_size..(h + 1) * head_size];
+        let mean: f32 = head_out.iter().sum::<f32>() / head_size as f32;
+        assert!(
+            (mean - 1.0).abs() < 0.01,
+            "GQA group 0 head {h}: mean={mean:.6}, expected ≈ 1.0 (cross-KV mixing?)"
+        );
+        // All values should be close to 1.0.
+        let max_dev = head_out.iter().map(|&v| (v - 1.0).abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_dev < 0.05,
+            "GQA group 0 head {h}: max deviation from 1.0 = {max_dev:.6} (cross-KV mixing?)"
+        );
+    }
+
+    // Heads 4-7 (kv_head 1): output should be ≈ 0.0 (V=0.0).
+    for h in (n_rep as usize)..(hq as usize) {
+        let head_out = &out_flat[h * head_size..(h + 1) * head_size];
+        let mean: f32 = head_out.iter().sum::<f32>() / head_size as f32;
+        assert!(
+            mean.abs() < 0.01,
+            "GQA group 1 head {h}: mean={mean:.6}, expected ≈ 0.0 (cross-KV mixing?)"
+        );
+        let max_dev = head_out.iter().map(|&v| v.abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_dev < 0.05,
+            "GQA group 1 head {h}: max deviation from 0.0 = {max_dev:.6} (cross-KV mixing?)"
+        );
+    }
+}
