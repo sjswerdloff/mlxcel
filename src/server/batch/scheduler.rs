@@ -428,6 +428,11 @@ pub struct BatchScheduler {
     /// disabled at config time so the hot path has zero overhead.
     prompt_cache: Option<Arc<PromptCacheStore>>,
 
+    /// Cold-storage for persisting detached KV caches to SSD. Enables
+    /// fast session restart by loading from disk instead of re-prefilling.
+    /// `None` when cold-storage is disabled.
+    cold_store: Option<Arc<mlxcel_core::cache::cold_store::ColdStore>>,
+
     /// Parallel map indexed by `SequenceId`: remembers the
     /// [`PromptCacheRequestContext`] per in-flight sequence so the donate-back
     /// path on completion can rebuild the cache key without touching the HTTP
@@ -976,6 +981,7 @@ impl BatchScheduler {
             reasoning_budget: None,
             thinking_token_ids: None,
             prompt_cache: None,
+            cold_store: None,
             prompt_cache_seq_ctx: std::collections::HashMap::new(),
             kv_cache_mode: KVCacheMode::Fp16,
             kvarn_v_bits: 8,
@@ -1331,6 +1337,12 @@ impl BatchScheduler {
         self
     }
 
+    /// Install a cold-storage backend for persisting detached KV caches to SSD.
+    pub fn with_cold_store(mut self, store: Option<Arc<mlxcel_core::cache::cold_store::ColdStore>>) -> Self {
+        self.cold_store = store;
+        self
+    }
+
     /// Whether the installed prompt-cache store is currently accepting
     /// lookups and inserts (scheduler-level gate).
     #[inline]
@@ -1511,6 +1523,46 @@ impl BatchScheduler {
                 found
             }
             None => {
+                // Store miss — try cold-storage (SSD) fallback.
+                if let Some(cs) = &self.cold_store {
+                    match cs.load(&ctx.session_key) {
+                        Ok(detached) => {
+                            let token_len = detached.prompt_len;
+                            tracing::info!(
+                                session_key = %ctx.session_key,
+                                token_len,
+                                "prompt-cache: SSD cold-store HIT (loading from disk)"
+                            );
+                            // Adopt the loaded cache into the pool.
+                            match self.cache_pool.adopt(
+                                &self.model as &dyn crate::generate::LanguageModel,
+                                detached,
+                            ) {
+                                Ok(seq_id) => {
+                                    self.batch_observability.record_prompt_cache_hit(token_len);
+                                    return Some((seq_id, token_len));
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        session_key = %ctx.session_key,
+                                        error = %err,
+                                        "cold-store: adopt failed after load; falling back to cold prefill"
+                                    );
+                                }
+                            }
+                        }
+                        Err(mlxcel_core::cache::cold_store::ColdStoreError::SessionNotFound(_)) => {
+                            // No cold-store entry either — genuine miss.
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                session_key = %ctx.session_key,
+                                error = %e,
+                                "cold-store: load failed (non-fatal, falling back to cold prefill)"
+                            );
+                        }
+                    }
+                }
                 tracing::info!(
                     total = tokens.len(),
                     store_entries = store.len(),
@@ -1985,6 +2037,20 @@ impl BatchScheduler {
             // took so the pool budget stays honest.
             self.release_unused_detached(kv_set);
             return;
+        }
+
+        // Persist to cold-storage (SSD) before wrapping in CacheEntry.
+        // Serialization happens synchronously; disk I/O is async.
+        if let Some(cs) = &self.cold_store {
+            if let DetachedKvSet::Dense(dense) = &kv_set {
+                if let Err(e) = cs.persist(&ctx.session_key, dense) {
+                    tracing::warn!(
+                        session_key = %ctx.session_key,
+                        error = %e,
+                        "cold-store: persist failed (non-fatal, in-memory cache still works)"
+                    );
+                }
+            }
         }
 
         // The `CacheEntry` takes ownership of `tokens` and the key borrows

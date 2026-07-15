@@ -76,6 +76,7 @@
 //! compressed-only memory target.
 
 pub mod batch_quant;
+pub mod cold_store;
 mod detach;
 pub mod harvest;
 pub mod kvarn;

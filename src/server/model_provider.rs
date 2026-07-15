@@ -164,6 +164,7 @@ impl ModelProvider {
             adapter_path,
             config,
             None,
+            None,
             batch_metrics,
             batch_observability,
         )
@@ -178,6 +179,7 @@ impl ModelProvider {
         adapter_path: Option<PathBuf>,
         config: &crate::server::ServerConfig,
         prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
+        cold_store: Option<Arc<mlxcel_core::cache::cold_store::ColdStore>>,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -244,6 +246,7 @@ impl ModelProvider {
                 config.lang_bias_config.clone(),
                 config.reasoning_budget,
                 prompt_cache_store,
+                cold_store,
                 config.kv_cache_mode,
                 config.kvarn_v_bits,
                 config.batch_kv_quant,
@@ -350,8 +353,9 @@ impl ModelProvider {
             crate::server::DecodeStorageBackend::Dense,
             None,
             crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
-            None,
-            None,
+            None,   // lang_bias_config
+            None,   // reasoning_budget
+            None,   // cold_store
             batch_metrics,
             batch_observability,
         )
@@ -386,6 +390,7 @@ impl ModelProvider {
         vision_cache_size: usize,
         lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
         reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
+        cold_store: Option<Arc<mlxcel_core::cache::cold_store::ColdStore>>,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -403,7 +408,8 @@ impl ModelProvider {
             vision_cache_size,
             lang_bias_config,
             reasoning_budget,
-            None,
+            None,   // prompt_cache_store: disabled
+            cold_store,
             mlxcel_core::cache::KVCacheMode::Fp16,
             8, // kvarn_v_bits: inert beside the Fp16 mode above
             mlxcel_core::cache::BatchKvQuantConfig::default(),
@@ -441,6 +447,7 @@ impl ModelProvider {
         lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
         reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
         prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
+        cold_store: Option<Arc<mlxcel_core::cache::cold_store::ColdStore>>,
         kv_cache_mode: mlxcel_core::cache::KVCacheMode,
         kvarn_v_bits: u8,
         batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
@@ -476,6 +483,7 @@ impl ModelProvider {
             lang_bias_config,
             reasoning_budget,
             prompt_cache_store,
+            cold_store,
             kv_cache_mode,
             kvarn_v_bits,
             batch_kv_quant,
@@ -520,6 +528,7 @@ impl ModelProvider {
         lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
         reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
         prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
+        cold_store: Option<Arc<mlxcel_core::cache::cold_store::ColdStore>>,
         kv_cache_mode: mlxcel_core::cache::KVCacheMode,
         kvarn_v_bits: u8,
         batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
@@ -563,6 +572,7 @@ impl ModelProvider {
             lang_bias_config,
             reasoning_budget,
             prompt_cache: prompt_cache_store.clone(),
+            cold_store,
             kv_cache_mode,
             kvarn_v_bits,
             batch_kv_quant,
@@ -658,6 +668,7 @@ impl ModelProvider {
             lang_bias_config: None,
             reasoning_budget: None,
             prompt_cache: None,
+            cold_store: None,
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
             kvarn_v_bits: 8, // inert width beside the Fp16 mode above
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),

@@ -167,13 +167,6 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
                 for (uint t = 0; t < actual_chunk; t++) {
                     uint tok_base = t * dim;
 
-                    // Causal mask: absolute position of this token must be <= q_pos.
-                    uint abs_tok_pos = abs_block_id * block_size + chunk_start + t;
-                    if (abs_tok_pos > (uint)q_pos) {
-                        // Future token — skip entirely.
-                        continue;
-                    }
-
                     // Q · K_t via simd_sum across 32 lanes.
                     float partial = 0.0f;
                     for (uint j = 0; j < dpt; j++) {
@@ -183,17 +176,27 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
                     }
                     float score = simd_sum(partial) * scale_v;
 
-                    // Online softmax with rescale.
-                    float m_new = fmax(m, score);
-                    float corr = fast::exp(m - m_new);
-                    float p = fast::exp(score - m_new);
-                    l = l * corr + p;
-                    for (uint j = 0; j < dpt; j++) {
-                        uint d = d0 + j;
-                        float vd = (d < dim) ? tg_v[tok_base + d] : 0.0f;
-                        acc[j] = acc[j] * corr + p * vd;
+                    // Causal mask: mask future tokens to -inf instead of
+                    // skipping (continue would deadlock on threadgroup_barrier).
+                    uint abs_tok_pos = abs_block_id * block_size + chunk_start + t;
+                    if (abs_tok_pos > (uint)q_pos) {
+                        score = -INFINITY;
                     }
-                    m = m_new;
+
+                    // Online softmax with rescale.
+                    // Skip contribution entirely for masked (-inf) tokens.
+                    if (isfinite(score)) {
+                        float m_new = fmax(m, score);
+                        float corr = fast::exp(m - m_new);
+                        float p = fast::exp(score - m_new);
+                        l = l * corr + p;
+                        for (uint j = 0; j < dpt; j++) {
+                            uint d = d0 + j;
+                            float vd = (d < dim) ? tg_v[tok_base + d] : 0.0f;
+                            acc[j] = acc[j] * corr + p * vd;
+                        }
+                        m = m_new;
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }

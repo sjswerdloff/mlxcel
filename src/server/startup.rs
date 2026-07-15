@@ -1754,6 +1754,15 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         None
     };
 
+    // Cold-storage for persisting detached KV caches to SSD.
+    // Enables fast session restart by loading from disk instead of re-prefilling.
+    let model_path_str = startup.model_path.to_string_lossy().to_string();
+    let cold_store = Arc::new(mlxcel_core::cache::cold_store::ColdStore::new(&model_path_str));
+    tracing::info!(
+        base_dir = %cold_store.base_dir().display(),
+        "Cold-storage enabled for KV cache SSD persistence"
+    );
+
     // `--timeout` is validated inside `new_with_server_config_and_prompt_cache` and
     // the resolved `Duration` is stashed on `ModelProvider`, where it flows into the drain loops.
     // A zero value triggers a logged warning and falls back to the 300 s default.
@@ -1762,6 +1771,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         startup.adapter_path.clone(),
         &config,
         prompt_cache_store.clone(),
+        Some(cold_store.clone()),
         batch_metrics.clone(),
         batch_observability.clone(),
     )?);
