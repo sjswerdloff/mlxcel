@@ -1323,12 +1323,23 @@ fn kv_outer_adversarial_distinct_kv_signatures() {
 /// Production-valid zero-count test: disjoint block selections between GQA groups.
 ///
 /// Hq=8, Hkv=2, G=4. Group 0 selects block 0 only, group 1 selects block 1 only.
-/// Union = [0, 1]. V for kv_head 0 = 1.0, kv_head 1 = 0.0.
+/// Union = [0, 1].
 ///
-/// This tests the query_counts predicate under the production data model:
-/// - Group 0's (head, block=1) pairs have count=0 → must not contribute
-/// - Group 1's (head, block=0) pairs have count=0 → must not contribute
-/// - Block 0 must not leak into group 1, and vice versa.
+/// Uses zero K (all scores = 0 → softmax weights = uniform) and distinct V per
+/// (KV head, block) pair:
+///   kv_head 0, block 0: V = 1.0   (selected by group 0)
+///   kv_head 0, block 1: V = 0.25  (NOT selected by group 0)
+///   kv_head 1, block 0: V = 0.75  (NOT selected by group 1)
+///   kv_head 1, block 1: V = 0.0   (selected by group 1)
+///
+/// If query_counts is ignored and both blocks attend:
+///   group 0 output = (1.0 + 0.25) / 2 = 0.625  (WRONG, should be 1.0)
+///   group 1 output = (0.75 + 0.0) / 2 = 0.375  (WRONG, should be 0.0)
+///
+/// Also asserts inactive phase-1 partials directly:
+///   inactive partial_m == -INFINITY
+///   inactive partial_l == 0
+///   inactive partial_v == 0
 #[test]
 fn kv_outer_disjoint_selections_no_leakage() {
     let b = 1i32;
@@ -1344,14 +1355,22 @@ fn kv_outer_disjoint_selections_no_leakage() {
     let scale = 1.0 / (dim as f32).sqrt();
 
     let q = synth_tensor(&[b, hq, 1, dim], 42);
-    let k = synth_tensor(&[b, hkv, total_kv_len, dim], 43);
+    // Zero K → all scores = 0 → softmax weights = uniform over visible tokens.
+    let k_data = vec![0.0f32; (b * hkv * total_kv_len * dim) as usize];
+    let k = ffi::from_slice_f32(&k_data, &[b, hkv, total_kv_len, dim]);
 
-    // V: kv_head 0 → 1.0, kv_head 1 → 0.0.
-    let v_tokens_per_head = (total_kv_len * dim) as usize;
+    // V: distinct per (kv_head, block) pair.
+    // kv_head 0, block 0 → 1.0;  kv_head 0, block 1 → 0.25
+    // kv_head 1, block 0 → 0.75; kv_head 1, block 1 → 0.0
+    let block_elems = (block_size * dim) as usize;
     let mut v_data = vec![0.0f32; (b * hkv * total_kv_len * dim) as usize];
-    for i in 0..v_tokens_per_head {
-        v_data[i] = 1.0;
-    }
+    // kv_head 0, block 0 (positions 0..block_elems-1)
+    for i in 0..block_elems { v_data[i] = 1.0; }
+    // kv_head 0, block 1 (positions block_elems..2*block_elems-1)
+    for i in block_elems..2 * block_elems { v_data[i] = 0.25; }
+    // kv_head 1, block 0 (positions 2*block_elems..3*block_elems-1)
+    for i in 2 * block_elems..3 * block_elems { v_data[i] = 0.75; }
+    // kv_head 1, block 1 stays 0.0
     let v = ffi::from_slice_f32(&v_data, &[b, hkv, total_kv_len, dim]);
 
     // Blocked layout: [B, Hkv, num_key_blocks, BlockSize, Dim]
@@ -1406,6 +1425,54 @@ fn kv_outer_disjoint_selections_no_leakage() {
     let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
     let partial_v = ffi::kv_outer_partials_take_v(partials.pin_mut());
 
+    // --- Assert phase-1 partials directly ---
+    let m_flat = flatten_fp32(&partial_m);
+    let l_flat = flatten_fp32(&partial_l);
+    let v_flat = flatten_fp32(&partial_v);
+
+    // Inactive (head, block) pairs: partial_m == -INF, partial_l == 0, partial_v == 0.
+    // Group 0 (heads 0-3) did NOT select block 1 (compact index 1).
+    for h in 0..(n_rep as usize) {
+        let idx = h * n_selected as usize + 1; // block 1
+        assert!(
+            m_flat[idx] == f32::NEG_INFINITY,
+            "Inactive partial_m should be -INF: head {h} block 1 = {}",
+            m_flat[idx]
+        );
+        assert!(
+            l_flat[idx] == 0.0,
+            "Inactive partial_l should be 0: head {h} block 1 = {}",
+            l_flat[idx]
+        );
+    }
+    // Group 1 (heads 4-7) did NOT select block 0 (compact index 0).
+    for h in (n_rep as usize)..(hq as usize) {
+        let idx = h * n_selected as usize + 0; // block 0
+        assert!(
+            m_flat[idx] == f32::NEG_INFINITY,
+            "Inactive partial_m should be -INF: head {h} block 0 = {}",
+            m_flat[idx]
+        );
+        assert!(
+            l_flat[idx] == 0.0,
+            "Inactive partial_l should be 0: head {h} block 0 = {}",
+            l_flat[idx]
+        );
+    }
+    // Inactive partial_v should be 0 (zero-init).
+    let dim_usize = dim as usize;
+    for h in 0..(n_rep as usize) {
+        let base = (h * n_selected as usize + 1) * dim_usize; // block 1
+        for d in 0..dim_usize {
+            assert!(
+                v_flat[base + d] == 0.0,
+                "Inactive partial_v should be 0: head {h} block 1 dim {d} = {}",
+                v_flat[base + d]
+            );
+        }
+    }
+
+    // --- Assert final output ---
     let out = ffi::turbo_minimax_sparse_kv_outer_reduction(
         &q, &partial_m, &partial_l, &partial_v, n_selected,
     );
@@ -1414,22 +1481,26 @@ fn kv_outer_disjoint_selections_no_leakage() {
     let head_size = dim as usize;
 
     // Group 0 (heads 0-3): attends block 0 where V=1.0 → output ≈ 1.0.
+    // If query_counts were ignored and block 1 (V=0.25) also contributed,
+    // output would be (1.0 + 0.25) / 2 = 0.625.
     for h in 0..(n_rep as usize) {
         let head_out = &out_flat[h * head_size..(h + 1) * head_size];
         let mean: f32 = head_out.iter().sum::<f32>() / head_size as f32;
         assert!(
             (mean - 1.0).abs() < 0.01,
-            "Group 0 head {h}: mean={mean:.6}, expected ≈ 1.0 (block 1 leaking in?)"
+            "Group 0 head {h}: mean={mean:.4}, expected 1.0 (block 1 leaking in?)"
         );
     }
 
     // Group 1 (heads 4-7): attends block 1 where V=0.0 → output ≈ 0.0.
+    // If query_counts were ignored and block 0 (V=0.75) also contributed,
+    // output would be (0.75 + 0.0) / 2 = 0.375.
     for h in (n_rep as usize)..(hq as usize) {
         let head_out = &out_flat[h * head_size..(h + 1) * head_size];
         let mean: f32 = head_out.iter().sum::<f32>() / head_size as f32;
         assert!(
             mean.abs() < 0.01,
-            "Group 1 head {h}: mean={mean:.6}, expected ≈ 0.0 (block 0 leaking in?)"
+            "Group 1 head {h}: mean={mean:.4}, expected 0.0 (block 0 leaking in?)"
         );
     }
 }

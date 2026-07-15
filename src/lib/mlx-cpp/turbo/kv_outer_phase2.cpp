@@ -129,6 +129,12 @@ std::unique_ptr<mlx::core::array> minimax_sparse_kv_outer_reduction(
     int q_len = q_shape[2];
     int dim = q_shape[3];
 
+    // Validate decode-only contract (grid and offsets omit batch).
+    if (batch != 1) {
+        throw std::runtime_error(
+            "kv_outer_phase2: decode only (B=1), got B=" + std::to_string(batch));
+    }
+
     auto& kernel = get_phase2_kernel().get();
 
     std::vector<std::pair<std::string, TemplateArg>> template_args = {

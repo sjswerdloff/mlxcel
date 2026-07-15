@@ -32,7 +32,7 @@
 // the cooperative KV load is correct.
 //
 // Threadgroup memory: tg_k[ChunkSize * Dim] + tg_v[ChunkSize * Dim]
-// For Dim=128, ChunkSize=16: 16 KB each, 32 KB total (Apple M3 limit).
+// For Dim=128, ChunkSize=32: 16 KB each, 32 KB total (Apple M3 limit).
 
 #include "minimax_sparse_kv_outer.h"
 
@@ -117,73 +117,84 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
     threadgroup float tg_k[ChunkSize * Dim];
     threadgroup float tg_v[ChunkSize * Dim];
 
+    // Activity gate: check if ANY head in this GQA group selected this block.
+    // Selection is GQA-group-shared, so checking the first head suffices.
+    // The value is uniform across all SIMD groups (same g_start, same kv_block_idx).
+    // A threadgroup barrier before this ensures all groups have entered.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bool tile_active = (query_counts[g_start * n_selected + kv_block_idx] > 0);
+
     // Outer loop: over chunks of the KV block.
-    // Each chunk is loaded ONCE cooperatively, then ALL assigned query heads process it.
-    // ALL SIMD groups participate in loads and barriers (even if num_heads == 0).
+    // ALL SIMD groups participate in barriers regardless of tile activity.
+    // Inactive tiles skip KV load and head computation but still hit barriers.
     for (uint chunk_start = 0; chunk_start < block_size; chunk_start += chunk_size) {
         uint chunk_end = min(chunk_start + chunk_size, block_size);
         uint actual_chunk = chunk_end - chunk_start;
         uint chunk_elems = actual_chunk * dim;
 
-        // Cooperatively load this chunk into threadgroup memory.
-        // ALL threads across ALL SIMD groups participate.
-        uint chunk_base = kv_base + chunk_start * dim;
-        for (uint i = linear_tid; i < chunk_elems; i += threads_per_tg) {
-            uint tok = i / dim;
-            uint d = i % dim;
-            tg_k[tok * dim + d] = (float)k_blocked[chunk_base + tok * dim + d];
-            tg_v[tok * dim + d] = (float)v_blocked[chunk_base + tok * dim + d];
+        if (tile_active) {
+            // Cooperatively load this chunk into threadgroup memory.
+            uint chunk_base = kv_base + chunk_start * dim;
+            for (uint i = linear_tid; i < chunk_elems; i += threads_per_tg) {
+                uint tok = i / dim;
+                uint d = i % dim;
+                tg_k[tok * dim + d] = (float)k_blocked[chunk_base + tok * dim + d];
+                tg_v[tok * dim + d] = (float)v_blocked[chunk_base + tok * dim + d];
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Process assigned query heads against this chunk.
-        // Only heads with query_counts > 0 for this (head, block) pair contribute.
-        for (uint hi = 0; hi < num_heads; hi++) {
-            uint qh = head_start + hi;
+        if (tile_active) {
+            // Process assigned query heads against this chunk.
+            // Only heads with query_counts > 0 for this (head, block) pair contribute.
+            for (uint hi = 0; hi < num_heads; hi++) {
+                uint qh = head_start + hi;
 
-            // Check if this (head, block) pair is actually selected.
-            uint head_block_idx = qh * n_selected + kv_block_idx;
-            uint count = (uint)query_counts[head_block_idx];
-            if (count == 0) continue;
+                // Check if this (head, block) pair is actually selected.
+                uint head_block_idx = qh * n_selected + kv_block_idx;
+                uint count = (uint)query_counts[head_block_idx];
+                if (count == 0) continue;
 
-            for (uint t = 0; t < actual_chunk; t++) {
-                uint tok_base = t * dim;
+                for (uint t = 0; t < actual_chunk; t++) {
+                    uint tok_base = t * dim;
 
-                // Q · K_t via simd_sum across 32 lanes.
-                float partial = 0.0f;
-                for (uint j = 0; j < dpt; j++) {
-                    uint d = d0 + j;
-                    float kd = (d < dim) ? tg_k[tok_base + d] : 0.0f;
-                    partial += q_reg[hi][j] * kd;
-                }
-                float score = simd_sum(partial) * scale_v;
-
-                // Causal mask.
-                uint abs_tok_pos = abs_block_id * block_size + chunk_start + t;
-                if (abs_tok_pos > (uint)inverted_index[head_block_idx]) {
-                    score = -INFINITY;
-                }
-
-                // Online softmax — skip masked tokens entirely.
-                if (isfinite(score)) {
-                    float m_new = fmax(m[hi], score);
-                    float corr = fast::exp(m[hi] - m_new);
-                    float p = fast::exp(score - m_new);
-                    l[hi] = l[hi] * corr + p;
+                    // Q · K_t via simd_sum across 32 lanes.
+                    float partial = 0.0f;
                     for (uint j = 0; j < dpt; j++) {
                         uint d = d0 + j;
-                        float vd = (d < dim) ? tg_v[tok_base + d] : 0.0f;
-                        acc[hi][j] = acc[hi][j] * corr + p * vd;
+                        float kd = (d < dim) ? tg_k[tok_base + d] : 0.0f;
+                        partial += q_reg[hi][j] * kd;
                     }
-                    m[hi] = m_new;
+                    float score = simd_sum(partial) * scale_v;
+
+                    // Causal mask.
+                    uint abs_tok_pos = abs_block_id * block_size + chunk_start + t;
+                    if (abs_tok_pos > (uint)inverted_index[head_block_idx]) {
+                        score = -INFINITY;
+                    }
+
+                    // Online softmax — skip masked tokens entirely.
+                    if (isfinite(score)) {
+                        float m_new = fmax(m[hi], score);
+                        float corr = fast::exp(m[hi] - m_new);
+                        float p = fast::exp(score - m_new);
+                        l[hi] = l[hi] * corr + p;
+                        for (uint j = 0; j < dpt; j++) {
+                            uint d = d0 + j;
+                            float vd = (d < dim) ? tg_v[tok_base + d] : 0.0f;
+                            acc[hi][j] = acc[hi][j] * corr + p * vd;
+                        }
+                        m[hi] = m_new;
+                    }
                 }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write partials to global memory for ALL assigned query heads.
-    // Inactive heads (count==0) write neutral values (already set by init).
+    // Write partials to global memory.
+    // Inactive tiles (tile_active==false) write neutral values (m=-INF, l=0, v=0).
+    // These are already set by the accumulator initialization above.
     for (uint hi = 0; hi < num_heads; hi++) {
         uint qh = head_start + hi;
         uint partial_base = qh * n_selected + kv_block_idx;
