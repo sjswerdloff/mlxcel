@@ -693,7 +693,128 @@ fn kv_outer_causal_mask_blocks_future_tokens() {
     );
 }
 
-/// Real-dimension test: dim=128, block_size=128, hq=64, hkv=4.
+/// Large-context test: closer to real server parameters.
+/// 8192 tokens (64 blocks), top_k=32 — exercises larger inverted index.
+#[test]
+fn kv_outer_large_context() {
+    let b = 1i32;
+    let hq = 64i32;
+    let hkv = 4i32;
+    let dim = 128i32;
+    let block_size = 128i32;
+    let top_k = 32i32; // real top_k
+    let total_kv_len = 8192i32; // 64 blocks
+    let num_key_blocks = total_kv_len / block_size;
+    let offset = 8191i32;
+    let scale = 1.0 / (dim as f32).sqrt();
+    let n_rep = hq / hkv;
+
+    let q = synth_tensor(&[b, hq, 1, dim], 100);
+    let k = synth_tensor(&[b, hkv, total_kv_len, dim], 200);
+    let v = synth_tensor(&[b, hkv, total_kv_len, dim], 300);
+
+    // Selection: all heads select blocks 0..top_k.
+    let sel_blocks_per_head: Vec<i32> = (0..top_k).collect();
+    let mut selected_data = Vec::new();
+    for _ in 0..hkv {
+        for &blk in &sel_blocks_per_head {
+            selected_data.push(blk as f32);
+        }
+    }
+    let _selected = ffi::astype(
+        &ffi::from_slice_f32(&selected_data, &[b, hkv, 1, top_k]),
+        dtype::INT32,
+    );
+
+    // Fetch only selected blocks (compact), not all blocks.
+    // The real dispatch does: fetch_msa_blocks(&union) → reshape to [b, hkv, n_selected, bs, d].
+    // Here we slice the first n_selected blocks from the full tensor.
+    let n_selected = top_k;
+    let k_all = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_all = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
+    let k_blocked = ffi::slice(&k_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
+    let v_blocked = ffi::slice(&v_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
+
+    let max_qpb = 1i32;
+    let mut inv_index = vec![0i32; (hkv * n_selected * max_qpb) as usize];
+    let mut counts = vec![0i32; (hkv * n_selected) as usize];
+    for kv_h in 0..hkv as usize {
+        for j in 0..top_k as usize {
+            let idx = kv_h * n_selected as usize + j;
+            counts[idx] = 1;
+            inv_index[idx] = offset;
+        }
+    }
+    let inv_index_arr = ffi::astype(
+        &ffi::from_slice_f32(
+            &inv_index.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+            &[b, hkv, n_selected, max_qpb],
+        ),
+        dtype::INT32,
+    );
+    let counts_arr = ffi::astype(
+        &ffi::from_slice_f32(
+            &counts.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+            &[b, hkv, n_selected],
+        ),
+        dtype::INT32,
+    );
+    let block_ids_arr = ffi::astype(
+        &ffi::from_slice_f32(
+            &sel_blocks_per_head.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+            &[n_selected],
+        ),
+        dtype::INT32,
+    );
+
+    // Phase 1 + Phase 2.
+    let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
+        &q, &k_blocked, &v_blocked, &inv_index_arr, &counts_arr, &block_ids_arr,
+        scale, block_size, max_qpb,
+    );
+    let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
+    let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
+    let partial_v = ffi::kv_outer_partials_take_v(partials.pin_mut());
+
+    // Check partials are finite.
+    let m_flat = flatten_fp32(&partial_m);
+    let l_flat = flatten_fp32(&partial_l);
+    let m_shape = ffi::array_shape(&partial_m);
+    eprintln!("partial_m shape: {m_shape:?}, len: {}", m_flat.len());
+    // Find first non-finite value for debugging.
+    for (i, &v) in m_flat.iter().enumerate() {
+        if !v.is_finite() {
+            eprintln!("partial_m[{i}] = {v}");
+            break;
+        }
+    }
+    let all_m_finite = m_flat.iter().all(|&x| x.is_finite());
+    let all_l_finite = l_flat.iter().all(|&x| x.is_finite());
+    assert!(all_m_finite, "partial_m should be finite at large context");
+    assert!(all_l_finite, "partial_l should be finite at large context");
+
+    let out = ffi::turbo_minimax_sparse_kv_outer_reduction(
+        &q, &partial_m, &partial_l, &partial_v, n_selected,
+    );
+
+    let out_flat = flatten_fp32(&out);
+    let all_finite = out_flat.iter().all(|&x| x.is_finite());
+    let has_nonzero = out_flat.iter().any(|&x| x != 0.0);
+    assert!(all_finite, "large-context output should be finite");
+    assert!(has_nonzero, "large-context output should be non-zero");
+
+    // Compare head 0 against reference.
+    let sel_full: Vec<i32> = sel_blocks_per_head.iter().cycle().take((hkv * top_k) as usize).cloned().collect();
+    let out_ref = reference_block_sparse_attention(
+        &q, &k_blocked, &v_blocked, &sel_full,
+        n_rep, top_k, block_size, num_key_blocks, offset, scale,
+    );
+    let ref_flat = flatten_fp32(&out_ref);
+    let head_size = dim as usize;
+    let rms = rms_diff(&out_flat[..head_size], &ref_flat[..head_size]);
+    eprintln!("large_context: head 0 RMS = {rms:.6e}");
+    assert!(rms < 0.1, "large-context RMS {rms:.6e} exceeds 0.1");
+}
 /// This matches the actual MiniMax-M3 server configuration and exercises
 /// multiple chunk iterations (chunk_size=16, 8 iterations per block).
 #[test]
@@ -722,16 +843,20 @@ fn kv_outer_real_dimensions() {
             selected_data.push(blk as f32);
         }
     }
-    let selected = ffi::astype(
+    let _selected = ffi::astype(
         &ffi::from_slice_f32(&selected_data, &[b, hkv, 1, top_k]),
         dtype::INT32,
     );
 
-    let k_blocked = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
-    let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
-
-    // Build inverted index.
+    // Fetch only selected blocks (compact), not all blocks.
+    // The real dispatch does: fetch_msa_blocks(&union) → reshape to [b, hkv, n_selected, bs, d].
+    // Here we simulate by slicing the first n_selected blocks from the full tensor.
     let n_selected = top_k;
+    let k_all = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_all = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
+    let k_blocked = ffi::slice(&k_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
+    let v_blocked = ffi::slice(&v_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
+
     let max_qpb = 1i32;
     let mut inv_index = vec![0i32; (hkv * n_selected * max_qpb) as usize];
     let mut counts = vec![0i32; (hkv * n_selected) as usize];

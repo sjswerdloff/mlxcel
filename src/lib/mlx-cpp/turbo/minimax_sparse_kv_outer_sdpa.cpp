@@ -204,19 +204,23 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
             // Write partials to global memory for this (q_head, q_pos, kv_block).
             // partial_m/l/v shapes: [B, Hq, L, n_key_blocks]
             // For decode (L=1), the partial buffer index is 0 (not the absolute q_pos).
-            uint partial_buf_idx = 0;
-            uint partial_base = partial_buf_idx * n_key_blocks + kv_block_idx;
-            uint partial_vec_base = partial_buf_idx * n_key_blocks * dim + kv_block_idx * dim;
+            // Bounds check: q_head_idx must be < Hq to prevent OOB writes.
+            uint hq_limit = (uint)q_shape[1];
+            if (q_head_idx < hq_limit) {
+                uint partial_buf_idx = 0;
+                uint partial_base = partial_buf_idx * n_key_blocks + kv_block_idx;
+                uint partial_vec_base = partial_buf_idx * n_key_blocks * dim + kv_block_idx * dim;
 
-            for (uint j = 0; j < dpt; j++) {
-                uint d = d0 + j;
-                if (d < dim) {
-                    partial_v[q_head_idx * n_key_blocks * dim + partial_vec_base + d] = acc[j];
+                for (uint j = 0; j < dpt; j++) {
+                    uint d = d0 + j;
+                    if (d < dim) {
+                        partial_v[q_head_idx * n_key_blocks * dim + partial_vec_base + d] = acc[j];
+                    }
                 }
-            }
-            if (lane == 0u) {
-                partial_m[q_head_idx * n_key_blocks + partial_base] = m;
-                partial_l[q_head_idx * n_key_blocks + partial_base] = l;
+                if (lane == 0u) {
+                    partial_m[q_head_idx * n_key_blocks + partial_base] = m;
+                    partial_l[q_head_idx * n_key_blocks + partial_base] = l;
+                }
             }
 
             // Reset for next query head (only if more to process).
