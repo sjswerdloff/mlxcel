@@ -77,19 +77,6 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
     uint head_start = g_start + sg * heads_per_simd;
     uint head_end = min(head_start + heads_per_simd, g_start + nrep);
 
-    // Early exit for inactive tiles: no Q load, no accumulators, no barriers.
-    if (query_counts[g_start * n_selected + kv_block_idx] == 0) {
-        uint nh = (head_start < g_start + nrep) ? (head_end - head_start) : 0;
-        for (uint hi = 0; hi < nh; hi++) {
-            uint partial_base = (head_start + hi) * n_selected + kv_block_idx;
-            if (lane == 0u) {
-                partial_m[partial_base] = -INFINITY;
-                partial_l[partial_base] = 0.0f;
-            }
-        }
-        return;
-    }
-
     // KV base offset: [B, Hkv, n_selected, BlockSize, Dim]
     uint kv_base = kv_head * n_selected * block_size * dim
                  + kv_block_idx * block_size * dim;
@@ -129,6 +116,31 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
     // Threadgroup memory for chunked KV load.
     threadgroup float tg_k[ChunkSize * Dim];
     threadgroup float tg_v[ChunkSize * Dim];
+
+    // Activity gate: check if ANY head in this GQA group selected this block.
+    // Selection is GQA-group-shared (API contract), so checking the first head
+    // suffices. The value is uniform across all SIMD groups (same g_start,
+    // same kv_block_idx). The barrier ensures all groups have entered.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bool tile_active = (query_counts[g_start * n_selected + kv_block_idx] > 0);
+
+    // Inactive tile: write neutral partials and return immediately.
+    // SAFE because tile_active is uniform across the entire threadgroup —
+    // all SIMD groups agree, so no divergent barrier issue.
+    if (!tile_active) {
+        // Neutral partials are already set by the zero-init output.
+        // Just need to write m=-INF for lane 0 of each head.
+        for (uint hi = 0; hi < num_heads; hi++) {
+            uint qh = head_start + hi;
+            uint partial_base = qh * n_selected + kv_block_idx;
+            if (lane == 0u) {
+                partial_m[partial_base] = -INFINITY;
+                partial_l[partial_base] = 0.0f;
+            }
+            // partial_v stays at init_value (0) — no write needed.
+        }
+        return;
+    }
 
     // Active tile: load KV chunks and process query heads.
     for (uint chunk_start = 0; chunk_start < block_size; chunk_start += chunk_size) {
