@@ -1125,17 +1125,22 @@ fn kv_outer_causal_mask_partial_block() {
     assert!(rms < 0.3, "partial-block causal RMS {rms:.6e} exceeds 0.3");
 }
 
-/// Zero-query blocks: some (head, block) pairs have no queries.
-/// Head 0 selects block 0 only; heads 1..3 select block 1 only.
-/// Block 0 has zero queries for heads 1..3; block 1 has zero for head 0.
+/// Zero-query blocks: disjoint selections between GQA groups (production-valid).
+///
+/// Hq=4, Hkv=2, G=2. Group 0 (heads 0-1) selects block 0 only.
+/// Group 1 (heads 2-3) selects block 1 only. Union = [0, 1].
+///
+/// Tile (kv_head=0, block=1) is inactive: no head in group 0 selected it.
+/// Tile (kv_head=1, block=0) is inactive: no head in group 1 selected it.
+///
+/// Uses zero K and distinct V per (KV head, block) to catch leakage.
 #[test]
 fn kv_outer_zero_query_blocks() {
     let b = 1i32;
     let hq = 4i32;
-    let hkv = 1i32;
+    let hkv = 2i32; // nrep = 2
     let dim = 32i32;
     let block_size = 4i32;
-    let top_k = 1i32;
     let total_kv_len = 8i32; // 2 blocks
     let num_key_blocks = total_kv_len / block_size;
     let n_rep = hq / hkv;
@@ -1143,31 +1148,42 @@ fn kv_outer_zero_query_blocks() {
     let scale = 1.0 / (dim as f32).sqrt();
 
     let q = synth_tensor(&[b, hq, 1, dim], 100);
-    let k = synth_tensor(&[b, hkv, total_kv_len, dim], 200);
-    let v = synth_tensor(&[b, hkv, total_kv_len, dim], 300);
+    // Zero K → uniform softmax weights.
+    let k_data = vec![0.0f32; (b * hkv * total_kv_len * dim) as usize];
+    let k = ffi::from_slice_f32(&k_data, &[b, hkv, total_kv_len, dim]);
 
-    let k_all = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
-    let v_all = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
-    // Both blocks in k_blocked for the kernel.
-    let k_blocked = ffi::slice(&k_all, &[0, 0, 0, 0, 0], &[b, hkv, 2, block_size, dim]);
-    let v_blocked = ffi::slice(&v_all, &[0, 0, 0, 0, 0], &[b, hkv, 2, block_size, dim]);
+    // V: distinct per (KV head, block).
+    let block_elems = (block_size * dim) as usize;
+    let mut v_data = vec![0.0f32; (b * hkv * total_kv_len * dim) as usize];
+    // kv_head 0, block 0 → 1.0
+    for i in 0..block_elems { v_data[i] = 1.0; }
+    // kv_head 0, block 1 → 0.25
+    for i in block_elems..2 * block_elems { v_data[i] = 0.25; }
+    // kv_head 1, block 0 → 0.75
+    for i in 2 * block_elems..3 * block_elems { v_data[i] = 0.75; }
+    // kv_head 1, block 1 → 0.0 (stays)
+    let v = ffi::from_slice_f32(&v_data, &[b, hkv, total_kv_len, dim]);
+
+    let k_blocked = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
     ffi::eval(&k_blocked);
     ffi::eval(&v_blocked);
 
-    // Build per-query-head inverted index with disjoint selections.
-    // Head 0: selects block 0 (compact index 0)
-    // Heads 1,2,3: selects block 1 (compact index 1)
-    let max_qpb = 1i32;
+    // Build per-query-head inverted index with disjoint GQA-group selections.
+    // Group 0 (heads 0-1): selects block 0 (compact index 0)
+    // Group 1 (heads 2-3): selects block 1 (compact index 1)
     let n_selected = 2i32;
+    let max_qpb = 1i32;
     let mut counts = vec![0i32; (hq * n_selected) as usize];
     let mut inv_index = vec![0i32; (hq * n_selected * max_qpb) as usize];
 
-    // Head 0 → block 0
-    counts[0 * n_selected as usize + 0] = 1;
-    inv_index[(0 * n_selected as usize + 0) * max_qpb as usize] = offset;
-
-    // Heads 1,2,3 → block 1
-    for h in 1..4 {
+    // Group 0: heads 0-1 → block 0
+    for h in 0..(n_rep as usize) {
+        counts[h * n_selected as usize + 0] = 1;
+        inv_index[(h * n_selected as usize + 0) * max_qpb as usize] = offset;
+    }
+    // Group 1: heads 2-3 → block 1
+    for h in (n_rep as usize)..(hq as usize) {
         counts[h * n_selected as usize + 1] = 1;
         inv_index[(h * n_selected as usize + 1) * max_qpb as usize] = offset;
     }
@@ -1199,29 +1215,66 @@ fn kv_outer_zero_query_blocks() {
     let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
     let partial_v = ffi::kv_outer_partials_take_v(partials.pin_mut());
 
+    // --- Assert inactive tiles have neutral partials ---
+    let m_flat = flatten_fp32(&partial_m);
+    let l_flat = flatten_fp32(&partial_l);
+
+    // Tile (kv_head=0, block=1): inactive for group 0.
+    // In the output layout, this corresponds to heads 0-1, block 1.
+    for h in 0..(n_rep as usize) {
+        let idx = h * n_selected as usize + 1;
+        assert!(
+            m_flat[idx] == f32::NEG_INFINITY,
+            "Inactive tile (kv0, blk1): partial_m should be -INF for head {h}, got {}",
+            m_flat[idx]
+        );
+        assert!(
+            l_flat[idx] == 0.0,
+            "Inactive tile (kv0, blk1): partial_l should be 0 for head {h}, got {}",
+            l_flat[idx]
+        );
+    }
+    // Tile (kv_head=1, block=0): inactive for group 1.
+    for h in (n_rep as usize)..(hq as usize) {
+        let idx = h * n_selected as usize + 0;
+        assert!(
+            m_flat[idx] == f32::NEG_INFINITY,
+            "Inactive tile (kv1, blk0): partial_m should be -INF for head {h}, got {}",
+            m_flat[idx]
+        );
+        assert!(
+            l_flat[idx] == 0.0,
+            "Inactive tile (kv1, blk0): partial_l should be 0 for head {h}, got {}",
+            l_flat[idx]
+        );
+    }
+
+    // --- Assert final output ---
     let out = ffi::turbo_minimax_sparse_kv_outer_reduction(
         &q, &partial_m, &partial_l, &partial_v, n_selected,
     );
 
     let out_flat = flatten_fp32(&out);
-    let all_finite = out_flat.iter().all(|&x| x.is_finite());
-    let has_nonzero = out_flat.iter().any(|&x| x != 0.0);
-    assert!(all_finite, "zero-query blocks: output should be finite");
-    assert!(has_nonzero, "zero-query blocks: output should be non-zero");
-
-    // Verify against reference (head 0 attends block 0, heads 1-3 attend block 1).
-    // Reference needs [Hkv * top_k] entries. Since Hkv=1, we pick block 0 for head 0
-    // and block 1 for heads 1-3. But reference_block_sparse_attention uses the same
-    // selection for all heads in a KV group, so we can't directly compare here.
-    // Instead, verify head 0 output differs from heads 1-3 (different blocks selected).
     let head_size = dim as usize;
-    let head0 = &out_flat[0..head_size];
-    let head1 = &out_flat[head_size..2 * head_size];
-    let rms_h01 = rms_diff(head0, head1);
-    assert!(
-        rms_h01 > 1e-4,
-        "zero-query: head 0 (block 0) and head 1 (block 1) should differ, RMS = {rms_h01:.6e}"
-    );
+
+    // Group 0 (heads 0-1): attends block 0, V=1.0 → output ≈ 1.0.
+    for h in 0..(n_rep as usize) {
+        let head_out = &out_flat[h * head_size..(h + 1) * head_size];
+        let mean: f32 = head_out.iter().sum::<f32>() / head_size as f32;
+        assert!(
+            (mean - 1.0).abs() < 0.01,
+            "Group 0 head {h}: mean={mean:.4}, expected 1.0"
+        );
+    }
+    // Group 1 (heads 2-3): attends block 1, V=0.0 → output ≈ 0.0.
+    for h in (n_rep as usize)..(hq as usize) {
+        let head_out = &out_flat[h * head_size..(h + 1) * head_size];
+        let mean: f32 = head_out.iter().sum::<f32>() / head_size as f32;
+        assert!(
+            mean.abs() < 0.01,
+            "Group 1 head {h}: mean={mean:.4}, expected 0.0"
+        );
+    }
 }
 
 /// Adversarial test: distinct KV-head V signatures catch cross-KV mixing.
