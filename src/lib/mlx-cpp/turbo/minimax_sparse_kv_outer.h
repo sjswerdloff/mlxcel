@@ -12,16 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// MSA KV-Outer Block-Sparse Decode Attention.
-//
-// Two-phase kernel following the paper's KV-outer iteration:
-//   Phase 1: Per-KV-block partial attention. Each threadgroup loads ONE KV
-//            block into threadgroup memory (SRAM) in chunks, then iterates
-//            over the inverted index to process all queries that attend to
-//            this block. Writes partial max, sum_exp, and weighted-V
-//            accumulators to global memory.
-//   Phase 2: Global softmax reduction. For each query, merges all partials
-//            from Phase 1 into the final normalized output.
+// MSA KV-Outer: shared types for Phase 1 and Phase 2.
 
 #pragma once
 
@@ -30,12 +21,14 @@
 
 namespace mlxcel::turbo {
 
+// Phase 1 output: partial max, sum_exp, and weighted-V accumulators.
 struct KvOuterPartials {
-    std::unique_ptr<mlx::core::array> partial_m;
-    std::unique_ptr<mlx::core::array> partial_l;
-    std::unique_ptr<mlx::core::array> partial_v;
+    std::unique_ptr<mlx::core::array> partial_m;  // [B, Hq, L, n_selected] f32
+    std::unique_ptr<mlx::core::array> partial_l;  // [B, Hq, L, n_selected] f32
+    std::unique_ptr<mlx::core::array> partial_v;  // [B, Hq, L, n_selected, Dim] f32
 };
 
+// Phase 1: per-KV-block partial attention with chunked KV loading.
 KvOuterPartials minimax_sparse_kv_outer_sdpa(
     const mlx::core::array& q,
     const mlx::core::array& k_blocked,
@@ -47,6 +40,7 @@ KvOuterPartials minimax_sparse_kv_outer_sdpa(
     int block_size,
     int max_queries_per_block);
 
+// Phase 2: global softmax reduction across partials.
 std::unique_ptr<mlx::core::array> minimax_sparse_kv_outer_reduction(
     const mlx::core::array& q,
     const mlx::core::array& partial_m,

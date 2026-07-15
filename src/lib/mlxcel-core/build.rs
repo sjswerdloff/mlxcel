@@ -59,7 +59,8 @@ fn main() {
         // MSA KV-outer block-sparse decode attention (Phase 1 + Phase 2).
         // Two-phase kernel: per-block partial attention with inverted index,
         // then global softmax reduction.
-        .file("../mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp")
+        .file("../mlx-cpp/turbo/kv_outer_phase1.cpp")
+        .file("../mlx-cpp/turbo/kv_outer_phase2.cpp")
         .include(&mlx_include)
         .include("cpp")
         .include("../mlx-cpp/turbo")
@@ -174,7 +175,8 @@ fn main() {
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.metal");
     // MSA KV-outer block-sparse decode attention.
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/minimax_sparse_kv_outer.h");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/kv_outer_phase1.cpp");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/kv_outer_phase2.cpp");
     println!("cargo:rerun-if-env-changed=MLX_CUDA_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_METAL");
     println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_ACCELERATE");

@@ -264,7 +264,7 @@ std::unique_ptr<MlxArray> steel_outputs_take_hot(Turbo4DelegatedSteelOutputs& o)
 }
 
 // KV-Stationary Block-Sparse Attention Phase 1 (KV-outer).
-// Implementation in `src/lib/mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp`.
+// Implementation in `src/lib/mlx-cpp/turbo/kv_outer_phase1.cpp`.
 // Each threadgroup loads ONE KV block into SRAM exactly once, then iterates
 // over the inverted index to pull in only the queries that require this block.
 // Returns partials (max, sum_exp, weighted-V) for Phase 2 reduction.
@@ -296,7 +296,7 @@ std::unique_ptr<KvOuterPartials> turbo_minimax_sparse_kv_outer_sdpa(
 }
 
 // KV-Stationary Block-Sparse Attention Phase 2 (global reduction).
-// Implementation in `src/lib/mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp`.
+// Implementation in `src/lib/mlx-cpp/turbo/kv_outer_phase1.cpp`.
 // For each query, sweeps across the partial outputs from Phase 1, computes
 // the final global attention distribution, and produces a normalized result.
 std::unique_ptr<MlxArray> turbo_minimax_sparse_kv_outer_reduction(

@@ -41,6 +41,53 @@ fn synth_tensor(shape: &[i32], seed: u32) -> UniquePtr<MlxArray> {
     ffi::from_slice_f32(&data, shape)
 }
 
+/// Build a per-query-head inverted index for decode (L=1).
+///
+/// All query heads in a GQA group share the same selected blocks.
+/// `compact_indices` maps each selection position to its compact slot in k_blocked.
+/// Returns (inv_index_arr, counts_arr) with shape [b, hq, n_selected, max_qpb].
+fn build_decode_inv_index(
+    b: i32,
+    hq: i32,
+    hkv: i32,
+    n_selected: i32,
+    top_k: i32,
+    offset: i32,
+    compact_indices: &[usize],
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let n_rep = hq / hkv;
+    let max_qpb = 1i32;
+    let mut counts = vec![0i32; (hq * n_selected) as usize];
+    let mut inv_index = vec![0i32; (hq * n_selected * max_qpb) as usize];
+
+    for qh in 0..hq as usize {
+        for j in 0..top_k as usize {
+            let compact = compact_indices[j];
+            if compact < n_selected as usize {
+                let idx = qh * n_selected as usize + compact;
+                counts[idx] = 1;
+                inv_index[idx * max_qpb as usize] = offset;
+            }
+        }
+    }
+
+    let inv_arr = ffi::astype(
+        &ffi::from_slice_f32(
+            &inv_index.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+            &[b, hq, n_selected, max_qpb],
+        ),
+        dtype::INT32,
+    );
+    let counts_arr = ffi::astype(
+        &ffi::from_slice_f32(
+            &counts.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+            &[b, hq, n_selected],
+        ),
+        dtype::INT32,
+    );
+    (inv_arr, counts_arr)
+}
+
 fn flatten_fp32(arr: &MlxArray) -> Vec<f32> {
     let a = ffi::astype(arr, dtype::FLOAT32);
     ffi::eval(&a);
@@ -191,40 +238,22 @@ fn kv_outer_smoke_test_shape_and_finite() {
     let _selected = ffi::astype(&selected, dtype::INT32);
 
     // Build blocked KV: [b, hkv, num_key_blocks, block_size, dim]
-    let k_blocked = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
-    let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
-
-    // Build inverted index and query counts for the selected blocks.
-    // For decode (l=1), each head has 1 query at position `offset`.
-    // selected blocks per head: [0, 1, 2] → 3 blocks, each with 1 query.
+    // Slice to n_selected blocks (compact).
     let n_selected = top_k;
-    let max_qpb = 1i32;
-    let mut inv_index = vec![0i32; (hkv * n_selected * max_qpb) as usize];
-    let mut counts = vec![0i32; (hkv * n_selected) as usize];
+    let k_all = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_all = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
+    let k_blocked = ffi::slice(&k_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
+    let v_blocked = ffi::slice(&v_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
+    ffi::eval(&k_blocked);
+    ffi::eval(&v_blocked);
 
-    for kv_h in 0..hkv as usize {
-        for j in 0..top_k as usize {
-            let _blk = kv_h * top_k as usize + j; // block index within this head's selection
-            let idx = kv_h * n_selected as usize + j;
-            counts[idx] = 1;
-            // For decode (L=1), q_pos within the partial buffer is 0, not the absolute offset.
-            inv_index[idx * max_qpb as usize] = 0;
-        }
-    }
-
-    let inv_index_arr = ffi::from_slice_f32(
-        &inv_index.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-        &[b, hkv, n_selected, max_qpb],
+    // Per-query-head inverted index.
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
     );
-    let inv_index_arr = ffi::astype(&inv_index_arr, dtype::INT32);
-    let counts_arr = ffi::from_slice_f32(
-        &counts.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-        &[b, hkv, n_selected],
-    );
-    let counts_arr = ffi::astype(&counts_arr, dtype::INT32);
 
-    // Block IDs: compact index → absolute block ID. In this test, all heads
-    // select blocks [0, 1, 2], so compact == absolute.
+    // Block IDs: compact → absolute (same in this test).
     let block_ids: Vec<i32> = (0..n_selected).collect();
     let block_ids_arr = ffi::from_slice_f32(
         &block_ids.iter().map(|&x| x as f32).collect::<Vec<_>>(),
@@ -242,7 +271,7 @@ fn kv_outer_smoke_test_shape_and_finite() {
         &block_ids_arr,
         scale,
         block_size,
-        max_qpb,
+        1,  // max_qpb = 1 for decode
     );
     let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
     let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
@@ -309,34 +338,19 @@ fn kv_outer_matches_reference_attention() {
     );
 
     // Build blocked KV: [b, hkv, num_key_blocks, block_size, dim]
-    let k_blocked = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
-    let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
-
-    // Build inverted index: each selected block has 1 query at q_pos=0 (L=1).
+    // Slice to selected blocks only (compact).
     let n_selected = top_k;
-    let max_qpb = 1i32;
-    let mut inv_index = vec![0i32; (hkv * n_selected * max_qpb) as usize];
-    let mut counts = vec![0i32; (hkv * n_selected) as usize];
-    for kv_h in 0..hkv as usize {
-        for j in 0..top_k as usize {
-            let idx = kv_h * n_selected as usize + j;
-            counts[idx] = 1;
-            inv_index[idx] = offset; // absolute position for causal masking
-        }
-    }
-    let inv_index_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &inv_index.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected, max_qpb],
-        ),
-        dtype::INT32,
-    );
-    let counts_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &counts.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected],
-        ),
-        dtype::INT32,
+    let k_all = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_all = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
+    let k_blocked = ffi::slice(&k_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
+    let v_blocked = ffi::slice(&v_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
+    ffi::eval(&k_blocked);
+    ffi::eval(&v_blocked);
+
+    // Per-query-head inverted index. Compact indices are [0, 1, 2] (positions in the slice).
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
     );
 
     // Block IDs: compact index → absolute block ID. Selected blocks are [0, 2, 3].
@@ -358,7 +372,7 @@ fn kv_outer_matches_reference_attention() {
         &block_ids_arr,
         scale,
         block_size,
-        max_qpb,
+        1,  // max_qpb = 1 for decode
     );
     let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
     let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
@@ -426,29 +440,9 @@ fn kv_outer_gqa_nonzero_debug() {
     let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
 
     let n_selected = top_k;
-    let max_qpb = 1i32;
-    let mut inv_index = vec![0i32; (hkv * n_selected * max_qpb) as usize];
-    let mut counts = vec![0i32; (hkv * n_selected) as usize];
-    for kv_h in 0..hkv as usize {
-        for j in 0..top_k as usize {
-            let idx = kv_h * n_selected as usize + j;
-            counts[idx] = 1;
-            inv_index[idx] = offset; // absolute position for causal masking
-        }
-    }
-    let inv_index_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &inv_index.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected, max_qpb],
-        ),
-        dtype::INT32,
-    );
-    let counts_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &counts.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected],
-        ),
-        dtype::INT32,
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
     );
 
     let block_ids: Vec<i32> = (0..n_selected).collect();
@@ -462,7 +456,7 @@ fn kv_outer_gqa_nonzero_debug() {
 
     let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
         &q, &k_blocked, &v_blocked, &inv_index_arr, &counts_arr, &block_ids_arr,
-        scale, block_size, max_qpb,
+        scale, block_size, 1,  // max_qpb = 1 for decode
     );
     let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
     let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
@@ -511,29 +505,9 @@ fn kv_outer_gqa_heads_differ() {
     let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
 
     let n_selected = top_k;
-    let max_qpb = 1i32;
-    let mut inv_index = vec![0i32; (hkv * n_selected * max_qpb) as usize];
-    let mut counts = vec![0i32; (hkv * n_selected) as usize];
-    for kv_h in 0..hkv as usize {
-        for j in 0..top_k as usize {
-            let idx = kv_h * n_selected as usize + j;
-            counts[idx] = 1;
-            inv_index[idx] = offset; // absolute position for causal masking
-        }
-    }
-    let inv_index_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &inv_index.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected, max_qpb],
-        ),
-        dtype::INT32,
-    );
-    let counts_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &counts.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected],
-        ),
-        dtype::INT32,
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
     );
 
     let block_ids: Vec<i32> = (0..n_selected).collect();
@@ -547,7 +521,7 @@ fn kv_outer_gqa_heads_differ() {
 
     let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
         &q, &k_blocked, &v_blocked, &inv_index_arr, &counts_arr, &block_ids_arr,
-        scale, block_size, max_qpb,
+        scale, block_size, 1,  // max_qpb = 1 for decode
     );
     let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
     let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
@@ -606,29 +580,9 @@ fn kv_outer_causal_mask_blocks_future_tokens() {
     let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
 
     let n_selected = top_k;
-    let max_qpb = 1i32;
-    let mut inv_index = vec![0i32; (hkv * n_selected * max_qpb) as usize];
-    let mut counts = vec![0i32; (hkv * n_selected) as usize];
-    for kv_h in 0..hkv as usize {
-        for j in 0..top_k as usize {
-            let idx = kv_h * n_selected as usize + j;
-            counts[idx] = 1;
-            inv_index[idx] = offset; // absolute position for causal masking
-        }
-    }
-    let inv_index_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &inv_index.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected, max_qpb],
-        ),
-        dtype::INT32,
-    );
-    let counts_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &counts.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected],
-        ),
-        dtype::INT32,
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
     );
 
     let block_ids: Vec<i32> = (0..n_selected).collect();
@@ -642,7 +596,7 @@ fn kv_outer_causal_mask_blocks_future_tokens() {
 
     let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
         &q, &k_blocked, &v_blocked, &inv_index_arr, &counts_arr, &block_ids_arr,
-        scale, block_size, max_qpb,
+        scale, block_size, 1,  // max_qpb = 1 for decode
     );
     let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
     let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
@@ -658,7 +612,7 @@ fn kv_outer_causal_mask_blocks_future_tokens() {
     );
     let n_sel_0 = 1i32;
     let inv_0 = ffi::astype(
-        &ffi::from_slice_f32(&[offset as f32], &[b, hkv, n_sel_0, max_qpb]),
+        &ffi::from_slice_f32(&[offset as f32], &[b, hkv, n_sel_0, 1]),
         dtype::INT32,
     );
     let cnt_0 = ffi::astype(
@@ -672,7 +626,7 @@ fn kv_outer_causal_mask_blocks_future_tokens() {
 
     let mut partials_0 = ffi::turbo_minimax_sparse_kv_outer_sdpa(
         &q, &k_blocked, &v_blocked, &inv_0, &cnt_0, &block_ids_0,
-        scale, block_size, max_qpb,
+        scale, block_size, 1,  // max_qpb = 1 for decode
     );
     let pm0 = ffi::kv_outer_partials_take_m(partials_0.pin_mut());
     let pl0 = ffi::kv_outer_partials_take_l(partials_0.pin_mut());
@@ -736,33 +690,12 @@ fn kv_outer_large_context() {
     let v_all = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
     let k_blocked = ffi::slice(&k_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
     let v_blocked = ffi::slice(&v_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
-    // Force materialization so shapes are correct when the kernel reads them.
     ffi::eval(&k_blocked);
     ffi::eval(&v_blocked);
 
-    let max_qpb = 1i32;
-    let mut inv_index = vec![0i32; (hkv * n_selected * max_qpb) as usize];
-    let mut counts = vec![0i32; (hkv * n_selected) as usize];
-    for kv_h in 0..hkv as usize {
-        for j in 0..top_k as usize {
-            let idx = kv_h * n_selected as usize + j;
-            counts[idx] = 1;
-            inv_index[idx] = offset;
-        }
-    }
-    let inv_index_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &inv_index.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected, max_qpb],
-        ),
-        dtype::INT32,
-    );
-    let counts_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &counts.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected],
-        ),
-        dtype::INT32,
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
     );
     let block_ids_arr = ffi::astype(
         &ffi::from_slice_f32(
@@ -775,7 +708,7 @@ fn kv_outer_large_context() {
     // Phase 1 + Phase 2.
     let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
         &q, &k_blocked, &v_blocked, &inv_index_arr, &counts_arr, &block_ids_arr,
-        scale, block_size, max_qpb,
+        scale, block_size, 1,  // max_qpb = 1 for decode
     );
     let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
     let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
@@ -854,37 +787,17 @@ fn kv_outer_real_dimensions() {
     );
 
     // Fetch only selected blocks (compact), not all blocks.
-    // The real dispatch does: fetch_msa_blocks(&union) → reshape to [b, hkv, n_selected, bs, d].
-    // Here we simulate by slicing the first n_selected blocks from the full tensor.
     let n_selected = top_k;
     let k_all = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
     let v_all = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
     let k_blocked = ffi::slice(&k_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
     let v_blocked = ffi::slice(&v_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
+    ffi::eval(&k_blocked);
+    ffi::eval(&v_blocked);
 
-    let max_qpb = 1i32;
-    let mut inv_index = vec![0i32; (hkv * n_selected * max_qpb) as usize];
-    let mut counts = vec![0i32; (hkv * n_selected) as usize];
-    for kv_h in 0..hkv as usize {
-        for j in 0..top_k as usize {
-            let idx = kv_h * n_selected as usize + j;
-            counts[idx] = 1;
-            inv_index[idx] = offset;
-        }
-    }
-    let inv_index_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &inv_index.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected, max_qpb],
-        ),
-        dtype::INT32,
-    );
-    let counts_arr = ffi::astype(
-        &ffi::from_slice_f32(
-            &counts.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-            &[b, hkv, n_selected],
-        ),
-        dtype::INT32,
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
     );
 
     let block_ids_arr = ffi::astype(
@@ -898,7 +811,7 @@ fn kv_outer_real_dimensions() {
     // Run Phase 1 + Phase 2.
     let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
         &q, &k_blocked, &v_blocked, &inv_index_arr, &counts_arr, &block_ids_arr,
-        scale, block_size, max_qpb,
+        scale, block_size, 1,  // max_qpb = 1 for decode
     );
     let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
     let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());

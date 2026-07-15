@@ -43,7 +43,9 @@ set(MLXCEL_TURBO_KERNEL_HEADERS
 set(MLXCEL_TURBO_KERNEL_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sparse_v_sdpa.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/turbo4_delegated_sdpa.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/paged_attention.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/paged_attention.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/kv_outer_phase1.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/kv_outer_phase2.cpp)
 
 set(MLXCEL_TURBO_KERNEL_METAL_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sparse_v_sdpa.metal
