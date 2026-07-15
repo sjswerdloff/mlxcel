@@ -2210,6 +2210,23 @@ impl SparseAttention {
         // Block IDs: maps compact index → absolute block ID for causal masking.
         let block_ids_arr = mlxcel_core::from_slice_i32(&union, &[n_selected]);
 
+        // Diagnostic: log kernel parameters.
+        let k_shape = mlxcel_core::array_shape(&k_blocked);
+        let sel_preview: Vec<i32> = sel_raw.iter().take(8).cloned().collect();
+        let union_preview: Vec<i32> = union.iter().take(8).cloned().collect();
+        let counts_preview: Vec<i32> = counts.iter().take(8).cloned().collect();
+        tracing::info!(
+            layer = self.layer_idx,
+            n_selected,
+            num_key_blocks,
+            max_qpb,
+            k_shape = ?k_shape,
+            sel_preview = ?sel_preview,
+            union_preview = ?union_preview,
+            counts_preview = ?counts_preview,
+            "kv-outer: pre-kernel diagnostics"
+        );
+
         // Phase 1: per-block partial attention.
         let scale = 1.0 / (d as f32).sqrt();
         let mut partials = mlxcel_core::turbo_minimax_sparse_kv_outer_sdpa(
@@ -2228,6 +2245,26 @@ impl SparseAttention {
         let partial_l = mlxcel_core::kv_outer_partials_take_l(partials.pin_mut());
         let partial_v = mlxcel_core::kv_outer_partials_take_v(partials.pin_mut());
 
+        // Diagnostic: check partials for validity.
+        let m_shape = mlxcel_core::array_shape(&partial_m);
+        let m_bytes = mlxcel_core::array_to_raw_bytes(&partial_m);
+        let m_vals: Vec<f32> = m_bytes.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let m_finite_count = m_vals.iter().filter(|v| v.is_finite()).count();
+        let m_nan_count = m_vals.iter().filter(|v| v.is_nan()).count();
+        let m_neginf_count = m_vals.iter().filter(|v| **v == f32::NEG_INFINITY).count();
+        tracing::info!(
+            layer = self.layer_idx,
+            partial_m_shape = ?m_shape,
+            total = m_vals.len(),
+            finite = m_finite_count,
+            nan = m_nan_count,
+            neg_inf = m_neginf_count,
+            first_4 = ?&m_vals[..4.min(m_vals.len())],
+            "kv-outer: post-Phase1 partial_m diagnostics"
+        );
+
         // Phase 2: global softmax reduction.
         let out = mlxcel_core::turbo_minimax_sparse_kv_outer_reduction(
             q,
@@ -2235,6 +2272,24 @@ impl SparseAttention {
             &partial_l,
             &partial_v,
             n_selected,
+        );
+
+        // Diagnostic: check output for validity.
+        let out_shape = mlxcel_core::array_shape(&out);
+        let out_bytes = mlxcel_core::array_to_raw_bytes(&out);
+        let out_vals: Vec<f32> = out_bytes.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let out_finite = out_vals.iter().filter(|v| v.is_finite()).count();
+        let out_nan = out_vals.iter().filter(|v| v.is_nan()).count();
+        tracing::info!(
+            layer = self.layer_idx,
+            out_shape = ?out_shape,
+            total = out_vals.len(),
+            finite = out_finite,
+            nan = out_nan,
+            first_4 = ?&out_vals[..4.min(out_vals.len())],
+            "kv-outer: post-Phase2 output diagnostics"
         );
 
         out

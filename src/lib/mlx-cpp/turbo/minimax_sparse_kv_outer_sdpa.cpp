@@ -427,7 +427,7 @@ KvOuterPartials minimax_sparse_kv_outer_sdpa(
         std::make_tuple(SIMD_WIDTH, num_sims, total_tiles),
         std::make_tuple(SIMD_WIDTH, num_sims, 1),
         template_args,
-        std::nullopt,
+        std::optional<float>(0.0f),  // Zero-initialize all outputs (partial_v must be 0 for zero-query slots)
         false,
         {});
 
