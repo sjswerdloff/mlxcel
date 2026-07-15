@@ -1524,39 +1524,37 @@ impl BatchScheduler {
             }
             None => {
                 // Store miss — try cold-storage (SSD) fallback.
+                // Content-addressed: finds longest matching token prefix.
                 if let Some(cs) = &self.cold_store {
-                    match cs.load(&ctx.session_key) {
-                        Ok(detached) => {
-                            let token_len = detached.prompt_len;
+                    match cs.load_prefix(&ctx.model_id, &ctx.template_sig, tokens) {
+                        Ok((detached, match_len)) => {
                             tracing::info!(
-                                session_key = %ctx.session_key,
-                                token_len,
-                                "prompt-cache: SSD cold-store HIT (loading from disk)"
+                                model_id = %ctx.model_id,
+                                match_len,
+                                total = tokens.len(),
+                                "prompt-cache: SSD cold-store HIT (longest prefix match)"
                             );
-                            // Adopt the loaded cache into the pool.
                             match self.cache_pool.adopt(
                                 &self.model as &dyn crate::generate::LanguageModel,
                                 detached,
                             ) {
                                 Ok(seq_id) => {
-                                    self.batch_observability.record_prompt_cache_hit(token_len);
-                                    return Some((seq_id, token_len));
+                                    self.batch_observability.record_prompt_cache_hit(match_len);
+                                    return Some((seq_id, match_len));
                                 }
                                 Err(err) => {
                                     tracing::warn!(
-                                        session_key = %ctx.session_key,
                                         error = %err,
                                         "cold-store: adopt failed after load; falling back to cold prefill"
                                     );
                                 }
                             }
                         }
-                        Err(mlxcel_core::cache::cold_store::ColdStoreError::SessionNotFound(_)) => {
+                        Err(mlxcel_core::cache::cold_store::ColdStoreError::NoMatch) => {
                             // No cold-store entry either — genuine miss.
                         }
                         Err(e) => {
                             tracing::warn!(
-                                session_key = %ctx.session_key,
                                 error = %e,
                                 "cold-store: load failed (non-fatal, falling back to cold prefill)"
                             );
@@ -2040,12 +2038,13 @@ impl BatchScheduler {
         }
 
         // Persist to cold-storage (SSD) before wrapping in CacheEntry.
-        // Serialization happens synchronously; disk I/O is async.
+        // Content-addressed: keyed by token prefix, not session.
         if let Some(cs) = &self.cold_store {
             if let DetachedKvSet::Dense(dense) = &kv_set {
-                if let Err(e) = cs.persist(&ctx.session_key, dense) {
+                if let Err(e) = cs.persist(&ctx.model_id, &ctx.template_sig, &tokens, dense) {
                     tracing::warn!(
-                        session_key = %ctx.session_key,
+                        model_id = %ctx.model_id,
+                        token_len = tokens.len(),
                         error = %e,
                         "cold-store: persist failed (non-fatal, in-memory cache still works)"
                     );

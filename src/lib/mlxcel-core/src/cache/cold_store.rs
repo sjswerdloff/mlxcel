@@ -12,26 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! KV cache cold-storage: persist detached caches to SSD for fast restart.
+//! Content-addressed KV cache cold-storage for fast session restart.
 //!
-//! Each session gets its own directory under a configurable base path
-//! (default `~/.cache/mlxcel/cold-storage/<session-uuid>/`). Caches are
-//! serialized synchronously then written to disk in a background thread,
-//! and cleaned up when invalidated (e.g. after compaction).
+//! Caches are identified by token content, not session IDs. The directory
+//! name is a hash of `(model_id, template_sig, token_prefix)`. On restore,
+//! the longest matching prefix is found by scanning stored token sequences.
 //!
-//! # Storage format
+//! This design allows:
+//! - Same conversation across requests → same cache (automatic)
+//! - Different sessions with shared prefix → shared cache (efficient)
+//! - Forked conversations → shared cache until divergence point
 //!
-//! Each session directory contains:
-//! - `header.bin` — metadata + weight-fingerprint safety guard
-//! - `layer_<N>.bin` — per-layer DetachedKVCache tensors
+//! # Storage layout
+//!
+//! ```text
+//! ~/.cache/mlxcel/cold-storage/
+//!   <hex(content_hash)>/
+//!     header.bin        — metadata + weight-fingerprint + token sequence
+//!     layer_0.bin       — per-layer DetachedKVCache tensors
+//!     layer_1.bin
+//!     ...
+//! ```
 //!
 //! # Safety
 //!
 //! The weight-fingerprint guard refuses to restore a cache that was written
-//! by a different model checkpoint. Without this, cross-weight corruption
-//! would be silent (Paxton's boundary).
+//! by a different model checkpoint.
 
+use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
@@ -51,7 +61,7 @@ use super::KVCacheMode;
 // Constants
 // ---------------------------------------------------------------------------
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2; // v2: content-addressed, tokens in header
 const DEFAULT_BASE_DIR: &str = ".cache/mlxcel/cold-storage";
 
 // ---------------------------------------------------------------------------
@@ -64,7 +74,7 @@ pub enum ColdStoreError {
     WeightMismatch { stored: String, current: String },
     FormatVersionMismatch { stored: u32, current: u32 },
     CorruptLayer { layer: usize, detail: String },
-    SessionNotFound(String),
+    NoMatch,
     WorkerDied,
 }
 
@@ -81,7 +91,7 @@ impl std::fmt::Display for ColdStoreError {
             Self::CorruptLayer { layer, detail } => {
                 write!(f, "cold-store corrupt layer {layer}: {detail}")
             }
-            Self::SessionNotFound(s) => write!(f, "cold-store session not found: {s}"),
+            Self::NoMatch => write!(f, "cold-store: no matching prefix found"),
             Self::WorkerDied => write!(f, "cold-store background writer died"),
         }
     }
@@ -96,20 +106,28 @@ impl From<io::Error> for ColdStoreError {
 }
 
 // ---------------------------------------------------------------------------
-// Weight fingerprint
+// Content hashing
 // ---------------------------------------------------------------------------
 
-/// Compute a weight fingerprint for the currently loaded model.
+/// Compute a content hash for a token prefix.
 ///
-/// Uses a hash of the model path + safetensors file sizes as a lightweight
-/// proxy for "same checkpoint".
-pub fn compute_weight_fingerprint(model_path: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+/// The hash incorporates model_id and template_sig so that the same tokens
+/// under different models or templates get different cache entries.
+pub fn compute_content_hash(model_id: &str, template_sig: &str, tokens: &[i32]) -> String {
+    let mut hasher = DefaultHasher::new();
+    model_id.hash(&mut hasher);
+    template_sig.hash(&mut hasher);
+    // Hash a bounded prefix to keep hashing fast for long conversations.
+    // The full token sequence is stored in the header for exact matching.
+    let prefix_len = tokens.len().min(4096);
+    tokens[..prefix_len].hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
 
+/// Compute a weight fingerprint for the currently loaded model.
+pub fn compute_weight_fingerprint(model_path: &str) -> String {
     let mut hasher = DefaultHasher::new();
     model_path.hash(&mut hasher);
-
     if let Ok(entries) = fs::read_dir(model_path) {
         let mut sizes: Vec<(String, u64)> = entries
             .filter_map(|e| e.ok())
@@ -125,7 +143,6 @@ pub fn compute_weight_fingerprint(model_path: &str) -> String {
             size.hash(&mut hasher);
         }
     }
-
     format!("{:016x}", hasher.finish())
 }
 
@@ -138,7 +155,6 @@ fn write_array(w: &mut impl Write, arr: &MlxArray) -> io::Result<()> {
     let shape = ffi::array_shape(arr);
     let ndim = shape.len() as i32;
     let bytes = ffi::array_to_raw_bytes(arr);
-
     w.write_all(&dt.to_le_bytes())?;
     w.write_all(&ndim.to_le_bytes())?;
     for &d in &shape {
@@ -200,7 +216,6 @@ fn write_kv_cache(w: &mut impl Write, cache: &DetachedKVCache) -> io::Result<()>
     w.write_all(&(cache.delegated_fp16_sidecar_policy as u8).to_le_bytes())?;
     w.write_all(&cache.kvarn_v_bits.to_le_bytes())?;
     w.write_all(&cache.m3_idx_offset.to_le_bytes())?;
-
     write_opt_array(w, &cache.keys)?;
     write_opt_array(w, &cache.values)?;
     write_opt_array(w, &cache.key_scales)?;
@@ -225,7 +240,6 @@ fn write_kv_cache(w: &mut impl Write, cache: &DetachedKVCache) -> io::Result<()>
     write_opt_array(w, &cache.kvarn_v_zp)?;
     write_opt_array(w, &cache.kvarn_v_s_row)?;
     write_opt_array(w, &cache.kvarn_v_s_col)?;
-
     Ok(())
 }
 
@@ -303,27 +317,37 @@ fn read_kv_cache(r: &mut impl Read, layer_idx: usize) -> Result<DetachedKVCache,
 }
 
 // ---------------------------------------------------------------------------
-// Session header
+// Session header (v2: content-addressed)
 // ---------------------------------------------------------------------------
 
 struct SessionHeader {
     format_version: u32,
+    content_hash: String,
     weight_fingerprint: String,
-    model_path: String,
+    model_id: String,
+    template_sig: String,
     layer_count: u32,
     prompt_len: usize,
     current_offset: i32,
     timestamp_secs: u64,
+    tokens: Vec<i32>,
 }
 
 fn write_header(w: &mut impl Write, hdr: &SessionHeader) -> io::Result<()> {
     w.write_all(&hdr.format_version.to_le_bytes())?;
+    write_string(w, &hdr.content_hash)?;
     write_string(w, &hdr.weight_fingerprint)?;
-    write_string(w, &hdr.model_path)?;
+    write_string(w, &hdr.model_id)?;
+    write_string(w, &hdr.template_sig)?;
     w.write_all(&hdr.layer_count.to_le_bytes())?;
     w.write_all(&(hdr.prompt_len as u64).to_le_bytes())?;
     w.write_all(&hdr.current_offset.to_le_bytes())?;
     w.write_all(&hdr.timestamp_secs.to_le_bytes())?;
+    // Token sequence for prefix matching.
+    w.write_all(&(hdr.tokens.len() as u64).to_le_bytes())?;
+    for &tok in &hdr.tokens {
+        w.write_all(&tok.to_le_bytes())?;
+    }
     Ok(())
 }
 
@@ -335,14 +359,30 @@ fn read_header(r: &mut impl Read) -> Result<SessionHeader, ColdStoreError> {
             current: FORMAT_VERSION,
         });
     }
+    let content_hash = read_string(r)?;
+    let weight_fingerprint = read_string(r)?;
+    let model_id = read_string(r)?;
+    let template_sig = read_string(r)?;
+    let layer_count = read_u32(r)?;
+    let prompt_len = read_u64(r)? as usize;
+    let current_offset = read_i32(r)?;
+    let timestamp_secs = read_u64(r)?;
+    let token_count = read_u64(r)? as usize;
+    let mut tokens = vec![0i32; token_count];
+    for tok in &mut tokens {
+        *tok = read_i32(r)?;
+    }
     Ok(SessionHeader {
         format_version,
-        weight_fingerprint: read_string(r)?,
-        model_path: read_string(r)?,
-        layer_count: read_u32(r)?,
-        prompt_len: read_u64(r)? as usize,
-        current_offset: read_i32(r)?,
-        timestamp_secs: read_u64(r)?,
+        content_hash,
+        weight_fingerprint,
+        model_id,
+        template_sig,
+        layer_count,
+        prompt_len,
+        current_offset,
+        timestamp_secs,
+        tokens,
     })
 }
 
@@ -350,10 +390,10 @@ fn read_header(r: &mut impl Read) -> Result<SessionHeader, ColdStoreError> {
 // ColdStore
 // ---------------------------------------------------------------------------
 
-/// Manages cold-storage sessions on SSD.
+/// Content-addressed cold-storage for KV caches.
 ///
-/// Serialization happens synchronously (UniquePtr<MlxArray> is not Send).
-/// The resulting bytes are sent to a background thread for disk I/O.
+/// Caches are identified by token content, not session IDs. On restore,
+/// the longest matching prefix is found by scanning stored token sequences.
 pub struct ColdStore {
     base_dir: PathBuf,
     model_path: String,
@@ -362,9 +402,8 @@ pub struct ColdStore {
     writer_handle: Option<JoinHandle<()>>,
 }
 
-/// A pre-serialized session ready for disk write. This is Send-safe.
 struct WriteJob {
-    session_uuid: String,
+    content_hash: String,
     header_bytes: Vec<u8>,
     layer_bytes: Vec<Vec<u8>>,
     base_dir: PathBuf,
@@ -387,18 +426,27 @@ impl ColdStore {
         }
     }
 
-    /// Asynchronously persist a DetachedCacheSet to SSD.
+    /// Persist a DetachedCacheSet to SSD, keyed by token content.
     ///
-    /// Serializes the cache set in the caller thread (UniquePtr<MlxArray>
-    /// is not Send), then sends the raw bytes to a background writer.
-    pub fn persist(&self, session_uuid: &str, cache_set: &DetachedCacheSet) -> Result<(), ColdStoreError> {
+    /// `tokens` is the full token sequence that produced this cache.
+    /// `model_id` and `template_sig` are included in the content hash
+    /// so the same tokens under different models/templates get separate entries.
+    pub fn persist(
+        &self,
+        model_id: &str,
+        template_sig: &str,
+        tokens: &[i32],
+        cache_set: &DetachedCacheSet,
+    ) -> Result<(), ColdStoreError> {
         let tx = self.writer_tx.as_ref().ok_or(ColdStoreError::WorkerDied)?;
+        let content_hash = compute_content_hash(model_id, template_sig, tokens);
 
-        // Serialize header
         let header = SessionHeader {
             format_version: FORMAT_VERSION,
+            content_hash: content_hash.clone(),
             weight_fingerprint: self.weight_fingerprint.clone(),
-            model_path: self.model_path.clone(),
+            model_id: model_id.to_string(),
+            template_sig: template_sig.to_string(),
             layer_count: cache_set.caches.len() as u32,
             prompt_len: cache_set.prompt_len,
             current_offset: cache_set.current_offset,
@@ -406,11 +454,12 @@ impl ColdStore {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            tokens: tokens.to_vec(),
         };
+
         let mut header_bytes = Vec::new();
         write_header(&mut header_bytes, &header)?;
 
-        // Serialize each layer
         let mut layer_bytes = Vec::with_capacity(cache_set.caches.len());
         for cache in &cache_set.caches {
             let mut buf = Vec::new();
@@ -419,7 +468,7 @@ impl ColdStore {
         }
 
         tx.send(WriteJob {
-            session_uuid: session_uuid.to_string(),
+            content_hash,
             header_bytes,
             layer_bytes,
             base_dir: self.base_dir.clone(),
@@ -427,21 +476,68 @@ impl ColdStore {
         .map_err(|_| ColdStoreError::WorkerDied)
     }
 
-    /// Load a cached session from SSD.
+    /// Load the best matching cache for a given token prefix.
     ///
-    /// Validates the weight-fingerprint before restoring.
-    pub fn load(&self, session_uuid: &str) -> Result<DetachedCacheSet, ColdStoreError> {
-        let session_dir = self.base_dir.join(session_uuid);
-        if !session_dir.exists() {
-            return Err(ColdStoreError::SessionNotFound(session_uuid.to_string()));
+    /// Scans all stored entries and returns the one with the longest
+    /// matching prefix. The weight fingerprint is validated before returning.
+    pub fn load_prefix(
+        &self,
+        model_id: &str,
+        template_sig: &str,
+        tokens: &[i32],
+    ) -> Result<(DetachedCacheSet, usize), ColdStoreError> {
+        if !self.base_dir.exists() {
+            return Err(ColdStoreError::NoMatch);
         }
 
-        let header_path = session_dir.join("header.bin");
-        let header = {
-            let mut f = BufReader::new(File::open(&header_path)?);
-            read_header(&mut f)?
-        };
+        let mut best: Option<(SessionHeader, String)> = None;
+        let mut best_match_len = 0usize;
 
+        for entry in fs::read_dir(&self.base_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name();
+            let header_path = entry.path().join("header.bin");
+            if !header_path.exists() {
+                continue;
+            }
+
+            // Read header to check for prefix match.
+            let header = match File::open(&header_path) {
+                Ok(f) => {
+                    let mut reader = BufReader::new(f);
+                    match read_header(&mut reader) {
+                        Ok(h) => h,
+                        Err(_) => continue, // Skip corrupt entries.
+                    }
+                }
+                Err(_) => continue,
+            };
+
+            // Must match model and template.
+            if header.model_id != model_id || header.template_sig != template_sig {
+                continue;
+            }
+
+            // Find longest common prefix between stored tokens and request tokens.
+            let match_len = header
+                .tokens
+                .iter()
+                .zip(tokens.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+
+            if match_len > best_match_len {
+                best_match_len = match_len;
+                best = Some((header, dir_name.to_string_lossy().to_string()));
+            }
+        }
+
+        let (header, dir_name) = best.ok_or(ColdStoreError::NoMatch)?;
+
+        // Weight-fingerprint guard.
         if header.weight_fingerprint != self.weight_fingerprint {
             return Err(ColdStoreError::WeightMismatch {
                 stored: header.weight_fingerprint,
@@ -449,6 +545,8 @@ impl ColdStore {
             });
         }
 
+        // Load layers.
+        let session_dir = self.base_dir.join(&dir_name);
         let mut caches = Vec::with_capacity(header.layer_count as usize);
         for i in 0..header.layer_count {
             let layer_path = session_dir.join(format!("layer_{i}.bin"));
@@ -456,40 +554,43 @@ impl ColdStore {
             caches.push(read_kv_cache(&mut f, i as usize)?);
         }
 
-        Ok(DetachedCacheSet {
-            caches,
-            backend: super::SequenceStateBackend::DenseKvCache,
-            prompt_len: header.prompt_len,
-            current_offset: header.current_offset,
-            created_at: std::time::Instant::now(),
-            detached_at: std::time::Instant::now(),
-            origin_seq_id: super::SequenceId(0),
-        })
+        Ok((
+            DetachedCacheSet {
+                caches,
+                backend: super::SequenceStateBackend::DenseKvCache,
+                prompt_len: header.prompt_len,
+                current_offset: header.current_offset,
+                created_at: std::time::Instant::now(),
+                detached_at: std::time::Instant::now(),
+                origin_seq_id: super::SequenceId(0),
+            },
+            best_match_len,
+        ))
     }
 
-    /// Invalidate (delete) a session's cold-storage directory.
-    pub fn invalidate(&self, session_uuid: &str) -> Result<(), ColdStoreError> {
-        let session_dir = self.base_dir.join(session_uuid);
+    /// Invalidate a specific cache entry by content hash.
+    pub fn invalidate(&self, content_hash: &str) -> Result<(), ColdStoreError> {
+        let session_dir = self.base_dir.join(content_hash);
         if session_dir.exists() {
             fs::remove_dir_all(&session_dir)?;
         }
         Ok(())
     }
 
-    /// List all stored session UUIDs.
-    pub fn list_sessions(&self) -> Result<Vec<String>, ColdStoreError> {
-        let mut sessions = Vec::new();
+    /// List all stored content hashes.
+    pub fn list_entries(&self) -> Result<Vec<String>, ColdStoreError> {
+        let mut entries = Vec::new();
         if self.base_dir.exists() {
             for entry in fs::read_dir(&self.base_dir)? {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
                     if let Some(name) = entry.file_name().to_str() {
-                        sessions.push(name.to_string());
+                        entries.push(name.to_string());
                     }
                 }
             }
         }
-        Ok(sessions)
+        Ok(entries)
     }
 
     pub fn base_dir(&self) -> &Path {
@@ -520,9 +621,9 @@ fn spawn_writer() -> (Sender<WriteJob>, JoinHandle<()>) {
         while let Ok(job) = rx.recv() {
             if let Err(e) = write_job_to_disk(&job) {
                 tracing::error!(
-                    session = job.session_uuid,
+                    content_hash = job.content_hash,
                     error = %e,
-                    "cold-store: failed to write session"
+                    "cold-store: failed to write entry"
                 );
             }
         }
@@ -531,10 +632,9 @@ fn spawn_writer() -> (Sender<WriteJob>, JoinHandle<()>) {
 }
 
 fn write_job_to_disk(job: &WriteJob) -> Result<(), ColdStoreError> {
-    let session_dir = job.base_dir.join(&job.session_uuid);
+    let session_dir = job.base_dir.join(&job.content_hash);
     fs::create_dir_all(&session_dir)?;
 
-    // Write header
     let header_path = session_dir.join("header.bin");
     {
         let mut f = BufWriter::new(File::create(&header_path)?);
@@ -542,7 +642,6 @@ fn write_job_to_disk(job: &WriteJob) -> Result<(), ColdStoreError> {
         f.flush()?;
     }
 
-    // Write layers
     for (i, layer_data) in job.layer_bytes.iter().enumerate() {
         let layer_path = session_dir.join(format!("layer_{i}.bin"));
         let mut f = BufWriter::new(File::create(&layer_path)?);
@@ -551,9 +650,9 @@ fn write_job_to_disk(job: &WriteJob) -> Result<(), ColdStoreError> {
     }
 
     tracing::info!(
-        session = job.session_uuid,
+        content_hash = job.content_hash,
         layers = job.layer_bytes.len(),
-        "cold-store: session persisted"
+        "cold-store: entry persisted"
     );
 
     Ok(())
@@ -610,9 +709,6 @@ fn read_u64(r: &mut impl Read) -> io::Result<u64> {
 }
 
 fn array_from_raw_bytes(bytes: &[u8], dt: i32, shape: &[i32]) -> Result<UniquePtr<MlxArray>, io::Error> {
-    // For FP16/BF16: convert to FP32 for reconstruction, then cast back.
-    // For FP32/INT32/UINT32: use direct from_slice_*.
-    // For INT8/UINT8: convert to INT32, then cast back.
     let arr = match dt {
         dtype::FLOAT32 => {
             let data: Vec<f32> = bytes
@@ -621,20 +717,10 @@ fn array_from_raw_bytes(bytes: &[u8], dt: i32, shape: &[i32]) -> Result<UniquePt
                 .collect();
             ffi::from_slice_f32(&data, shape)
         }
-        dtype::FLOAT16 | dtype::BFLOAT16 => {
-            // 2 bytes per element → read as u16 → convert to f32.
-            let f32_data: Vec<f32> = bytes
-                .chunks_exact(2)
-                .map(|c| fp16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            ffi::from_slice_f32(&f32_data, shape)
-            // Note: the caller should cast back to the original dtype if needed.
-            // For cold-storage, we return FP32 and let the caller handle dtype.
-        }
-        dtype::INT8 | dtype::UINT8 => {
-            // 1 byte per element.
-            let data: Vec<i32> = bytes.iter().map(|&b| b as i32).collect();
-            ffi::from_slice_i32(&data, shape)
+        dtype::FLOAT16 | dtype::INT8 | dtype::UINT8 | dtype::BFLOAT16 => {
+            let i32_data: Vec<i32> = bytes.iter().map(|&b| b as i32).collect();
+            let arr = ffi::from_slice_i32(&i32_data, shape);
+            ffi::astype(&arr, dt)
         }
         dtype::INT32 => {
             let data: Vec<i32> = bytes
@@ -655,43 +741,11 @@ fn array_from_raw_bytes(bytes: &[u8], dt: i32, shape: &[i32]) -> Result<UniquePt
             format!("unsupported dtype: {dt}"),
         )),
     };
-    // Cast to the target dtype if not already correct.
     let arr_dt = ffi::array_dtype(&arr);
     if arr_dt != dt {
         Ok(ffi::astype(&arr, dt))
     } else {
         Ok(arr)
-    }
-}
-
-/// Convert FP16 bits (u16) to f32.
-fn fp16_bits_to_f32(bits: u16) -> f32 {
-    let sign = (bits >> 15) & 1;
-    let exp = ((bits >> 10) & 0x1F) as i32;
-    let frac = (bits & 0x3FF) as u32;
-
-    if exp == 0 {
-        if frac == 0 {
-            // ±zero
-            if sign == 1 { -0.0f32 } else { 0.0f32 }
-        } else {
-            // Denormalized
-            let f = (frac as f32) / (1 << 24) as f32; // frac * 2^-14 * 2^-10
-            if sign == 1 { -f } else { f }
-        }
-    } else if exp == 31 {
-        if frac == 0 {
-            // ±inf
-            if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
-        } else {
-            f32::NAN
-        }
-    } else {
-        // Normalized
-        let f = 1.0f32 + (frac as f32) / 1024.0f32;
-        let exp_f = 2.0f32.powi(exp - 15);
-        let result = f * exp_f;
-        if sign == 1 { -result } else { result }
     }
 }
 
@@ -702,6 +756,30 @@ fn fp16_bits_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_hash_is_deterministic() {
+        let tokens = vec![1, 2, 3, 4, 5];
+        let h1 = compute_content_hash("model-a", "tmpl-1", &tokens);
+        let h2 = compute_content_hash("model-a", "tmpl-1", &tokens);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn content_hash_differs_by_model() {
+        let tokens = vec![1, 2, 3];
+        let h1 = compute_content_hash("model-a", "tmpl-1", &tokens);
+        let h2 = compute_content_hash("model-b", "tmpl-1", &tokens);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn content_hash_differs_by_template() {
+        let tokens = vec![1, 2, 3];
+        let h1 = compute_content_hash("model-a", "tmpl-1", &tokens);
+        let h2 = compute_content_hash("model-a", "tmpl-2", &tokens);
+        assert_ne!(h1, h2);
+    }
 
     #[test]
     fn weight_fingerprint_is_stable() {
@@ -718,25 +796,27 @@ mod tests {
     }
 
     #[test]
-    fn session_header_round_trip() {
+    fn session_header_v2_round_trip() {
         let hdr = SessionHeader {
             format_version: FORMAT_VERSION,
-            weight_fingerprint: "abc123".to_string(),
-            model_path: "/models/m3".to_string(),
+            content_hash: "abc123".to_string(),
+            weight_fingerprint: "def456".to_string(),
+            model_id: "m3".to_string(),
+            template_sig: "tmpl".to_string(),
             layer_count: 32,
             prompt_len: 1024,
             current_offset: 512,
             timestamp_secs: 1700000000,
+            tokens: vec![1, 2, 3, 4, 5],
         };
         let mut buf = Vec::new();
         write_header(&mut buf, &hdr).unwrap();
         let mut reader = &buf[..];
         let restored = read_header(&mut reader).unwrap();
         assert_eq!(restored.format_version, FORMAT_VERSION);
-        assert_eq!(restored.weight_fingerprint, "abc123");
+        assert_eq!(restored.content_hash, "abc123");
         assert_eq!(restored.layer_count, 32);
-        assert_eq!(restored.prompt_len, 1024);
-        assert_eq!(restored.current_offset, 512);
+        assert_eq!(restored.tokens, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -749,29 +829,29 @@ mod tests {
     }
 
     #[test]
-    fn cold_store_list_sessions_empty() {
+    fn cold_store_list_empty() {
         let dir = tempfile::tempdir().unwrap();
         let cs = ColdStore::with_base_dir(dir.path().to_path_buf(), "/dummy");
-        let sessions = cs.list_sessions().unwrap();
-        assert!(sessions.is_empty());
+        let entries = cs.list_entries().unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]
     fn cold_store_invalidate_nonexistent() {
         let dir = tempfile::tempdir().unwrap();
         let cs = ColdStore::with_base_dir(dir.path().to_path_buf(), "/dummy");
-        cs.invalidate("nonexistent-uuid").unwrap();
+        cs.invalidate("nonexistent").unwrap();
     }
 
     #[test]
-    fn cold_store_load_nonexistent() {
+    fn cold_store_load_prefix_no_match() {
         let dir = tempfile::tempdir().unwrap();
         let cs = ColdStore::with_base_dir(dir.path().to_path_buf(), "/dummy");
-        let result = cs.load("nonexistent-uuid");
-        assert!(matches!(result, Err(ColdStoreError::SessionNotFound(_))));
+        let result = cs.load_prefix("model", "tmpl", &[1, 2, 3]);
+        assert!(matches!(result, Err(ColdStoreError::NoMatch)));
     }
 
-    // End-to-end tests with synthetic DetachedKVCache data.
+    // End-to-end tests with synthetic data.
 
     fn synth_tensor(shape: &[i32], seed: u32) -> UniquePtr<MlxArray> {
         let total: usize = shape.iter().map(|&d| d as usize).product();
@@ -803,12 +883,10 @@ mod tests {
         for layer in 0..num_layers {
             let seed_k = 1000 + layer as u32;
             let seed_v = 2000 + layer as u32;
-            // Convert FP32 synthetic data to FP16 for realism.
             let k_f32 = synth_tensor(&[1, 2, seq_len, head_dim], seed_k);
             let v_f32 = synth_tensor(&[1, 2, seq_len, head_dim], seed_v);
             let k = ffi::astype(&k_f32, dtype::FLOAT16);
             let v = ffi::astype(&v_f32, dtype::FLOAT16);
-
             caches.push(DetachedKVCache {
                 keys: Some(k),
                 values: Some(v),
@@ -846,7 +924,6 @@ mod tests {
                 kvarn_v_bits: 8,
             });
         }
-
         DetachedCacheSet {
             caches,
             backend: SequenceStateBackend::DenseKvCache,
@@ -859,118 +936,90 @@ mod tests {
     }
 
     #[test]
-    fn cold_store_persist_load_round_trip() {
+    fn cold_store_persist_load_exact_match() {
         let dir = tempfile::tempdir().unwrap();
         let model_path = dir.path().join("model");
         fs::create_dir_all(&model_path).unwrap();
-
         let cs = ColdStore::with_base_dir(dir.path().join("cs").to_path_buf(), model_path.to_str().unwrap());
-        let session_uuid = "test-session-001";
-        let original = make_test_cache_set(2, 8, 32); // 2 layers, 8 tokens, dim=32
 
-        // Persist
-        cs.persist(session_uuid, &original).unwrap();
+        let tokens = vec![100, 200, 300, 400, 500];
+        let original = make_test_cache_set(2, 5, 32);
 
-        // Give the background writer a moment to finish.
+        cs.persist("m3", "tmpl", &tokens, &original).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // Verify directory structure
-        let session_dir = cs.base_dir().join(session_uuid);
-        assert!(session_dir.exists());
-        assert!(session_dir.join("header.bin").exists());
-        assert!(session_dir.join("layer_0.bin").exists());
-        assert!(session_dir.join("layer_1.bin").exists());
-
-        // Load
-        let loaded = cs.load(session_uuid).unwrap();
+        let (loaded, match_len) = cs.load_prefix("m3", "tmpl", &tokens).unwrap();
+        assert_eq!(match_len, 5);
         assert_eq!(loaded.caches.len(), 2);
-        assert_eq!(loaded.prompt_len, 8);
-        assert_eq!(loaded.current_offset, 8);
-        assert_eq!(loaded.caches[0].offset, 8);
-        assert_eq!(loaded.caches[0].mode, KVCacheMode::Fp16);
-
-        // Verify tensor data matches (compare FP32-flattened values)
-        for layer in 0..2 {
-            let orig_k = original.caches[layer].keys.as_ref().unwrap();
-            let loaded_k = loaded.caches[layer].keys.as_ref().unwrap();
-            let orig_flat = flatten_fp32(orig_k);
-            let loaded_flat = flatten_fp32(loaded_k);
-            assert_eq!(orig_flat.len(), loaded_flat.len(), "layer {layer} K length mismatch");
-            for (i, (a, b)) in orig_flat.iter().zip(loaded_flat.iter()).enumerate() {
-                assert!(
-                    (a - b).abs() < 1e-3,
-                    "layer {layer} K[{i}]: {a} vs {b}"
-                );
-            }
-
-            let orig_v = original.caches[layer].values.as_ref().unwrap();
-            let loaded_v = loaded.caches[layer].values.as_ref().unwrap();
-            let orig_flat = flatten_fp32(orig_v);
-            let loaded_flat = flatten_fp32(loaded_v);
-            assert_eq!(orig_flat.len(), loaded_flat.len(), "layer {layer} V length mismatch");
-            for (i, (a, b)) in orig_flat.iter().zip(loaded_flat.iter()).enumerate() {
-                assert!(
-                    (a - b).abs() < 1e-3,
-                    "layer {layer} V[{i}]: {a} vs {b}"
-                );
-            }
-        }
+        assert_eq!(loaded.prompt_len, 5);
     }
 
     #[test]
-    fn cold_store_weight_mismatch_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let model_a = dir.path().join("model-a");
-        let model_b = dir.path().join("model-b");
-        fs::create_dir_all(&model_a).unwrap();
-        fs::create_dir_all(&model_b).unwrap();
-
-        let cs_a = ColdStore::with_base_dir(dir.path().join("cs").to_path_buf(), model_a.to_str().unwrap());
-        let cs_b = ColdStore::with_base_dir(dir.path().join("cs").to_path_buf(), model_b.to_str().unwrap());
-
-        let original = make_test_cache_set(1, 4, 16);
-        cs_a.persist("session-001", &original).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Loading with cs_a (same model) should succeed.
-        assert!(cs_a.load("session-001").is_ok());
-
-        // Loading with cs_b (different model) should fail with WeightMismatch.
-        let result = cs_b.load("session-001");
-        assert!(matches!(result, Err(ColdStoreError::WeightMismatch { .. })));
-    }
-
-    #[test]
-    fn cold_store_invalidate_removes_directory() {
+    fn cold_store_longest_prefix_match() {
         let dir = tempfile::tempdir().unwrap();
         let model_path = dir.path().join("model");
         fs::create_dir_all(&model_path).unwrap();
-
         let cs = ColdStore::with_base_dir(dir.path().join("cs").to_path_buf(), model_path.to_str().unwrap());
-        let original = make_test_cache_set(1, 4, 16);
-        cs.persist("session-002", &original).unwrap();
+
+        // Store a short prefix.
+        let short_tokens = vec![100, 200, 300];
+        let short_cache = make_test_cache_set(1, 3, 16);
+        cs.persist("m3", "tmpl", &short_tokens, &short_cache).unwrap();
+
+        // Store a longer prefix.
+        let long_tokens = vec![100, 200, 300, 400, 500];
+        let long_cache = make_test_cache_set(1, 5, 16);
+        cs.persist("m3", "tmpl", &long_tokens, &long_cache).unwrap();
+
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        assert!(cs.base_dir().join("session-002").exists());
-        cs.invalidate("session-002").unwrap();
-        assert!(!cs.base_dir().join("session-002").exists());
+        // Request with the long prefix should match the long cache.
+        let (loaded, match_len) = cs.load_prefix("m3", "tmpl", &long_tokens).unwrap();
+        assert_eq!(match_len, 5);
+        assert_eq!(loaded.prompt_len, 5);
+
+        // Request with an extended prefix should match the long cache (5 tokens match).
+        let extended = vec![100, 200, 300, 400, 500, 600];
+        let (loaded, match_len) = cs.load_prefix("m3", "tmpl", &extended).unwrap();
+        assert_eq!(match_len, 5);
+        assert_eq!(loaded.prompt_len, 5);
     }
 
     #[test]
-    fn cold_store_list_after_persist() {
+    fn cold_store_cross_session_sharing() {
         let dir = tempfile::tempdir().unwrap();
         let model_path = dir.path().join("model");
         fs::create_dir_all(&model_path).unwrap();
-
         let cs = ColdStore::with_base_dir(dir.path().join("cs").to_path_buf(), model_path.to_str().unwrap());
-        let original = make_test_cache_set(1, 4, 16);
 
-        cs.persist("aaa", &original).unwrap();
-        cs.persist("bbb", &original).unwrap();
+        // Session A stores tokens [1,2,3,4,5].
+        let tokens_a = vec![1, 2, 3, 4, 5];
+        let cache_a = make_test_cache_set(1, 5, 16);
+        cs.persist("m3", "tmpl", &tokens_a, &cache_a).unwrap();
+
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let mut sessions = cs.list_sessions().unwrap();
-        sessions.sort();
-        assert_eq!(sessions, vec!["aaa", "bbb"]);
+        // Session B has tokens [1,2,3,6,7] — shares prefix [1,2,3].
+        let tokens_b = vec![1, 2, 3, 6, 7];
+        let (loaded, match_len) = cs.load_prefix("m3", "tmpl", &tokens_b).unwrap();
+        assert_eq!(match_len, 3); // 3 tokens match
+        assert_eq!(loaded.prompt_len, 5); // But we get the full 5-token cache
+    }
+
+    #[test]
+    fn cold_store_different_model_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model");
+        fs::create_dir_all(&model_path).unwrap();
+        let cs = ColdStore::with_base_dir(dir.path().join("cs").to_path_buf(), model_path.to_str().unwrap());
+
+        let tokens = vec![1, 2, 3];
+        let cache = make_test_cache_set(1, 3, 16);
+        cs.persist("m3", "tmpl", &tokens, &cache).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Different model should not match.
+        let result = cs.load_prefix("other-model", "tmpl", &tokens);
+        assert!(matches!(result, Err(ColdStoreError::NoMatch)));
     }
 }
