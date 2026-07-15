@@ -240,13 +240,31 @@ KvOuterPartials minimax_sparse_kv_outer_sdpa(
     const auto& q_shape = q.shape();
     const auto& k_shape = k_blocked.shape();
 
+    int batch = q_shape[0];
     int hq = q_shape[1];
+    int q_len = q_shape[2];
     int dim = q_shape[3];
     int hkv = k_shape[1];
     int n_selected = k_shape[2];
 
-    int n_rep = hkv > 0 ? hq / hkv : 1;
-    if (n_rep < 1) n_rep = 1;
+    // Validate decode-only contract.
+    if (batch != 1 || q_len != 1) {
+        throw std::runtime_error(
+            "kv_outer_phase1: decode only (B=1, L=1), got B="
+            + std::to_string(batch) + " L=" + std::to_string(q_len));
+    }
+    if (hkv == 0 || hq % hkv != 0) {
+        throw std::runtime_error(
+            "kv_outer_phase1: Hq must be divisible by Hkv, got Hq="
+            + std::to_string(hq) + " Hkv=" + std::to_string(hkv));
+    }
+    if (max_queries_per_block != 1) {
+        throw std::runtime_error(
+            "kv_outer_phase1: max_queries_per_block must be 1, got "
+            + std::to_string(max_queries_per_block));
+    }
+
+    int n_rep = hq / hkv;
 
     auto& kernel = get_phase1_kernel().get();
 

@@ -1319,3 +1319,117 @@ fn kv_outer_adversarial_distinct_kv_signatures() {
         );
     }
 }
+
+/// Production-valid zero-count test: disjoint block selections between GQA groups.
+///
+/// Hq=8, Hkv=2, G=4. Group 0 selects block 0 only, group 1 selects block 1 only.
+/// Union = [0, 1]. V for kv_head 0 = 1.0, kv_head 1 = 0.0.
+///
+/// This tests the query_counts predicate under the production data model:
+/// - Group 0's (head, block=1) pairs have count=0 → must not contribute
+/// - Group 1's (head, block=0) pairs have count=0 → must not contribute
+/// - Block 0 must not leak into group 1, and vice versa.
+#[test]
+fn kv_outer_disjoint_selections_no_leakage() {
+    let b = 1i32;
+    let hq = 8i32;
+    let hkv = 2i32; // nrep = 4
+    let dim = 32i32;
+    let block_size = 4i32;
+    let top_k = 1i32; // each group selects exactly 1 block
+    let total_kv_len = 8i32; // 2 blocks
+    let num_key_blocks = total_kv_len / block_size;
+    let n_rep = hq / hkv;
+    let offset = 7i32;
+    let scale = 1.0 / (dim as f32).sqrt();
+
+    let q = synth_tensor(&[b, hq, 1, dim], 42);
+    let k = synth_tensor(&[b, hkv, total_kv_len, dim], 43);
+
+    // V: kv_head 0 → 1.0, kv_head 1 → 0.0.
+    let v_tokens_per_head = (total_kv_len * dim) as usize;
+    let mut v_data = vec![0.0f32; (b * hkv * total_kv_len * dim) as usize];
+    for i in 0..v_tokens_per_head {
+        v_data[i] = 1.0;
+    }
+    let v = ffi::from_slice_f32(&v_data, &[b, hkv, total_kv_len, dim]);
+
+    // Blocked layout: [B, Hkv, num_key_blocks, BlockSize, Dim]
+    let k_blocked = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
+    ffi::eval(&k_blocked);
+    ffi::eval(&v_blocked);
+
+    // Build per-query-head inverted index with disjoint selections.
+    // Group 0 (heads 0-3): selects block 0 (compact index 0)
+    // Group 1 (heads 4-7): selects block 1 (compact index 1)
+    let n_selected = 2i32; // union has 2 blocks
+    let max_qpb = 1i32;
+    let mut counts = vec![0i32; (hq * n_selected) as usize];
+    let mut inv_index = vec![0i32; (hq * n_selected * max_qpb) as usize];
+
+    // Group 0: heads 0-3 → block 0 (compact index 0)
+    for h in 0..(n_rep as usize) {
+        counts[h * n_selected as usize + 0] = 1;
+        inv_index[(h * n_selected as usize + 0) * max_qpb as usize] = offset;
+    }
+    // Group 1: heads 4-7 → block 1 (compact index 1)
+    for h in (n_rep as usize)..(hq as usize) {
+        counts[h * n_selected as usize + 1] = 1;
+        inv_index[(h * n_selected as usize + 1) * max_qpb as usize] = offset;
+    }
+
+    let inv_arr = ffi::astype(
+        &ffi::from_slice_f32(
+            &inv_index.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+            &[b, hq, n_selected, max_qpb],
+        ),
+        dtype::INT32,
+    );
+    let counts_arr = ffi::astype(
+        &ffi::from_slice_f32(
+            &counts.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+            &[b, hq, n_selected],
+        ),
+        dtype::INT32,
+    );
+    let block_ids_arr = ffi::astype(
+        &ffi::from_slice_f32(&[0.0, 1.0], &[n_selected]),
+        dtype::INT32,
+    );
+
+    let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
+        &q, &k_blocked, &v_blocked, &inv_arr, &counts_arr, &block_ids_arr,
+        scale, block_size, 1,
+    );
+    let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
+    let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
+    let partial_v = ffi::kv_outer_partials_take_v(partials.pin_mut());
+
+    let out = ffi::turbo_minimax_sparse_kv_outer_reduction(
+        &q, &partial_m, &partial_l, &partial_v, n_selected,
+    );
+
+    let out_flat = flatten_fp32(&out);
+    let head_size = dim as usize;
+
+    // Group 0 (heads 0-3): attends block 0 where V=1.0 → output ≈ 1.0.
+    for h in 0..(n_rep as usize) {
+        let head_out = &out_flat[h * head_size..(h + 1) * head_size];
+        let mean: f32 = head_out.iter().sum::<f32>() / head_size as f32;
+        assert!(
+            (mean - 1.0).abs() < 0.01,
+            "Group 0 head {h}: mean={mean:.6}, expected ≈ 1.0 (block 1 leaking in?)"
+        );
+    }
+
+    // Group 1 (heads 4-7): attends block 1 where V=0.0 → output ≈ 0.0.
+    for h in (n_rep as usize)..(hq as usize) {
+        let head_out = &out_flat[h * head_size..(h + 1) * head_size];
+        let mean: f32 = head_out.iter().sum::<f32>() / head_size as f32;
+        assert!(
+            mean.abs() < 0.01,
+            "Group 1 head {h}: mean={mean:.6}, expected ≈ 0.0 (block 0 leaking in?)"
+        );
+    }
+}

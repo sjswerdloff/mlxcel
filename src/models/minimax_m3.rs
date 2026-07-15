@@ -121,7 +121,7 @@ fn k1_fixed_blocks_enabled() -> bool {
 }
 
 static KV_OUTER_DIAG: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var_os("MLXCEL_KV_OUTER_DIAG").is_some());
+    std::sync::LazyLock::new(|| std::env::var("MLXCEL_KV_OUTER_DIAG").is_ok_and(|v| v == "1"));
 
 /// MLXCEL_KV_OUTER=1 enables the KV-outer block-sparse attention kernel.
 /// This is an alternative execution pattern for MSA decode: instead of
@@ -2200,22 +2200,24 @@ impl SparseAttention {
         let k_blocked = mlxcel_core::reshape(&k_full, &[b, h_kv, n_selected, bs, d]);
         let v_blocked = mlxcel_core::reshape(&v_full, &[b, h_kv, n_selected, bs, d]);
 
-        // Diagnostic: log kernel parameters.
-        let k_shape = mlxcel_core::array_shape(&k_blocked);
-        let sel_preview: Vec<i32> = sel_raw.iter().take(8).cloned().collect();
-        let union_preview: Vec<i32> = union.iter().take(8).cloned().collect();
-        let counts_preview: Vec<i32> = counts.iter().take(8).cloned().collect();
-        tracing::info!(
-            layer = self.layer_idx,
-            n_selected,
-            num_key_blocks,
-            max_qpb,
-            k_shape = ?k_shape,
-            sel_preview = ?sel_preview,
-            union_preview = ?union_preview,
-            counts_preview = ?counts_preview,
-            "kv-outer: pre-kernel diagnostics"
-        );
+        // Diagnostic: log kernel parameters (guarded — formatting/logging overhead).
+        if *KV_OUTER_DIAG {
+            let k_shape = mlxcel_core::array_shape(&k_blocked);
+            let sel_preview: Vec<i32> = sel_raw.iter().take(8).cloned().collect();
+            let union_preview: Vec<i32> = union.iter().take(8).cloned().collect();
+            let counts_preview: Vec<i32> = counts.iter().take(8).cloned().collect();
+            tracing::info!(
+                layer = self.layer_idx,
+                n_selected,
+                num_key_blocks,
+                max_qpb,
+                k_shape = ?k_shape,
+                sel_preview = ?sel_preview,
+                union_preview = ?union_preview,
+                counts_preview = ?counts_preview,
+                "kv-outer: pre-kernel diagnostics"
+            );
+        }
 
         // Phase 1: per-block partial attention.
         let scale = 1.0 / (d as f32).sqrt();
