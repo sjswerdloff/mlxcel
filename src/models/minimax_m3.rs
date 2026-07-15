@@ -2139,8 +2139,10 @@ impl SparseAttention {
         let b = 1i32;
         let l = 1i32;
         let h_kv = self.num_kv_heads;
+        let h_q = self.num_heads;
         let d = self.head_dim;
         let bs = self.block_size;
+        let n_rep = h_q / h_kv;
         let num_key_blocks = (kv_len + bs - 1) / bs;
 
         // Sync selection to host and compute sorted unique union.
@@ -2161,54 +2163,39 @@ impl SparseAttention {
         }
 
         // Build inverted index using compact positions.
-        // inverted_index: [b, h_kv, n_selected, max_qpb] — query positions per block.
-        // query_counts: [b, h_kv, n_selected] — how many queries per block.
+        // inverted_index: [b, h_q, n_selected, max_qpb] — query positions per block PER QUERY HEAD.
+        // query_counts: [b, h_q, n_selected] — how many queries per block PER QUERY HEAD.
+        // Each query head in a GQA group selects the same blocks, but the kernel
+        // needs per-head entries because it processes one head at a time.
         let n_selected = union.len() as i32;
-        let mut counts = vec![0i32; (h_kv * n_selected) as usize];
-        for h in 0..h_kv as usize {
+        let mut counts = vec![0i32; (h_q * n_selected) as usize];
+        let max_qpb = 1i32; // decode: 1 query per block per head
+
+        let mut inv_index = vec![0i32; (h_q * n_selected * max_qpb) as usize];
+        for qh in 0..h_q as usize {
+            let kv_h = qh / (n_rep as usize);
             for j in 0..self.top_k as usize {
-                let abs_blk = sel_raw[h * self.top_k as usize + j] as usize;
+                let abs_blk = sel_raw[kv_h * self.top_k as usize + j] as usize;
                 if abs_blk < num_key_blocks as usize {
                     let compact = table[abs_blk] as usize;
                     if compact < n_selected as usize {
-                        counts[h * n_selected as usize + compact] += 1;
+                        let idx = qh * n_selected as usize + compact;
+                        counts[idx] = 1;
+                        inv_index[idx * max_qpb as usize] = offset;
                     }
                 }
             }
         }
 
-        let max_qpb = *counts.iter().max().unwrap_or(&1).max(&1);
-
-        let mut inv_index = vec![0i32; (h_kv * n_selected * max_qpb) as usize];
-        let mut counts_tmp = vec![0i32; (h_kv * n_selected) as usize];
-        for h in 0..h_kv as usize {
-            // For decode (l=1), the query position within L is 0 (not the absolute offset).
-            let q_pos = offset;
-            for j in 0..self.top_k as usize {
-                let abs_blk = sel_raw[h * self.top_k as usize + j] as usize;
-                if abs_blk < num_key_blocks as usize {
-                    let compact = table[abs_blk] as usize;
-                    if compact < n_selected as usize {
-                        let idx = h * n_selected as usize + compact;
-                        let slot = counts_tmp[idx] as usize;
-                        if slot < max_qpb as usize {
-                            inv_index[idx * max_qpb as usize + slot] = q_pos;
-                        }
-                        counts_tmp[idx] += 1;
-                    }
-                }
-            }
-        }
+        let inv_index_arr = mlxcel_core::from_slice_i32(&inv_index, &[b, h_q, n_selected, max_qpb]);
+        let counts_arr = mlxcel_core::from_slice_i32(&counts, &[b, h_q, n_selected]);
+        // Block IDs: maps compact index → absolute block ID for causal masking.
+        let block_ids_arr = mlxcel_core::from_slice_i32(&union, &[n_selected]);
 
         // Fetch only the union blocks and reshape to blocked form.
         let (k_full, v_full) = cache.fetch_msa_blocks(&union);
         let k_blocked = mlxcel_core::reshape(&k_full, &[b, h_kv, n_selected, bs, d]);
         let v_blocked = mlxcel_core::reshape(&v_full, &[b, h_kv, n_selected, bs, d]);
-
-        let inv_index_arr = mlxcel_core::from_slice_i32(&inv_index, &[b, h_kv, n_selected, max_qpb]);
-        let counts_arr = mlxcel_core::from_slice_i32(&counts, &[b, h_kv, n_selected]);
-        // Block IDs: maps compact index → absolute block ID for causal masking.
-        let block_ids_arr = mlxcel_core::from_slice_i32(&union, &[n_selected]);
 
         // Diagnostic: log kernel parameters.
         let k_shape = mlxcel_core::array_shape(&k_blocked);

@@ -85,12 +85,8 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
     // block_ids maps compact index → absolute block ID.
     uint abs_block_id = (uint)block_ids[kv_block_idx];
 
-    // Query counts and inverted index for this block.
-    // query_counts is [B, Hkv, n_selected], inv_index is [B, Hkv, n_selected, MaxQPB].
-    // Must offset by kv_head to read the correct head's data.
-    uint head_block_idx = kv_head * n_key_blocks + kv_block_idx;
-    uint num_queries = (uint)query_counts[head_block_idx];
-    uint idx_offset = head_block_idx * max_qpb;
+    // Query counts and inverted index — per-query-head layout: [B, Hq, n_selected, MaxQPB].
+    // Each query head has its own counts/entries even though GQA heads share KV blocks.
 
     // Base offset in the blocked KV layout: [B, Hkv, num_key_blocks, BlockSize, Dim]
     uint kv_base = kv_head * n_key_blocks * block_size * dim
@@ -110,24 +106,26 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
     uint h_start = sg * heads_per_simd;
     uint h_end = min(h_start + heads_per_simd, nrep);
 
-    // If this block has no queries for this head, write neutral partials
-    // (m=-inf, l=0) so Phase 2 contributes nothing from this block.
-    if (num_queries == 0) {
-        for (uint rh = h_start; rh < h_end; rh++) {
-            uint q_head_idx = kv_head * nrep + rh;
+    // Process each query head in this SIMD group's range.
+    // Each head has its own entry in the per-query-head inverted index.
+    for (uint rh = h_start; rh < h_end; rh++) {
+        uint q_head_idx = kv_head * nrep + rh;
+
+        // Per-head query count from the per-query-head inverted index.
+        uint head_block_idx = q_head_idx * n_key_blocks + kv_block_idx;
+        uint num_queries = (uint)query_counts[head_block_idx];
+        uint idx_offset = head_block_idx * max_qpb;
+
+        // If this head has no queries for this block, write neutral partials.
+        if (num_queries == 0) {
             uint partial_base = 0 * n_key_blocks + kv_block_idx;
             if (lane == 0u) {
                 partial_m[q_head_idx * n_key_blocks + partial_base] = -INFINITY;
                 partial_l[q_head_idx * n_key_blocks + partial_base] = 0.0f;
             }
+            // partial_v stays at init value (0) — no contribution after rescale.
+            continue;
         }
-        return;
-    }
-
-    // Initialize accumulators for each query head in this SIMD group's range.
-    // We process query heads sequentially — for each, we sweep all chunks.
-    for (uint rh = h_start; rh < h_end; rh++) {
-        uint q_head_idx = kv_head * nrep + rh;
 
         // Load this query head's Q slice into registers.
         float q_reg[DimsPerThread];
