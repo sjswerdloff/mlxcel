@@ -849,3 +849,377 @@ fn kv_outer_real_dimensions() {
         "real-dimension RMS {rms:.6e} exceeds 0.1"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Focused tests for all-heads-per-block kernel structure (no model load)
+// ---------------------------------------------------------------------------
+
+/// Hq > NumSims: exercises heads_per_simd > 1.
+/// With NumSims=4 and Hq=8, each SIMD group processes 2 query heads.
+/// This tests that the per-head accumulators don't interfere.
+#[test]
+fn kv_outer_heads_per_simd_gt1() {
+    let b = 1i32;
+    let hq = 8i32;
+    let hkv = 2i32; // nrep = 4
+    let dim = 32i32;
+    let block_size = 4i32;
+    let top_k = 2i32;
+    let total_kv_len = 8i32;
+    let num_key_blocks = total_kv_len / block_size;
+    let n_rep = hq / hkv;
+    let offset = 7i32;
+    let scale = 1.0 / (dim as f32).sqrt();
+
+    let q = synth_tensor(&[b, hq, 1, dim], 42);
+    let k = synth_tensor(&[b, hkv, total_kv_len, dim], 43);
+    let v = synth_tensor(&[b, hkv, total_kv_len, dim], 44);
+
+    let k_blocked = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
+    ffi::eval(&k_blocked);
+    ffi::eval(&v_blocked);
+
+    let n_selected = top_k;
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
+    );
+    let block_ids_arr = ffi::astype(
+        &ffi::from_slice_f32(&[0.0, 1.0], &[n_selected]),
+        dtype::INT32,
+    );
+
+    let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
+        &q, &k_blocked, &v_blocked, &inv_index_arr, &counts_arr, &block_ids_arr,
+        scale, block_size, 1,
+    );
+    let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
+    let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
+    let partial_v = ffi::kv_outer_partials_take_v(partials.pin_mut());
+
+    let out = ffi::turbo_minimax_sparse_kv_outer_reduction(
+        &q, &partial_m, &partial_l, &partial_v, n_selected,
+    );
+
+    let out_flat = flatten_fp32(&out);
+    assert_eq!(out_flat.len(), (hq * dim) as usize);
+    let all_finite = out_flat.iter().all(|&x| x.is_finite());
+    let has_nonzero = out_flat.iter().any(|&x| x != 0.0);
+    assert!(all_finite, "heads_per_simd>1: output should be finite");
+    assert!(has_nonzero, "heads_per_simd>1: output should be non-zero");
+
+    // Verify against reference.
+    let sel_full: Vec<i32> = (0..hkv).flat_map(|_| vec![0i32, 1]).collect();
+    let out_ref = reference_block_sparse_attention(
+        &q, &k_blocked, &v_blocked, &sel_full,
+        n_rep, top_k, block_size, num_key_blocks, offset, scale,
+    );
+    let ref_flat = flatten_fp32(&out_ref);
+    let rms = rms_diff(&out_flat, &ref_flat);
+    eprintln!("heads_per_simd_gt1: RMS = {rms:.6e}");
+    assert!(rms < 0.15, "heads_per_simd>1 RMS {rms:.6e} exceeds 0.15");
+}
+
+/// Non-uniform head distribution: Hq=5, NumSims=4 → [2, 2, 1, 0].
+/// The 4th SIMD group gets 0 heads. Tests that the zero-head path
+/// writes neutral partials without crashing.
+#[test]
+fn kv_outer_non_uniform_head_distribution() {
+    let b = 1i32;
+    let hq = 5i32;
+    let hkv = 1i32; // nrep = 5
+    let dim = 32i32;
+    let block_size = 4i32;
+    let top_k = 2i32;
+    let total_kv_len = 8i32;
+    let num_key_blocks = total_kv_len / block_size;
+    let n_rep = hq / hkv;
+    let offset = 7i32;
+    let scale = 1.0 / (dim as f32).sqrt();
+
+    let q = synth_tensor(&[b, hq, 1, dim], 100);
+    let k = synth_tensor(&[b, hkv, total_kv_len, dim], 200);
+    let v = synth_tensor(&[b, hkv, total_kv_len, dim], 300);
+
+    let k_blocked = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
+    ffi::eval(&k_blocked);
+    ffi::eval(&v_blocked);
+
+    let n_selected = top_k;
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
+    );
+    let block_ids_arr = ffi::astype(
+        &ffi::from_slice_f32(&[0.0, 1.0], &[n_selected]),
+        dtype::INT32,
+    );
+
+    let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
+        &q, &k_blocked, &v_blocked, &inv_index_arr, &counts_arr, &block_ids_arr,
+        scale, block_size, 1,
+    );
+    let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
+    let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
+    let partial_v = ffi::kv_outer_partials_take_v(partials.pin_mut());
+
+    let out = ffi::turbo_minimax_sparse_kv_outer_reduction(
+        &q, &partial_m, &partial_l, &partial_v, n_selected,
+    );
+
+    let out_flat = flatten_fp32(&out);
+    assert_eq!(out_flat.len(), (hq * dim) as usize);
+    let all_finite = out_flat.iter().all(|&x| x.is_finite());
+    let has_nonzero = out_flat.iter().any(|&x| x != 0.0);
+    assert!(all_finite, "non-uniform: output should be finite");
+    assert!(has_nonzero, "non-uniform: output should be non-zero");
+
+    // Verify against reference.
+    let sel_full: Vec<i32> = (0..hkv).flat_map(|_| vec![0i32, 1]).collect();
+    let out_ref = reference_block_sparse_attention(
+        &q, &k_blocked, &v_blocked, &sel_full,
+        n_rep, top_k, block_size, num_key_blocks, offset, scale,
+    );
+    let ref_flat = flatten_fp32(&out_ref);
+    let rms = rms_diff(&out_flat, &ref_flat);
+    eprintln!("non_uniform: RMS = {rms:.6e}");
+    assert!(rms < 0.1, "non-uniform RMS {rms:.6e} exceeds 0.1");
+}
+
+/// M3-realistic GQA ratio: Hq=64, Hkv=4, nrep=16.
+/// This matches the actual MiniMax-M3 configuration.
+/// With NumSims=4, each SIMD group processes 16 query heads.
+#[test]
+fn kv_outer_m3_gqa_ratio() {
+    let b = 1i32;
+    let hq = 64i32;
+    let hkv = 4i32;
+    let dim = 128i32;
+    let block_size = 128i32;
+    let top_k = 4i32; // small k for speed
+    let total_kv_len = 512i32; // 4 blocks
+    let num_key_blocks = total_kv_len / block_size;
+    let n_rep = hq / hkv;
+    let offset = 511i32;
+    let scale = 1.0 / (dim as f32).sqrt();
+
+    let q = synth_tensor(&[b, hq, 1, dim], 42);
+    let k = synth_tensor(&[b, hkv, total_kv_len, dim], 43);
+    let v = synth_tensor(&[b, hkv, total_kv_len, dim], 44);
+
+    let k_blocked = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
+    ffi::eval(&k_blocked);
+    ffi::eval(&v_blocked);
+
+    let n_selected = top_k;
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
+    );
+    let block_ids_arr = ffi::astype(
+        &ffi::from_slice_f32(
+            &(0..top_k).map(|x| x as f32).collect::<Vec<_>>(),
+            &[n_selected],
+        ),
+        dtype::INT32,
+    );
+
+    let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
+        &q, &k_blocked, &v_blocked, &inv_index_arr, &counts_arr, &block_ids_arr,
+        scale, block_size, 1,
+    );
+    let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
+    let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
+    let partial_v = ffi::kv_outer_partials_take_v(partials.pin_mut());
+
+    let out = ffi::turbo_minimax_sparse_kv_outer_reduction(
+        &q, &partial_m, &partial_l, &partial_v, n_selected,
+    );
+
+    let out_flat = flatten_fp32(&out);
+    assert_eq!(out_flat.len(), (hq * dim) as usize);
+    let all_finite = out_flat.iter().all(|&x| x.is_finite());
+    let has_nonzero = out_flat.iter().any(|&x| x != 0.0);
+    assert!(all_finite, "M3 GQA: output should be finite");
+    assert!(has_nonzero, "M3 GQA: output should be non-zero");
+
+    // Verify against reference (first 4 heads only for speed).
+    let sel_full: Vec<i32> = (0..hkv).flat_map(|_| (0..top_k).collect::<Vec<_>>()).collect();
+    let out_ref = reference_block_sparse_attention(
+        &q, &k_blocked, &v_blocked, &sel_full,
+        n_rep, top_k, block_size, num_key_blocks, offset, scale,
+    );
+    let ref_flat = flatten_fp32(&out_ref);
+    let head_size = dim as usize;
+    // Compare all heads — the kernel should match the reference for every head.
+    let rms = rms_diff(&out_flat, &ref_flat);
+    eprintln!("m3_gqa_ratio: RMS = {rms:.6e}");
+    assert!(rms < 0.1, "M3 GQA RMS {rms:.6e} exceeds 0.1");
+}
+
+/// Causal mask with partial visibility: query at offset 129 with block_size=128.
+/// Block 0 (positions 0..127) is fully visible.
+/// Block 1 (positions 128..255) has only position 128 visible.
+/// The kernel must mask positions 129..255 to -inf.
+#[test]
+fn kv_outer_causal_mask_partial_block() {
+    let b = 1i32;
+    let hq = 1i32;
+    let hkv = 1i32;
+    let dim = 32i32;
+    let block_size = 128i32;
+    let top_k = 2i32;
+    let total_kv_len = 256i32; // 2 blocks
+    let num_key_blocks = total_kv_len / block_size;
+    let n_rep = hq / hkv;
+    let offset = 129i32; // block 0 fully visible, block 1 only pos 128
+    let scale = 1.0 / (dim as f32).sqrt();
+
+    let q = synth_tensor(&[b, hq, 1, dim], 42);
+    let k = synth_tensor(&[b, hkv, total_kv_len, dim], 43);
+    let v = synth_tensor(&[b, hkv, total_kv_len, dim], 44);
+
+    let k_blocked = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_blocked = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
+    ffi::eval(&k_blocked);
+    ffi::eval(&v_blocked);
+
+    let n_selected = top_k;
+    let compact_indices: Vec<usize> = (0..top_k as usize).collect();
+    let (inv_index_arr, counts_arr) = build_decode_inv_index(
+        b, hq, hkv, n_selected, top_k, offset, &compact_indices,
+    );
+    let block_ids_arr = ffi::astype(
+        &ffi::from_slice_f32(&[0.0, 1.0], &[n_selected]),
+        dtype::INT32,
+    );
+
+    let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
+        &q, &k_blocked, &v_blocked, &inv_index_arr, &counts_arr, &block_ids_arr,
+        scale, block_size, 1,
+    );
+    let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
+    let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
+    let partial_v = ffi::kv_outer_partials_take_v(partials.pin_mut());
+
+    let out = ffi::turbo_minimax_sparse_kv_outer_reduction(
+        &q, &partial_m, &partial_l, &partial_v, n_selected,
+    );
+
+    let out_flat = flatten_fp32(&out);
+    let all_finite = out_flat.iter().all(|&x| x.is_finite());
+    assert!(all_finite, "partial-block causal: output should be finite");
+
+    // Verify against reference.
+    let sel_full: Vec<i32> = vec![0, 1];
+    let out_ref = reference_block_sparse_attention(
+        &q, &k_blocked, &v_blocked, &sel_full,
+        n_rep, top_k, block_size, num_key_blocks, offset, scale,
+    );
+    let ref_flat = flatten_fp32(&out_ref);
+    let rms = rms_diff(&out_flat, &ref_flat);
+    eprintln!("causal_mask_partial: RMS = {rms:.6e}");
+    assert!(rms < 0.3, "partial-block causal RMS {rms:.6e} exceeds 0.3");
+}
+
+/// Zero-query blocks: some (head, block) pairs have no queries.
+/// Head 0 selects block 0 only; heads 1..3 select block 1 only.
+/// Block 0 has zero queries for heads 1..3; block 1 has zero for head 0.
+#[test]
+fn kv_outer_zero_query_blocks() {
+    let b = 1i32;
+    let hq = 4i32;
+    let hkv = 1i32;
+    let dim = 32i32;
+    let block_size = 4i32;
+    let top_k = 1i32;
+    let total_kv_len = 8i32; // 2 blocks
+    let num_key_blocks = total_kv_len / block_size;
+    let n_rep = hq / hkv;
+    let offset = 7i32;
+    let scale = 1.0 / (dim as f32).sqrt();
+
+    let q = synth_tensor(&[b, hq, 1, dim], 100);
+    let k = synth_tensor(&[b, hkv, total_kv_len, dim], 200);
+    let v = synth_tensor(&[b, hkv, total_kv_len, dim], 300);
+
+    let k_all = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
+    let v_all = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
+    // Both blocks in k_blocked for the kernel.
+    let k_blocked = ffi::slice(&k_all, &[0, 0, 0, 0, 0], &[b, hkv, 2, block_size, dim]);
+    let v_blocked = ffi::slice(&v_all, &[0, 0, 0, 0, 0], &[b, hkv, 2, block_size, dim]);
+    ffi::eval(&k_blocked);
+    ffi::eval(&v_blocked);
+
+    // Build per-query-head inverted index with disjoint selections.
+    // Head 0: selects block 0 (compact index 0)
+    // Heads 1,2,3: selects block 1 (compact index 1)
+    let max_qpb = 1i32;
+    let n_selected = 2i32;
+    let mut counts = vec![0i32; (hq * n_selected) as usize];
+    let mut inv_index = vec![0i32; (hq * n_selected * max_qpb) as usize];
+
+    // Head 0 → block 0
+    counts[0 * n_selected as usize + 0] = 1;
+    inv_index[(0 * n_selected as usize + 0) * max_qpb as usize] = offset;
+
+    // Heads 1,2,3 → block 1
+    for h in 1..4 {
+        counts[h * n_selected as usize + 1] = 1;
+        inv_index[(h * n_selected as usize + 1) * max_qpb as usize] = offset;
+    }
+
+    let inv_arr = ffi::astype(
+        &ffi::from_slice_f32(
+            &inv_index.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+            &[b, hq, n_selected, max_qpb],
+        ),
+        dtype::INT32,
+    );
+    let counts_arr = ffi::astype(
+        &ffi::from_slice_f32(
+            &counts.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+            &[b, hq, n_selected],
+        ),
+        dtype::INT32,
+    );
+    let block_ids_arr = ffi::astype(
+        &ffi::from_slice_f32(&[0.0, 1.0], &[n_selected]),
+        dtype::INT32,
+    );
+
+    let mut partials = ffi::turbo_minimax_sparse_kv_outer_sdpa(
+        &q, &k_blocked, &v_blocked, &inv_arr, &counts_arr, &block_ids_arr,
+        scale, block_size, 1,
+    );
+    let partial_m = ffi::kv_outer_partials_take_m(partials.pin_mut());
+    let partial_l = ffi::kv_outer_partials_take_l(partials.pin_mut());
+    let partial_v = ffi::kv_outer_partials_take_v(partials.pin_mut());
+
+    let out = ffi::turbo_minimax_sparse_kv_outer_reduction(
+        &q, &partial_m, &partial_l, &partial_v, n_selected,
+    );
+
+    let out_flat = flatten_fp32(&out);
+    let all_finite = out_flat.iter().all(|&x| x.is_finite());
+    let has_nonzero = out_flat.iter().any(|&x| x != 0.0);
+    assert!(all_finite, "zero-query blocks: output should be finite");
+    assert!(has_nonzero, "zero-query blocks: output should be non-zero");
+
+    // Verify against reference (head 0 attends block 0, heads 1-3 attend block 1).
+    // Reference needs [Hkv * top_k] entries. Since Hkv=1, we pick block 0 for head 0
+    // and block 1 for heads 1-3. But reference_block_sparse_attention uses the same
+    // selection for all heads in a KV group, so we can't directly compare here.
+    // Instead, verify head 0 output differs from heads 1-3 (different blocks selected).
+    let head_size = dim as usize;
+    let head0 = &out_flat[0..head_size];
+    let head1 = &out_flat[head_size..2 * head_size];
+    let rms_h01 = rms_diff(head0, head1);
+    assert!(
+        rms_h01 > 1e-4,
+        "zero-query: head 0 (block 0) and head 1 (block 1) should differ, RMS = {rms_h01:.6e}"
+    );
+}

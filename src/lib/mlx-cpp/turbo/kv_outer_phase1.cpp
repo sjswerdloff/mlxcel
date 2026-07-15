@@ -14,20 +14,23 @@
 
 // MSA KV-Outer Phase 1: Per-KV-block partial attention.
 //
-// Each threadgroup loads ONE KV block into threadgroup memory in chunks.
-// The chunk loop is outermost: each chunk is loaded ONCE cooperatively
-// by all SIMD groups, then all assigned query heads process it while
-// it's resident. This is the paper's KV-outer IO amortization.
+// Each threadgroup handles ONE KV block. It loads chunks of that block
+// into threadgroup memory cooperatively, then processes ALL query heads
+// that map to this KV head while each chunk is resident.
+//
+// This is the paper's KV-outer IO amortization: KV loaded once per chunk,
+// processed by all G query heads. The previous implementation dispatched
+// one threadgroup per (q_head, block) pair, so G=16 threadgroups all
+// loaded the same KV block independently — defeating the amortization.
 //
 // Thread topology:
-//   Grid: (SIMD_WIDTH, NumSims, Hq * n_selected) — 3D
+//   Grid: (SIMD_WIDTH, NumSims, n_selected) — 3D
 //   Threadgroup: (SIMD_WIDTH, NumSims, 1)
-//   Grid.z flattens (q_head, block_idx): q_head = flat / n_selected,
-//                                         block_idx = flat % n_selected
+//   Grid.z = kv_block_idx (one threadgroup per KV block)
 //
-// Each SIMD group independently processes its query head. No cross-SIMD
-// barriers needed — accumulators live in registers, partials are written
-// directly to global memory. Phase 2 handles the global reduction.
+// Each SIMD group processes ceil(Hq / NumSims) query heads.
+// No cross-SIMD barriers needed — accumulators live in registers,
+// partials are written directly to global memory.
 //
 // Threadgroup memory: tg_k[ChunkSize * Dim] + tg_v[ChunkSize * Dim]
 // For Dim=128, ChunkSize=16: 16 KB each, 32 KB total (Apple M3 limit).
@@ -51,44 +54,44 @@ namespace {
 
 constexpr int SIMD_WIDTH = 32;
 
-// Phase 1 kernel: chunk-outermost KV-outer block-sparse attention.
+// Phase 1 kernel: chunk-outermost, all-heads-per-block KV-outer attention.
 constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
     uint lane = thread_position_in_threadgroup.x;    // 0 .. 31
     uint sg = thread_position_in_threadgroup.y;      // 0 .. NumSims-1
-    uint flat_idx = threadgroup_position_in_grid.z;
+    uint kv_block_idx = threadgroup_position_in_grid.z;
 
     uint n_selected = (uint)k_blocked_shape[2];
-    uint q_head_idx = flat_idx / n_selected;
-    uint kv_block_idx = flat_idx % n_selected;
-
     uint dim = (uint)Dim;
     uint dpt = (uint)DimsPerThread;
     uint d0 = lane * dpt;
     uint block_size = (uint)BlockSize;
     uint chunk_size = (uint)ChunkSize;
     uint hq = (uint)q_shape[1];
+    uint nrep = (uint)NRep;
+    uint num_sims = (uint)NumSims;
 
-    // Bounds guard.
-    if (q_head_idx >= hq) return;
+    // Determine which query heads this SIMD group processes.
+    uint heads_per_simd = (hq + num_sims - 1) / num_sims;
+    uint head_start = sg * heads_per_simd;
+    uint head_end = min(head_start + heads_per_simd, hq);
 
-    // Per-head query count from the per-query-head inverted index.
-    uint head_block_idx = q_head_idx * n_selected + kv_block_idx;
-    uint num_queries = (uint)query_counts[head_block_idx];
-    uint idx_offset = head_block_idx * (uint)MaxQueriesPerBlock;
-
-    // If no queries for this (head, block), write neutral partials.
-    if (num_queries == 0) {
-        uint partial_base = 0 * n_selected + kv_block_idx;
-        partial_m[q_head_idx * n_selected + partial_base] = -INFINITY;
-        partial_l[q_head_idx * n_selected + partial_base] = 0.0f;
-        // partial_v stays at init_value (0).
+    // If no query heads assigned to this SIMD group, write neutral partials and exit.
+    if (head_start >= hq) {
+        for (uint h = 0; h < heads_per_simd; h++) {
+            uint qh = head_start + h;
+            if (qh < hq) {
+                uint partial_base = qh * n_selected + kv_block_idx;
+                partial_m[partial_base] = -INFINITY;
+                partial_l[partial_base] = 0.0f;
+            }
+        }
         return;
     }
 
-    // KV base offset in blocked layout: [B, Hkv, n_selected, BlockSize, Dim]
-    // Hkv is derived from the GQA mapping: kv_head = q_head_idx / NRep.
-    uint nrep = (uint)NRep;
-    uint kv_head = q_head_idx / nrep;
+    // KV base offset: [B, Hkv, n_selected, BlockSize, Dim]
+    // All query heads in this SIMD group map to the same KV head.
+    // Use the first assigned head to derive kv_head.
+    uint kv_head = head_start / nrep;
     uint kv_base = kv_head * n_selected * block_size * dim
                  + kv_block_idx * block_size * dim;
 
@@ -97,96 +100,109 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
 
     float scale_v = scale[0];
 
-    // Load this query head's Q slice into registers.
-    float q_reg[DimsPerThread];
-    for (uint j = 0; j < dpt; j++) {
-        uint d = d0 + j;
-        q_reg[j] = (d < dim) ? q[q_head_idx * dim + d] : 0.0f;
+    // Load ALL assigned query heads' Q slices into registers.
+    // Each SIMD group holds heads_per_simd sets of DimsPerThread floats.
+    float q_reg[MaxHeadsPerSimd][DimsPerThread];
+    uint num_heads = head_end - head_start;
+    for (uint hi = 0; hi < num_heads; hi++) {
+        uint qh = head_start + hi;
+        for (uint j = 0; j < dpt; j++) {
+            uint d = d0 + j;
+            q_reg[hi][j] = (d < dim) ? q[qh * dim + d] : 0.0f;
+        }
     }
 
-    // Online softmax accumulators (in registers, per SIMD group).
-    float m = -INFINITY;
-    float l = 0.0f;
-    float acc[DimsPerThread];
-    for (uint j = 0; j < dpt; j++) acc[j] = 0.0f;
+    // Online softmax accumulators (in registers, per head).
+    float m[MaxHeadsPerSimd];
+    float l[MaxHeadsPerSimd];
+    float acc[MaxHeadsPerSimd][DimsPerThread];
+    for (uint hi = 0; hi < num_heads; hi++) {
+        m[hi] = -INFINITY;
+        l[hi] = 0.0f;
+        for (uint j = 0; j < dpt; j++) acc[hi][j] = 0.0f;
+    }
 
     // Linear thread ID across all SIMD groups for cooperative load.
     uint linear_tid = sg * 32 + lane;
-    uint threads_per_tg = (uint)NumSims * 32;
+    uint threads_per_tg = num_sims * 32;
 
     // Threadgroup memory for chunked KV load.
     threadgroup float tg_k[ChunkSize * Dim];
     threadgroup float tg_v[ChunkSize * Dim];
 
     // Outer loop: over chunks of the KV block.
-    // Each chunk is loaded ONCE, then all heads process it.
+    // Each chunk is loaded ONCE cooperatively, then ALL query heads process it.
     for (uint chunk_start = 0; chunk_start < block_size; chunk_start += chunk_size) {
         uint chunk_end = min(chunk_start + chunk_size, block_size);
         uint actual_chunk = chunk_end - chunk_start;
         uint chunk_elems = actual_chunk * dim;
 
         // Cooperatively load this chunk into threadgroup memory.
-        // All threads in the threadgroup participate (linear_tid).
+        // ALL threads across ALL SIMD groups participate.
         uint chunk_base = kv_base + chunk_start * dim;
         for (uint i = linear_tid; i < chunk_elems; i += threads_per_tg) {
             uint tok = i / dim;
             uint d = i % dim;
-            uint off = chunk_base + tok * dim + d;
-            tg_k[tok * dim + d] = (float)k_blocked[off];
-            tg_v[tok * dim + d] = (float)v_blocked[off];
+            tg_k[tok * dim + d] = (float)k_blocked[chunk_base + tok * dim + d];
+            tg_v[tok * dim + d] = (float)v_blocked[chunk_base + tok * dim + d];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Process all tokens in this chunk.
-        for (uint t = 0; t < actual_chunk; t++) {
-            uint tok_base = t * dim;
+        // Process ALL assigned query heads against this chunk.
+        // The KV data is resident in threadgroup memory — no additional loads.
+        for (uint hi = 0; hi < num_heads; hi++) {
+            uint qh = head_start + hi;
+            for (uint t = 0; t < actual_chunk; t++) {
+                uint tok_base = t * dim;
 
-            // Q · K_t via simd_sum across 32 lanes.
-            float partial = 0.0f;
-            for (uint j = 0; j < dpt; j++) {
-                uint d = d0 + j;
-                float kd = (d < dim) ? tg_k[tok_base + d] : 0.0f;
-                partial += q_reg[j] * kd;
-            }
-            float score = simd_sum(partial) * scale_v;
-
-            // Causal mask: mask future tokens to -inf.
-            uint abs_tok_pos = abs_block_id * block_size + chunk_start + t;
-            if (abs_tok_pos > (uint)inverted_index[idx_offset]) {
-                score = -INFINITY;
-            }
-
-            // Online softmax — skip masked tokens entirely.
-            if (isfinite(score)) {
-                float m_new = fmax(m, score);
-                float corr = fast::exp(m - m_new);
-                float p = fast::exp(score - m_new);
-                l = l * corr + p;
+                // Q · K_t via simd_sum across 32 lanes.
+                float partial = 0.0f;
                 for (uint j = 0; j < dpt; j++) {
                     uint d = d0 + j;
-                    float vd = (d < dim) ? tg_v[tok_base + d] : 0.0f;
-                    acc[j] = acc[j] * corr + p * vd;
+                    float kd = (d < dim) ? tg_k[tok_base + d] : 0.0f;
+                    partial += q_reg[hi][j] * kd;
                 }
-                m = m_new;
+                float score = simd_sum(partial) * scale_v;
+
+                // Causal mask.
+                uint abs_tok_pos = abs_block_id * block_size + chunk_start + t;
+                if (abs_tok_pos > (uint)inverted_index[qh * n_selected + kv_block_idx]) {
+                    score = -INFINITY;
+                }
+
+                // Online softmax — skip masked tokens entirely.
+                if (isfinite(score)) {
+                    float m_new = fmax(m[hi], score);
+                    float corr = fast::exp(m[hi] - m_new);
+                    float p = fast::exp(score - m_new);
+                    l[hi] = l[hi] * corr + p;
+                    for (uint j = 0; j < dpt; j++) {
+                        uint d = d0 + j;
+                        float vd = (d < dim) ? tg_v[tok_base + d] : 0.0f;
+                        acc[hi][j] = acc[hi][j] * corr + p * vd;
+                    }
+                    m[hi] = m_new;
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write partials to global memory.
-    // For decode (L=1), partial_buf_idx = 0.
-    uint partial_buf_idx = 0;
-    uint partial_base = partial_buf_idx * n_selected + kv_block_idx;
+    // Write partials to global memory for ALL assigned query heads.
+    for (uint hi = 0; hi < num_heads; hi++) {
+        uint qh = head_start + hi;
+        uint partial_base = qh * n_selected + kv_block_idx;
 
-    for (uint j = 0; j < dpt; j++) {
-        uint d = d0 + j;
-        if (d < dim) {
-            partial_v[q_head_idx * n_selected * dim + partial_base * dim + d] = acc[j];
+        for (uint j = 0; j < dpt; j++) {
+            uint d = d0 + j;
+            if (d < dim) {
+                partial_v[partial_base * dim + d] = acc[hi][j];
+            }
         }
-    }
-    if (lane == 0u) {
-        partial_m[q_head_idx * n_selected + partial_base] = m;
-        partial_l[q_head_idx * n_selected + partial_base] = l;
+        if (lane == 0u) {
+            partial_m[partial_base] = m[hi];
+            partial_l[partial_base] = l[hi];
+        }
     }
 )";
 
@@ -229,9 +245,7 @@ KvOuterPartials minimax_sparse_kv_outer_sdpa(
     const auto& q_shape = q.shape();
     const auto& k_shape = k_blocked.shape();
 
-    int batch = q_shape[0];
     int hq = q_shape[1];
-    int q_len = q_shape[2];
     int dim = q_shape[3];
     int hkv = k_shape[1];
     int n_selected = k_shape[2];
@@ -255,6 +269,7 @@ KvOuterPartials minimax_sparse_kv_outer_sdpa(
     chunk_size = cs;
 
     int num_sims = 4;
+    int heads_per_simd = (hq + num_sims - 1) / num_sims;
 
     std::vector<std::pair<std::string, TemplateArg>> template_args = {
         {"Dim", dim},
@@ -264,6 +279,7 @@ KvOuterPartials minimax_sparse_kv_outer_sdpa(
         {"NRep", n_rep},
         {"DimsPerThread", dims_per_thread},
         {"NumSims", num_sims},
+        {"MaxHeadsPerSimd", heads_per_simd},
     };
 
     auto scale_arr = mlx::core::full(mlx::core::Shape{1}, scale, mlx::core::float32);
@@ -278,10 +294,11 @@ KvOuterPartials minimax_sparse_kv_outer_sdpa(
         scale_arr,      // [1]                                        f32
     };
 
+    // Output shapes: [B, Hq, L, n_selected] for decode (B=1, L=1).
     std::vector<Shape> output_shapes = {
-        Shape{batch, hq, q_len, n_selected},        // partial_m
-        Shape{batch, hq, q_len, n_selected},        // partial_l
-        Shape{batch, hq, q_len, n_selected, dim},   // partial_v
+        Shape{1, hq, 1, n_selected},        // partial_m
+        Shape{1, hq, 1, n_selected},        // partial_l
+        Shape{1, hq, 1, n_selected, dim},   // partial_v
     };
     std::vector<Dtype> output_dtypes = {
         mlx::core::float32,
@@ -289,14 +306,13 @@ KvOuterPartials minimax_sparse_kv_outer_sdpa(
         mlx::core::float32,
     };
 
-    // Grid: (SIMD_WIDTH, NumSims, Hq * n_selected) — 3D.
-    // Each threadgroup handles one (q_head, block) pair.
-    int total_tiles = hq * n_selected;
+    // Grid: (SIMD_WIDTH, NumSims, n_selected) — one threadgroup per KV block.
+    // Each SIMD group processes ceil(Hq / NumSims) query heads inside the kernel.
     auto results = kernel(
         inputs,
         output_shapes,
         output_dtypes,
-        std::make_tuple(SIMD_WIDTH, num_sims, total_tiles),
+        std::make_tuple(SIMD_WIDTH, num_sims, n_selected),
         std::make_tuple(SIMD_WIDTH, num_sims, 1),
         template_args,
         std::optional<float>(0.0f),  // Zero-init outputs (partial_v must be 0 for zero-query slots).
