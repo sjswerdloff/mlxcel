@@ -729,11 +729,16 @@ fn kv_outer_large_context() {
     // Fetch only selected blocks (compact), not all blocks.
     // The real dispatch does: fetch_msa_blocks(&union) → reshape to [b, hkv, n_selected, bs, d].
     // Here we slice the first n_selected blocks from the full tensor.
+    // IMPORTANT: eval the slice to force materialization — MLX lazy evaluation
+    // means k_shape[2] in the C++ launcher reads the pre-slice shape otherwise.
     let n_selected = top_k;
     let k_all = ffi::reshape(&k, &[b, hkv, num_key_blocks, block_size, dim]);
     let v_all = ffi::reshape(&v, &[b, hkv, num_key_blocks, block_size, dim]);
     let k_blocked = ffi::slice(&k_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
     let v_blocked = ffi::slice(&v_all, &[0, 0, 0, 0, 0], &[b, hkv, n_selected, block_size, dim]);
+    // Force materialization so shapes are correct when the kernel reads them.
+    ffi::eval(&k_blocked);
+    ffi::eval(&v_blocked);
 
     let max_qpb = 1i32;
     let mut inv_index = vec![0i32; (hkv * n_selected * max_qpb) as usize];
