@@ -1842,6 +1842,68 @@ std::unique_ptr<MlxArray> paged_attention_decode(
     const MlxArray& visible_lens,
     float scale);
 
+// KV-Stationary Block-Sparse Attention for MiniMax M3 (Phase 1).
+// Wraps `mlxcel::turbo::minimax_sparse_kv_outer_sdpa`. Each threadgroup loads
+// ONE KV block into SRAM exactly once, then iterates over the inverted index
+// to pull in only the queries that require this block. Outputs partial max,
+// sum_exp, and weighted V accumulators for Phase 2 reduction.
+//
+// Inputs:
+// - `q`:              `[B, Hq, L, Dim]` FP32 — queries (rotated frame).
+// - `k_blocked`:      `[B, Hkv, num_key_blocks, block_size, Dim]` FP16 — blocked K.
+// - `v_blocked`:      `[B, Hkv, num_key_blocks, block_size, Dim]` FP16 — blocked V.
+// - `inverted_index`: `[B, Hkv, num_key_blocks, max_queries_per_block]` INT32.
+// - `query_counts`:   `[B, Hkv, num_key_blocks]` INT32.
+// - `scale`:          `[1]` FP32 — attention scale (1/sqrt(head_dim)).
+// - `block_size`:     INT32 — MSA block size (128 for MiniMax-M3).
+// - `max_queries_per_block`: INT32 — padded dimension for inverted index.
+//
+// Returns partials for Phase 2: {out_partial_m, out_partial_l, out_partial_v}.
+// Implementation lives in `src/lib/mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp`.
+struct KvOuterPartials {
+    std::unique_ptr<MlxArray> partial_m;  // [B, Hq, L, num_key_blocks] f32
+    std::unique_ptr<MlxArray> partial_l;  // [B, Hq, L, num_key_blocks] f32
+    std::unique_ptr<MlxArray> partial_v;  // [B, Hq, L, num_key_blocks, Dim] f32
+};
+
+std::unique_ptr<KvOuterPartials> turbo_minimax_sparse_kv_outer_sdpa(
+    const MlxArray& q,
+    const MlxArray& k_blocked,
+    const MlxArray& v_blocked,
+    const MlxArray& inverted_index,
+    const MlxArray& query_counts,
+    float scale,
+    int32_t block_size,
+    int32_t max_queries_per_block);
+
+// KV-Stationary Block-Sparse Attention for MiniMax M3 (Phase 2).
+// Wraps `mlxcel::turbo::minimax_sparse_kv_outer_reduction`. For each query,
+// sweeps across the partial outputs from Phase 1, computes the final global
+// attention distribution, and produces a normalized result.
+//
+// Inputs:
+// - `q`:              `[B, Hq, L, Dim]` FP32 — queries (for shape metadata).
+// - `partial_m`:      `[B, Hq, L, num_key_blocks]` FP32 — partial max from Phase 1.
+// - `partial_l`:      `[B, Hq, L, num_key_blocks]` FP32 — partial sum_exp from Phase 1.
+// - `partial_v`:      `[B, Hq, L, num_key_blocks, Dim]` FP32 — partial V accumulators.
+// - `num_key_blocks`: INT32 — number of key blocks.
+//
+// Returns `[B, Hq, L, Dim]` FP32 — normalized attention output.
+// Implementation lives in `src/lib/mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp`.
+std::unique_ptr<MlxArray> turbo_minimax_sparse_kv_outer_reduction(
+    const MlxArray& q,
+    const MlxArray& partial_m,
+    const MlxArray& partial_l,
+    const MlxArray& partial_v,
+    int32_t num_key_blocks);
+
+// Move out the partials from a KV-outer Phase 1 outputs struct. The cxx
+// bridge does not directly model "destructure a struct returned by FFI", so we
+// expose three takers that the Rust side calls before dropping the struct.
+std::unique_ptr<MlxArray> kv_outer_partials_take_m(KvOuterPartials& o);
+std::unique_ptr<MlxArray> kv_outer_partials_take_l(KvOuterPartials& o);
+std::unique_ptr<MlxArray> kv_outer_partials_take_v(KvOuterPartials& o);
+
 // Opaque holder for weights loaded via MLX's native load_safetensors().
 // Arrays are lazy — MLX manages the mmap internally, no eager copy needed.
 struct MlxLoadedWeights {

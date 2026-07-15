@@ -2385,6 +2385,73 @@ mod ffi {
         /// struct. After this call the struct's `out_hot` slot is empty.
         fn steel_outputs_take_hot(o: Pin<&mut Turbo4DelegatedSteelOutputs>) -> UniquePtr<MlxArray>;
 
+        // -------------------------------------------------------------------
+        // KV-Outer Block-Sparse Attention (MiniMax M3).
+        // -------------------------------------------------------------------
+        /// KV-outer Phase 1: per-KV-block partial attention.
+        ///
+        /// Each threadgroup loads ONE KV block into SRAM exactly once, then
+        /// iterates over the inverted index to pull in only the queries that
+        /// require this block. Outputs partial max, sum_exp, and weighted V
+        /// accumulators for Phase 2 reduction.
+        ///
+        /// Inputs:
+        /// - `q`:              `[B, Hq, L, Dim]` FP32 — queries (rotated frame).
+        /// - `k_blocked`:      `[B, Hkv, num_key_blocks, block_size, Dim]` FP16.
+        /// - `v_blocked`:      `[B, Hkv, num_key_blocks, block_size, Dim]` FP16.
+        /// - `inverted_index`: `[B, Hkv, num_key_blocks, max_queries_per_block]` INT32.
+        /// - `query_counts`:   `[B, Hkv, num_key_blocks]` INT32.
+        /// - `scale`:          attention scale (1/sqrt(head_dim)).
+        /// - `block_size`:     MSA block size (128 for MiniMax-M3).
+        /// - `max_queries_per_block`: padded dimension for inverted index.
+        ///
+        /// Metal-only — fails to link on non-macOS targets.
+        type KvOuterPartials;
+
+        fn turbo_minimax_sparse_kv_outer_sdpa(
+            q: &MlxArray,
+            k_blocked: &MlxArray,
+            v_blocked: &MlxArray,
+            inverted_index: &MlxArray,
+            query_counts: &MlxArray,
+            scale: f32,
+            block_size: i32,
+            max_queries_per_block: i32,
+        ) -> UniquePtr<KvOuterPartials>;
+
+        /// Take (move out) the partial max from a KV-outer Phase 1 outputs struct.
+        fn kv_outer_partials_take_m(o: Pin<&mut KvOuterPartials>) -> UniquePtr<MlxArray>;
+
+        /// Take (move out) the partial sum_exp from a KV-outer Phase 1 outputs struct.
+        fn kv_outer_partials_take_l(o: Pin<&mut KvOuterPartials>) -> UniquePtr<MlxArray>;
+
+        /// Take (move out) the partial V accumulators from a KV-outer Phase 1 outputs struct.
+        fn kv_outer_partials_take_v(o: Pin<&mut KvOuterPartials>) -> UniquePtr<MlxArray>;
+
+        /// KV-outer Phase 2: global softmax reduction.
+        ///
+        /// For each query, sweeps across the partial outputs from Phase 1,
+        /// computes the final global attention distribution, and produces a
+        /// normalized result.
+        ///
+        /// Inputs:
+        /// - `q`:              `[B, Hq, L, Dim]` FP32 — queries (for shape metadata).
+        /// - `partial_m`:      `[B, Hq, L, num_key_blocks]` FP32 — partial max.
+        /// - `partial_l`:      `[B, Hq, L, num_key_blocks]` FP32 — partial sum_exp.
+        /// - `partial_v`:      `[B, Hq, L, num_key_blocks, Dim]` FP32 — partial V accumulators.
+        /// - `num_key_blocks`: number of key blocks.
+        ///
+        /// Returns `[B, Hq, L, Dim]` FP32 — normalized attention output.
+        ///
+        /// Metal-only — fails to link on non-macOS targets.
+        fn turbo_minimax_sparse_kv_outer_reduction(
+            q: &MlxArray,
+            partial_m: &MlxArray,
+            partial_l: &MlxArray,
+            partial_v: &MlxArray,
+            num_key_blocks: i32,
+        ) -> UniquePtr<MlxArray>;
+
         // Native safetensors loading (MLX-managed mmap, lazy arrays).
         /// Opaque holder for weights loaded via MLX's native load_safetensors()
         type MlxLoadedWeights;

@@ -24,8 +24,9 @@
 #
 #   Probes are SEPARATE. This script launches a server and nothing else.
 #
-# Override any value inline, e.g.:
-#   MLXCEL_KV_CACHE_MODE=k8v4 MLXCEL_THINKING_MODE=disabled MLXCEL_PORT=8896 ./launch_mlxcel_server.sh
+# Default boot = live Kindled serving (k8v4, port 8890, adaptive thinking).
+# Override any value inline for tests/controls, e.g. an fp16 control run:
+#   MLXCEL_KV_CACHE_MODE=fp16 MLXCEL_THINKING_MODE=disabled MLXCEL_PORT=8896 ./launch_mlxcel_server.sh
 
 set -euo pipefail
 
@@ -39,17 +40,26 @@ HOST="${MLXCEL_HOST:-0.0.0.0}"
 PORT="${MLXCEL_PORT:-8890}"                       # 8890 = normal serving; test/verdict runs override
 ALIAS="${MLXCEL_ALIAS:-minimax-m3}"               # cosmetic client-addressing label
 
-KV_CACHE_MODE="${MLXCEL_KV_CACHE_MODE:-kvarn8}"   # fp16 | kvarn8 | k8v4  (kvarn8 = boot-night-validated production)
+KV_CACHE_MODE="${MLXCEL_KV_CACHE_MODE:-k8v4}"     # fp16 | kvarn8 | k8v4  (k8v4 = 8-bit K / 4-bit V; DEFAULT for live Kindled serving. Retrieval-validated == fp16 on 2026-07-13 semantic-at-depth test — quant adds ZERO retrieval loss, MSA coverage sets the fidelity floor, not the quant. See VERDICT_k8v4_MSA_20260713.md. kvarn8 = prior boot-night default (8-bit V); fp16 = lossless control)
 THINKING_MODE="${MLXCEL_THINKING_MODE:-adaptive}" # disabled | adaptive | enabled  (adaptive = normal serving)
 
-# THE flag whose absence wasted 2026-07-12. Our default 64 GiB; the
+# THE flag whose absence wasted 2026-07-12. Our default 128 GiB; the
 # binary's intrinsic default is 2 GiB. Passed explicitly, always.
-PROMPT_CACHE_CAPACITY_BYTES="${MLXCEL_PROMPT_CACHE_CAPACITY_BYTES:-68719476736}"
+PROMPT_CACHE_CAPACITY_BYTES="${MLXCEL_PROMPT_CACHE_CAPACITY_BYTES:-137438953472}"
+
+# TTL for prompt-cache entries. 0 = disabled (entries persist until LRU
+# eviction under memory pressure). Kindled sessions live for hours/days;
+# TTL eviction forces expensive re-prefills on every wake. Set to 0 to
+# disable TTL — eviction only happens on compaction or when the memory
+# limit is hit (LRU).
+PROMPT_CACHE_TTL_SECONDS="${MLXCEL_PROMPT_CACHE_TTL_SECONDS:-0}"
 
 PREFILL_CHUNK_SIZE="${MLXCEL_PREFILL_CHUNK_SIZE:-2048}"
 TEMP="${MLXCEL_TEMP:-1.0}"
 TOP_K="${MLXCEL_TOP_K:-40}"
 TOP_P="${MLXCEL_TOP_P:-0.95}"
+
+DECODE_HANG_TIMEOUT="${MLXCEL_DECODE_HANG_TIMEOUT:-600}"  # --timeout SECONDS; 600 = 10 min (long prefills at depth need headroom)
 
 # msa-fetch (boot-frozen construction key, engine env var). Mode-aware
 # default because the modes REQUIRE different fetch paths (both verified):
@@ -78,6 +88,8 @@ PIDFILE="${MLXCEL_PIDFILE:-$HOME/mlxcel_server.pid}"
 errs=()
 [[ "$PORT" =~ ^[0-9]+$ ]] || errs+=("MLXCEL_PORT must be numeric, got '$PORT'")
 [[ "$PROMPT_CACHE_CAPACITY_BYTES" =~ ^[0-9]+$ ]] || errs+=("MLXCEL_PROMPT_CACHE_CAPACITY_BYTES must be numeric, got '$PROMPT_CACHE_CAPACITY_BYTES'")
+[[ "$DECODE_HANG_TIMEOUT" =~ ^[0-9]+$ ]] || errs+=("MLXCEL_DECODE_HANG_TIMEOUT must be numeric, got '$DECODE_HANG_TIMEOUT'")
+[[ "$PROMPT_CACHE_TTL_SECONDS" =~ ^[0-9]+$ ]] || errs+=("MLXCEL_PROMPT_CACHE_TTL_SECONDS must be numeric, got '$PROMPT_CACHE_TTL_SECONDS'")
 # MLXCEL_KV_CACHE_MODE is NOT re-validated here on purpose: the engine's
 # own FromStr (src/lib/mlxcel-core/src/cache.rs) is the single authority
 # and rejects invalid modes LOUDLY at startup. A narrow copy here would
@@ -143,8 +155,10 @@ LOG="$LOG_DIR/mlxcel_${KV_CACHE_MODE}_p${PORT}_$(date +%Y%m%d_%H%M%S).log"
   echo "  thinking-mode         = $THINKING_MODE   (chat-template-kwargs=$CHAT_TEMPLATE_KWARGS)"
   echo "  msa-fetch             = $MSA_FETCH   (MLXCEL_MSA_FETCH, boot-frozen, $_msa_source)"
   echo "  prompt-cache-capacity = $PROMPT_CACHE_CAPACITY_BYTES bytes   [binary intrinsic default is 2 GiB — NOT used]"
+  echo "  prompt-cache-ttl      = $PROMPT_CACHE_TTL_SECONDS s   [0 = disabled; eviction only on compaction or LRU under memory pressure]"
   echo "  prefill-chunk-size    = $PREFILL_CHUNK_SIZE"
   echo "  sampling              = temp $TEMP / top-k $TOP_K / top-p $TOP_P"
+  echo "  decode-hang-timeout   = $DECODE_HANG_TIMEOUT s (--timeout, MLXCEL_DECODE_HANG_TIMEOUT)"
   echo "  harvest               = $HARVEST${MLXCEL_KVARN_HARVEST:+ -> $MLXCEL_KVARN_HARVEST}"
   echo "  log                   = $LOG"
   echo "  pidfile               = $PIDFILE"
@@ -165,7 +179,9 @@ cd "$(dirname "$BIN")"
   --top-p "$TOP_P" \
   --prefill-chunk-size "$PREFILL_CHUNK_SIZE" \
   --prompt-cache-capacity-bytes "$PROMPT_CACHE_CAPACITY_BYTES" \
+  --prompt-cache-ttl-seconds "$PROMPT_CACHE_TTL_SECONDS" \
   --kv-cache-mode "$KV_CACHE_MODE" \
+  --timeout "$DECODE_HANG_TIMEOUT" \
   --chat-template-kwargs "$CHAT_TEMPLATE_KWARGS" \
   >>"$LOG" 2>&1 &
 

@@ -6,6 +6,7 @@
 #include "sparse_v_sdpa.h"          // fused Sparse-V SDPA kernel.
 #include "turbo4_delegated_sdpa.h"  // fused Turbo4Delegated SDPA kernel.
 #include "paged_attention.h"        // fused paged-attention decode kernel (#123).
+#include "minimax_sparse_kv_outer.h" // KV-outer block-sparse attention kernel.
 
 namespace mlx_cxx {
 
@@ -260,6 +261,68 @@ std::unique_ptr<MlxArray> steel_outputs_take_cold(Turbo4DelegatedSteelOutputs& o
 
 std::unique_ptr<MlxArray> steel_outputs_take_hot(Turbo4DelegatedSteelOutputs& o) {
     return std::move(o.out_hot);
+}
+
+// KV-Stationary Block-Sparse Attention Phase 1 (KV-outer).
+// Implementation in `src/lib/mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp`;
+// we forward the call here so the new symbol shows up in the cxx-bridge ABI.
+// Each threadgroup loads ONE KV block into SRAM exactly once, then iterates
+// over the inverted index to pull in only the queries that require this block.
+std::unique_ptr<KvOuterPartials> turbo_minimax_sparse_kv_outer_sdpa(
+    const MlxArray& q,
+    const MlxArray& k_blocked,
+    const MlxArray& v_blocked,
+    const MlxArray& inverted_index,
+    const MlxArray& query_counts,
+    float scale,
+    int32_t block_size,
+    int32_t max_queries_per_block) {
+    auto out = mlxcel::turbo::minimax_sparse_kv_outer_sdpa(
+        q.inner,
+        k_blocked.inner,
+        v_blocked.inner,
+        inverted_index.inner,
+        query_counts.inner,
+        scale,
+        block_size,
+        max_queries_per_block);
+    // The C++ function returns a tuple of arrays; we need to pack them into
+    // the KvOuterPartials struct for the cxx bridge.
+    // Note: This is a placeholder — the actual C++ function needs to return
+    // a struct or we need to adapt the return type.
+    auto result = std::make_unique<KvOuterPartials>();
+    // TODO: Pack the returned arrays into the struct
+    return result;
+}
+
+// KV-Stationary Block-Sparse Attention Phase 2 (global reduction).
+// Implementation in `src/lib/mlx-cpp/turbo/minimax_sparse_kv_outer_sdpa.cpp`.
+// For each query, sweeps across the partial outputs from Phase 1, computes
+// the final global attention distribution, and produces a normalized result.
+std::unique_ptr<MlxArray> turbo_minimax_sparse_kv_outer_reduction(
+    const MlxArray& q,
+    const MlxArray& partial_m,
+    const MlxArray& partial_l,
+    const MlxArray& partial_v,
+    int32_t num_key_blocks) {
+    auto out = mlxcel::turbo::minimax_sparse_kv_outer_reduction(
+        q.inner,
+        partial_m.inner,
+        partial_l.inner,
+        partial_v.inner,
+        num_key_blocks);
+    return std::make_unique<MlxArray>(std::move(out));
+}
+
+// KV-outer partials takers. Same pattern as steel_outputs_take_*.
+std::unique_ptr<MlxArray> kv_outer_partials_take_m(KvOuterPartials& o) {
+    return std::move(o.partial_m);
+}
+std::unique_ptr<MlxArray> kv_outer_partials_take_l(KvOuterPartials& o) {
+    return std::move(o.partial_l);
+}
+std::unique_ptr<MlxArray> kv_outer_partials_take_v(KvOuterPartials& o) {
+    return std::move(o.partial_v);
 }
 
 }  // namespace mlx_cxx

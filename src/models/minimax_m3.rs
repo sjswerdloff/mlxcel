@@ -120,6 +120,28 @@ fn k1_fixed_blocks_enabled() -> bool {
     })
 }
 
+/// MLXCEL_KV_OUTER=1 enables the KV-outer block-sparse attention kernel.
+/// This is an alternative execution pattern for MSA decode: instead of
+/// iterating over queries and gathering scattered KV blocks (Q-outer),
+/// each threadgroup loads ONE KV block into SRAM exactly once, then
+/// iterates over the inverted index to pull in only the queries that
+/// require this block. Amortizes KV loads at large context.
+///
+/// OFF by default — opt-in, env-gated, no production-path perturbation.
+fn kv_outer_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let on = std::env::var("MLXCEL_KV_OUTER").is_ok_and(|v| v == "1");
+        if on {
+            info!(
+                "KV-OUTER ACTIVE: KV-stationary block-sparse attention kernel enabled — \
+                 each threadgroup loads ONE KV block into SRAM, iterates queries via inverted index"
+            );
+        }
+        on
+    })
+}
+
 fn k1_prof_record(stage: usize, t: &Option<std::time::Instant>) {
     if let Some(t) = t {
         K1_PROF_NANOS[stage].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1382,6 +1404,32 @@ impl SparseAttention {
         }
         let t2 = profiling.then(std::time::Instant::now);
 
+        // KV-outer block-sparse attention (MLXCEL_KV_OUTER=1).
+        // Alternative execution pattern: each threadgroup loads ONE KV block
+        // into SRAM exactly once, then iterates over the inverted index to
+        // pull in only the queries that require this block. Amortizes KV
+        // loads at large context. Falls through to the standard fetch+core
+        // path when disabled.
+        if kv_outer_enabled() && b == 1 && l == 1 {
+            static KV_OUTER_DISPATCHED: std::sync::Once = std::sync::Once::new();
+            KV_OUTER_DISPATCHED.call_once(|| {
+                tracing::info!(
+                    layer = self.layer_idx,
+                    "KV-outer block-sparse attention active (first dispatch this process)"
+                );
+            });
+            let out = self.sparse_decode_attention_kv_outer(
+                q, &selected, cache, kv_len, offset,
+            );
+            if profiling {
+                mlxcel_core::eval(&out);
+                k1_prof_record(2, &t2);
+                k1_prof_record(3, &t2);
+                k1_prof_maybe_report();
+            }
+            return out;
+        }
+
         // Compact window: only the union blocks, standard frame, each
         // exactly block_size tokens (tail zero-padded inside). Fetch is
         // mode-dispatched: kvarn8 dequants exactly the requested tiles;
@@ -2067,6 +2115,118 @@ impl SparseAttention {
         let out = mlxcel_core::transpose_axes(&out, &[0, 2, 1, 3]);
         let out = mlxcel_core::reshape(&out, &[1, 1, self.num_heads * d]);
         self.o_proj.forward(&out)
+    }
+
+    /// KV-outer block-sparse attention for MSA decode.
+    ///
+    /// Alternative execution pattern: instead of iterating over queries and
+    /// gathering scattered KV blocks (Q-outer), this builds an inverted index
+    /// mapping each KV block to the queries that attend to it, then calls the
+    /// KV-outer Metal kernel which assigns a threadgroup to each KV block,
+    /// loads it into SRAM exactly once, and iterates over the queries.
+    ///
+    /// Phase 1: per-KV-block partial attention (max, sum_exp, weighted V)
+    /// Phase 2: global softmax reduction across all partial blocks per query
+    ///
+    /// Only called when MLXCEL_KV_OUTER=1 and decode (b==1, l==1).
+    fn sparse_decode_attention_kv_outer(
+        &self,
+        q: &MlxArray,
+        selected: &MlxArray,
+        cache: &KVCache,
+        kv_len: i32,
+        offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        let b = 1i32;
+        let l = 1i32;
+        let h_kv = self.num_kv_heads;
+        let h_q = self.num_heads;
+        let d = self.head_dim;
+        let bs = self.block_size;
+        let num_key_blocks = (kv_len + bs - 1) / bs;
+
+        // Build inverted index: for each KV block, which queries attend to it.
+        // selected: [b, h_kv, l, top_k] — absolute block indices per (head, token).
+        // inverted_index: [b, h_kv, num_key_blocks, max_queries_per_block] — query positions per block.
+        // query_counts: [b, h_kv, num_key_blocks] — how many queries per block.
+        let sel_bytes = mlxcel_core::array_to_raw_bytes(&mlxcel_core::astype(selected, mlxcel_core::dtype::INT32));
+        let sel_raw: Vec<i32> = sel_bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Count queries per block per head
+        let mut counts = vec![0i32; (h_kv * num_key_blocks) as usize];
+        for h in 0..h_kv as usize {
+            for j in 0..self.top_k as usize {
+                let blk = sel_raw[h * self.top_k as usize + j] as usize;
+                if blk < num_key_blocks as usize {
+                    counts[h * num_key_blocks as usize + blk] += 1;
+                }
+            }
+        }
+
+        // Max queries per block (for padding)
+        let max_qpb = *counts.iter().max().unwrap_or(&1).max(&1);
+
+        // Build inverted index
+        let mut inv_index = vec![0i32; (h_kv * num_key_blocks * max_qpb) as usize];
+        let mut counts_tmp = vec![0i32; (h_kv * num_key_blocks) as usize];
+        for h in 0..h_kv as usize {
+            // For decode (l==1), the query position is offset
+            let q_pos = offset;
+            for j in 0..self.top_k as usize {
+                let blk = sel_raw[h * self.top_k as usize + j] as usize;
+                if blk < num_key_blocks as usize {
+                    let idx = h * num_key_blocks as usize + blk;
+                    let slot = counts_tmp[idx] as usize;
+                    if slot < max_qpb as usize {
+                        inv_index[idx * max_qpb as usize + slot] = q_pos;
+                    }
+                    counts_tmp[idx] += 1;
+                }
+            }
+        }
+
+        // Reshape K/V to blocked form: [b, h_kv, num_key_blocks, bs, d]
+        // This requires the cache to have the full window materialized.
+        // For now, use fetch_kvarn8 to get the full window and reshape.
+        let (k_full, v_full) = cache.fetch_kvarn8();
+        let k_blocked = mlxcel_core::reshape(&k_full, &[b, h_kv, num_key_blocks, bs, d]);
+        let v_blocked = mlxcel_core::reshape(&v_full, &[b, h_kv, num_key_blocks, bs, d]);
+
+        // Convert to MLX arrays for the kernel
+        let inv_index_arr = mlxcel_core::from_slice_i32(&inv_index, &[b, h_kv, num_key_blocks, max_qpb]);
+        let counts_arr = mlxcel_core::from_slice_i32(&counts, &[b, h_kv, num_key_blocks]);
+
+        // Call KV-outer Phase 1
+        let scale = 1.0 / (d as f32).sqrt();
+        let mut partials = mlxcel_core::turbo_minimax_sparse_kv_outer_sdpa(
+            q,
+            &k_blocked,
+            &v_blocked,
+            &inv_index_arr,
+            &counts_arr,
+            scale,
+            bs,
+            max_qpb,
+        );
+
+        // Extract partials
+        let partial_m = mlxcel_core::kv_outer_partials_take_m(partials.pin_mut());
+        let partial_l = mlxcel_core::kv_outer_partials_take_l(partials.pin_mut());
+        let partial_v = mlxcel_core::kv_outer_partials_take_v(partials.pin_mut());
+
+        // Call KV-outer Phase 2 (global reduction)
+        let out = mlxcel_core::turbo_minimax_sparse_kv_outer_reduction(
+            q,
+            &partial_m,
+            &partial_l,
+            &partial_v,
+            num_key_blocks,
+        );
+
+        out
     }
 
     fn sparse_sdpa(
