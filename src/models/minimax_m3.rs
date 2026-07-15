@@ -1421,6 +1421,10 @@ impl SparseAttention {
             let out = self.sparse_decode_attention_kv_outer(
                 q, &selected, cache, kv_len, offset,
             );
+            // Apply output projection: [B, Hq, 1, Dim] → [B, 1, Hq*Dim] → o_proj.
+            let out = mlxcel_core::transpose_axes(&out, &[0, 2, 1, 3]);
+            let out = mlxcel_core::reshape(&out, &[b, l, self.num_heads * self.head_dim]);
+            let out = self.o_proj.forward(&out);
             if profiling {
                 mlxcel_core::eval(&out);
                 k1_prof_record(2, &t2);
@@ -2203,6 +2207,8 @@ impl SparseAttention {
 
         let inv_index_arr = mlxcel_core::from_slice_i32(&inv_index, &[b, h_kv, n_selected, max_qpb]);
         let counts_arr = mlxcel_core::from_slice_i32(&counts, &[b, h_kv, n_selected]);
+        // Block IDs: maps compact index → absolute block ID for causal masking.
+        let block_ids_arr = mlxcel_core::from_slice_i32(&union, &[n_selected]);
 
         // Phase 1: per-block partial attention.
         let scale = 1.0 / (d as f32).sqrt();
@@ -2212,6 +2218,7 @@ impl SparseAttention {
             &v_blocked,
             &inv_index_arr,
             &counts_arr,
+            &block_ids_arr,
             scale,
             bs,
             max_qpb,

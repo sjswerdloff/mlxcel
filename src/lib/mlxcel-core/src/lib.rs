@@ -2414,6 +2414,7 @@ mod ffi {
             v_blocked: &MlxArray,
             inverted_index: &MlxArray,
             query_counts: &MlxArray,
+            block_ids: &MlxArray,
             scale: f32,
             block_size: i32,
             max_queries_per_block: i32,

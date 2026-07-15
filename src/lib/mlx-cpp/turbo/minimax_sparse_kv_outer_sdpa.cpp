@@ -79,15 +79,21 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
     uint block_size = (uint)BlockSize;
     uint chunk_size = (uint)ChunkSize;
     uint nrep = (uint)NRep;
-    uint num_key_blocks = (uint)k_blocked_shape[2];
     uint max_qpb = (uint)MaxQueriesPerBlock;
 
+    // Absolute block ID for this compact index. Used for causal masking.
+    // block_ids maps compact index → absolute block ID.
+    uint abs_block_id = (uint)block_ids[kv_block_idx];
+
     // Query counts and inverted index for this block.
-    uint num_queries = (uint)query_counts[kv_block_idx];
-    uint idx_offset = kv_block_idx * max_qpb;
+    // query_counts is [B, Hkv, n_selected], inv_index is [B, Hkv, n_selected, MaxQPB].
+    // Must offset by kv_head to read the correct head's data.
+    uint head_block_idx = kv_head * n_key_blocks + kv_block_idx;
+    uint num_queries = (uint)query_counts[head_block_idx];
+    uint idx_offset = head_block_idx * max_qpb;
 
     // Base offset in the blocked KV layout: [B, Hkv, num_key_blocks, BlockSize, Dim]
-    uint kv_base = kv_head * num_key_blocks * block_size * dim
+    uint kv_base = kv_head * n_key_blocks * block_size * dim
                  + kv_block_idx * block_size * dim;
 
     float scale_v = scale[0];
@@ -103,6 +109,20 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
     uint heads_per_simd = (nrep + (uint)NumSims - 1) / (uint)NumSims;
     uint h_start = sg * heads_per_simd;
     uint h_end = min(h_start + heads_per_simd, nrep);
+
+    // If this block has no queries for this head, write neutral partials
+    // (m=-inf, l=0) so Phase 2 contributes nothing from this block.
+    if (num_queries == 0) {
+        for (uint rh = h_start; rh < h_end; rh++) {
+            uint q_head_idx = kv_head * nrep + rh;
+            uint partial_base = 0 * n_key_blocks + kv_block_idx;
+            if (lane == 0u) {
+                partial_m[q_head_idx * n_key_blocks + partial_base] = -INFINITY;
+                partial_l[q_head_idx * n_key_blocks + partial_base] = 0.0f;
+            }
+        }
+        return;
+    }
 
     // Initialize accumulators for each query head in this SIMD group's range.
     // We process query heads sequentially — for each, we sweep all chunks.
@@ -148,7 +168,7 @@ constexpr const char* KV_OUTER_PHASE1_SOURCE = R"(
                     uint tok_base = t * dim;
 
                     // Causal mask: absolute position of this token must be <= q_pos.
-                    uint abs_tok_pos = chunk_start + t;
+                    uint abs_tok_pos = abs_block_id * block_size + chunk_start + t;
                     if (abs_tok_pos > (uint)q_pos) {
                         // Future token — skip entirely.
                         continue;
@@ -274,7 +294,7 @@ struct Phase1KernelHolder {
         std::call_once(init_flag, [this] {
             kernel = mlx::core::fast::metal_kernel(
                 "msa_kv_outer_phase1",
-                {"q", "k_blocked", "v_blocked", "inverted_index", "query_counts", "scale"},
+                {"q", "k_blocked", "v_blocked", "inverted_index", "query_counts", "block_ids", "scale"},
                 {"partial_m", "partial_l", "partial_v"},
                 std::string(KV_OUTER_PHASE1_SOURCE));
         });
@@ -316,6 +336,7 @@ KvOuterPartials minimax_sparse_kv_outer_sdpa(
     const mlx::core::array& v_blocked,
     const mlx::core::array& inverted_index,
     const mlx::core::array& query_counts,
+    const mlx::core::array& block_ids,
     float scale,
     int block_size,
     int max_queries_per_block) {
@@ -369,10 +390,11 @@ KvOuterPartials minimax_sparse_kv_outer_sdpa(
 
     std::vector<mlx::core::array> inputs = {
         q,              // [B, Hq, L, Dim]                           f32
-        k_blocked,      // [B, Hkv, num_key_blocks, BlockSize, Dim]  f16
-        v_blocked,      // [B, Hkv, num_key_blocks, BlockSize, Dim]  f16
-        inverted_index, // [B, Hkv, num_key_blocks, MaxQPB]          i32
-        query_counts,   // [B, Hkv, num_key_blocks]                  i32
+        k_blocked,      // [B, Hkv, n_selected, BlockSize, Dim]      f16
+        v_blocked,      // [B, Hkv, n_selected, BlockSize, Dim]      f16
+        inverted_index, // [B, Hkv, n_selected, MaxQPB]              i32
+        query_counts,   // [B, Hkv, n_selected]                      i32
+        block_ids,      // [n_selected]                               i32 — compact → absolute
         scale_arr,      // [1]                                        f32
     };
 

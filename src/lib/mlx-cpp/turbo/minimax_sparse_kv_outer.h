@@ -42,6 +42,7 @@ KvOuterPartials minimax_sparse_kv_outer_sdpa(
     const mlx::core::array& v_blocked,
     const mlx::core::array& inverted_index,
     const mlx::core::array& query_counts,
+    const mlx::core::array& block_ids,
     float scale,
     int block_size,
     int max_queries_per_block);

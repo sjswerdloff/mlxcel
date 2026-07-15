@@ -1872,6 +1872,7 @@ std::unique_ptr<KvOuterPartials> turbo_minimax_sparse_kv_outer_sdpa(
     const MlxArray& v_blocked,
     const MlxArray& inverted_index,
     const MlxArray& query_counts,
+    const MlxArray& block_ids,
     float scale,
     int32_t block_size,
     int32_t max_queries_per_block);
