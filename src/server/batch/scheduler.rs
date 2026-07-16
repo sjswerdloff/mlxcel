@@ -299,6 +299,14 @@ pub struct BatchScheduler {
     /// prefill is in progress.
     chunked_prefill_seq: Option<SequenceInfo>,
 
+    // -- Donation in-progress tracking --
+    /// Tracks in-progress cache donations to prevent redundant prefills.
+    /// Key: hash of the token sequence being donated.
+    /// Value: requests waiting for this donation to complete.
+    /// When a donation starts, an entry is inserted. When it completes,
+    /// all waiting requests are re-enqueued (they'll find the cache).
+    donation_in_progress: std::collections::HashMap<u64, Vec<ModelRequest>>,
+
     // -- Shutdown flag --
     shutdown_requested: bool,
 
@@ -970,6 +978,7 @@ impl BatchScheduler {
             enable_preemption,
             preemption_policy,
             chunked_prefill_seq: None,
+            donation_in_progress: std::collections::HashMap::new(),
             shutdown_requested: false,
             max_batch_prefill: max_batch_prefill.max(1),
             decode_storage_backend: effective_decode_storage,
@@ -1353,6 +1362,14 @@ impl BatchScheduler {
             .unwrap_or(false)
     }
 
+    /// Compute a fast hash of a token sequence for donation tracking.
+    fn hash_tokens(tokens: &[i32]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        tokens.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Build a [`PromptCacheKey`] bound to the per-request metadata the
     /// scheduler captured at enqueue time. Returns `None` when the request
     /// carried no [`PromptCacheRequestContext`] (e.g. non-chat endpoints).
@@ -1539,6 +1556,31 @@ impl BatchScheduler {
                                 detached,
                             ) {
                                 Ok(seq_id) => {
+                                    // Truncate the adopted cache to the matched length.
+                                    // The cold-store entry may have more tokens than matched
+                                    // (e.g., from accumulated prefill continuations).
+                                    let target = match_len as i32;
+                                    if let Some(caches) = self.cache_pool.get_caches_mut(seq_id) {
+                                        let needs_truncate = caches.first()
+                                            .map_or(false, |c| c.offset > target);
+                                        if needs_truncate {
+                                            let from = caches.first().map_or(0, |c| c.offset);
+                                            for cache in caches.iter_mut() {
+                                                if let Err(err) = cache.trim_to(target) {
+                                                    tracing::warn!(
+                                                        "cold-store adopt: truncate to {target} failed ({err}); falling back to cold prefill"
+                                                    );
+                                                    self.release_sequence_caches(seq_id);
+                                                    return None;
+                                                }
+                                            }
+                                            tracing::debug!(
+                                                from,
+                                                to = target,
+                                                "cold-store adopt: truncated adopted cache to matched prefix length"
+                                            );
+                                        }
+                                    }
                                     self.batch_observability.record_prompt_cache_hit(match_len);
                                     return Some((seq_id, match_len));
                                 }
@@ -2037,6 +2079,11 @@ impl BatchScheduler {
             return;
         }
 
+        // Mark donation as in-progress so new requests for the same token
+        // sequence wait instead of starting a redundant prefill.
+        let token_hash = Self::hash_tokens(&tokens);
+        self.donation_in_progress.entry(token_hash).or_default();
+
         // Persist to cold-storage (SSD) before wrapping in CacheEntry.
         // Content-addressed: keyed by token prefix, not session.
         if let Some(cs) = &self.cold_store {
@@ -2100,6 +2147,22 @@ impl BatchScheduler {
         // paths queued: byte/entry-budget `enforce_caps` (LRU), idempotent
         // replacement removal, or an oversized / disabled decline.
         self.drain_store_paged_releases();
+
+        // Donation complete — remove tracking entry and re-enqueue any
+        // requests that arrived while the donation was in progress.
+        if let Some(waiting) = self.donation_in_progress.remove(&token_hash) {
+            let count = waiting.len();
+            if count > 0 {
+                tracing::info!(
+                    token_hash,
+                    waiting_count = count,
+                    "donation complete: re-enqueuing waiting requests"
+                );
+                for req in waiting {
+                    self.handle_incoming(req);
+                }
+            }
+        }
     }
 
     /// Apply thinking-budget enforcement to a freshly sampled
@@ -2684,6 +2747,30 @@ impl BatchScheduler {
             let _ = response_tx.send(GenerateEvent::Error(
                 "Empty prompt: request has no input tokens to process".to_string(),
             ));
+            return;
+        }
+
+        // Check if a donation is in progress for this token sequence.
+        // If so, hold the request until the donation completes — the cache
+        // will be available after that.
+        let token_hash = Self::hash_tokens(&prompt_tokens);
+        if self.donation_in_progress.contains_key(&token_hash) {
+            tracing::info!(
+                token_hash,
+                "request held: donation in progress for same token sequence"
+            );
+            self.donation_in_progress
+                .entry(token_hash)
+                .or_default()
+                .push(ModelRequest::Generate {
+                    prompt,
+                    options,
+                    images,
+                    audio,
+                    videos,
+                    response_tx,
+                    cancelled,
+                });
             return;
         }
 
