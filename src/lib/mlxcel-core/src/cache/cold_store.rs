@@ -717,7 +717,13 @@ fn array_from_raw_bytes(bytes: &[u8], dt: i32, shape: &[i32]) -> Result<UniquePt
                 .collect();
             ffi::from_slice_f32(&data, shape)
         }
-        dtype::FLOAT16 | dtype::INT8 | dtype::UINT8 | dtype::BFLOAT16 => {
+        dtype::FLOAT16 => {
+            ffi::from_bytes_f16(bytes, shape, false)
+        }
+        dtype::BFLOAT16 => {
+            ffi::from_bytes_f16(bytes, shape, true)
+        }
+        dtype::INT8 | dtype::UINT8 => {
             let i32_data: Vec<i32> = bytes.iter().map(|&b| b as i32).collect();
             let arr = ffi::from_slice_i32(&i32_data, shape);
             ffi::astype(&arr, dt)

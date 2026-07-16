@@ -4102,12 +4102,23 @@ impl BatchScheduler {
                     }
                 }
             } else {
-                let logits = self.model.forward_with_sequence_id(
-                    &input,
-                    Some(seq.seq_id),
-                    caches,
-                    pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
-                );
+                let logits = if chunk_range.is_terminal {
+                    // Terminal chunk: use full forward with LM-head for sampling
+                    self.model.forward_with_sequence_id(
+                        &input,
+                        Some(seq.seq_id),
+                        caches,
+                        pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+                    )
+                } else {
+                    // Non-terminal chunk: use cache-only forward (skip LM-head)
+                    self.model.forward_cache_only_with_sequence_id(
+                        &input,
+                        Some(seq.seq_id),
+                        caches,
+                        pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+                    )
+                };
                 mlxcel_core::eval(&logits);
                 logits
             };
@@ -4259,12 +4270,23 @@ impl BatchScheduler {
                 mlxcel_core::cache::set_prefill_finalize_caps(caches, actual_chunk_len as i32);
             }
 
-            let logits = self.model.forward_with_sequence_id(
-                &input,
-                Some(seq.seq_id),
-                caches,
-                pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
-            );
+            let logits = if chunk_range.is_terminal {
+                // Final chunk: use full forward with LM-head for sampling
+                self.model.forward_with_sequence_id(
+                    &input,
+                    Some(seq.seq_id),
+                    caches,
+                    pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+                )
+            } else {
+                // Intermediate chunk: use cache-only forward (skip LM-head)
+                self.model.forward_cache_only_with_sequence_id(
+                    &input,
+                    Some(seq.seq_id),
+                    caches,
+                    pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+                )
+            };
 
             // Trim padding positions from KV caches when the chunk was padded
             // — tripwire first: a kvarn cache cannot strip them.

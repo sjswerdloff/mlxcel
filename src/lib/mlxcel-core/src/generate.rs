@@ -532,6 +532,43 @@ pub trait LanguageModel {
         self.forward(input_ids, caches, mask)
     }
 
+    /// Cache-only prefill: run transformer layers, skip LM-head.
+    ///
+    /// Used for intermediate chunks during chunked prefill. The KV cache is
+    /// populated but no vocabulary projection is computed. The caller must
+    /// apply the LM-head separately to the final hidden state after all
+    /// chunks are processed.
+    ///
+    /// Default implementation falls back to regular forward (no optimization).
+    fn forward_cache_only(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward(input_ids, caches, mask)
+    }
+
+    /// Cache-only prefill with sequence identity.
+    fn forward_cache_only_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let _ = seq_id;
+        self.forward_cache_only(input_ids, caches, mask)
+    }
+
+    /// Apply LM-head to hidden states (for final chunk after cache-only prefill).
+    ///
+    /// Default implementation falls back to regular forward (no optimization).
+    fn apply_lm_head(&self, hidden_states: &MlxArray) -> UniquePtr<MlxArray> {
+        // Default: run full forward on a single position (not ideal but safe)
+        self.forward(hidden_states, &mut [], None)
+    }
+
     /// Embedding-prefill forward with optional scheduler sequence identity.
     fn forward_with_embeddings_and_sequence_id(
         &self,

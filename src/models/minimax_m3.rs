@@ -3469,6 +3469,45 @@ impl MiniMaxM3Model {
         }
     }
 
+    /// Cache-only prefill: run transformer layers and norm, skip LM-head.
+    ///
+    /// Used for intermediate chunks during chunked prefill. The KV cache is
+    /// populated but no vocabulary projection is computed. The caller must
+    /// apply the LM-head separately to the final hidden state after all
+    /// chunks are processed.
+    pub fn forward_cache_only(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let in_shape = mlxcel_core::array_shape(input_ids);
+        debug!(
+            input_shape = ?in_shape,
+            cache_offset = caches.first().map(|c| c.offset).unwrap_or(-1),
+            mask_present = mask.is_some(),
+            num_layers = self.layers.len(),
+            "model.forward_cache_only entry"
+        );
+        let mut h = self.embed_tokens.forward(input_ids);
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward(&h, &mut caches[i], mask);
+            if (i + 1) % 5 == 0 {
+                mlxcel_core::eval(&h);
+            }
+        }
+        self.norm.forward(&h)
+    }
+
+    /// Apply LM-head to hidden states (for final chunk after cache-only prefill).
+    pub fn apply_lm_head(&self, h: &MlxArray) -> UniquePtr<MlxArray> {
+        if let Some(ref head) = self.lm_head {
+            head.forward(h)
+        } else {
+            self.embed_tokens.as_linear(h)
+        }
+    }
+
     pub fn make_caches(&self) -> Vec<KVCache> {
         (0..self.layers.len()).map(|_| KVCache::new()).collect()
     }
@@ -3616,6 +3655,17 @@ impl LanguageModel for MiniMaxM3Model {
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         MiniMaxM3Model::forward(self, input_ids, caches, mask)
+    }
+    fn forward_cache_only(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        MiniMaxM3Model::forward_cache_only(self, input_ids, caches, mask)
+    }
+    fn apply_lm_head(&self, hidden_states: &MlxArray) -> UniquePtr<MlxArray> {
+        MiniMaxM3Model::apply_lm_head(self, hidden_states)
     }
     fn make_caches(&self) -> Vec<KVCache> {
         MiniMaxM3Model::make_caches(self)
