@@ -1537,6 +1537,29 @@ impl BatchScheduler {
                     total = tokens.len(),
                     "prompt-cache: longest-prefix MATCH (raw, before adoption)"
                 );
+                // Diagnostic: when match is much shorter than total tokens,
+                // dump the divergence point to understand why tokens differ.
+                if found.1 > 0 && found.1 < tokens.len() {
+                    let gap = tokens.len() - found.1;
+                    if gap > 1000 {
+                        let stored = &found.0.tokens;
+                        let div_point = found.1;
+                        let window = 20; // dump 20 tokens around divergence
+                        let s_start = div_point.saturating_sub(window);
+                        let s_end = (div_point + window).min(stored.len());
+                        let r_start = div_point.saturating_sub(window);
+                        let r_end = (div_point + window).min(tokens.len());
+                        tracing::warn!(
+                            matched_len = div_point,
+                            total = tokens.len(),
+                            stored_len = stored.len(),
+                            gap,
+                            stored_around_div = ?&stored[s_start..s_end],
+                            request_around_div = ?&tokens[r_start..r_end],
+                            "prompt-cache: large divergence detected — dumping tokens around mismatch point"
+                        );
+                    }
+                }
                 found
             }
             None => {
