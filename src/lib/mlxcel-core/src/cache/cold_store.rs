@@ -762,6 +762,7 @@ fn array_from_raw_bytes(bytes: &[u8], dt: i32, shape: &[i32]) -> Result<UniquePt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::SequenceStateBackend;
 
     #[test]
     fn content_hash_is_deterministic() {
@@ -1027,5 +1028,120 @@ mod tests {
         // Different model should not match.
         let result = cs.load_prefix("other-model", "tmpl", &tokens);
         assert!(matches!(result, Err(ColdStoreError::NoMatch)));
+    }
+
+    #[test]
+    fn cold_store_fp16_tensor_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model");
+        fs::create_dir_all(&model_path).unwrap();
+        let cs = ColdStore::with_base_dir(dir.path().join("cs").to_path_buf(), model_path.to_str().unwrap());
+
+        // Create FP16 tensors with known values.
+        let num_layers = 2;
+        let seq_len = 4;
+        let head_dim = 8;
+        let tokens = vec![100, 200, 300, 400];
+
+        let mut caches = Vec::new();
+        for layer in 0..num_layers {
+            // Create deterministic FP16 data.
+            let k_f32 = synth_tensor(&[1, 2, seq_len, head_dim], 1000 + layer as u32);
+            let v_f32 = synth_tensor(&[1, 2, seq_len, head_dim], 2000 + layer as u32);
+            let k = ffi::astype(&k_f32, dtype::FLOAT16);
+            let v = ffi::astype(&v_f32, dtype::FLOAT16);
+
+            // Get the raw bytes of the original FP16 tensors.
+            ffi::eval(&k);
+            ffi::eval(&v);
+            let k_bytes_orig = ffi::array_to_raw_bytes(&k);
+            let v_bytes_orig = ffi::array_to_raw_bytes(&v);
+
+            caches.push(DetachedKVCache {
+                keys: Some(k),
+                values: Some(v),
+                offset: seq_len,
+                step: 0,
+                mode: KVCacheMode::Fp16,
+                key_scales: None,
+                val_scales: None,
+                v_packed: None,
+                v_norms: None,
+                v_rescale: None,
+                k_packed: None,
+                k_norms: None,
+                turbo_seed: 0,
+                cold_offset: 0,
+                hot_threshold: 0,
+                delegated_fp16_fast_path: false,
+                delegated_fp16_sidecar_policy: super::super::turbo::DelegatedFp16SidecarPolicy::default(),
+                m3_idx_k: None,
+                m3_idx_offset: 0,
+                kvarn_sink_k: None,
+                kvarn_sink_v: None,
+                kvarn_tail_k: None,
+                kvarn_tail_v: None,
+                kvarn_hist_k: None,
+                kvarn_hist_v: None,
+                kvarn_k_scale: None,
+                kvarn_k_zp: None,
+                kvarn_k_s_row: None,
+                kvarn_k_s_col: None,
+                kvarn_v_scale: None,
+                kvarn_v_zp: None,
+                kvarn_v_s_row: None,
+                kvarn_v_s_col: None,
+                kvarn_v_bits: 8,
+            });
+        }
+
+        let original = DetachedCacheSet {
+            caches,
+            backend: SequenceStateBackend::DenseKvCache,
+            prompt_len: seq_len as usize,
+            current_offset: seq_len,
+            created_at: std::time::Instant::now(),
+            detached_at: std::time::Instant::now(),
+            origin_seq_id: super::super::SequenceId(0),
+        };
+
+        // Persist to cold-store.
+        cs.persist("m3", "tmpl", &tokens, &original).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Load from cold-store.
+        let (loaded, match_len) = cs.load_prefix("m3", "tmpl", &tokens).unwrap();
+        assert_eq!(match_len, 4);
+        assert_eq!(loaded.caches.len(), num_layers);
+
+        // Verify FP16 tensor bytes are identical.
+        for layer in 0..num_layers {
+            let orig_cache = &original.caches[layer];
+            let loaded_cache = &loaded.caches[layer];
+
+            // Check keys.
+            let orig_k = orig_cache.keys.as_ref().unwrap();
+            let loaded_k = loaded_cache.keys.as_ref().unwrap();
+            ffi::eval(orig_k);
+            ffi::eval(loaded_k);
+            let orig_k_bytes = ffi::array_to_raw_bytes(orig_k);
+            let loaded_k_bytes = ffi::array_to_raw_bytes(loaded_k);
+            assert_eq!(
+                orig_k_bytes, loaded_k_bytes,
+                "Layer {layer}: FP16 key tensor bytes differ after round-trip"
+            );
+
+            // Check values.
+            let orig_v = orig_cache.values.as_ref().unwrap();
+            let loaded_v = loaded_cache.values.as_ref().unwrap();
+            ffi::eval(orig_v);
+            ffi::eval(loaded_v);
+            let orig_v_bytes = ffi::array_to_raw_bytes(orig_v);
+            let loaded_v_bytes = ffi::array_to_raw_bytes(loaded_v);
+            assert_eq!(
+                orig_v_bytes, loaded_v_bytes,
+                "Layer {layer}: FP16 value tensor bytes differ after round-trip"
+            );
+        }
     }
 }
