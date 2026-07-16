@@ -205,6 +205,40 @@ fn read_opt_array(r: &mut impl Read) -> io::Result<Option<UniquePtr<MlxArray>>> 
 // DetachedKVCache serialization
 // ---------------------------------------------------------------------------
 
+/// Collect raw pointers to all populated arrays in a DetachedKVCache.
+/// Used to batch-evaluate all arrays before serialization (single GPU→CPU sync).
+fn collect_array_ptrs(cache: &DetachedKVCache, out: &mut Vec<*const MlxArray>) {
+    let arrays: Vec<Option<&UniquePtr<MlxArray>>> = vec![
+        cache.keys.as_ref(),
+        cache.values.as_ref(),
+        cache.key_scales.as_ref(),
+        cache.val_scales.as_ref(),
+        cache.v_packed.as_ref(),
+        cache.v_norms.as_ref(),
+        cache.v_rescale.as_ref(),
+        cache.k_packed.as_ref(),
+        cache.k_norms.as_ref(),
+        cache.m3_idx_k.as_ref(),
+        cache.kvarn_sink_k.as_ref(),
+        cache.kvarn_sink_v.as_ref(),
+        cache.kvarn_tail_k.as_ref(),
+        cache.kvarn_tail_v.as_ref(),
+        cache.kvarn_hist_k.as_ref(),
+        cache.kvarn_hist_v.as_ref(),
+        cache.kvarn_k_scale.as_ref(),
+        cache.kvarn_k_zp.as_ref(),
+        cache.kvarn_k_s_row.as_ref(),
+        cache.kvarn_k_s_col.as_ref(),
+        cache.kvarn_v_scale.as_ref(),
+        cache.kvarn_v_zp.as_ref(),
+        cache.kvarn_v_s_row.as_ref(),
+        cache.kvarn_v_s_col.as_ref(),
+    ];
+    for arr in arrays.into_iter().flatten() {
+        out.push(arr.as_ptr() as *const _);
+    }
+}
+
 fn write_kv_cache(w: &mut impl Write, cache: &DetachedKVCache) -> io::Result<()> {
     w.write_all(&(cache.mode as u8).to_le_bytes())?;
     w.write_all(&cache.offset.to_le_bytes())?;
@@ -461,6 +495,18 @@ impl ColdStore {
         write_header(&mut header_bytes, &header)?;
 
         let mut layer_bytes = Vec::with_capacity(cache_set.caches.len());
+
+        // Batch-evaluate all arrays across all layers before writing.
+        // This forces a single GPU→CPU synchronization instead of one per
+        // array per layer (600 sync calls for k8v4 with 60 layers).
+        let mut all_ptrs: Vec<*const MlxArray> = Vec::new();
+        for cache in &cache_set.caches {
+            collect_array_ptrs(cache, &mut all_ptrs);
+        }
+        if !all_ptrs.is_empty() {
+            unsafe { ffi::eval_all(&all_ptrs); }
+        }
+
         for cache in &cache_set.caches {
             let mut buf = Vec::new();
             write_kv_cache(&mut buf, cache)?;
