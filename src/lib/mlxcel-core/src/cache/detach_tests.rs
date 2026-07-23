@@ -1327,3 +1327,404 @@ fn m3_idx_k_round_trip_unaffected_by_int8_kv_mode() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6. `DetachedKVCache::validate_for` — adopt-time deep validation (issue-4).
+//
+// Regression-test-must-regress discipline: every `rejects_*` test injects
+// exactly ONE mismatch into an otherwise-valid cache and asserts Err; the
+// `*_passes` tests pin that the valid construction is Ok, so each rejection
+// is red-on-bug-present AND green-on-bug-fixed.
+// ---------------------------------------------------------------------------
+
+mod validate_for {
+    use super::*;
+
+    const VH: i32 = 4; // n_kv_heads
+    const VD: i32 = 64; // head_dim (power of 2: KVarN-legal; VD/8=8, VD/32=2)
+    const VLEN: i32 = 16;
+    const TILE: i32 = crate::cache::kvarn::KVARN_TILE_TOKENS;
+
+    fn geom() -> ExpectedCacheGeometry {
+        ExpectedCacheGeometry {
+            n_kv_heads: VH,
+            k_head_dim: VD,
+            v_head_dim: VD,
+            dtype: dtype::FLOAT16,
+        }
+    }
+
+    fn z(shape: &[i32], dt: i32) -> Option<UniquePtr<MlxArray>> {
+        Some(ffi::zeros(shape, dt))
+    }
+
+    /// All-None handle with the given mode tag; tests populate per-mode
+    /// tensors and then mutate exactly one thing.
+    fn blank(mode: KVCacheMode) -> DetachedKVCache {
+        DetachedKVCache {
+            keys: None,
+            values: None,
+            offset: 0,
+            step: 256,
+            mode,
+            key_scales: None,
+            val_scales: None,
+            v_packed: None,
+            v_norms: None,
+            v_rescale: None,
+            k_packed: None,
+            k_norms: None,
+            turbo_seed: 0,
+            cold_offset: 0,
+            hot_threshold: 0,
+            delegated_fp16_fast_path: false,
+            delegated_fp16_sidecar_policy: crate::cache::turbo::DelegatedFp16SidecarPolicy::Predecode,
+            m3_idx_k: None,
+            m3_idx_offset: 0,
+            kvarn_sink_k: None,
+            kvarn_sink_v: None,
+            kvarn_tail_k: None,
+            kvarn_tail_v: None,
+            kvarn_hist_k: None,
+            kvarn_hist_v: None,
+            kvarn_k_scale: None,
+            kvarn_k_zp: None,
+            kvarn_k_s_row: None,
+            kvarn_k_s_col: None,
+            kvarn_v_scale: None,
+            kvarn_v_zp: None,
+            kvarn_v_s_row: None,
+            kvarn_v_s_col: None,
+            kvarn_v_bits: 8,
+        }
+    }
+
+    fn fp16_valid() -> DetachedKVCache {
+        let mut c = blank(KVCacheMode::Fp16);
+        c.keys = z(&[1, VH, VLEN, VD], dtype::FLOAT16);
+        c.values = z(&[1, VH, VLEN, VD], dtype::FLOAT16);
+        c.offset = VLEN;
+        c
+    }
+
+    fn int8_valid() -> DetachedKVCache {
+        let mut c = blank(KVCacheMode::Int8);
+        c.keys = z(&[1, VH, VLEN, VD], dtype::INT8);
+        c.values = z(&[1, VH, VLEN, VD], dtype::INT8);
+        c.key_scales = z(&[1, VH, VLEN, 1], dtype::FLOAT16);
+        c.val_scales = z(&[1, VH, VLEN, 1], dtype::FLOAT16);
+        c.offset = VLEN;
+        c
+    }
+
+    fn turbo4_asym_valid() -> DetachedKVCache {
+        let mut c = blank(KVCacheMode::Turbo4Asym);
+        c.keys = z(&[1, VH, VLEN, VD], dtype::FLOAT16);
+        c.v_packed = z(&[1, VH, VLEN, VD / 2], dtype::UINT8);
+        c.v_norms = z(&[1, VH, VLEN, 1], dtype::FLOAT16);
+        c.offset = VLEN;
+        c
+    }
+
+    fn turbo4_sym_valid() -> DetachedKVCache {
+        let mut c = blank(KVCacheMode::Turbo4);
+        c.k_packed = z(&[1, VH, VLEN, VD / 2], dtype::UINT8);
+        c.k_norms = z(&[1, VH, VLEN, 1], dtype::FLOAT16);
+        c.v_packed = z(&[1, VH, VLEN, VD / 2], dtype::UINT8);
+        c.v_norms = z(&[1, VH, VLEN, 1], dtype::FLOAT16);
+        c.offset = VLEN;
+        c
+    }
+
+    /// sink(TILE) + one history tile(TILE) + tail(7); exact-length layout.
+    fn kvarn_valid(v_bits: u8) -> DetachedKVCache {
+        let mut c = blank(KVCacheMode::KVarN8);
+        c.kvarn_v_bits = v_bits;
+        c.kvarn_sink_k = z(&[1, VH, TILE, VD], dtype::FLOAT16);
+        c.kvarn_sink_v = z(&[1, VH, TILE, VD], dtype::FLOAT16);
+        c.kvarn_hist_k = z(&[1, VH, TILE, VD], dtype::UINT8);
+        c.kvarn_k_scale = z(&[1, VH, TILE, 1], dtype::FLOAT32);
+        c.kvarn_k_zp = z(&[1, VH, TILE, 1], dtype::FLOAT32);
+        c.kvarn_k_s_row = z(&[1, VH, TILE, 1], dtype::FLOAT32);
+        c.kvarn_k_s_col = z(&[1, VH, 1, VD], dtype::FLOAT32);
+        c.kvarn_v_s_col = z(&[1, VH, 1, VD], dtype::FLOAT32);
+        match v_bits {
+            8 => {
+                c.kvarn_hist_v = z(&[1, VH, TILE, VD], dtype::UINT8);
+                c.kvarn_v_scale = z(&[1, VH, TILE, 1], dtype::FLOAT32);
+                c.kvarn_v_zp = z(&[1, VH, TILE, 1], dtype::FLOAT32);
+                c.kvarn_v_s_row = z(&[1, VH, TILE, 1], dtype::FLOAT32);
+            }
+            4 => {
+                c.kvarn_hist_v = z(&[1, VH, TILE, VD / 8], dtype::UINT32);
+                c.kvarn_v_scale = z(&[1, VH, TILE, VD / 32], dtype::FLOAT32);
+                c.kvarn_v_zp = z(&[1, VH, TILE, VD / 32], dtype::FLOAT32);
+                // v_s_row stays None: the fold IS its storage.
+            }
+            _ => unreachable!(),
+        }
+        c.kvarn_tail_k = z(&[1, VH, 7, VD], dtype::FLOAT16);
+        c.kvarn_tail_v = z(&[1, VH, 7, VD], dtype::FLOAT16);
+        c.offset = TILE + TILE + 7;
+        c
+    }
+
+    fn assert_rejects(result: Result<(), String>, needle: &str) {
+        let err = result.expect_err("mutation must be caught");
+        assert!(
+            err.contains(needle),
+            "error should name the mismatch ({needle:?}); got: {err}"
+        );
+    }
+
+    // -- Valid constructions pass (green-on-bug-fixed baseline) --
+
+    #[test]
+    fn fp16_valid_cache_passes() {
+        fp16_valid()
+            .validate_for(KVCacheMode::Fp16, 8, &geom())
+            .unwrap();
+    }
+
+    #[test]
+    fn int8_valid_cache_passes() {
+        int8_valid()
+            .validate_for(KVCacheMode::Int8, 8, &geom())
+            .unwrap();
+    }
+
+    #[test]
+    fn turbo4_asym_valid_cache_passes() {
+        turbo4_asym_valid()
+            .validate_for(KVCacheMode::Turbo4Asym, 8, &geom())
+            .unwrap();
+    }
+
+    #[test]
+    fn turbo4_sym_valid_cache_passes() {
+        turbo4_sym_valid()
+            .validate_for(KVCacheMode::Turbo4, 8, &geom())
+            .unwrap();
+    }
+
+    #[test]
+    fn kvarn8_v8_valid_cache_passes() {
+        kvarn_valid(8)
+            .validate_for(KVCacheMode::KVarN8, 8, &geom())
+            .unwrap();
+    }
+
+    #[test]
+    fn kvarn8_v4_valid_cache_passes() {
+        kvarn_valid(4)
+            .validate_for(KVCacheMode::KVarN8, 4, &geom())
+            .unwrap();
+    }
+
+    /// Dense buffers are step-aligned CAPACITY slabs (update_fp16 allocates
+    /// n_steps*step and clone_handle moves them unsliced): capacity slack
+    /// above `offset` is a REAL state, not corruption.
+    #[test]
+    fn fp16_capacity_slack_passes() {
+        let mut c = fp16_valid();
+        c.keys = z(&[1, VH, VLEN + 32, VD], dtype::FLOAT16);
+        c.values = z(&[1, VH, VLEN + 32, VD], dtype::FLOAT16);
+        c.validate_for(KVCacheMode::Fp16, 8, &geom()).unwrap();
+    }
+
+    // -- One injected mismatch each --
+
+    /// Mutation: cold-store entry written under Fp16, model configured Int8
+    /// (THE issue-4 wrong-mode adopt).
+    #[test]
+    fn rejects_wrong_mode() {
+        assert_rejects(
+            fp16_valid().validate_for(KVCacheMode::Int8, 8, &geom()),
+            "mode mismatch",
+        );
+    }
+
+    /// Mutation: k8v8 entry resurrected into a k8v4-configured model —
+    /// packed-u32 V codes would be mislabeled as u8.
+    #[test]
+    fn rejects_wrong_kvarn_v_bits() {
+        assert_rejects(
+            kvarn_valid(8).validate_for(KVCacheMode::KVarN8, 4, &geom()),
+            "kvarn_v_bits mismatch",
+        );
+    }
+
+    /// Mutation: INT8 codes without their per-token dequant scales.
+    #[test]
+    fn rejects_missing_int8_scales() {
+        let mut c = int8_valid();
+        c.key_scales = None;
+        assert_rejects(c.validate_for(KVCacheMode::Int8, 8, &geom()), "key_scales");
+    }
+
+    /// Mutation: packed sidecar present on an Fp16 entry (mode tag lies
+    /// about the layout).
+    #[test]
+    fn rejects_stray_sidecar_in_fp16() {
+        let mut c = fp16_valid();
+        c.v_packed = z(&[1, VH, VLEN, VD / 2], dtype::UINT8);
+        assert_rejects(c.validate_for(KVCacheMode::Fp16, 8, &geom()), "v_packed");
+    }
+
+    /// Mutation: values stored float32 where the model reads float16.
+    #[test]
+    fn rejects_wrong_dtype_values() {
+        let mut c = fp16_valid();
+        c.values = z(&[1, VH, VLEN, VD], dtype::FLOAT32);
+        assert_rejects(c.validate_for(KVCacheMode::Fp16, 8, &geom()), "dtype");
+    }
+
+    /// Mutation: header claims more tokens than the tensors hold — the
+    /// adopted reader would slice past the buffer.
+    #[test]
+    fn rejects_offset_beyond_capacity() {
+        let mut c = fp16_valid();
+        c.offset = VLEN + 1;
+        assert_rejects(c.validate_for(KVCacheMode::Fp16, 8, &geom()), "capacity");
+    }
+
+    /// Mutation: rank-3 keys tensor.
+    #[test]
+    fn rejects_rank_mismatch() {
+        let mut c = fp16_valid();
+        c.keys = z(&[VH, VLEN, VD], dtype::FLOAT16);
+        assert_rejects(c.validate_for(KVCacheMode::Fp16, 8, &geom()), "rank");
+    }
+
+    /// Mutation: entry from a different model family (head count differs).
+    #[test]
+    fn rejects_wrong_n_kv_heads() {
+        let mut c = fp16_valid();
+        c.keys = z(&[1, VH + 1, VLEN, VD], dtype::FLOAT16);
+        assert_rejects(c.validate_for(KVCacheMode::Fp16, 8, &geom()), "kv heads");
+    }
+
+    /// Mutation: head_dim differs (values narrower than the model's V).
+    #[test]
+    fn rejects_wrong_head_dim() {
+        let mut c = fp16_valid();
+        c.values = z(&[1, VH, VLEN, VD / 2], dtype::FLOAT16);
+        assert_rejects(c.validate_for(KVCacheMode::Fp16, 8, &geom()), "trailing dim");
+    }
+
+    /// Mutation: Turbo4Asym v_packed with an un-packed trailing dim (D
+    /// instead of D/2).
+    #[test]
+    fn rejects_turbo4_asym_unpacked_dim() {
+        let mut c = turbo4_asym_valid();
+        c.v_packed = z(&[1, VH, VLEN, VD], dtype::UINT8);
+        assert_rejects(
+            c.validate_for(KVCacheMode::Turbo4Asym, 8, &geom()),
+            "trailing dim",
+        );
+    }
+
+    /// Mutation: Turbo4 packed/norms capacity desync (norms longer than
+    /// codes — dequant would pair rows with the wrong norms).
+    #[test]
+    fn rejects_turbo4_sym_lockstep_break() {
+        let mut c = turbo4_sym_valid();
+        c.v_norms = z(&[1, VH, VLEN + 8, 1], dtype::FLOAT16);
+        assert_rejects(c.validate_for(KVCacheMode::Turbo4, 8, &geom()), "lockstep");
+    }
+
+    /// Mutation: KVarN spans don't sum to offset (a token exists that no
+    /// tensor accounts for).
+    #[test]
+    fn rejects_kvarn_length_equation_break() {
+        let mut c = kvarn_valid(8);
+        c.offset += 1;
+        assert_rejects(
+            c.validate_for(KVCacheMode::KVarN8, 8, &geom()),
+            "length equation",
+        );
+    }
+
+    /// Mutation: history length not tile-aligned (a half-tile cannot be
+    /// dequantized against per-tile s_col).
+    #[test]
+    fn rejects_kvarn_hist_not_tile_aligned() {
+        let mut c = kvarn_valid(8);
+        let bad = 100;
+        c.kvarn_hist_k = z(&[1, VH, bad, VD], dtype::UINT8);
+        c.kvarn_hist_v = z(&[1, VH, bad, VD], dtype::UINT8);
+        c.kvarn_k_scale = z(&[1, VH, bad, 1], dtype::FLOAT32);
+        c.kvarn_k_zp = z(&[1, VH, bad, 1], dtype::FLOAT32);
+        c.kvarn_k_s_row = z(&[1, VH, bad, 1], dtype::FLOAT32);
+        c.kvarn_v_scale = z(&[1, VH, bad, 1], dtype::FLOAT32);
+        c.kvarn_v_zp = z(&[1, VH, bad, 1], dtype::FLOAT32);
+        c.kvarn_v_s_row = z(&[1, VH, bad, 1], dtype::FLOAT32);
+        c.offset = TILE + bad + 7;
+        assert_rejects(c.validate_for(KVCacheMode::KVarN8, 8, &geom()), "tile");
+    }
+
+    /// Mutation: v4 entry carrying a per-token v_s_row — under v4 the fold
+    /// IS its storage; presence means the writer was v8.
+    #[test]
+    fn rejects_kvarn_v4_with_s_row() {
+        let mut c = kvarn_valid(4);
+        c.kvarn_v_s_row = z(&[1, VH, TILE, 1], dtype::FLOAT32);
+        assert_rejects(
+            c.validate_for(KVCacheMode::KVarN8, 4, &geom()),
+            "kvarn_v_s_row",
+        );
+    }
+
+    /// Mutation: KVarN entry without its FP16 attention sink.
+    #[test]
+    fn rejects_kvarn_missing_sink() {
+        let mut c = kvarn_valid(8);
+        c.kvarn_sink_k = None;
+        assert_rejects(
+            c.validate_for(KVCacheMode::KVarN8, 8, &geom()),
+            "kvarn_sink_k",
+        );
+    }
+
+    /// Mutation: empty handle (offset 0) — nothing adoptable.
+    #[test]
+    fn rejects_empty_cache() {
+        assert_rejects(
+            blank(KVCacheMode::Fp16).validate_for(KVCacheMode::Fp16, 8, &geom()),
+            "at least one token",
+        );
+    }
+
+    /// Mutation: M3 indexer shorter than its recorded offset (the cycle-79
+    /// desync class).
+    #[test]
+    fn rejects_m3_idx_desync() {
+        let mut c = fp16_valid();
+        c.m3_idx_k = z(&[1, 1, VLEN - 1, 32], dtype::FLOAT16);
+        c.m3_idx_offset = VLEN;
+        assert_rejects(c.validate_for(KVCacheMode::Fp16, 8, &geom()), "m3_idx");
+    }
+
+    /// Set-level: the failing layer is named, and the per-layer mode table
+    /// is honored (layer 0 Fp16 passes; layer 1 diverges).
+    #[test]
+    fn set_validate_reports_layer_index() {
+        let set = DetachedCacheSet {
+            caches: vec![fp16_valid(), int8_valid()],
+            backend: SequenceStateBackend::DenseKvCache,
+            prompt_len: VLEN as usize,
+            current_offset: VLEN,
+            created_at: Instant::now(),
+            detached_at: Instant::now(),
+            origin_seq_id: SequenceId::from_raw(0),
+        };
+        // Model expects Fp16 on BOTH layers: layer 1 must be named.
+        let err = set
+            .validate_for(&[KVCacheMode::Fp16, KVCacheMode::Fp16], 8, &geom())
+            .expect_err("layer-1 mode divergence must be caught");
+        assert!(err.contains("layer 1"), "got: {err}");
+        // And the honest table passes.
+        set.validate_for(&[KVCacheMode::Fp16, KVCacheMode::Int8], 8, &geom())
+            .unwrap();
+    }
+}

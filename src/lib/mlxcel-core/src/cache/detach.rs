@@ -629,6 +629,864 @@ impl std::fmt::Debug for DetachedKVCache {
 }
 
 // ---------------------------------------------------------------------------
+// Adopt-time deep validation (issue-4: cold-store adopt defense-in-depth)
+// ---------------------------------------------------------------------------
+
+/// The live model's expected dense per-layer KV cache geometry, used to
+/// anchor a deserialized [`DetachedKVCache`] to the real model before
+/// [`CachePool::adopt`] installs it.
+///
+/// Core-side sibling of the server's `ExpectedBlockGeometry`
+/// (`src/distributed/kv_cache_serde/types.rs`). That struct cannot be
+/// reused here: it lives in the server crate (dependency points the other
+/// way) and carries paged-pool fields (`num_layers`, `block_size`) that a
+/// per-layer dense check does not consult. K and V head dims are separate
+/// fields because `update_fp16` tracks them separately (MLA-class models
+/// project them differently); on most architectures they are equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectedCacheGeometry {
+    /// Key/value head count (axis 1 of every per-layer 4-D tensor).
+    pub n_kv_heads: i32,
+    /// K per-head dimension (axis 3 of `keys` / K-side sidecars).
+    pub k_head_dim: i32,
+    /// V per-head dimension (axis 3 of `values` / V-side sidecars).
+    pub v_head_dim: i32,
+    /// MLX dtype code of the model's runtime activation dtype
+    /// (e.g. `dtype::FLOAT16` = 9, `dtype::BFLOAT16` = 12). This is what
+    /// `Fp16`-mode keys/values are stored as — `update_fp16` allocates its
+    /// buffers with the incoming activation dtype rather than forcing
+    /// float16. Quantized modes pin their own storage dtypes and do not
+    /// consult this field for the quantized tensors.
+    pub dtype: i32,
+}
+
+/// Human-readable name for an MLX dtype code (error messages only).
+fn dtype_code_name(code: i32) -> &'static str {
+    match code {
+        crate::dtype::BOOL => "bool",
+        crate::dtype::UINT8 => "uint8",
+        crate::dtype::UINT16 => "uint16",
+        crate::dtype::UINT32 => "uint32",
+        crate::dtype::UINT64 => "uint64",
+        crate::dtype::INT8 => "int8",
+        crate::dtype::INT16 => "int16",
+        crate::dtype::INT32 => "int32",
+        crate::dtype::INT64 => "int64",
+        crate::dtype::FLOAT16 => "float16",
+        crate::dtype::FLOAT32 => "float32",
+        crate::dtype::FLOAT64 => "float64",
+        crate::dtype::BFLOAT16 => "bfloat16",
+        crate::dtype::COMPLEX64 => "complex64",
+        _ => "unknown",
+    }
+}
+
+/// A tensor the current mode requires. Returns the array or a role-named
+/// error.
+fn require_present<'a>(
+    role: &str,
+    t: &'a Option<UniquePtr<MlxArray>>,
+) -> Result<&'a MlxArray, String> {
+    t.as_deref()
+        .ok_or_else(|| format!("{role}: required for this mode but absent"))
+}
+
+/// A tensor the current mode must NOT carry. A populated forbidden sidecar
+/// means the handle was produced under a different mode than its tag
+/// claims (or the file is corrupt) — either way adopting it is unsafe.
+fn require_absent(role: &str, t: &Option<UniquePtr<MlxArray>>) -> Result<(), String> {
+    if t.is_some() {
+        return Err(format!("{role}: must be absent for this mode but is present"));
+    }
+    Ok(())
+}
+
+/// Shared per-tensor check: rank 4, batch axis 1, expected head count,
+/// expected trailing dim, expected dtype. Returns the seq-axis length
+/// (axis 2) for the caller's lockstep / length checks.
+fn check_tensor(
+    role: &str,
+    arr: &MlxArray,
+    dtype_expected: i32,
+    n_kv_heads: i32,
+    last_dim: i32,
+) -> Result<i32, String> {
+    let shape = ffi::array_shape(arr);
+    if shape.len() != 4 {
+        return Err(format!(
+            "{role}: expected rank 4, got rank {} (shape {:?})",
+            shape.len(),
+            shape
+        ));
+    }
+    if shape[0] != 1 {
+        return Err(format!(
+            "{role}: expected batch axis 1, got {} (shape {:?})",
+            shape[0], shape
+        ));
+    }
+    if shape[1] != n_kv_heads {
+        return Err(format!(
+            "{role}: expected {n_kv_heads} kv heads on axis 1, got {} (shape {:?})",
+            shape[1], shape
+        ));
+    }
+    if shape[3] != last_dim {
+        return Err(format!(
+            "{role}: expected trailing dim {last_dim}, got {} (shape {:?})",
+            shape[3], shape
+        ));
+    }
+    let dt = ffi::array_dtype(arr);
+    if dt != dtype_expected {
+        return Err(format!(
+            "{role}: expected dtype {} ({dtype_expected}), got {} ({dt})",
+            dtype_code_name(dtype_expected),
+            dtype_code_name(dt)
+        ));
+    }
+    Ok(shape[2])
+}
+
+impl DetachedKVCache {
+    /// Adopt-time deep validation: verify this handle's mode tag, per-mode
+    /// tensor presence/absence, per-role dtypes, and per-role shapes
+    /// against the live model's configured mode, KVarN V width, and
+    /// geometry — BEFORE [`KVCache::install_detached`] wires the buffers
+    /// under a reader that will interpret them by mode.
+    ///
+    /// Defense-in-depth for the cold-store adopt path (issue-4): the
+    /// serialized format validates only per-tensor byte_len/dtype
+    /// consistency and the set-level offset equality; nothing today stops
+    /// a wrong-mode / wrong-width / wrong-model-family entry from being
+    /// installed and silently dequantized into garbage attention. The
+    /// in-memory handoff paths already enforce geometry
+    /// (`ExpectedBlockGeometry` in `handoff_impl.rs`) and layout equality
+    /// (`PagedCacheLayout` in `paged_detach.rs`); this is the dense
+    /// deserialization-boundary sibling.
+    ///
+    /// Seq-axis semantics (verified against the writers, NOT symmetric):
+    /// * Dense / Turbo tensors carry a step-aligned CAPACITY on axis 2
+    ///   (`update_fp16` et al. allocate `n_steps * step` slabs and
+    ///   `clone_handle` moves them unsliced), so the check is
+    ///   `capacity >= offset` plus lockstep equality across sidecars —
+    ///   requiring exact equality would reject virtually every real
+    ///   entry.
+    /// * KVarN tensors are exact-length (concatenate-grown), so
+    ///   `sink_len + hist_len + tail_len == offset` is enforced exactly,
+    ///   with `hist_len` tile-aligned.
+    ///
+    /// `v_bits_expected` is consulted only when `mode_expected` is
+    /// [`KVCacheMode::KVarN8`] (the width field is inert for every other
+    /// mode, mirroring `KVCache::kvarn_v_bits` semantics).
+    ///
+    /// Returns `Err(String)` naming the exact mismatch (detach.rs error
+    /// convention; cold-store callers wrap it in
+    /// `ColdStoreError::CorruptLayer { layer, detail }`).
+    pub fn validate_for(
+        &self,
+        mode_expected: KVCacheMode,
+        v_bits_expected: u8,
+        geometry: &ExpectedCacheGeometry,
+    ) -> Result<(), String> {
+        self.validate_for_inner(mode_expected, v_bits_expected, geometry)
+            .map_err(|e| format!("DetachedKVCache::validate_for: {e}"))
+    }
+
+    fn validate_for_inner(
+        &self,
+        mode_expected: KVCacheMode,
+        v_bits_expected: u8,
+        g: &ExpectedCacheGeometry,
+    ) -> Result<(), String> {
+        use crate::dtype;
+
+        if g.n_kv_heads <= 0 || g.k_head_dim <= 0 || g.v_head_dim <= 0 {
+            return Err(format!(
+                "expected geometry is degenerate (n_kv_heads={}, k_head_dim={}, v_head_dim={}) — caller bug",
+                g.n_kv_heads, g.k_head_dim, g.v_head_dim
+            ));
+        }
+        if self.offset <= 0 {
+            return Err(format!(
+                "offset {} — an adoptable cache must carry at least one token",
+                self.offset
+            ));
+        }
+        // (a) mode-vs-config. This is THE issue-4 gate: `CachePool::adopt`
+        // installs `KVCache::new_with_mode(detached.mode)`, so a wrong-mode
+        // entry adopts "successfully" and the model then reads tensors laid
+        // out for a different quantization scheme.
+        if self.mode != mode_expected {
+            return Err(format!(
+                "mode mismatch: cache is {:?}, model is configured for {:?} — \
+                 adopting would install {:?}-layout tensors under a {:?} reader",
+                self.mode, mode_expected, self.mode, mode_expected
+            ));
+        }
+        if mode_expected == KVCacheMode::KVarN8 {
+            if v_bits_expected != 8 && v_bits_expected != 4 {
+                return Err(format!(
+                    "expected kvarn_v_bits {v_bits_expected} is not a legal width (8 or 4) — caller bug"
+                ));
+            }
+            if self.kvarn_v_bits != v_bits_expected {
+                return Err(format!(
+                    "kvarn_v_bits mismatch: cache is v{}, model is configured for v{} — \
+                     packed V codes would be silently mislabeled (the exact wrong the \
+                     field's round-trip contract exists to kill)",
+                    self.kvarn_v_bits, v_bits_expected
+                ));
+            }
+        }
+
+        // MiniMax-M3 indexer lockstep (mode-agnostic; the cycle-79 desync
+        // class: adopted MSA dispatch seeing m3_idx_offset != offset).
+        match self.m3_idx_k.as_deref() {
+            None => {
+                if self.m3_idx_offset != 0 {
+                    return Err(format!(
+                        "m3_idx_offset {} with no m3_idx_k tensor",
+                        self.m3_idx_offset
+                    ));
+                }
+            }
+            Some(idx) => {
+                let shape = ffi::array_shape(idx);
+                if shape.len() != 4 {
+                    return Err(format!(
+                        "m3_idx_k: expected rank 4, got rank {} (shape {:?})",
+                        shape.len(),
+                        shape
+                    ));
+                }
+                if shape[2] != self.m3_idx_offset {
+                    return Err(format!(
+                        "m3_idx_k seq axis {} != m3_idx_offset {}",
+                        shape[2], self.m3_idx_offset
+                    ));
+                }
+                if self.m3_idx_offset != self.offset {
+                    return Err(format!(
+                        "m3_idx_offset {} != offset {} — adopted MSA dispatch would desync",
+                        self.m3_idx_offset, self.offset
+                    ));
+                }
+            }
+        }
+
+        // KVarN sidecars must be empty for every non-KVarN mode; dense /
+        // turbo tensors must be empty for KVarN8. Listed once, consumed by
+        // the per-mode arms below.
+        let kvarn_fields: [(&str, &Option<UniquePtr<MlxArray>>); 14] = [
+            ("kvarn_sink_k", &self.kvarn_sink_k),
+            ("kvarn_sink_v", &self.kvarn_sink_v),
+            ("kvarn_tail_k", &self.kvarn_tail_k),
+            ("kvarn_tail_v", &self.kvarn_tail_v),
+            ("kvarn_hist_k", &self.kvarn_hist_k),
+            ("kvarn_hist_v", &self.kvarn_hist_v),
+            ("kvarn_k_scale", &self.kvarn_k_scale),
+            ("kvarn_k_zp", &self.kvarn_k_zp),
+            ("kvarn_k_s_row", &self.kvarn_k_s_row),
+            ("kvarn_k_s_col", &self.kvarn_k_s_col),
+            ("kvarn_v_scale", &self.kvarn_v_scale),
+            ("kvarn_v_zp", &self.kvarn_v_zp),
+            ("kvarn_v_s_row", &self.kvarn_v_s_row),
+            ("kvarn_v_s_col", &self.kvarn_v_s_col),
+        ];
+
+        // (b) + (c) + (d): per-mode decision table.
+        match mode_expected {
+            KVCacheMode::Fp16 => {
+                for (role, t) in [
+                    ("key_scales", &self.key_scales),
+                    ("val_scales", &self.val_scales),
+                    ("v_packed", &self.v_packed),
+                    ("v_norms", &self.v_norms),
+                    ("v_rescale", &self.v_rescale),
+                    ("k_packed", &self.k_packed),
+                    ("k_norms", &self.k_norms),
+                ] {
+                    require_absent(role, t)?;
+                }
+                for (role, t) in &kvarn_fields {
+                    require_absent(role, t)?;
+                }
+                let k = require_present("keys", &self.keys)?;
+                let v = require_present("values", &self.values)?;
+                let k_cap = check_tensor("keys", k, g.dtype, g.n_kv_heads, g.k_head_dim)?;
+                let v_cap = check_tensor("values", v, g.dtype, g.n_kv_heads, g.v_head_dim)?;
+                if k_cap < self.offset {
+                    return Err(format!(
+                        "offset {} exceeds keys seq capacity {k_cap}",
+                        self.offset
+                    ));
+                }
+                if v_cap != k_cap {
+                    return Err(format!(
+                        "keys/values seq-capacity lockstep broken: keys {k_cap}, values {v_cap}"
+                    ));
+                }
+            }
+
+            KVCacheMode::Int8 => {
+                for (role, t) in [
+                    ("v_packed", &self.v_packed),
+                    ("v_norms", &self.v_norms),
+                    ("v_rescale", &self.v_rescale),
+                    ("k_packed", &self.k_packed),
+                    ("k_norms", &self.k_norms),
+                ] {
+                    require_absent(role, t)?;
+                }
+                for (role, t) in &kvarn_fields {
+                    require_absent(role, t)?;
+                }
+                let k = require_present("keys", &self.keys)?;
+                let v = require_present("values", &self.values)?;
+                let ks = require_present("key_scales", &self.key_scales)?;
+                let vs = require_present("val_scales", &self.val_scales)?;
+                let k_cap = check_tensor("keys", k, dtype::INT8, g.n_kv_heads, g.k_head_dim)?;
+                let v_cap = check_tensor("values", v, dtype::INT8, g.n_kv_heads, g.v_head_dim)?;
+                let ks_cap = check_tensor("key_scales", ks, dtype::FLOAT16, g.n_kv_heads, 1)?;
+                let vs_cap = check_tensor("val_scales", vs, dtype::FLOAT16, g.n_kv_heads, 1)?;
+                if k_cap < self.offset {
+                    return Err(format!(
+                        "offset {} exceeds keys seq capacity {k_cap}",
+                        self.offset
+                    ));
+                }
+                if v_cap != k_cap || ks_cap != k_cap || vs_cap != k_cap {
+                    return Err(format!(
+                        "INT8 seq-capacity lockstep broken: keys {k_cap}, values {v_cap}, \
+                         key_scales {ks_cap}, val_scales {vs_cap} — dequantization would \
+                         pair codes with the wrong per-token scales"
+                    ));
+                }
+            }
+
+            KVCacheMode::Turbo4Asym | KVCacheMode::Turbo3Asym => {
+                for (role, t) in [
+                    ("values", &self.values),
+                    ("key_scales", &self.key_scales),
+                    ("val_scales", &self.val_scales),
+                    ("k_packed", &self.k_packed),
+                    ("k_norms", &self.k_norms),
+                ] {
+                    require_absent(role, t)?;
+                }
+                for (role, t) in &kvarn_fields {
+                    require_absent(role, t)?;
+                }
+                let packed_dim = if mode_expected == KVCacheMode::Turbo4Asym {
+                    if g.v_head_dim % 2 != 0 {
+                        return Err(format!(
+                            "Turbo4Asym requires even v_head_dim, geometry says {}",
+                            g.v_head_dim
+                        ));
+                    }
+                    g.v_head_dim / 2
+                } else {
+                    if g.v_head_dim % 8 != 0 {
+                        return Err(format!(
+                            "Turbo3Asym requires v_head_dim divisible by 8, geometry says {}",
+                            g.v_head_dim
+                        ));
+                    }
+                    g.v_head_dim * 3 / 8
+                };
+                let k = require_present("keys", &self.keys)?;
+                let vp = require_present("v_packed", &self.v_packed)?;
+                let vn = require_present("v_norms", &self.v_norms)?;
+                let k_cap = check_tensor("keys", k, dtype::FLOAT16, g.n_kv_heads, g.k_head_dim)?;
+                let vp_cap = check_tensor("v_packed", vp, dtype::UINT8, g.n_kv_heads, packed_dim)?;
+                let vn_cap = check_tensor("v_norms", vn, dtype::FLOAT16, g.n_kv_heads, 1)?;
+                if k_cap < self.offset {
+                    return Err(format!(
+                        "offset {} exceeds keys seq capacity {k_cap}",
+                        self.offset
+                    ));
+                }
+                if vp_cap != k_cap || vn_cap != k_cap {
+                    return Err(format!(
+                        "Turbo V-sidecar seq-capacity lockstep broken: keys {k_cap}, \
+                         v_packed {vp_cap}, v_norms {vn_cap}"
+                    ));
+                }
+                // v_rescale is a precomputed optimization sidecar; lockstep
+                // when present, but legitimately absent (e.g. entries built
+                // by paths that predate it).
+                if let Some(vr) = self.v_rescale.as_deref() {
+                    let vr_cap = check_tensor("v_rescale", vr, dtype::FLOAT16, g.n_kv_heads, 1)?;
+                    if vr_cap != k_cap {
+                        return Err(format!(
+                            "v_rescale seq capacity {vr_cap} != keys capacity {k_cap}"
+                        ));
+                    }
+                }
+            }
+
+            KVCacheMode::Turbo4 => {
+                for (role, t) in [
+                    ("keys", &self.keys),
+                    ("values", &self.values),
+                    ("key_scales", &self.key_scales),
+                    ("val_scales", &self.val_scales),
+                ] {
+                    require_absent(role, t)?;
+                }
+                for (role, t) in &kvarn_fields {
+                    require_absent(role, t)?;
+                }
+                if g.k_head_dim % 2 != 0 || g.v_head_dim % 2 != 0 {
+                    return Err(format!(
+                        "Turbo4 requires even head dims, geometry says k={} v={}",
+                        g.k_head_dim, g.v_head_dim
+                    ));
+                }
+                let kp = require_present("k_packed", &self.k_packed)?;
+                let kn = require_present("k_norms", &self.k_norms)?;
+                let vp = require_present("v_packed", &self.v_packed)?;
+                let vn = require_present("v_norms", &self.v_norms)?;
+                let kp_cap =
+                    check_tensor("k_packed", kp, dtype::UINT8, g.n_kv_heads, g.k_head_dim / 2)?;
+                let kn_cap = check_tensor("k_norms", kn, dtype::FLOAT16, g.n_kv_heads, 1)?;
+                let vp_cap =
+                    check_tensor("v_packed", vp, dtype::UINT8, g.n_kv_heads, g.v_head_dim / 2)?;
+                let vn_cap = check_tensor("v_norms", vn, dtype::FLOAT16, g.n_kv_heads, 1)?;
+                if kp_cap < self.offset {
+                    return Err(format!(
+                        "offset {} exceeds k_packed seq capacity {kp_cap}",
+                        self.offset
+                    ));
+                }
+                if kn_cap != kp_cap || vp_cap != kp_cap || vn_cap != kp_cap {
+                    return Err(format!(
+                        "Turbo4 packed/norms seq-capacity lockstep broken: k_packed {kp_cap}, \
+                         k_norms {kn_cap}, v_packed {vp_cap}, v_norms {vn_cap}"
+                    ));
+                }
+                if let Some(vr) = self.v_rescale.as_deref() {
+                    let vr_cap = check_tensor("v_rescale", vr, dtype::FLOAT16, g.n_kv_heads, 1)?;
+                    if vr_cap != kp_cap {
+                        return Err(format!(
+                            "v_rescale seq capacity {vr_cap} != k_packed capacity {kp_cap}"
+                        ));
+                    }
+                }
+            }
+
+            KVCacheMode::Turbo4Delegated => {
+                for (role, t) in [
+                    ("key_scales", &self.key_scales),
+                    ("val_scales", &self.val_scales),
+                    ("k_packed", &self.k_packed),
+                    ("k_norms", &self.k_norms),
+                ] {
+                    require_absent(role, t)?;
+                }
+                for (role, t) in &kvarn_fields {
+                    require_absent(role, t)?;
+                }
+                if g.v_head_dim % 2 != 0 {
+                    return Err(format!(
+                        "Turbo4Delegated requires even v_head_dim, geometry says {}",
+                        g.v_head_dim
+                    ));
+                }
+                if self.cold_offset < 0 || self.cold_offset > self.offset {
+                    return Err(format!(
+                        "cold_offset {} outside [0, offset={}]",
+                        self.cold_offset, self.offset
+                    ));
+                }
+                // Unified K, same shape contract as Fp16 but always cast
+                // to float16 by the delegated update path.
+                let k = require_present("keys", &self.keys)?;
+                let k_cap = check_tensor("keys", k, dtype::FLOAT16, g.n_kv_heads, g.k_head_dim)?;
+                if k_cap < self.offset {
+                    return Err(format!(
+                        "offset {} exceeds unified-K seq capacity {k_cap}",
+                        self.offset
+                    ));
+                }
+                // Cold-V sidecars must cover the cold span when one exists.
+                if self.cold_offset > 0 {
+                    let vp = require_present("v_packed (cold V)", &self.v_packed)?;
+                    let vn = require_present("v_norms (cold V)", &self.v_norms)?;
+                    let vp_cap = check_tensor(
+                        "v_packed",
+                        vp,
+                        dtype::UINT8,
+                        g.n_kv_heads,
+                        g.v_head_dim / 2,
+                    )?;
+                    let vn_cap = check_tensor("v_norms", vn, dtype::FLOAT16, g.n_kv_heads, 1)?;
+                    if vp_cap < self.cold_offset || vn_cap < self.cold_offset {
+                        return Err(format!(
+                            "cold-V sidecars shorter than cold_offset {}: v_packed {vp_cap}, \
+                             v_norms {vn_cap}",
+                            self.cold_offset
+                        ));
+                    }
+                } else {
+                    // Predecode-policy sidecars may exist ahead of the cold
+                    // boundary; validate their layout when present.
+                    if let Some(vp) = self.v_packed.as_deref() {
+                        check_tensor("v_packed", vp, dtype::UINT8, g.n_kv_heads, g.v_head_dim / 2)?;
+                    }
+                    if let Some(vn) = self.v_norms.as_deref() {
+                        check_tensor("v_norms", vn, dtype::FLOAT16, g.n_kv_heads, 1)?;
+                    }
+                }
+                if let Some(vr) = self.v_rescale.as_deref() {
+                    check_tensor("v_rescale", vr, dtype::FLOAT16, g.n_kv_heads, 1)?;
+                }
+                // V working set: unified FP16 (fast path) or hot ring.
+                let visible_v = if self.delegated_fp16_fast_path {
+                    self.offset
+                } else {
+                    self.offset - self.cold_offset
+                };
+                match self.values.as_deref() {
+                    Some(v) => {
+                        let v_cap =
+                            check_tensor("values", v, dtype::FLOAT16, g.n_kv_heads, g.v_head_dim)?;
+                        if v_cap < visible_v {
+                            return Err(format!(
+                                "visible V length {visible_v} exceeds values seq capacity {v_cap}"
+                            ));
+                        }
+                    }
+                    // A populated visible-V span with no buffer cannot be
+                    // decoded against. (`values == None` with
+                    // `visible_v == 0` is a real post-fold state.)
+                    None if visible_v > 0 => {
+                        return Err(format!(
+                            "values: required (visible V span {visible_v} > 0) but absent"
+                        ));
+                    }
+                    None => {}
+                }
+            }
+
+            KVCacheMode::KVarN8 => {
+                use crate::cache::kvarn::{KVARN_TILE_TOKENS, KVARN_V4_GROUP_SIZE};
+                for (role, t) in [
+                    ("keys", &self.keys),
+                    ("values", &self.values),
+                    ("key_scales", &self.key_scales),
+                    ("val_scales", &self.val_scales),
+                    ("v_packed", &self.v_packed),
+                    ("v_norms", &self.v_norms),
+                    ("v_rescale", &self.v_rescale),
+                    ("k_packed", &self.k_packed),
+                    ("k_norms", &self.k_norms),
+                ] {
+                    require_absent(role, t)?;
+                }
+
+                // Sink: first tile, FP16, never quantized. `is_empty()`
+                // keys off kvarn_sink_k, so a non-empty KVarN cache MUST
+                // carry it.
+                let sink_k = require_present("kvarn_sink_k", &self.kvarn_sink_k)?;
+                let sink_v = require_present("kvarn_sink_v", &self.kvarn_sink_v)?;
+                let sink_k_len =
+                    check_tensor("kvarn_sink_k", sink_k, dtype::FLOAT16, g.n_kv_heads, g.k_head_dim)?;
+                let sink_v_len =
+                    check_tensor("kvarn_sink_v", sink_v, dtype::FLOAT16, g.n_kv_heads, g.v_head_dim)?;
+                if sink_v_len != sink_k_len {
+                    return Err(format!(
+                        "sink K/V lockstep broken: sink_k {sink_k_len}, sink_v {sink_v_len}"
+                    ));
+                }
+                if sink_k_len <= 0 || sink_k_len > KVARN_TILE_TOKENS {
+                    return Err(format!(
+                        "sink length {sink_k_len} outside (0, {KVARN_TILE_TOKENS}]"
+                    ));
+                }
+
+                // History group: all-or-none presence (writer appends every
+                // member of the group per finalized tile batch).
+                let hist_group: [(&str, bool); 9] = [
+                    ("kvarn_hist_k", self.kvarn_hist_k.is_some()),
+                    ("kvarn_hist_v", self.kvarn_hist_v.is_some()),
+                    ("kvarn_k_scale", self.kvarn_k_scale.is_some()),
+                    ("kvarn_k_zp", self.kvarn_k_zp.is_some()),
+                    ("kvarn_k_s_row", self.kvarn_k_s_row.is_some()),
+                    ("kvarn_k_s_col", self.kvarn_k_s_col.is_some()),
+                    ("kvarn_v_scale", self.kvarn_v_scale.is_some()),
+                    ("kvarn_v_zp", self.kvarn_v_zp.is_some()),
+                    ("kvarn_v_s_col", self.kvarn_v_s_col.is_some()),
+                ];
+                let hist_present = self.kvarn_hist_k.is_some();
+                for (role, present) in hist_group {
+                    if present != hist_present {
+                        return Err(format!(
+                            "history tile group presence broken: kvarn_hist_k is {} but {role} is {}",
+                            if hist_present { "present" } else { "absent" },
+                            if present { "present" } else { "absent" }
+                        ));
+                    }
+                }
+                // v_s_row: k8v8 stores it per token; k8v4 folds it into
+                // scale/zp at write time — "the fold IS its storage" — so a
+                // populated v_s_row under v4 means the entry was written by
+                // a different width than its tag claims.
+                match self.kvarn_v_bits {
+                    8 => {
+                        if self.kvarn_v_s_row.is_some() != hist_present {
+                            return Err(format!(
+                                "kvarn_v_s_row presence ({}) must match history presence ({}) at v_bits=8",
+                                self.kvarn_v_s_row.is_some(),
+                                hist_present
+                            ));
+                        }
+                    }
+                    4 => {
+                        require_absent("kvarn_v_s_row (folded at v_bits=4)", &self.kvarn_v_s_row)?;
+                    }
+                    other => {
+                        return Err(format!("stored kvarn_v_bits {other} is not a legal width"));
+                    }
+                }
+
+                let mut hist_len = 0i32;
+                if hist_present {
+                    let hist_k = require_present("kvarn_hist_k", &self.kvarn_hist_k)?;
+                    hist_len = check_tensor(
+                        "kvarn_hist_k",
+                        hist_k,
+                        dtype::UINT8,
+                        g.n_kv_heads,
+                        g.k_head_dim,
+                    )?;
+                    if hist_len <= 0 || hist_len % KVARN_TILE_TOKENS != 0 {
+                        return Err(format!(
+                            "history length {hist_len} is not a positive multiple of the \
+                             tile size {KVARN_TILE_TOKENS}"
+                        ));
+                    }
+                    let n_tiles = hist_len / KVARN_TILE_TOKENS;
+                    for (role, t) in [
+                        ("kvarn_k_scale", &self.kvarn_k_scale),
+                        ("kvarn_k_zp", &self.kvarn_k_zp),
+                        ("kvarn_k_s_row", &self.kvarn_k_s_row),
+                    ] {
+                        let arr = require_present(role, t)?;
+                        let len = check_tensor(role, arr, dtype::FLOAT32, g.n_kv_heads, 1)?;
+                        if len != hist_len {
+                            return Err(format!(
+                                "{role} seq length {len} != history length {hist_len}"
+                            ));
+                        }
+                    }
+                    let ksc = require_present("kvarn_k_s_col", &self.kvarn_k_s_col)?;
+                    let ksc_tiles = check_tensor(
+                        "kvarn_k_s_col",
+                        ksc,
+                        dtype::FLOAT32,
+                        g.n_kv_heads,
+                        g.k_head_dim,
+                    )?;
+                    if ksc_tiles != n_tiles {
+                        return Err(format!(
+                            "kvarn_k_s_col tile axis {ksc_tiles} != n_tiles {n_tiles}"
+                        ));
+                    }
+                    let vsc = require_present("kvarn_v_s_col", &self.kvarn_v_s_col)?;
+                    let vsc_tiles = check_tensor(
+                        "kvarn_v_s_col",
+                        vsc,
+                        dtype::FLOAT32,
+                        g.n_kv_heads,
+                        g.v_head_dim,
+                    )?;
+                    if vsc_tiles != n_tiles {
+                        return Err(format!(
+                            "kvarn_v_s_col tile axis {vsc_tiles} != n_tiles {n_tiles}"
+                        ));
+                    }
+
+                    let hist_v = require_present("kvarn_hist_v", &self.kvarn_hist_v)?;
+                    match self.kvarn_v_bits {
+                        8 => {
+                            let hv_len = check_tensor(
+                                "kvarn_hist_v",
+                                hist_v,
+                                dtype::UINT8,
+                                g.n_kv_heads,
+                                g.v_head_dim,
+                            )?;
+                            if hv_len != hist_len {
+                                return Err(format!(
+                                    "kvarn_hist_v seq length {hv_len} != history length {hist_len}"
+                                ));
+                            }
+                            for (role, t) in [
+                                ("kvarn_v_scale", &self.kvarn_v_scale),
+                                ("kvarn_v_zp", &self.kvarn_v_zp),
+                                ("kvarn_v_s_row", &self.kvarn_v_s_row),
+                            ] {
+                                let arr = require_present(role, t)?;
+                                let len =
+                                    check_tensor(role, arr, dtype::FLOAT32, g.n_kv_heads, 1)?;
+                                if len != hist_len {
+                                    return Err(format!(
+                                        "{role} seq length {len} != history length {hist_len}"
+                                    ));
+                                }
+                            }
+                        }
+                        4 => {
+                            if g.v_head_dim % 8 != 0 || g.v_head_dim % KVARN_V4_GROUP_SIZE != 0 {
+                                return Err(format!(
+                                    "k8v4 requires v_head_dim divisible by 8 and by \
+                                     gs={KVARN_V4_GROUP_SIZE}, geometry says {}",
+                                    g.v_head_dim
+                                ));
+                            }
+                            let hv_len = check_tensor(
+                                "kvarn_hist_v",
+                                hist_v,
+                                dtype::UINT32,
+                                g.n_kv_heads,
+                                g.v_head_dim / 8,
+                            )?;
+                            if hv_len != hist_len {
+                                return Err(format!(
+                                    "kvarn_hist_v seq length {hv_len} != history length {hist_len}"
+                                ));
+                            }
+                            for (role, t) in [
+                                ("kvarn_v_scale", &self.kvarn_v_scale),
+                                ("kvarn_v_zp", &self.kvarn_v_zp),
+                            ] {
+                                let arr = require_present(role, t)?;
+                                let len = check_tensor(
+                                    role,
+                                    arr,
+                                    dtype::FLOAT32,
+                                    g.n_kv_heads,
+                                    g.v_head_dim / KVARN_V4_GROUP_SIZE,
+                                )?;
+                                if len != hist_len {
+                                    return Err(format!(
+                                        "{role} seq length {len} != history length {hist_len}"
+                                    ));
+                                }
+                            }
+                        }
+                        _ => unreachable!("width validated above"),
+                    }
+                }
+
+                // Tail: FP16 partial-tile accumulation, K/V lockstep.
+                let mut tail_len = 0i32;
+                match (self.kvarn_tail_k.as_deref(), self.kvarn_tail_v.as_deref()) {
+                    (Some(tk), Some(tv)) => {
+                        let tk_len = check_tensor(
+                            "kvarn_tail_k",
+                            tk,
+                            dtype::FLOAT16,
+                            g.n_kv_heads,
+                            g.k_head_dim,
+                        )?;
+                        let tv_len = check_tensor(
+                            "kvarn_tail_v",
+                            tv,
+                            dtype::FLOAT16,
+                            g.n_kv_heads,
+                            g.v_head_dim,
+                        )?;
+                        if tv_len != tk_len {
+                            return Err(format!(
+                                "tail K/V lockstep broken: tail_k {tk_len}, tail_v {tv_len}"
+                            ));
+                        }
+                        if tk_len <= 0 {
+                            return Err(format!("tail present with non-positive length {tk_len}"));
+                        }
+                        tail_len = tk_len;
+                    }
+                    (None, None) => {}
+                    (k, v) => {
+                        return Err(format!(
+                            "tail K/V presence broken: tail_k {}, tail_v {}",
+                            if k.is_some() { "present" } else { "absent" },
+                            if v.is_some() { "present" } else { "absent" }
+                        ));
+                    }
+                }
+
+                // The writer fills the sink completely before anything
+                // reaches history or tail.
+                if (hist_present || tail_len > 0) && sink_k_len != KVARN_TILE_TOKENS {
+                    return Err(format!(
+                        "sink length {sink_k_len} < {KVARN_TILE_TOKENS} with history/tail \
+                         present — sink must fill before spill"
+                    ));
+                }
+                // KVarN tensors are exact-length: the three spans must
+                // account for every logical token.
+                let total = sink_k_len + hist_len + tail_len;
+                if total != self.offset {
+                    return Err(format!(
+                        "KVarN length equation broken: sink {sink_k_len} + hist {hist_len} + \
+                         tail {tail_len} = {total} != offset {}",
+                        self.offset
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DetachedCacheSet {
+    /// Set-level adopt-time validation: layer count vs the expected
+    /// per-layer mode table, cross-layer seq-len consistency, then
+    /// [`DetachedKVCache::validate_for`] on every layer.
+    ///
+    /// `layer_modes_expected` must be the SAME table the scheduler applies
+    /// to freshly allocated sequences (`apply_kv_cache_mode_to`'s
+    /// resolution — Boundary-V / `skip_last_layer` keep some layers Fp16),
+    /// so the adopt expectation can never drift from allocation behavior.
+    /// Assumes uniform head geometry across layers (true for every dense
+    /// transformer this pool serves; a future mixed-geometry architecture
+    /// needs a per-layer geometry table here).
+    pub fn validate_for(
+        &self,
+        layer_modes_expected: &[KVCacheMode],
+        v_bits_expected: u8,
+        geometry: &ExpectedCacheGeometry,
+    ) -> Result<(), String> {
+        if self.caches.is_empty() {
+            return Err("DetachedCacheSet::validate_for: set carries no layer caches".into());
+        }
+        if self.caches.len() != layer_modes_expected.len() {
+            return Err(format!(
+                "DetachedCacheSet::validate_for: set has {} layers, model expects {}",
+                self.caches.len(),
+                layer_modes_expected.len()
+            ));
+        }
+        if !self.has_consistent_seq_len() {
+            return Err(format!(
+                "DetachedCacheSet::validate_for: layers disagree on seq_len: {:?}",
+                self.caches.iter().map(|c| c.offset).collect::<Vec<_>>()
+            ));
+        }
+        for (i, (cache, &mode)) in self.caches.iter().zip(layer_modes_expected).enumerate() {
+            cache
+                .validate_for(mode, v_bits_expected, geometry)
+                .map_err(|e| format!("layer {i}: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // KVCache extensions
 // ---------------------------------------------------------------------------
 

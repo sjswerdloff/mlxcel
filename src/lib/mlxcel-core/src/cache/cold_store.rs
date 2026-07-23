@@ -23,30 +23,35 @@
 //! - Different sessions with shared prefix → shared cache (efficient)
 //! - Forked conversations → shared cache until divergence point
 //!
-//! # Storage layout
+//! # Storage layout (v3, via `cold_store_reference.rs`)
 //!
 //! ```text
 //! ~/.cache/mlxcel/cold-storage/
-//!   <hex(content_hash)>/
-//!     header.bin        — metadata + weight-fingerprint + token sequence
-//!     layer_0.bin       — per-layer DetachedKVCache tensors
-//!     layer_1.bin
-//!     ...
+//!   cold-storage-v3/
+//!     <hex(identity_sha256)>/            — runtime+model+template+layout+tokens
+//!       gen-<pid>-<nanos>-<counter>/     — immutable generation
+//!         layer_0000.bin                 — per-layer DetachedKVCache tensors
+//!         layer_0001.bin
+//!         ...
+//!         header.bin                     — identity, per-layer SHA-256 + lengths
+//!         COMMITTED                      — atomic publication marker (magic +
+//!                                          header SHA-256); written last
 //! ```
 //!
 //! # Safety
 //!
-//! The weight-fingerprint guard refuses to restore a cache that was written
-//! by a different model checkpoint.
+//! The runtime fingerprint (derived from the model-weight fingerprint) is part
+//! of the identity: a cache written by a different checkpoint never matches.
+//! Loads see only fully COMMITTED generations, verify every layer's length and
+//! SHA-256 checksum, and run `validate_consistency` before any FFI shape op.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cxx::UniquePtr;
 use sha2::{Digest, Sha256};
@@ -58,19 +63,29 @@ use crate::ffi::MlxArray;
 use super::detach::{DetachedCacheSet, DetachedKVCache};
 use super::KVCacheMode;
 
-#[cfg(any(test, feature = "coldstore-reference-sync"))]
 #[path = "cold_store_reference.rs"]
 mod reference;
-#[cfg(any(test, feature = "coldstore-reference-sync"))]
 pub use reference::{ReferenceColdStore, ReferenceSnapshot, runtime_fingerprint_from_manifest};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
+// v2 header format: production-dead since persist/load moved to the v3
+// reference machinery, retained for the v2 round-trip + bound-fix tests.
+#[allow(dead_code)]
 const FORMAT_VERSION: u32 = 2; // v2: content-addressed, tokens in header
 const DEFAULT_BASE_DIR: &str = ".cache/mlxcel/cold-storage";
 const MAX_SERIALIZED_TENSOR_RANK: usize = 32;
+
+/// Header-scan resource bounds, mirroring the reference implementation
+/// (cold_store_reference.rs `MAX_TOKENS` / `MAX_LAYERS`). A corrupt header
+/// must produce an `Err` the load_prefix scan loop can skip — never an
+/// allocation abort that takes down every subsequent restore scan.
+#[allow(dead_code)]
+const MAX_HEADER_TOKENS: usize = 2_000_000;
+#[allow(dead_code)]
+const MAX_HEADER_LAYERS: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -396,9 +411,489 @@ fn read_kv_cache(r: &mut impl Read, layer_idx: usize) -> Result<DetachedKVCache,
 }
 
 // ---------------------------------------------------------------------------
-// Session header (v2: content-addressed)
+// Post-read semantic validation (PRE-FFI guard)
 // ---------------------------------------------------------------------------
 
+/// Per-layer semantic + shape validation of a freshly deserialized
+/// [`DetachedKVCache`]. MUST run after [`read_kv_cache`] and BEFORE the
+/// cache is adopted (`install_detached`) or fetched.
+///
+/// Why this exists (issue-6): the layer format is positional with no
+/// cross-field validation, and the downstream first-use paths assume these
+/// invariants without checking:
+/// * `fetch_kvarn8` (cache.rs:1522) panics on `kvarn_v_bits ∉ {8,4}`;
+/// * the assemble closures `.unwrap()` the hist sidecars (cache.rs:1408-1412,
+///   1467-1472) and index `shape[0..4]` unchecked (cache.rs:1414/1461);
+/// * `ffi::slice`/`reshape`/`concatenate` are bare-`UniquePtr` cxx calls —
+///   an MLX shape exception there is `std::terminate`, uncatchable by both
+///   `Err => continue` AND `catch_unwind`. The abort class can only be
+///   PREVENTED, which is this function's job.
+///
+/// Only `ffi::array_shape` / `ffi::array_dtype` (metadata reads) are called
+/// here — no shape-sensitive MLX op touches the tensors before validation
+/// passes. Every violation is `ColdStoreError::CorruptLayer`; this function
+/// never panics on any input.
+pub fn validate_consistency(
+    cache: &DetachedKVCache,
+    layer_idx: usize,
+) -> Result<(), ColdStoreError> {
+    use super::kvarn::{KVARN_TILE_TOKENS, KVARN_V4_GROUP_SIZE};
+
+    let corrupt = |detail: String| ColdStoreError::CorruptLayer {
+        layer: layer_idx,
+        detail,
+    };
+
+    // ── Scalar sanity ────────────────────────────────────────────────────
+    if cache.offset < 0 {
+        return Err(corrupt(format!("negative offset {}", cache.offset)));
+    }
+    if cache.m3_idx_offset < 0 {
+        return Err(corrupt(format!(
+            "negative m3_idx_offset {}",
+            cache.m3_idx_offset
+        )));
+    }
+
+    // ── Rank guard ───────────────────────────────────────────────────────
+    // Every tensor in this format is rank 4 with seq axis 2 (detach.rs
+    // trim paths, cache.rs append paths, install_detached's own
+    // `shape.len() == 4` probe). A wrong-rank tensor reaching ffi::slice
+    // aborts the process; refuse it here.
+    let rank4 = |name: &str,
+                 opt: &Option<UniquePtr<MlxArray>>|
+     -> Result<Option<Vec<i32>>, ColdStoreError> {
+        match opt {
+            None => Ok(None),
+            Some(a) => {
+                let s = ffi::array_shape(a);
+                if s.len() != 4 {
+                    Err(corrupt(format!(
+                        "{name}: expected rank 4, got rank {} (shape {s:?})",
+                        s.len()
+                    )))
+                } else {
+                    Ok(Some(s))
+                }
+            }
+        }
+    };
+
+    let keys = rank4("keys", &cache.keys)?;
+    let values = rank4("values", &cache.values)?;
+    let key_scales = rank4("key_scales", &cache.key_scales)?;
+    let val_scales = rank4("val_scales", &cache.val_scales)?;
+    let _v_packed = rank4("v_packed", &cache.v_packed)?;
+    let _v_norms = rank4("v_norms", &cache.v_norms)?;
+    let _v_rescale = rank4("v_rescale", &cache.v_rescale)?;
+    let _k_packed = rank4("k_packed", &cache.k_packed)?;
+    let _k_norms = rank4("k_norms", &cache.k_norms)?;
+    let m3 = rank4("m3_idx_k", &cache.m3_idx_k)?;
+    let sink_k = rank4("kvarn_sink_k", &cache.kvarn_sink_k)?;
+    let sink_v = rank4("kvarn_sink_v", &cache.kvarn_sink_v)?;
+    let tail_k = rank4("kvarn_tail_k", &cache.kvarn_tail_k)?;
+    let tail_v = rank4("kvarn_tail_v", &cache.kvarn_tail_v)?;
+    let hist_k = rank4("kvarn_hist_k", &cache.kvarn_hist_k)?;
+    let hist_v = rank4("kvarn_hist_v", &cache.kvarn_hist_v)?;
+    let k_scale = rank4("kvarn_k_scale", &cache.kvarn_k_scale)?;
+    let k_zp = rank4("kvarn_k_zp", &cache.kvarn_k_zp)?;
+    let k_s_row = rank4("kvarn_k_s_row", &cache.kvarn_k_s_row)?;
+    let k_s_col = rank4("kvarn_k_s_col", &cache.kvarn_k_s_col)?;
+    let v_scale = rank4("kvarn_v_scale", &cache.kvarn_v_scale)?;
+    let v_zp = rank4("kvarn_v_zp", &cache.kvarn_v_zp)?;
+    let v_s_row = rank4("kvarn_v_s_row", &cache.kvarn_v_s_row)?;
+    let v_s_col = rank4("kvarn_v_s_col", &cache.kvarn_v_s_col)?;
+
+    // ── M3 indexer (mode-agnostic) ───────────────────────────────────────
+    // Detached contract: exact-length `[b, 1, m3_idx_offset, index_dim]`
+    // (clone_handle slice-to-fill, detach.rs:701-708; field doc :136).
+    // A desync here is the cycle-79 asymmetric-reshape crash class.
+    if let Some(s) = &m3 {
+        if s[1] != 1 {
+            return Err(corrupt(format!(
+                "m3_idx_k: head axis must be 1, got {} (shape {s:?})",
+                s[1]
+            )));
+        }
+        if s[2] != cache.m3_idx_offset {
+            return Err(corrupt(format!(
+                "m3_idx_k seq length {} != m3_idx_offset {}",
+                s[2], cache.m3_idx_offset
+            )));
+        }
+    }
+
+    // ── Mode-specific ────────────────────────────────────────────────────
+    let kvarn_fields_present = sink_k.is_some()
+        || sink_v.is_some()
+        || tail_k.is_some()
+        || tail_v.is_some()
+        || hist_k.is_some()
+        || hist_v.is_some()
+        || k_scale.is_some()
+        || k_zp.is_some()
+        || k_s_row.is_some()
+        || k_s_col.is_some()
+        || v_scale.is_some()
+        || v_zp.is_some()
+        || v_s_row.is_some()
+        || v_s_col.is_some();
+
+    if cache.mode != KVCacheMode::KVarN8 && kvarn_fields_present {
+        // "KVarN8 state (mode == KVCacheMode::KVarN8; all None otherwise)"
+        // — cache.rs:631. Kvarn droppings under another mode mean the mode
+        // byte and the tensor table disagree: reject, don't guess which lies.
+        return Err(corrupt(format!(
+            "kvarn tensors present under non-KVarN8 mode {:?}",
+            cache.mode
+        )));
+    }
+
+    match cache.mode {
+        KVCacheMode::Fp16 => {
+            if cache.offset > 0 {
+                let k = keys
+                    .as_ref()
+                    .ok_or_else(|| corrupt("Fp16: keys missing with offset > 0".into()))?;
+                let v = values
+                    .as_ref()
+                    .ok_or_else(|| corrupt("Fp16: values missing with offset > 0".into()))?;
+                // keys/values are CAPACITY buffers (clone_handle moves the
+                // step-grown buffer unsliced): capacity >= offset, batch and
+                // head axes in lockstep. capacity < offset would make the
+                // downstream fetch slice read out of bounds → MLX abort.
+                if k[2] < cache.offset || v[2] < cache.offset {
+                    return Err(corrupt(format!(
+                        "Fp16: seq capacity (K {}, V {}) below offset {}",
+                        k[2], v[2], cache.offset
+                    )));
+                }
+                if k[0] != v[0] || k[1] != v[1] {
+                    return Err(corrupt(format!(
+                        "Fp16: K/V batch-head mismatch ({:?} vs {:?})",
+                        &k[..2],
+                        &v[..2]
+                    )));
+                }
+            }
+        }
+        KVCacheMode::Int8 => {
+            if cache.offset > 0 {
+                let k = keys
+                    .as_ref()
+                    .ok_or_else(|| corrupt("Int8: keys missing with offset > 0".into()))?;
+                let v = values
+                    .as_ref()
+                    .ok_or_else(|| corrupt("Int8: values missing with offset > 0".into()))?;
+                let ks = key_scales.as_ref().ok_or_else(|| {
+                    corrupt("Int8: key_scales missing with offset > 0".into())
+                })?;
+                let vs = val_scales.as_ref().ok_or_else(|| {
+                    corrupt("Int8: val_scales missing with offset > 0".into())
+                })?;
+                for (name, s) in [("keys", k), ("values", v), ("key_scales", ks), ("val_scales", vs)]
+                {
+                    if s[2] < cache.offset {
+                        return Err(corrupt(format!(
+                            "Int8: {name} seq capacity {} below offset {}",
+                            s[2], cache.offset
+                        )));
+                    }
+                }
+            }
+        }
+        KVCacheMode::KVarN8 => {
+            // The single validated gate for the cache.rs:1522 panic class:
+            // kvarn_v_bits comes off disk unvalidated; a flipped byte is a
+            // guaranteed panic on first fetch_kvarn8 without this check.
+            if cache.kvarn_v_bits != 8 && cache.kvarn_v_bits != 4 {
+                return Err(corrupt(format!(
+                    "kvarn_v_bits must be 8 or 4, got {}",
+                    cache.kvarn_v_bits
+                )));
+            }
+
+            // K/V pairing: the writers fill sink/hist/tail K and V in
+            // lockstep (cache.rs:1217-1224, 1317-1358; trim_to slices in
+            // lockstep). A lone side would panic/abort in assemble.
+            for (name, a, b) in [
+                ("kvarn_sink_k/kvarn_sink_v", sink_k.is_some(), sink_v.is_some()),
+                ("kvarn_hist_k/kvarn_hist_v", hist_k.is_some(), hist_v.is_some()),
+                ("kvarn_tail_k/kvarn_tail_v", tail_k.is_some(), tail_v.is_some()),
+            ] {
+                if a != b {
+                    return Err(corrupt(format!("{name} presence mismatch")));
+                }
+            }
+
+            // Reference geometry (b, h, d) from the first present tensor.
+            let geom = sink_k.as_ref().or(tail_k.as_ref()).or(hist_k.as_ref());
+            let (b, h, d) = match geom {
+                Some(s) => (s[0], s[1], s[3]),
+                None => {
+                    // Empty kvarn state is only consistent with offset 0.
+                    if cache.offset != 0 {
+                        return Err(corrupt(format!(
+                            "KVarN8: offset {} with no kvarn tensors \
+                             (fetch would panic on an empty cache)",
+                            cache.offset
+                        )));
+                    }
+                    return Ok(());
+                }
+            };
+            // v4 hist_k carries full D; d itself must be group-divisible
+            // for the v4 dequant reshape (checked under the v4 arm below).
+
+            let check_bhd = |name: &str, s: &Option<Vec<i32>>| -> Result<(), ColdStoreError> {
+                if let Some(s) = s {
+                    if s[0] != b || s[1] != h || s[3] != d {
+                        return Err(corrupt(format!(
+                            "{name}: shape {s:?} inconsistent with [b={b}, h={h}, ·, d={d}]"
+                        )));
+                    }
+                }
+                Ok(())
+            };
+            check_bhd("kvarn_sink_k", &sink_k)?;
+            check_bhd("kvarn_sink_v", &sink_v)?;
+            check_bhd("kvarn_tail_k", &tail_k)?;
+            check_bhd("kvarn_tail_v", &tail_v)?;
+            check_bhd("kvarn_hist_k", &hist_k)?;
+
+            // Sink: fills first, capped at one tile, never quantized
+            // (cache.rs:1200-1231; the #36 cap does not stop the sink fill)
+            // ⇒ sink_len == min(offset, KVARN_TILE_TOKENS) always.
+            let sink_len = sink_k.as_ref().map_or(0, |s| s[2]);
+            if let (Some(sk), Some(sv)) = (&sink_k, &sink_v) {
+                if sk[2] != sv[2] {
+                    return Err(corrupt(format!(
+                        "sink K len {} != sink V len {}",
+                        sk[2], sv[2]
+                    )));
+                }
+            }
+            if cache.offset > 0 && sink_k.is_none() {
+                return Err(corrupt(
+                    "KVarN8: sink missing with offset > 0 (sink fills first)".into(),
+                ));
+            }
+            if sink_len != cache.offset.min(KVARN_TILE_TOKENS) {
+                return Err(corrupt(format!(
+                    "sink length {} != min(offset {}, tile {})",
+                    sink_len, cache.offset, KVARN_TILE_TOKENS
+                )));
+            }
+
+            // Tail: present ⇒ non-empty, K/V lengths in lockstep.
+            let tail_len = tail_k.as_ref().map_or(0, |s| s[2]);
+            if let (Some(tk), Some(tv)) = (&tail_k, &tail_v) {
+                if tk[2] != tv[2] {
+                    return Err(corrupt(format!(
+                        "tail K len {} != tail V len {}",
+                        tk[2], tv[2]
+                    )));
+                }
+                if tk[2] <= 0 {
+                    return Err(corrupt("tail present but empty".into()));
+                }
+            }
+
+            // History + sidecars.
+            let hist_len = hist_k.as_ref().map_or(0, |s| s[2]);
+            if let Some(hk) = &hist_k {
+                let t = hk[2];
+                if t <= 0 || t % KVARN_TILE_TOKENS != 0 {
+                    return Err(corrupt(format!(
+                        "hist length {t} not a positive multiple of tile {KVARN_TILE_TOKENS}"
+                    )));
+                }
+                let n_tiles = t / KVARN_TILE_TOKENS;
+
+                // K side is 8-bit in BOTH V widths (cache.rs:1313-1315).
+                if ffi::array_dtype(cache.kvarn_hist_k.as_ref().unwrap()) != dtype::UINT8 {
+                    return Err(corrupt("kvarn_hist_k: expected u8 codes".into()));
+                }
+                let require = |name: &str,
+                               s: &Option<Vec<i32>>|
+                 -> Result<Vec<i32>, ColdStoreError> {
+                    s.clone()
+                        .ok_or_else(|| corrupt(format!("{name} missing while hist present")))
+                };
+                // Per-token row params [b,h,T_hist,1] in lockstep with hist
+                // dim2; per-tile s_col [b,h,n_tiles,d] (cache.rs:643-646,
+                // 1317-1323). assemble unwraps these (cache.rs:1408-1412).
+                for (name, s) in [
+                    ("kvarn_k_scale", require("kvarn_k_scale", &k_scale)?),
+                    ("kvarn_k_zp", require("kvarn_k_zp", &k_zp)?),
+                    ("kvarn_k_s_row", require("kvarn_k_s_row", &k_s_row)?),
+                ] {
+                    if s != vec![b, h, t, 1] {
+                        return Err(corrupt(format!(
+                            "{name}: shape {s:?} != [{b}, {h}, {t}, 1] (hist lockstep)"
+                        )));
+                    }
+                }
+                let sc = require("kvarn_k_s_col", &k_s_col)?;
+                if sc != vec![b, h, n_tiles, d] {
+                    return Err(corrupt(format!(
+                        "kvarn_k_s_col: shape {sc:?} != [{b}, {h}, n_tiles={n_tiles}, {d}]"
+                    )));
+                }
+
+                // V side per kvarn_v_bits (cache.rs:1324-1359, :678-684).
+                let hv = hist_v
+                    .as_ref()
+                    .expect("pairing check guarantees hist_v when hist_k present");
+                if hv[2] != t {
+                    return Err(corrupt(format!(
+                        "hist V length {} != hist K length {t} \
+                         (K and V tiles finalize together)",
+                        hv[2]
+                    )));
+                }
+                match cache.kvarn_v_bits {
+                    8 => {
+                        if hv[3] != d {
+                            return Err(corrupt(format!(
+                                "kvarn_hist_v (v8): trailing dim {} != d {d}",
+                                hv[3]
+                            )));
+                        }
+                        if ffi::array_dtype(cache.kvarn_hist_v.as_ref().unwrap())
+                            != dtype::UINT8
+                        {
+                            return Err(corrupt("kvarn_hist_v (v8): expected u8 codes".into()));
+                        }
+                        for (name, s) in [
+                            ("kvarn_v_scale", require("kvarn_v_scale", &v_scale)?),
+                            ("kvarn_v_zp", require("kvarn_v_zp", &v_zp)?),
+                            ("kvarn_v_s_row", require("kvarn_v_s_row", &v_s_row)?),
+                        ] {
+                            if s != vec![b, h, t, 1] {
+                                return Err(corrupt(format!(
+                                    "{name}: shape {s:?} != [{b}, {h}, {t}, 1] (hist lockstep)"
+                                )));
+                            }
+                        }
+                    }
+                    4 => {
+                        // Packed u32 nibbles [B,H,T,D/8]; folded per-group
+                        // params [B,H,T,D/gs]; s_row MUST be None (the fold
+                        // IS its storage — kvarn.rs:476-481). A v4 entry
+                        // with s_row present is a mislabeled/mixed record.
+                        if d % 8 != 0 || d % KVARN_V4_GROUP_SIZE != 0 {
+                            return Err(corrupt(format!(
+                                "v4: head_dim {d} not divisible by 8 and \
+                                 group size {KVARN_V4_GROUP_SIZE}"
+                            )));
+                        }
+                        if hv[3] != d / 8 {
+                            return Err(corrupt(format!(
+                                "kvarn_hist_v (v4): trailing dim {} != d/8 = {}",
+                                hv[3],
+                                d / 8
+                            )));
+                        }
+                        if ffi::array_dtype(cache.kvarn_hist_v.as_ref().unwrap())
+                            != dtype::UINT32
+                        {
+                            return Err(corrupt(
+                                "kvarn_hist_v (v4): expected packed u32 codes".into(),
+                            ));
+                        }
+                        let g = d / KVARN_V4_GROUP_SIZE;
+                        for (name, s) in [
+                            ("kvarn_v_scale", require("kvarn_v_scale", &v_scale)?),
+                            ("kvarn_v_zp", require("kvarn_v_zp", &v_zp)?),
+                        ] {
+                            if s != vec![b, h, t, g] {
+                                return Err(corrupt(format!(
+                                    "{name}: shape {s:?} != [{b}, {h}, {t}, {g}] \
+                                     (folded per-group lockstep)"
+                                )));
+                            }
+                        }
+                        if v_s_row.is_some() {
+                            return Err(corrupt(
+                                "kvarn_v_s_row present under v_bits=4 \
+                                 (the fold IS its storage; must be None)"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    _ => unreachable!("v_bits validated above"),
+                }
+                let vsc = require("kvarn_v_s_col", &v_s_col)?;
+                if vsc != vec![b, h, n_tiles, d] {
+                    return Err(corrupt(format!(
+                        "kvarn_v_s_col: shape {vsc:?} != [{b}, {h}, n_tiles={n_tiles}, {d}]"
+                    )));
+                }
+            } else {
+                // No hist ⇒ no orphan sidecars (no writer produces that
+                // state; trim_to clears them together, detach.rs:527-536).
+                for (name, present) in [
+                    ("kvarn_k_scale", k_scale.is_some()),
+                    ("kvarn_k_zp", k_zp.is_some()),
+                    ("kvarn_k_s_row", k_s_row.is_some()),
+                    ("kvarn_k_s_col", k_s_col.is_some()),
+                    ("kvarn_v_scale", v_scale.is_some()),
+                    ("kvarn_v_zp", v_zp.is_some()),
+                    ("kvarn_v_s_row", v_s_row.is_some()),
+                    ("kvarn_v_s_col", v_s_col.is_some()),
+                ] {
+                    if present {
+                        return Err(corrupt(format!("{name} present without history")));
+                    }
+                }
+            }
+
+            // THE window-sum invariant (trim_to arithmetic detach.rs:540-541,
+            // update accounting cache.rs:1226/1381, synth cache.rs:2054-2115):
+            // offset == sink_len + hist_len + tail_len. Violation means the
+            // assembled attention window disagrees with the logical length —
+            // silent wrong attention or an abort at the concat/adopt boundary.
+            if cache.offset != sink_len + hist_len + tail_len {
+                return Err(corrupt(format!(
+                    "offset {} != sink {} + hist {} + tail {}",
+                    cache.offset, sink_len, hist_len, tail_len
+                )));
+            }
+        }
+        KVCacheMode::Turbo4Asym
+        | KVCacheMode::Turbo3Asym
+        | KVCacheMode::Turbo4
+        | KVCacheMode::Turbo4Delegated => {
+            // Rank-4 guards above already cover the abort class for these
+            // modes' tensors. Presence contracts are NOT asserted here:
+            // the delegated fast-path variants condition the interpretation
+            // of `values`/`v_packed` on `delegated_fp16_fast_path` and
+            // sidecar policy (detach.rs:92-104, 404-434), and I could not
+            // confirm a single presence rule across all of them from source.
+            if cache.mode == KVCacheMode::Turbo4Delegated
+                && (cache.cold_offset < 0 || cache.cold_offset > cache.offset)
+            {
+                return Err(corrupt(format!(
+                    "Turbo4Delegated: cold_offset {} outside [0, offset {}]",
+                    cache.cold_offset, cache.offset
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Session header (v2: content-addressed)
+//
+// Production-dead since persist/load moved to the v3 reference machinery.
+// Retained (allow(dead_code)) because the v2 round-trip test and the
+// read_header bound-fix regression tests still exercise it.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
 struct SessionHeader {
     format_version: u32,
     content_hash: String,
@@ -412,6 +907,7 @@ struct SessionHeader {
     tokens: Vec<i32>,
 }
 
+#[allow(dead_code)]
 fn write_header(w: &mut impl Write, hdr: &SessionHeader) -> io::Result<()> {
     w.write_all(&hdr.format_version.to_le_bytes())?;
     write_string(w, &hdr.content_hash)?;
@@ -430,6 +926,7 @@ fn write_header(w: &mut impl Write, hdr: &SessionHeader) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn read_header(r: &mut impl Read) -> Result<SessionHeader, ColdStoreError> {
     let format_version = read_u32(r)?;
     if format_version != FORMAT_VERSION {
@@ -443,13 +940,24 @@ fn read_header(r: &mut impl Read) -> Result<SessionHeader, ColdStoreError> {
     let model_id = read_string(r)?;
     let template_sig = read_string(r)?;
     let layer_count = read_u32(r)?;
-    let prompt_len = read_u64(r)? as usize;
+    bounded_usize(u64::from(layer_count), MAX_HEADER_LAYERS, "layer count")?;
+    let prompt_len = bounded_usize(read_u64(r)?, MAX_HEADER_TOKENS, "prompt length")?;
     let current_offset = read_i32(r)?;
     let timestamp_secs = read_u64(r)?;
-    let token_count = read_u64(r)? as usize;
-    let mut tokens = vec![0i32; token_count];
-    for tok in &mut tokens {
-        *tok = read_i32(r)?;
+    // A flipped/hostile token count must NOT reach `vec![0i32; n]`: a huge n
+    // is an allocation abort (handle_alloc_error), which `Err => continue`
+    // in the scan loop cannot catch — one corrupt header would kill every
+    // restore scan. Bound first, then fallibly reserve.
+    let token_count = bounded_usize(read_u64(r)?, MAX_HEADER_TOKENS, "token count")?;
+    let mut tokens = Vec::new();
+    tokens.try_reserve_exact(token_count).map_err(|error| {
+        ColdStoreError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot allocate {token_count} tokens: {error}"),
+        ))
+    })?;
+    for _ in 0..token_count {
+        tokens.push(read_i32(r)?);
     }
     Ok(SessionHeader {
         format_version,
@@ -473,18 +981,34 @@ fn read_header(r: &mut impl Read) -> Result<SessionHeader, ColdStoreError> {
 ///
 /// Caches are identified by token content, not session IDs. On restore,
 /// the longest matching prefix is found by scanning stored token sequences.
+///
+/// Persist/restore is routed through the v3 [`ReferenceColdStore`] machinery:
+/// per-layer SHA-256 checksums, atomic `COMMITTED` publication, full-token +
+/// layout identity, and bounded/validated loads. The Q3 thread-affinity split
+/// is preserved: serialization (`MlxArray` -> bytes) happens on the calling
+/// (inference) thread in [`ColdStore::persist`]; only `Vec<u8>` crosses to the
+/// background writer, which publishes via
+/// [`ReferenceColdStore::persist_serialized`].
 pub struct ColdStore {
     base_dir: PathBuf,
+    #[allow(dead_code)] // retained model-weight identity; folded into ref_store's runtime fingerprint
     weight_fingerprint: String,
+    ref_store: std::sync::Arc<ReferenceColdStore>,
     writer_tx: Option<Sender<WriteJob>>,
     writer_handle: Option<JoinHandle<()>>,
 }
 
+/// Pre-serialized persist work handed to the background writer.
+///
+/// Q3 constraint: `MlxArray` -> raw bytes is thread-affine under Metal, so
+/// only already-serialized `Vec<u8>` plus identity inputs may cross threads.
 struct WriteJob {
-    content_hash: String,
-    header_bytes: Vec<u8>,
+    model_id: String,
+    template_sig: String,
+    covered_tokens: Vec<i32>,
+    prompt_len: usize,
+    layout_fingerprint: [u8; 32],
     layer_bytes: Vec<Vec<u8>>,
-    base_dir: PathBuf,
 }
 
 impl ColdStore {
@@ -494,10 +1018,24 @@ impl ColdStore {
 
     pub fn with_base_dir(base_dir: PathBuf, model_path: &str) -> Self {
         let weight_fingerprint = compute_weight_fingerprint(model_path);
-        let (tx, handle) = spawn_writer();
+        // Known scope gap: the runtime manifest currently captures only weight
+        // identity (model path + safetensors bytes). Backend-dtype policy and
+        // MLX/Metal build identity are NOT yet folded in. Mode + kvarn layout
+        // ARE covered: layout_fingerprint is folded into the v3 identity hash,
+        // so a mode mismatch already fails to match.
+        // TODO(fuller-manifest): extend the manifest with backend dtype policy
+        // and MLX build identity.
+        let runtime_fingerprint =
+            runtime_fingerprint_from_manifest(weight_fingerprint.as_bytes());
+        let ref_store = std::sync::Arc::new(ReferenceColdStore::new(
+            base_dir.clone(),
+            runtime_fingerprint,
+        ));
+        let (tx, handle) = spawn_writer(std::sync::Arc::clone(&ref_store));
         ColdStore {
             base_dir,
             weight_fingerprint,
+            ref_store,
             writer_tx: Some(tx),
             writer_handle: Some(handle),
         }
@@ -539,161 +1077,62 @@ impl ColdStore {
             });
         }
         let tokens = &tokens[..cache_covered_len];
-        let content_hash = compute_content_hash(model_id, template_sig, tokens);
 
-        let header = SessionHeader {
-            format_version: FORMAT_VERSION,
-            content_hash: content_hash.clone(),
-            weight_fingerprint: self.weight_fingerprint.clone(),
-            model_id: model_id.to_string(),
-            template_sig: template_sig.to_string(),
-            layer_count: cache_set.caches.len() as u32,
-            prompt_len: cache_set.prompt_len.min(cache_covered_len),
-            current_offset: cache_set.seq_len(),
-            timestamp_secs: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            tokens: tokens.to_vec(),
-        };
-
-        let mut header_bytes = Vec::new();
-        write_header(&mut header_bytes, &header)?;
-
-        let mut layer_bytes = Vec::with_capacity(cache_set.caches.len());
-
-        // Batch-evaluate all arrays across all layers before writing.
-        // This forces a single GPU→CPU synchronization instead of one per
-        // array per layer (600 sync calls for k8v4 with 60 layers).
-        let mut all_ptrs: Vec<*const MlxArray> = Vec::new();
-        for cache in &cache_set.caches {
-            collect_array_ptrs(cache, &mut all_ptrs);
-        }
-        if !all_ptrs.is_empty() {
-            unsafe { ffi::eval_all(&all_ptrs); }
-        }
-
-        for cache in &cache_set.caches {
-            let mut buf = Vec::new();
-            write_kv_cache(&mut buf, cache)?;
-            layer_bytes.push(buf);
-        }
+        // Q3 constraint: MlxArray -> raw bytes is thread-affine under Metal.
+        // Serialize every layer (and hash the layout) ON THIS (inference)
+        // thread; only Vec<u8> crosses to the background writer.
+        // serialize_cache_set_layers batch-evaluates all arrays first (single
+        // GPU→CPU sync instead of one per array per layer).
+        let layout_fingerprint = reference::layout_fingerprint(cache_set);
+        let layer_bytes = reference::serialize_cache_set_layers(cache_set)?;
 
         tx.send(WriteJob {
-            content_hash,
-            header_bytes,
+            model_id: model_id.to_string(),
+            template_sig: template_sig.to_string(),
+            covered_tokens: tokens.to_vec(),
+            prompt_len: cache_set.prompt_len.min(cache_covered_len),
+            layout_fingerprint,
             layer_bytes,
-            base_dir: self.base_dir.clone(),
         })
         .map_err(|_| ColdStoreError::WorkerDied)
     }
 
     /// Load the best matching cache for a given token prefix.
     ///
-    /// Scans all stored entries and returns the one with the longest
-    /// matching prefix. The weight fingerprint is validated before returning.
+    /// Delegates to the v3 [`ReferenceColdStore::load_prefix`]: only fully
+    /// COMMITTED generations are visible, every layer is length- and
+    /// SHA-256-checked, `validate_consistency` runs pre-FFI, and the runtime
+    /// fingerprint (weight identity) is validated before any candidate is
+    /// eligible. Returns the longest committed matching prefix.
     pub fn load_prefix(
         &self,
         model_id: &str,
         template_sig: &str,
         tokens: &[i32],
     ) -> Result<(DetachedCacheSet, usize), ColdStoreError> {
-        if !self.base_dir.exists() {
-            return Err(ColdStoreError::NoMatch);
-        }
-
-        let mut best: Option<(SessionHeader, String)> = None;
-        let mut best_match_len = 0usize;
-
-        for entry in fs::read_dir(&self.base_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let dir_name = entry.file_name();
-            let header_path = entry.path().join("header.bin");
-            if !header_path.exists() {
-                continue;
-            }
-
-            // Read header to check for prefix match.
-            let header = match File::open(&header_path) {
-                Ok(f) => {
-                    let mut reader = BufReader::new(f);
-                    match read_header(&mut reader) {
-                        Ok(h) => h,
-                        Err(_) => continue, // Skip corrupt entries.
-                    }
-                }
-                Err(_) => continue,
-            };
-
-            // Must match model and template.
-            if header.model_id != model_id || header.template_sig != template_sig {
-                continue;
-            }
-
-            // Find longest common prefix between stored tokens and request tokens.
-            let match_len = header
-                .tokens
-                .iter()
-                .zip(tokens.iter())
-                .take_while(|(a, b)| a == b)
-                .count();
-
-            if match_len > best_match_len {
-                best_match_len = match_len;
-                best = Some((header, dir_name.to_string_lossy().to_string()));
-            }
-        }
-
-        let (header, dir_name) = best.ok_or(ColdStoreError::NoMatch)?;
-
-        // Weight-fingerprint guard.
-        if header.weight_fingerprint != self.weight_fingerprint {
-            return Err(ColdStoreError::WeightMismatch {
-                stored: header.weight_fingerprint,
-                current: self.weight_fingerprint.clone(),
-            });
-        }
-
-        // Load layers.
-        let session_dir = self.base_dir.join(&dir_name);
-        let mut caches = Vec::with_capacity(header.layer_count as usize);
-        for i in 0..header.layer_count {
-            let layer_path = session_dir.join(format!("layer_{i}.bin"));
-            let mut f = BufReader::new(File::open(&layer_path)?);
-            caches.push(read_kv_cache(&mut f, i as usize)?);
-        }
-
-        Ok((
-            DetachedCacheSet {
-                caches,
-                backend: super::SequenceStateBackend::DenseKvCache,
-                prompt_len: header.prompt_len,
-                current_offset: header.current_offset,
-                created_at: std::time::Instant::now(),
-                detached_at: std::time::Instant::now(),
-                origin_seq_id: super::SequenceId(0),
-            },
-            best_match_len,
-        ))
+        self.ref_store.load_prefix(model_id, template_sig, tokens)
     }
 
-    /// Invalidate a specific cache entry by content hash.
-    pub fn invalidate(&self, content_hash: &str) -> Result<(), ColdStoreError> {
-        let session_dir = self.base_dir.join(content_hash);
-        if session_dir.exists() {
-            fs::remove_dir_all(&session_dir)?;
+    /// Invalidate a specific cache entry by v3 identity hash (the directory
+    /// name under `<base_dir>/cold-storage-v3/`, as returned by
+    /// [`ColdStore::list_entries`]). Removes every generation of that identity.
+    // TODO(v3-admin): richer admin surface (per-generation invalidation, GC).
+    pub fn invalidate(&self, identity_hex: &str) -> Result<(), ColdStoreError> {
+        let identity_dir = self.ref_store.root_dir().join(identity_hex);
+        if identity_dir.exists() {
+            fs::remove_dir_all(&identity_dir)?;
         }
         Ok(())
     }
 
-    /// List all stored content hashes.
+    /// List all stored v3 identity hashes (directory names under
+    /// `<base_dir>/cold-storage-v3/`).
+    // TODO(v3-admin): expose committed-generation detail, not just identities.
     pub fn list_entries(&self) -> Result<Vec<String>, ColdStoreError> {
         let mut entries = Vec::new();
-        if self.base_dir.exists() {
-            for entry in fs::read_dir(&self.base_dir)? {
+        let root = self.ref_store.root_dir();
+        if root.exists() {
+            for entry in fs::read_dir(&root)? {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
                     if let Some(name) = entry.file_name().to_str() {
@@ -727,47 +1166,43 @@ impl Drop for ColdStore {
 // Background writer
 // ---------------------------------------------------------------------------
 
-fn spawn_writer() -> (Sender<WriteJob>, JoinHandle<()>) {
+fn spawn_writer(
+    ref_store: std::sync::Arc<ReferenceColdStore>,
+) -> (Sender<WriteJob>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<WriteJob>();
     let handle = thread::spawn(move || {
         while let Ok(job) = rx.recv() {
-            if let Err(e) = write_job_to_disk(&job) {
-                tracing::error!(
-                    content_hash = job.content_hash,
-                    error = %e,
-                    "cold-store: failed to write entry"
-                );
+            // The job carries PRE-SERIALIZED bytes (Q3: serialization stayed
+            // on the inference thread); publication here is pure I/O with
+            // per-layer checksums and an atomic COMMITTED marker.
+            match ref_store.persist_serialized(
+                &job.model_id,
+                &job.template_sig,
+                &job.covered_tokens,
+                job.prompt_len,
+                job.layout_fingerprint,
+                &job.layer_bytes,
+            ) {
+                Ok(snapshot) => {
+                    tracing::info!(
+                        identity = %snapshot.identity_hex,
+                        generation = %snapshot.generation,
+                        layers = job.layer_bytes.len(),
+                        "cold-store: entry persisted"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        model_id = %job.model_id,
+                        covered_tokens = job.covered_tokens.len(),
+                        error = %e,
+                        "cold-store: failed to write entry"
+                    );
+                }
             }
         }
     });
     (tx, handle)
-}
-
-fn write_job_to_disk(job: &WriteJob) -> Result<(), ColdStoreError> {
-    let session_dir = job.base_dir.join(&job.content_hash);
-    fs::create_dir_all(&session_dir)?;
-
-    let header_path = session_dir.join("header.bin");
-    {
-        let mut f = BufWriter::new(File::create(&header_path)?);
-        f.write_all(&job.header_bytes)?;
-        f.flush()?;
-    }
-
-    for (i, layer_data) in job.layer_bytes.iter().enumerate() {
-        let layer_path = session_dir.join(format!("layer_{i}.bin"));
-        let mut f = BufWriter::new(File::create(&layer_path)?);
-        f.write_all(layer_data)?;
-        f.flush()?;
-    }
-
-    tracing::info!(
-        content_hash = job.content_hash,
-        layers = job.layer_bytes.len(),
-        "cold-store: entry persisted"
-    );
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -784,11 +1219,13 @@ fn default_base_dir() -> PathBuf {
     PathBuf::from("/tmp/mlxcel/cold-storage")
 }
 
+#[allow(dead_code)] // v2 header helper; kept for the retained v2 tests
 fn write_string(w: &mut impl Write, s: &str) -> io::Result<()> {
     w.write_all(&(s.len() as u32).to_le_bytes())?;
     w.write_all(s.as_bytes())
 }
 
+#[allow(dead_code)] // v2 header helper; kept for the retained v2 tests
 fn read_string(r: &mut impl Read) -> io::Result<String> {
     let len = read_u32(r)? as usize;
     let mut buf = vec![0u8; len];
@@ -818,6 +1255,26 @@ fn read_u64(r: &mut impl Read) -> io::Result<u64> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
+}
+
+/// Bound an untrusted length field read from disk. Mirrors the reference's
+/// `bounded_usize` (cold_store_reference.rs:763). Returns an InvalidData
+/// `Io` error so the header-scan `Err(_) => continue` guard skips the entry.
+#[allow(dead_code)] // v2 header helper; kept for the retained v2 tests
+fn bounded_usize(value: u64, maximum: usize, field: &str) -> Result<usize, ColdStoreError> {
+    let value = usize::try_from(value).map_err(|_| {
+        ColdStoreError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} does not fit usize"),
+        ))
+    })?;
+    if value > maximum {
+        return Err(ColdStoreError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} {value} exceeds limit {maximum}"),
+        )));
+    }
+    Ok(value)
 }
 
 fn validate_array_metadata(
@@ -1067,6 +1524,279 @@ mod tests {
         }
     }
 
+    // ===================== Sharpened KV concurrency probe (Q3 gate) =====================
+    // Author: Clement (clement-7074f29f). Review: Xander (dev/MLX) + Violet (QE), K=2 decorrelated.
+    // Design: DESIGN_sharpened_concurrency_probe_20260723.md (6 revisions, both sign-offs).
+    // Reader models the off-thread serializer: runs the REAL write_kv_cache over a NON-CONTIGUOUS set
+    // (transpose forces contiguous()+eval() = real Metal work, not a trivial memcpy). Evaluator models
+    // live inference: own generation stream + heavy/varied alloc churn (saturates the shared thread pool).
+    // TWO axes, each with a validity control: correctness (byte-compare; negative control proves teeth) and
+    // latency decoupling (evaluator per-iter latency with/without writer; sensitivity control proves the
+    // instrument can see a stall). Output tagged "PROBE". A green is only trusted if its control fired.
+    struct SharedSet(DetachedCacheSet);
+    // SAFETY: evidence for a future ownership design ONLY — NOT a claim MLX ops are Send+Sync. The set is
+    // immutable and read-only across threads; the reader serializes it, never mutates it.
+    unsafe impl Send for SharedSet {}
+    unsafe impl Sync for SharedSet {}
+
+    fn probe_serialize_set(set: &DetachedCacheSet) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for c in &set.caches {
+            write_kv_cache(&mut buf, c).expect("write_kv_cache");
+        }
+        buf
+    }
+
+    // Xander adjudication (SIGTRAP): cross-thread contiguous()+eval() is unsafe under Metal. The transposed
+    // (lazy, non-contiguous) S made the reader do cross-thread graph construction+eval → crash. The SAFE
+    // off-thread path is memcpy of PRE-MATERIALIZED CONTIGUOUS arrays — eval on the inference thread first
+    // (what eval_all already does), then the writer memcpy+disk-writes off-thread. This builder materializes
+    // S on the MAIN thread so the reader's array_to_raw_bytes is a pure memcpy (no cross-thread eval).
+    fn probe_make_materialized_set(num_layers: usize, seq_len: i32, head_dim: i32) -> DetachedCacheSet {
+        let set = make_test_cache_set(num_layers, seq_len, head_dim); // contiguous fp16 (astype), no transpose
+        for c in &set.caches {
+            if let Some(k) = &c.keys {
+                ffi::eval(k); // materialize on the main (origin) thread
+            }
+            if let Some(v) = &c.values {
+                ffi::eval(v);
+            }
+        }
+        set
+    }
+
+    // Evaluator (inference-proxy): own generation stream + heavy varied churn; returns wall time.
+    fn probe_evaluator_work(iters: usize) -> std::time::Duration {
+        if let Some(s) = crate::streams::new_thread_local_generation_stream() {
+            crate::streams::install_thread_local_default_stream(Some(&s));
+        }
+        let start = std::time::Instant::now();
+        for i in 0..iters {
+            let sz = 128 + ((i % 8) as i32) * 64; // varied alloc sizes → stress the global allocator + pool
+            let t = synth_tensor(&[sz, sz], 4242 + i as u32);
+            let a = ffi::astype(&t, dtype::FLOAT16);
+            let b = ffi::transpose(&a);
+            let c = ffi::reshape(&b, &[sz, sz]); // reshape of a transposed view forces a real contiguous copy
+            ffi::eval(&c); // eval is synchronous → wall time captures GPU work (per CLAUDE.md timing note)
+        }
+        start.elapsed()
+    }
+
+    // Run `readers` serializer threads + 1 evaluator concurrently, watchdog-bounded.
+    // Returns (all_readers_ok, hang, evaluator_latency).
+    fn probe_run(
+        shared: std::sync::Arc<SharedSet>,
+        expected: std::sync::Arc<Vec<u8>>,
+        iters: usize,
+        readers: usize,
+        isolate_reader_stream: bool,
+        watchdog: std::time::Duration,
+    ) -> (bool, bool, std::time::Duration) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(&'static str, bool)>();
+        for _ in 0..readers {
+            let shared = shared.clone();
+            let expected = expected.clone();
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                if isolate_reader_stream {
+                    if let Some(s) = crate::streams::new_thread_local_generation_stream() {
+                        crate::streams::install_thread_local_default_stream(Some(&s));
+                    }
+                }
+                let mut ok = true;
+                for _ in 0..iters {
+                    if probe_serialize_set(&shared.0) != *expected {
+                        ok = false;
+                        break;
+                    }
+                }
+                let _ = done_tx.send(("reader", ok));
+            });
+        }
+        let (lat_tx, lat_rx) = std::sync::mpsc::channel();
+        {
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                let elapsed = probe_evaluator_work(iters);
+                let _ = lat_tx.send(elapsed);
+                let _ = done_tx.send(("eval", true));
+            });
+        }
+        drop(done_tx);
+        let expected_msgs = readers + 1;
+        let mut got = 0usize;
+        let mut readers_ok = true;
+        let deadline = std::time::Instant::now() + watchdog;
+        while got < expected_msgs {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match done_rx.recv_timeout(remaining) {
+                Ok((who, ok)) => {
+                    got += 1;
+                    if who == "reader" && !ok {
+                        readers_ok = false;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let hang = got < expected_msgs;
+        let latency = lat_rx.try_recv().unwrap_or(watchdog);
+        (readers_ok, hang, latency)
+    }
+
+    // Q3 concurrency-gate probe (Clement, cycle 94): DELIBERATELY crashes the
+    // process (SIGTRAP) to demonstrate that off-thread serialization of
+    // Metal-resident MlxArrays is thread-affine and unsafe. The verdict is
+    // settled; this stays as a manually-runnable artifact (`--ignored`) and is
+    // #[ignore]'d so it never aborts the default test suite.
+    #[ignore = "Q3 thread-affinity probe: intentionally SIGTRAPs; run with --ignored"]
+    #[test]
+    fn sharpened_kv_concurrency_probe() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let iters = 100usize;
+        let watchdog = Duration::from_secs(60);
+
+        // Pre-materialized-contiguous S (Xander fix): reader = pure memcpy, no cross-thread eval.
+        // (The lazy/non-contiguous S variant SIGTRAPs — recorded separately as the cross-thread-eval finding.)
+        println!("PROBE variant=materialized-contiguous (reader does memcpy, no cross-thread eval)");
+        let set = probe_make_materialized_set(8, 128, 64);
+        let expected = Arc::new(probe_serialize_set(&set));
+        let shared = Arc::new(SharedSet(set));
+        assert!(!expected.is_empty(), "PROBE: ground truth serialization empty");
+        println!("PROBE ground-truth-bytes={}", expected.len());
+
+        // AXIS-1 NEGATIVE CONTROL: a corrupted buffer MUST compare unequal → byte-compare has teeth.
+        let mut corrupt = (*expected).clone();
+        corrupt[expected.len() / 2] ^= 0xFF;
+        let neg_fires = corrupt != *expected;
+        println!("PROBE axis1-negative-control-fired={}", neg_fires);
+        assert!(neg_fires, "PROBE: negative control did NOT fire — byte-compare invalid");
+
+        // BASELINE: evaluator alone (no writer).
+        let baseline = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(probe_evaluator_work(iters));
+            });
+            rx.recv().unwrap()
+        };
+        println!("PROBE baseline-eval-ms={}", baseline.as_millis());
+
+        // READER-ALONE (Violet's discriminator): reader memcpy-serializes materialized S on an isolated
+        // stream, NO concurrent evaluator. PASS -> the crash needs concurrent eval (Xander's scheduler
+        // mechanism = real limit). CRASH -> cross-thread sharing/access itself faults (probe artifact).
+        {
+            let shared_ra = shared.clone();
+            let expected_ra = expected.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                // DECISIVE STREAM-INSTALL VERIFICATION (Xander's fix):
+                // The prior form silently no-op'd if new_thread_local_generation_stream()
+                // returned None — leaving the reader thread WITHOUT a Metal stream AND
+                // without an armed teardown finalizer (see streams.rs:191-247). In that
+                // case a SIGSEGV cannot be attributed: it may be a real cross-thread Metal
+                // thread-affinity fault, or merely the teardown-race artifact of a thread
+                // that touched MLX with no finalizer. We remove the ambiguity: explicitly
+                // arm the finalizer, install an explicit GPU stream, and print confirmation
+                // BEFORE touching S. If we see stream-installed=true here and STILL fault
+                // during serialization -> real thread-affinity -> off-thread dead. If it
+                // now passes -> the earlier crash was a missing-context/teardown artifact
+                // -> off-thread optimization is back on the table.
+                let gpu = crate::ffi::is_gpu_available();
+                crate::streams::init_thread(); // arm teardown finalizer unconditionally
+                let installed = if let Some(s) = crate::streams::new_thread_local_generation_stream() {
+                    crate::streams::install_thread_local_default_stream(Some(&s));
+                    true
+                } else {
+                    false
+                };
+                use std::io::Write as _;
+                println!(
+                    "PROBE reader-alone is-gpu-available={} stream-installed={} finalizer-armed=true (BEFORE touching S)",
+                    gpu, installed
+                );
+                let _ = std::io::stdout().flush();
+                let mut ok = true;
+                for _ in 0..iters {
+                    if probe_serialize_set(&shared_ra.0) != *expected_ra {
+                        ok = false;
+                        break;
+                    }
+                }
+                // FLUSHED loop-completed marker: distinguishes a crash DURING serialization
+                // (real cross-thread Metal thread-affinity — this line never prints) from a
+                // crash at thread teardown (serialization survived — this line prints, then
+                // the finalizer/static-destructor path faults). Block-buffered file stdout
+                // makes the flush mandatory: without it, absence of this line is uninformative.
+                println!(
+                    "PROBE reader-alone loop-completed ok={} (serialization SURVIVED; any crash after this is teardown, not thread-affinity)",
+                    ok
+                );
+                let _ = std::io::stdout().flush();
+                let _ = tx.send(ok);
+            });
+            match rx.recv_timeout(watchdog) {
+                Ok(ok) => println!("PROBE reader-alone-materialized ok={} (no concurrent evaluator)", ok),
+                Err(_) => println!("PROBE reader-alone-materialized HANG"),
+            }
+        }
+
+        // VARIANT B — isolated streams (the production question).
+        let (b_ok, b_hang, b_lat) =
+            probe_run(shared.clone(), expected.clone(), iters, 1, true, watchdog);
+        println!(
+            "PROBE variantB-isolated ok={} hang={} eval-ms={}",
+            b_ok, b_hang, b_lat.as_millis()
+        );
+
+        // VARIANT A — same default stream (CONTROL: null hyp says this is the stressed path).
+        let (a_ok, a_hang, a_lat) =
+            probe_run(shared.clone(), expected.clone(), iters, 1, false, watchdog);
+        println!(
+            "PROBE variantA-samestream ok={} hang={} eval-ms={}",
+            a_ok, a_hang, a_lat.as_millis()
+        );
+
+        // AXIS-2 SENSITIVITY CONTROL: forced heavy contention (4 same-stream readers) MUST spike
+        // evaluator latency vs baseline, or the latency instrument is too coarse to trust a flat result.
+        let (_f_ok, _f_hang, f_lat) =
+            probe_run(shared.clone(), expected.clone(), iters, 4, false, watchdog);
+        let spiked = f_lat.as_millis() > baseline.as_millis() * 3 / 2;
+        println!(
+            "PROBE axis2-sensitivity forced-ms={} baseline-ms={} spiked={}",
+            f_lat.as_millis(), baseline.as_millis(), spiked
+        );
+
+        // TWO-AXIS VERDICT + RED-origin attribution.
+        let correctness = b_ok && !b_hang;
+        let latency_flat = (b_lat.as_millis() as f64) < (baseline.as_millis() as f64) * 1.5;
+        let verdict = if !correctness {
+            "OFF-THREAD-OUT (fallback: serialize-on-inference-thread)"
+        } else if latency_flat {
+            "OPTIMIZATION-VIABLE (off-thread decouples)"
+        } else {
+            "CORRECT-BUT-STALLS -> compaction-boundary sync (clean landing)"
+        };
+        println!(
+            "PROBE VERDICT correctness={} latency-flat={} => {}",
+            correctness, latency_flat, verdict
+        );
+        if b_hang {
+            println!("PROBE RED-origin=HANG (scheduler-completion)");
+        } else if !b_ok {
+            println!("PROBE RED-origin=MISMATCH (corruption)");
+        } else if !latency_flat {
+            println!("PROBE RED-origin=LATENCY-only (contention)");
+        }
+        // Construct-validity guard: the sensitivity control must be able to show a stall, else a flat
+        // axis-2 means "couldn't measure one," not "no contention." Report, don't hard-fail (Metal-dependent).
+        println!("PROBE construct-validity sensitivity-control-usable={}", spiked || !latency_flat);
+    }
+
     #[test]
     fn cold_store_persist_load_exact_match() {
         let dir = tempfile::tempdir().unwrap();
@@ -1105,6 +1835,56 @@ mod tests {
         assert_eq!(match_len, 5);
         assert_eq!(loaded.seq_len(), 5);
         assert_eq!(loaded.current_offset, 5);
+    }
+
+    #[test]
+    fn production_coldstore_v3_roundtrip_persists_and_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model");
+        fs::create_dir_all(&model_path).unwrap();
+        let base = dir.path().join("cs");
+        let mut cs = ColdStore::with_base_dir(base.clone(), model_path.to_str().unwrap());
+
+        let tokens = vec![11, 22, 33, 44, 55];
+        let original = make_test_cache_set(2, 5, 32);
+        cs.persist("m3", "tmpl", &tokens, &original).unwrap();
+
+        // The writer is async; shutdown() drops the channel and JOINS the
+        // writer thread, so the COMMITTED marker is durably published before
+        // any load is attempted (no sleep/polling race).
+        cs.shutdown();
+
+        // The entry landed in the v3 layout with an atomic COMMITTED marker.
+        let root = base.join("cold-storage-v3");
+        let identity_dirs: Vec<_> = fs::read_dir(&root)
+            .expect("v3 root exists")
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(identity_dirs.len(), 1, "one identity expected");
+        let generation_dirs: Vec<_> = fs::read_dir(&identity_dirs[0])
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(generation_dirs.len(), 1, "one generation expected");
+        assert!(
+            generation_dirs[0].join("COMMITTED").is_file(),
+            "generation must be atomically committed"
+        );
+
+        // Verified load through the production API on the same store.
+        let (loaded, matched) = cs.load_prefix("m3", "tmpl", &tokens).unwrap();
+        assert_eq!(matched, 5);
+        assert_eq!(loaded.seq_len(), 5);
+        assert_eq!(loaded.caches.len(), 2);
+
+        // A FRESH ColdStore over the same base_dir (same model weights ->
+        // same runtime fingerprint) also loads it: on-disk durability +
+        // checksum-verified restore through the production API.
+        let cs2 = ColdStore::with_base_dir(base, model_path.to_str().unwrap());
+        let (reloaded, rematched) = cs2.load_prefix("m3", "tmpl", &tokens).unwrap();
+        assert_eq!(rematched, 5);
+        assert_eq!(reloaded.seq_len(), 5);
+        assert_eq!(reloaded.caches.len(), 2);
     }
 
     #[test]
@@ -1459,5 +2239,242 @@ mod tests {
         write_kv_cache(&mut reencoded, &restored).unwrap();
 
         assert_eq!(reencoded, encoded);
+    }
+
+    // ================= issue-6: post-read validation (regression tests) =================
+    // Contract per test: the SAME fixture that passes green is mutated one
+    // field at a time; each mutation must produce Err(CorruptLayer) from a
+    // plain call — red-on-bug-present, green-on-bug-absent, and never a panic.
+
+    fn kvarn_fixture(v_bits: u8) -> DetachedKVCache {
+        // Same construction as kvarn4_cache_serialization_round_trip_is_bit_exact:
+        // b=1, h=1, d=32, total=300 → sink 128 + hist 128 (1 tile) + tail 44.
+        let mut live = super::super::KVCache::synth_kvarn_state(1, 1, 32, 300, 16, 7, v_bits);
+        live.clone_handle()
+    }
+
+    fn fp16_fixture() -> DetachedKVCache {
+        make_test_cache_set(1, 5, 32).caches.remove(0)
+    }
+
+    /// Serialize + deserialize so the mutation provably survives the on-disk
+    /// positional format (read_kv_cache accepts it) and is caught only by
+    /// validate_consistency.
+    fn roundtrip(cache: &DetachedKVCache) -> DetachedKVCache {
+        let mut buf = Vec::new();
+        write_kv_cache(&mut buf, cache).unwrap();
+        read_kv_cache(&mut io::Cursor::new(&buf), 0).unwrap()
+    }
+
+    fn assert_corrupt(result: Result<(), ColdStoreError>, what: &str) {
+        assert!(
+            matches!(result, Err(ColdStoreError::CorruptLayer { .. })),
+            "{what}: expected Err(CorruptLayer), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_consistency_accepts_healthy_fixtures() {
+        // Green control: without it every red test below could be red for
+        // the wrong reason (a validator that rejects everything).
+        validate_consistency(&fp16_fixture(), 0).expect("healthy fp16");
+        validate_consistency(&roundtrip(&fp16_fixture()), 0).expect("healthy fp16 roundtrip");
+        validate_consistency(&kvarn_fixture(8), 0).expect("healthy k8v8");
+        validate_consistency(&kvarn_fixture(4), 0).expect("healthy k8v4");
+        validate_consistency(&roundtrip(&kvarn_fixture(4)), 0).expect("healthy k8v4 roundtrip");
+    }
+
+    #[test]
+    fn validate_rejects_bad_v_bits_after_disk_roundtrip() {
+        // The cache.rs:1522 panic class: a single flipped v_bits byte.
+        for bad in [0u8, 5, 255] {
+            let mut c = kvarn_fixture(4);
+            c.kvarn_v_bits = bad;
+            let restored = roundtrip(&c); // read_kv_cache accepts it unvalidated
+            assert_corrupt(
+                validate_consistency(&restored, 3),
+                &format!("v_bits={bad}"),
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_wrong_rank_tensor() {
+        // The cxx std::terminate class: rank-2 tensor reaching ffi::slice.
+        let mut c = fp16_fixture();
+        c.keys = Some(ffi::astype(&synth_tensor(&[5, 32], 11), dtype::FLOAT16));
+        assert_corrupt(validate_consistency(&roundtrip(&c), 0), "rank-2 keys");
+
+        let mut c = kvarn_fixture(8);
+        c.kvarn_sink_k = Some(ffi::astype(&synth_tensor(&[128, 32], 12), dtype::FLOAT16));
+        assert_corrupt(validate_consistency(&c, 0), "rank-2 kvarn_sink_k");
+    }
+
+    #[test]
+    fn validate_rejects_offset_window_sum_mismatch() {
+        // offset != sink + hist + tail (300 = 128 + 128 + 44 in the fixture).
+        let mut c = kvarn_fixture(8);
+        c.offset += 1;
+        assert_corrupt(validate_consistency(&roundtrip(&c), 0), "offset+1");
+
+        let mut c = kvarn_fixture(4);
+        c.offset = 172; // drops exactly the hist tile from the sum
+        assert_corrupt(validate_consistency(&c, 0), "offset shrunk past hist");
+
+        let mut c = fp16_fixture();
+        c.offset = -1;
+        assert_corrupt(validate_consistency(&c, 0), "negative offset");
+    }
+
+    #[test]
+    fn validate_rejects_m3_idx_offset_mismatch() {
+        // The cycle-79 desync class: m3_idx_offset != m3_idx_k seq length.
+        let mut c = kvarn_fixture(8);
+        assert!(c.m3_idx_k.is_some(), "fixture must carry m3 state");
+        c.m3_idx_offset -= 1;
+        assert_corrupt(validate_consistency(&roundtrip(&c), 0), "m3 desync");
+    }
+
+    #[test]
+    fn validate_rejects_missing_mode_sidecars() {
+        // KVarN8 v8: assemble unwraps these (cache.rs:1408-1412).
+        let mut c = kvarn_fixture(8);
+        c.kvarn_v_scale = None;
+        assert_corrupt(validate_consistency(&roundtrip(&c), 0), "v8 missing v_scale");
+
+        let mut c = kvarn_fixture(8);
+        c.kvarn_k_s_row = None;
+        assert_corrupt(validate_consistency(&c, 0), "missing k_s_row");
+
+        let mut c = kvarn_fixture(8);
+        c.kvarn_sink_k = None;
+        c.kvarn_sink_v = None;
+        assert_corrupt(validate_consistency(&c, 0), "missing sink with offset>0");
+
+        // Fp16: fetch requires both K and V.
+        let mut c = fp16_fixture();
+        c.values = None;
+        assert_corrupt(validate_consistency(&c, 0), "fp16 missing values");
+
+        // Int8: scales are mandatory for dequantization.
+        let mut c = fp16_fixture();
+        c.mode = KVCacheMode::Int8; // keys/values present, scales absent
+        assert_corrupt(validate_consistency(&roundtrip(&c), 0), "int8 missing scales");
+    }
+
+    #[test]
+    fn validate_rejects_v4_fold_violation() {
+        // v4 contract: kvarn_v_s_row MUST be None (the fold IS its storage).
+        let mut c = kvarn_fixture(4);
+        assert!(c.kvarn_v_s_row.is_none(), "fixture contract");
+        c.kvarn_v_s_row = Some(synth_tensor(&[1, 1, 128, 1], 13));
+        assert_corrupt(validate_consistency(&roundtrip(&c), 0), "v4 s_row present");
+    }
+
+    #[test]
+    fn validate_rejects_param_lockstep_mismatch() {
+        // scale dim2 out of lockstep with hist dim2 (128 in the fixture).
+        let mut c = kvarn_fixture(8);
+        c.kvarn_v_scale = Some(synth_tensor(&[1, 1, 64, 1], 14));
+        assert_corrupt(validate_consistency(&c, 0), "v_scale dim2 != hist dim2");
+
+        // s_col dim2 != n_tiles (1 in the fixture).
+        let mut c = kvarn_fixture(8);
+        c.kvarn_v_s_col = Some(synth_tensor(&[1, 1, 2, 32], 15));
+        assert_corrupt(validate_consistency(&c, 0), "s_col dim2 != n_tiles");
+
+        // v4: folded params dim3 != d/gs (32/32 = 1 in the fixture).
+        let mut c = kvarn_fixture(4);
+        c.kvarn_v_zp = Some(synth_tensor(&[1, 1, 128, 4], 16));
+        assert_corrupt(validate_consistency(&c, 0), "v4 zp dim3 != d/gs");
+    }
+
+    #[test]
+    fn validate_rejects_unaligned_history() {
+        // hist dim2 must be a positive multiple of KVARN_TILE_TOKENS (128).
+        let mut c = kvarn_fixture(8);
+        c.kvarn_hist_k = Some(ffi::astype(
+            &synth_tensor(&[1, 1, 100, 32], 17),
+            dtype::UINT8,
+        ));
+        assert_corrupt(validate_consistency(&c, 0), "hist not tile-aligned");
+    }
+
+    #[test]
+    fn validate_rejects_capacity_below_offset() {
+        // Fp16 keys capacity (seq axis) below the logical offset ⇒ the
+        // downstream fetch slice would read out of bounds → MLX abort.
+        let mut c = fp16_fixture(); // keys seq capacity == 5
+        c.offset = 6;
+        assert_corrupt(validate_consistency(&roundtrip(&c), 0), "capacity < offset");
+    }
+
+    #[test]
+    fn validate_rejects_kvarn_state_under_wrong_mode() {
+        // Mode byte and tensor table disagree — never guess which lies.
+        let mut c = fp16_fixture();
+        c.kvarn_sink_k = Some(ffi::astype(&synth_tensor(&[1, 2, 5, 32], 18), dtype::FLOAT16));
+        assert_corrupt(validate_consistency(&c, 0), "kvarn droppings on fp16");
+    }
+
+    #[test]
+    fn read_header_bounds_token_count_without_panicking() {
+        let hdr = SessionHeader {
+            format_version: FORMAT_VERSION,
+            content_hash: "abc".to_string(),
+            weight_fingerprint: "def".to_string(),
+            model_id: "m3".to_string(),
+            template_sig: "tmpl".to_string(),
+            layer_count: 2,
+            prompt_len: 0,
+            current_offset: 0,
+            timestamp_secs: 0,
+            tokens: vec![], // token count is the final 8 bytes of the header
+        };
+        let mut buf = Vec::new();
+        write_header(&mut buf, &hdr).unwrap();
+
+        // Hostile count: previously `vec![0i32; u64::MAX as usize]` — an
+        // allocation abort that Err=>continue in the scan loop cannot catch,
+        // so ONE corrupt header killed every subsequent restore scan.
+        for hostile in [u64::MAX, (MAX_HEADER_TOKENS as u64) + 1] {
+            let mut corrupt = buf.clone();
+            let n = corrupt.len();
+            corrupt[n - 8..].copy_from_slice(&hostile.to_le_bytes());
+            let result = read_header(&mut &corrupt[..]); // plain call: must NOT panic/abort
+            assert!(
+                result.is_err(),
+                "token_count={hostile}: expected Err, got Ok"
+            );
+        }
+    }
+
+    #[test]
+    fn read_header_bounds_layer_count_and_prompt_len() {
+        let base = |layer_count: u32, prompt_len: usize| SessionHeader {
+            format_version: FORMAT_VERSION,
+            content_hash: "abc".to_string(),
+            weight_fingerprint: "def".to_string(),
+            model_id: "m3".to_string(),
+            template_sig: "tmpl".to_string(),
+            layer_count,
+            prompt_len,
+            current_offset: 3,
+            timestamp_secs: 0,
+            tokens: vec![1, 2, 3],
+        };
+
+        let mut buf = Vec::new();
+        write_header(&mut buf, &base((MAX_HEADER_LAYERS as u32) + 1, 3)).unwrap();
+        assert!(read_header(&mut &buf[..]).is_err(), "layer_count over limit");
+
+        let mut buf = Vec::new();
+        write_header(&mut buf, &base(2, usize::MAX)).unwrap();
+        assert!(read_header(&mut &buf[..]).is_err(), "prompt_len over limit");
+
+        // Bounds must not reject healthy headers (regression guard for the fix).
+        let mut buf = Vec::new();
+        write_header(&mut buf, &base(2, 3)).unwrap();
+        assert!(read_header(&mut &buf[..]).is_ok(), "healthy header rejected");
     }
 }

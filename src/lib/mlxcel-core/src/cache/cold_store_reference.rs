@@ -1,8 +1,12 @@
-//! Construction-gated synchronous v3 cold-store reference implementation.
+//! Synchronous v3 cold-store implementation: the correctness oracle for
+//! fresh-process append-clean validation, and — since Gate 2 closed — the
+//! PRODUCTION persist/restore machinery behind `ColdStore`.
 //!
-//! This is the correctness oracle for fresh-process append-clean validation.
-//! It is intentionally absent from normal production builds and must not be
-//! wired into the serving scheduler's donation path.
+//! The async production `ColdStore` splits work across the Q3 thread-affinity
+//! boundary: the inference thread serializes ([`serialize_cache_set_layers`] +
+//! [`layout_fingerprint`]), and its background writer publishes via
+//! [`ReferenceColdStore::persist_serialized`]. Loads delegate to
+//! [`ReferenceColdStore::load_prefix`] (checksum-verified, COMMITTED-gated).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, Write};
@@ -104,43 +108,75 @@ impl ReferenceColdStore {
         tokens: &[i32],
         cache_set: &DetachedCacheSet,
     ) -> Result<ReferenceSnapshot, ColdStoreError> {
-        let _guard = self.persist_lock.lock().map_err(|_| {
-            ColdStoreError::Io(io::Error::other("reference cold-store persist lock poisoned"))
-        })?;
         let cache_covered_tokens = validate_cache_covered_tokens(tokens, cache_set)?;
-        let tokens = &tokens[..cache_covered_tokens];
+        let covered = &tokens[..cache_covered_tokens];
         if cache_set.caches.len() > MAX_LAYERS {
             return Err(invalid_data(format!(
                 "layer count {} exceeds limit {MAX_LAYERS}",
                 cache_set.caches.len()
             )));
         }
-
         let layout_fingerprint = layout_fingerprint(cache_set);
+        let layer_bytes = serialize_cache_set_layers(cache_set)?;
+        self.persist_serialized(
+            model_id,
+            template_sig,
+            covered,
+            cache_set.prompt_len,
+            layout_fingerprint,
+            &layer_bytes,
+        )
+    }
+
+    /// Publish PRE-SERIALIZED layer bytes as one immutable, per-layer-checksummed,
+    /// atomically-committed generation.
+    ///
+    /// This is the write half of the async production split: the inference thread
+    /// serializes the cache (via [`serialize_cache_set_layers`]) and computes the
+    /// [`layout_fingerprint`] — because `MlxArray` -> raw bytes is thread-affine
+    /// under Metal (see the concurrency verdict) — then a background writer thread
+    /// calls this to publish. Only `Vec<u8>` crosses the thread boundary. The
+    /// caller MUST have serialized every layer on the thread that owns the arrays
+    /// and computed `layout_fingerprint` from the same cache set.
+    pub fn persist_serialized(
+        &self,
+        model_id: &str,
+        template_sig: &str,
+        covered_tokens: &[i32],
+        prompt_len: usize,
+        layout_fingerprint: [u8; 32],
+        layer_bytes: &[Vec<u8>],
+    ) -> Result<ReferenceSnapshot, ColdStoreError> {
+        let _guard = self.persist_lock.lock().map_err(|_| {
+            ColdStoreError::Io(io::Error::other("reference cold-store persist lock poisoned"))
+        })?;
+        let cache_covered_tokens = covered_tokens.len();
+        if cache_covered_tokens == 0 || cache_covered_tokens > MAX_TOKENS {
+            return Err(invalid_data(format!(
+                "cache-covered length {cache_covered_tokens} is invalid"
+            )));
+        }
+        if layer_bytes.is_empty() || layer_bytes.len() > MAX_LAYERS {
+            return Err(invalid_data(format!(
+                "layer count {} is invalid (limit {MAX_LAYERS})",
+                layer_bytes.len()
+            )));
+        }
+
         let identity_sha256 = identity_hash(
             &self.runtime_fingerprint,
             model_id,
             template_sig,
             &layout_fingerprint,
-            tokens,
+            covered_tokens,
         );
         let identity_hex = hex_digest(&identity_sha256);
         let identity_dir = self.root_dir().join(&identity_hex);
         fs::create_dir_all(&identity_dir)?;
         let generation_dir = create_generation_dir(&identity_dir)?;
 
-        let mut all_ptrs = Vec::new();
-        for cache in &cache_set.caches {
-            collect_array_ptrs(cache, &mut all_ptrs);
-        }
-        if !all_ptrs.is_empty() {
-            unsafe { ffi::eval_all(&all_ptrs) };
-        }
-
-        let mut layers = Vec::with_capacity(cache_set.caches.len());
-        for (index, cache) in cache_set.caches.iter().enumerate() {
-            let mut bytes = Vec::new();
-            write_kv_cache(&mut bytes, cache)?;
+        let mut layers = Vec::with_capacity(layer_bytes.len());
+        for (index, bytes) in layer_bytes.iter().enumerate() {
             let byte_len = u64::try_from(bytes.len()).map_err(|_| {
                 invalid_data("serialized layer length does not fit u64".into())
             })?;
@@ -152,9 +188,9 @@ impl ReferenceColdStore {
             let metadata = LayerMetadata {
                 index: index as u32,
                 byte_len,
-                sha256: sha256(&bytes),
+                sha256: sha256(bytes),
             };
-            write_file(&generation_dir.join(layer_filename(index)), &bytes, false)?;
+            write_file(&generation_dir.join(layer_filename(index)), bytes, false)?;
             layers.push(metadata);
         }
 
@@ -164,10 +200,10 @@ impl ReferenceColdStore {
             layout_fingerprint,
             model_id: model_id.to_string(),
             template_sig: template_sig.to_string(),
-            prompt_len: cache_set.prompt_len.min(cache_covered_tokens),
+            prompt_len: prompt_len.min(cache_covered_tokens),
             cache_covered_tokens,
             timestamp_nanos: now_nanos(),
-            tokens: tokens.to_vec(),
+            tokens: covered_tokens.to_vec(),
             layers,
         };
         let header_bytes = encode_header(&header)?;
@@ -198,7 +234,7 @@ impl ReferenceColdStore {
             identity = %identity_hex,
             generation = %generation,
             layers = header.layers.len(),
-            "COLD-STORE REFERENCE WRITER persisted a generation; Gate 2 remains OPEN"
+            "COLD-STORE v3 published a committed generation"
         );
         Ok(ReferenceSnapshot {
             identity_hex,
@@ -341,6 +377,32 @@ fn validate_cache_covered_tokens(
     Ok(cache_covered_tokens)
 }
 
+/// Serialize every layer of a cache set to raw bytes ON THE CALLING THREAD.
+///
+/// `MlxArray` -> raw bytes is thread-affine under Metal (`array_to_raw_bytes`
+/// runs `contiguous()`+`eval()` on the calling thread's Metal command context),
+/// so this MUST run on the thread that owns the arrays (the inference/generation
+/// thread). The resulting per-layer `Vec<u8>` is the ONLY thing safe to hand to
+/// a background writer thread for publication via [`ReferenceColdStore::persist_serialized`].
+pub(crate) fn serialize_cache_set_layers(
+    cache_set: &DetachedCacheSet,
+) -> Result<Vec<Vec<u8>>, ColdStoreError> {
+    let mut all_ptrs = Vec::new();
+    for cache in &cache_set.caches {
+        collect_array_ptrs(cache, &mut all_ptrs);
+    }
+    if !all_ptrs.is_empty() {
+        unsafe { ffi::eval_all(&all_ptrs) };
+    }
+    let mut layer_bytes = Vec::with_capacity(cache_set.caches.len());
+    for cache in &cache_set.caches {
+        let mut bytes = Vec::new();
+        write_kv_cache(&mut bytes, cache)?;
+        layer_bytes.push(bytes);
+    }
+    Ok(layer_bytes)
+}
+
 fn load_candidate(candidate: &Candidate) -> Result<DetachedCacheSet, ColdStoreError> {
     let header = &candidate.header;
     let mut caches = Vec::with_capacity(header.layers.len());
@@ -371,6 +433,7 @@ fn load_candidate(candidate: &Candidate) -> Result<DetachedCacheSet, ColdStoreEr
         }
         let mut cursor = Cursor::new(bytes.as_slice());
         let cache = read_kv_cache(&mut cursor, expected_index)?;
+        super::validate_consistency(&cache, expected_index)?;
         if cursor.position() != actual_len as u64 {
             return Err(invalid_data(format!(
                 "layer {expected_index} contains trailing bytes"
@@ -573,7 +636,7 @@ fn identity_hash(
     hasher.finalize().into()
 }
 
-fn layout_fingerprint(cache_set: &DetachedCacheSet) -> [u8; 32] {
+pub(crate) fn layout_fingerprint(cache_set: &DetachedCacheSet) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update((cache_set.caches.len() as u64).to_le_bytes());
     for cache in &cache_set.caches {

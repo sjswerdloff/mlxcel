@@ -101,6 +101,9 @@ pub mod turbo;
 #[cfg(test)]
 #[path = "cache/turbo_tests.rs"]
 mod turbo_tests;
+#[cfg(test)]
+#[path = "cache/from_bytes_guard_tests.rs"]
+mod from_bytes_guard_tests;
 
 pub use batch_quant::{
     BatchKvQuantConfig, BatchQuantizedKVCache, BatchTurboQuantKVCache, DEFAULT_KV_GROUP_SIZE,
