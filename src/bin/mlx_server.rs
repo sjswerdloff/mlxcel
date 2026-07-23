@@ -384,6 +384,31 @@ struct ServerArgs {
     )]
     diffusion_threshold: f32,
 
+    /// Enable decoupled prefill on disconnect. When true, a client disconnect
+    /// during chunked prefill orphans the sequence instead of cancelling it.
+    #[arg(
+        long = "decouple-prefill-on-disconnect",
+        env = "MLXCEL_DECOUPLE_PREFILL_ON_DISCONNECT",
+        default_value_t = false
+    )]
+    decouple_prefill_on_disconnect: bool,
+
+    /// Minimum prompt length for orphaning on disconnect.
+    #[arg(
+        long = "decouple-prefill-min-tokens",
+        env = "MLXCEL_DECOUPLE_PREFILL_MIN_TOKENS",
+        default_value_t = 8192
+    )]
+    decouple_prefill_min_tokens: usize,
+
+    /// Maximum concurrent orphaned prefills.
+    #[arg(
+        long = "max-orphaned-prefills",
+        env = "MLXCEL_MAX_ORPHANED_PREFILLS",
+        default_value_t = 2
+    )]
+    max_orphaned_prefills: usize,
+
     /// Preemption policy: "longest-first" (default) or "lowest-priority"
     #[arg(long = "preemption-policy", default_value = "longest-first")]
     preemption_policy: String,
@@ -1385,6 +1410,9 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         max_denoising_steps: args.max_denoising_steps,
         diffusion_sampler: args.diffusion_sampler.clone(),
         diffusion_threshold: args.diffusion_threshold,
+        decouple_prefill_on_disconnect: args.decouple_prefill_on_disconnect,
+        decouple_prefill_min_tokens: args.decouple_prefill_min_tokens,
+        max_orphaned_prefills: args.max_orphaned_prefills,
     })
 }
 

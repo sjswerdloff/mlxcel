@@ -164,6 +164,9 @@ fn sample_input() -> ServerStartupInput {
         max_denoising_steps: None,
         diffusion_sampler: "entropy-bound".to_string(),
         diffusion_threshold: 0.9,
+        decouple_prefill_on_disconnect: false,
+        decouple_prefill_min_tokens: 8192,
+        max_orphaned_prefills: 2,
     }
 }
 

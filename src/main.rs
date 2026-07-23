@@ -1611,6 +1611,11 @@ pub(crate) struct ServeArgs {
     // set the per-request diffusion defaults for the single-stream worker loop.
     #[command(flatten)]
     pub(crate) diffusion: DiffusionServeOptions,
+
+    // Decoupled prefill coalescing options (--decouple-prefill-on-disconnect,
+    // --decouple-prefill-min-tokens, --max-orphaned-prefills).
+    #[command(flatten)]
+    pub(crate) decouple: DecoupledPrefillServeOptions,
 }
 
 /// Serve-level block-diffusion options.
@@ -1657,6 +1662,53 @@ impl Default for DiffusionServeOptions {
             max_denoising_steps: None,
             diffusion_sampler: "entropy-bound".to_string(),
             diffusion_threshold: 0.9,
+        }
+    }
+}
+
+/// Serve-level decoupled prefill coalescing options.
+///
+/// When enabled, a client disconnect during chunked prefill orphans the
+/// sequence instead of cancelling it. The prefill continues to completion
+/// and donates its KV cache. This solves the problem of long prefills
+/// (~16 min for 155K tokens) being killed by client idle timeouts (~5 min).
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Decoupled Prefill Options")]
+pub(crate) struct DecoupledPrefillServeOptions {
+    /// Enable decoupled prefill on disconnect. When true, a client disconnect
+    /// during chunked prefill orphans the sequence instead of cancelling it.
+    #[arg(
+        long = "decouple-prefill-on-disconnect",
+        env = "MLXCEL_DECOUPLE_PREFILL_ON_DISCONNECT",
+        default_value_t = false
+    )]
+    pub(crate) decouple_prefill_on_disconnect: bool,
+
+    /// Minimum prompt length for orphaning on disconnect. Shorter prefills
+    /// cancel normally.
+    #[arg(
+        long = "decouple-prefill-min-tokens",
+        env = "MLXCEL_DECOUPLE_PREFILL_MIN_TOKENS",
+        default_value_t = 8192
+    )]
+    pub(crate) decouple_prefill_min_tokens: usize,
+
+    /// Maximum concurrent orphaned prefills. Beyond this cap, disconnects
+    /// cancel normally.
+    #[arg(
+        long = "max-orphaned-prefills",
+        env = "MLXCEL_MAX_ORPHANED_PREFILLS",
+        default_value_t = 2
+    )]
+    pub(crate) max_orphaned_prefills: usize,
+}
+
+impl Default for DecoupledPrefillServeOptions {
+    fn default() -> Self {
+        Self {
+            decouple_prefill_on_disconnect: false,
+            decouple_prefill_min_tokens: 8192,
+            max_orphaned_prefills: 2,
         }
     }
 }

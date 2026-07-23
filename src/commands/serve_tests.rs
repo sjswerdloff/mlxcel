@@ -142,6 +142,8 @@ fn sample_args() -> crate::ServeArgs {
         surgery: None,
         // serve-level diffusion knobs (#217 phase 3): engine defaults in tests.
         diffusion: crate::DiffusionServeOptions::default(),
+        // decoupled prefill coalescing: defaults in tests.
+        decouple: crate::DecoupledPrefillServeOptions::default(),
     }
 }
 
