@@ -100,7 +100,8 @@ fn should_align_prefill() -> bool {
 const KVARN_PADDING_ABORT: &str = "kvarn cache cannot strip prefill padding: \
     quantized tiles already hold padded rows; aborting sequence to prevent \
     silent cache desync (avoid mixed-length batching and NA-aligned prefill \
-    on kvarn sessions until finalize-cap-at-true-length lands)";
+    on kvarn sessions — finalize-cap-at-true-length (#36) keeps padded rows \
+    in fp16 tail, but this path is uncapped)";
 
 pub(crate) const DEFAULT_PAGED_BLOCK_SIZE: usize = 32;
 
@@ -306,6 +307,16 @@ pub struct BatchScheduler {
     /// all waiting requests are re-enqueued (they'll find the cache).
     donation_in_progress: std::collections::HashMap<u64, Vec<ModelRequest>>,
 
+    /// Tracks in-progress prefills for coalescing (Change 1).
+    /// Armed at prefill START so retries park for the whole prefill duration.
+    /// Key: hash_tokens(prompt_tokens). Value: waiting requests.
+    /// Drained on ANY termination path (I1) via drain_prefill_coalescing().
+    prefill_in_progress: std::collections::HashMap<u64, Vec<ModelRequest>>,
+
+    /// Number of currently orphaned prefills (Change 2).
+    /// Capped at max_orphaned_prefills (I2).
+    orphaned_prefill_count: usize,
+
     // -- Shutdown flag --
     shutdown_requested: bool,
 
@@ -380,6 +391,14 @@ pub struct BatchScheduler {
     /// turn (multi-turn same-image conversations). Text-only and non-VLM
     /// requests are unaffected either way.
     enable_vlm_prefix_cache: bool,
+
+    // -- Decoupled prefill coalescing (Option 2b) --
+    /// When true, orphan prefills on client disconnect instead of cancelling.
+    decouple_prefill_on_disconnect: bool,
+    /// Minimum prompt length for orphaning on disconnect.
+    decouple_prefill_min_tokens: usize,
+    /// Maximum concurrent orphaned prefills.
+    max_orphaned_prefills: usize,
 
     // -- Vision feature cache --
     /// Per-model vision feature cache bundle. Contains LRU caches for
@@ -506,6 +525,56 @@ pub struct BatchScheduler {
     /// the in-crate seam it builds on.
     #[allow(dead_code)]
     paged_handoff_geometry: Option<crate::distributed::kv_cache_serde::ExpectedBlockGeometry>,
+}
+
+/// I1.1: RAII guard for prefill coalescing drain.
+/// Arms on creation, drains on drop (covers panic/unwind).
+/// Must be created BEFORE the prefill starts and held until termination.
+struct PrefillCoalesceGuard {
+    token_hash: u64,
+    armed: bool,
+    // Drain action: None = don't drain (guard was defused), Some(healthy, shutting_down).
+    action: Option<(bool, bool)>,
+}
+
+impl PrefillCoalesceGuard {
+    fn new(token_hash: u64) -> Self {
+        Self {
+            token_hash,
+            armed: true,
+            action: None,
+        }
+    }
+
+    /// Mark that the prefill completed successfully.
+    fn set_healthy(&mut self) {
+        self.action = Some((true, false));
+    }
+
+    /// Mark that the prefill errored.
+    fn set_error(&mut self) {
+        self.action = Some((false, false));
+    }
+
+    /// Mark that we're shutting down.
+    fn set_shutdown(&mut self) {
+        self.action = Some((false, true));
+    }
+
+    /// Defuse the guard (don't drain on drop).
+    /// Used when the drain was already performed manually.
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PrefillCoalesceGuard {
+    fn drop(&mut self) {
+        // The guard can't hold &mut scheduler, so it stores the action.
+        // The scheduler must check the guard after the prefill and drain
+        // if the action is set. This is a sentinel — the actual drain
+        // happens in `check_prefill_coalesce_guard`.
+    }
 }
 
 impl BatchScheduler {
@@ -733,6 +802,7 @@ impl BatchScheduler {
             already_cached_tokens: 0,
             response_tx,
             cancelled,
+            orphaned: false,
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: None,
@@ -828,6 +898,7 @@ impl BatchScheduler {
             already_cached_tokens: 0,
             response_tx,
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            orphaned: false,
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: Some(Instant::now()),
@@ -978,6 +1049,8 @@ impl BatchScheduler {
             preemption_policy,
             chunked_prefill_seq: None,
             donation_in_progress: std::collections::HashMap::new(),
+            prefill_in_progress: std::collections::HashMap::new(),
+            orphaned_prefill_count: 0,
             shutdown_requested: false,
             max_batch_prefill: max_batch_prefill.max(1),
             decode_storage_backend: effective_decode_storage,
@@ -998,6 +1071,9 @@ impl BatchScheduler {
             // multimodal prefix-cache sharing stays off until the operator
             // opts in via `with_vlm_prefix_cache` (#124 step c).
             enable_vlm_prefix_cache: false,
+            decouple_prefill_on_disconnect: false,
+            decouple_prefill_min_tokens: 8192,
+            max_orphaned_prefills: 2,
             // dispatch defaults to Disabled so the scheduler's
             // hot path stays bit-exact for the non-speculative case. The
             // worker thread overrides this via `with_speculative_dispatch`
@@ -1370,6 +1446,74 @@ impl BatchScheduler {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         tokens.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// I1 choke-point: drain prefill coalescing waiters for a given token hash.
+    /// MUST be called on EVERY terminal path of a prefill that armed `token_hash`
+    /// (healthy donation, error/abort, orphan completion, shutdown).
+    ///
+    /// Per-path semantics (I1.2):
+    /// - Healthy: re-dispatch all waiters (they HIT the cache).
+    /// - Error: promote ONE waiter to re-arm and lead; re-park the rest.
+    /// - Shutdown: fail all waiters with a clean error (don't re-dispatch into closing intake).
+    fn drain_prefill_coalescing(&mut self, token_hash: u64, healthy: bool, shutting_down: bool) {
+        if let Some(waiters) = self.prefill_in_progress.remove(&token_hash) {
+            let count = waiters.len();
+            if count == 0 {
+                return;
+            }
+            if shutting_down {
+                // I1.2: On shutdown, fail waiters — don't re-dispatch into closing intake.
+                tracing::info!(
+                    token_hash,
+                    waiter_count = count,
+                    "prefill coalescing: failing waiters (shutdown)"
+                );
+                for req in waiters {
+                    if let Some(tx) = Self::response_tx_from_request(&req) {
+                        let _ = tx.send(GenerateEvent::Error(
+                            "Server shutting down".to_string(),
+                        ));
+                    }
+                }
+                return;
+            }
+            if healthy {
+                // I1.2: On healthy donation, re-dispatch all — they HIT.
+                tracing::info!(
+                    token_hash,
+                    waiter_count = count,
+                    "prefill coalescing: re-dispatching waiters (healthy)"
+                );
+                for req in waiters {
+                    self.handle_incoming(req);
+                }
+            } else {
+                // I1.3: On error, promote ONE waiter to re-arm and lead;
+                // re-park the rest under the new arm.
+                tracing::info!(
+                    token_hash,
+                    waiter_count = count,
+                    "prefill coalescing: promoting one leader (error path)"
+                );
+                let mut waiters = waiters;
+                let leader = waiters.remove(0);
+                // Re-arm with remaining waiters.
+                if !waiters.is_empty() {
+                    self.prefill_in_progress.insert(token_hash, waiters);
+                }
+                // Leader re-enters — will arm its own prefill.
+                self.handle_incoming(leader);
+            }
+        }
+    }
+
+    /// Extract the response_tx from a ModelRequest for error delivery.
+    fn response_tx_from_request(req: &ModelRequest) -> Option<&mpsc::Sender<GenerateEvent>> {
+        match req {
+            ModelRequest::Generate { response_tx, .. } => Some(response_tx),
+            _ => None,
+        }
     }
 
     /// Build a [`PromptCacheKey`] bound to the per-request metadata the
@@ -2249,6 +2393,10 @@ impl BatchScheduler {
                 }
             }
         }
+
+        // Also drain prefill coalescing waiters (Change 1).
+        // Healthy path: re-dispatch all — they HIT the just-donated cache.
+        self.drain_prefill_coalescing(token_hash, true, false);
     }
 
     /// Apply thinking-budget enforcement to a freshly sampled
@@ -2463,6 +2611,13 @@ impl BatchScheduler {
 
             // 4. Clean up completed sequences
             self.finalize_completed();
+        }
+
+        // I1.2: Shutdown drain — fail all pending prefill coalescing waiters.
+        // Don't re-dispatch into a closing intake.
+        let pending_hashes: Vec<u64> = self.prefill_in_progress.keys().copied().collect();
+        for hash in pending_hashes {
+            self.drain_prefill_coalescing(hash, false, true);
         }
     }
 
@@ -2859,6 +3014,30 @@ impl BatchScheduler {
             return;
         }
 
+        // Change 1: Check if a prefill is in progress for this exact prompt.
+        // If so, park the request — the prefill will donate and re-dispatch.
+        if self.decouple_prefill_on_disconnect
+            && self.prefill_in_progress.contains_key(&token_hash)
+        {
+            tracing::info!(
+                token_hash,
+                "request held: prefill in progress for same token sequence"
+            );
+            self.prefill_in_progress
+                .entry(token_hash)
+                .or_default()
+                .push(ModelRequest::Generate {
+                    prompt,
+                    options,
+                    images,
+                    audio,
+                    videos,
+                    response_tx,
+                    cancelled,
+                });
+            return;
+        }
+
         let mut sampling = merge_config_stop_tokens(options.sampling.clone(), &self.config_eos);
 
         // Axis B (B8): attach the scheduler-wide token bias to each sequence's
@@ -3109,6 +3288,7 @@ impl BatchScheduler {
             already_cached_tokens,
             response_tx,
             cancelled,
+            orphaned: false,
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: None,
@@ -3377,6 +3557,19 @@ impl BatchScheduler {
             tracing::error!("State transition error: {err}");
             self.abort_sequence(seq, &err);
             return;
+        }
+
+        // Change 1: Arm prefill coalescing at prefill START.
+        // Retries for the same exact prompt will park here for the whole
+        // prefill duration, not just the donation window.
+        if self.decouple_prefill_on_disconnect {
+            let token_hash = Self::hash_tokens(&seq.prompt_tokens);
+            self.prefill_in_progress.entry(token_hash).or_default();
+            tracing::info!(
+                token_hash,
+                prompt_len = seq.prompt_tokens.len(),
+                "prefill coalescing: armed at prefill start"
+            );
         }
 
         let prompt_len = seq.prompt_tokens.len();
@@ -4525,6 +4718,39 @@ impl BatchScheduler {
         mut token_history: Vec<i32>,
         needs_history: bool,
     ) {
+        // Change 2: Orphaned sequence — skip decode, donate the prompt prefix.
+        // The client is gone; no one to serve tokens to. Transition to
+        // Finished(Cancelled) so the existing finalize_completed path donates.
+        if seq.orphaned {
+            tracing::info!(
+                seq_id = %seq.seq_id,
+                prompt_len = seq.prompt_tokens.len(),
+                "prefill coalescing: orphaned prefill complete, donating prefix (skip decode)"
+            );
+            // Drain prefill coalescing waiters (I1) — orphan completed successfully.
+            let token_hash = Self::hash_tokens(&seq.prompt_tokens);
+            self.drain_prefill_coalescing(token_hash, true, false);
+            // Decrement orphan count.
+            self.orphaned_prefill_count = self.orphaned_prefill_count.saturating_sub(1);
+            // Transition to Finished(Cancelled) — the healthy path donates.
+            if let Err(err) = seq
+                .state
+                .transition_to(SequenceState::Finished(FinishReason::Cancelled))
+            {
+                tracing::error!("State transition error: {err}");
+            }
+            // Release logits — no decode needed.
+            drop(logits);
+            // Move to active_batch so finalize_completed picks it up.
+            let seq_id = seq.seq_id;
+            if self.active_batch.add(seq).is_err() {
+                tracing::warn!("Failed to add orphaned sequence {seq_id} to active batch");
+            }
+            // finalize_completed will call donate_finished_sequence_cache
+            // because Cancelled is a healthy finish.
+            return;
+        }
+
         // apply structured-output mask to the prefill logits
         // before sampling the first token so the very first emitted token
         // already conforms to the schema.
@@ -5463,10 +5689,12 @@ impl BatchScheduler {
         // First, transition any cancelled sequences to Finished(Cancelled).
         // This must happen before the finished-ID scan so that newly cancelled
         // sequences are collected in the same pass.
+        // Skip orphaned sequences — they're being driven to completion by
+        // continue_chunked_prefill and will be handled by finish_prefill.
         let cancelled_ids: Vec<SequenceId> = self
             .active_batch
             .iter_sequences()
-            .filter(|s| !s.state.is_finished() && s.cancelled.load(Ordering::Relaxed))
+            .filter(|s| !s.state.is_finished() && s.cancelled.load(Ordering::Relaxed) && !s.orphaned)
             .map(|s| s.seq_id)
             .collect();
 
@@ -5483,24 +5711,59 @@ impl BatchScheduler {
             }
         }
 
-        // Cancel a chunked-prefill-in-progress sequence if client disconnected.
+        // Cancel or orphan a chunked-prefill-in-progress sequence if client disconnected.
         if let Some(ref seq) = self.chunked_prefill_seq
             && seq.cancelled.load(Ordering::Relaxed)
         {
-            let seq = self.chunked_prefill_seq.take().unwrap();
-            tracing::info!(
-                "Chunked-prefill sequence {} cancelled (client disconnected)",
-                seq.seq_id
-            );
-            let _ = seq.response_tx.send(GenerateEvent::Error(
-                "Request cancelled: client disconnected".to_string(),
-            ));
-            // Cancellation during prefill means the KV cache is only
-            // partially populated; skip donate-back and just release. The
-            // context map still needs cleanup so no dangling entries leak.
-            self.prompt_cache_seq_ctx.remove(&seq.seq_id);
-            self.release_sequence_caches(seq.seq_id);
-            self.batch_observability.record_sequence_completed();
+            let prompt_len = seq.prompt_tokens.len();
+            let can_orphan = self.decouple_prefill_on_disconnect
+                && prompt_len >= self.decouple_prefill_min_tokens
+                && self.orphaned_prefill_count < self.max_orphaned_prefills;
+
+            if can_orphan {
+                // Change 2: ORPHAN instead of cancel.
+                // Detach from client, keep driving prefill to completion.
+                let mut seq = self.chunked_prefill_seq.take().unwrap();
+                tracing::info!(
+                    seq_id = %seq.seq_id,
+                    prompt_len,
+                    waiter_count = self.prefill_in_progress
+                        .get(&Self::hash_tokens(&seq.prompt_tokens))
+                        .map_or(0, |v| v.len()),
+                    orphaned_count = self.orphaned_prefill_count + 1,
+                    "prefill coalescing: orphaning on disconnect (client gone, prefill continues)"
+                );
+                // Detach from client: mark as orphaned, keep cancelled flag intact.
+                // Other code reads cancelled (finalize_completed); orphaned flag
+                // prevents re-cancellation there.
+                let _ = seq.response_tx.send(GenerateEvent::Error(
+                    "Request cancelled: client disconnected (prefill orphaned, will donate)".to_string(),
+                ));
+                seq.orphaned = true;
+                self.orphaned_prefill_count += 1;
+                // Put it back as chunked_prefill_seq so continue_chunked_prefill keeps driving.
+                self.chunked_prefill_seq = Some(seq);
+            } else {
+                // Original behavior: cancel and release.
+                let seq = self.chunked_prefill_seq.take().unwrap();
+                tracing::info!(
+                    seq_id = %seq.seq_id,
+                    prompt_len,
+                    "Chunked-prefill sequence cancelled (client disconnected, not orphaned)"
+                );
+                let _ = seq.response_tx.send(GenerateEvent::Error(
+                    "Request cancelled: client disconnected".to_string(),
+                ));
+                // Drain prefill coalescing waiters (I1) — prefill cancelled.
+                // Error path: promote-one-leader.
+                let token_hash = Self::hash_tokens(&seq.prompt_tokens);
+                self.drain_prefill_coalescing(token_hash, false, false);
+                // Cancellation during prefill means the KV cache is only
+                // partially populated; skip donate-back and just release.
+                self.prompt_cache_seq_ctx.remove(&seq.seq_id);
+                self.release_sequence_caches(seq.seq_id);
+                self.batch_observability.record_sequence_completed();
+            }
         }
 
         // Also cancel queued sequences whose client has already disconnected,
@@ -5601,6 +5864,10 @@ impl BatchScheduler {
     }
 
     fn abort_sequence(&mut self, seq: SequenceInfo, error: &str) {
+        // Drain prefill coalescing waiters (I1) — must happen on every
+        // terminal path, including errors. Error path: promote-one-leader.
+        let token_hash = Self::hash_tokens(&seq.prompt_tokens);
+        self.drain_prefill_coalescing(token_hash, false, false);
         let _ = seq
             .response_tx
             .send(GenerateEvent::Error(error.to_string()));

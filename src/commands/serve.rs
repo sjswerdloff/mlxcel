@@ -356,6 +356,11 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         max_denoising_steps: args.diffusion.max_denoising_steps,
         diffusion_sampler: args.diffusion.diffusion_sampler,
         diffusion_threshold: args.diffusion.diffusion_threshold,
+        // Decoupled prefill coalescing (Option 2b) — default off.
+        // TODO: wire CLI args when --decouple-prefill-on-disconnect is added.
+        decouple_prefill_on_disconnect: false,
+        decouple_prefill_min_tokens: 8192,
+        max_orphaned_prefills: 2,
     })
 }
 

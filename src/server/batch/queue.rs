@@ -273,6 +273,7 @@ mod tests {
             already_cached_tokens: 0,
             response_tx: tx,
             cancelled: Arc::new(AtomicBool::new(false)),
+            orphaned: false,
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: None,

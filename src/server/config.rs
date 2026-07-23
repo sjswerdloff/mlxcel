@@ -497,6 +497,20 @@ pub struct ServerConfig {
     /// `--diffusion-threshold` (issue #217 phase 3). Confidence threshold for
     /// the confidence-threshold sampler. Only diffusion models read it.
     pub diffusion_threshold: f32,
+
+    /// `--decouple-prefill-on-disconnect` / `MLXCEL_DECOUPLE_PREFILL_ON_DISCONNECT`.
+    /// When true, a client disconnect during chunked prefill orphans the sequence
+    /// instead of cancelling it. The prefill continues to completion and donates
+    /// its KV cache. Default off.
+    pub decouple_prefill_on_disconnect: bool,
+    /// `--decouple-prefill-min-tokens` / `MLXCEL_DECOUPLE_PREFILL_MIN_TOKENS`.
+    /// Minimum prompt length for orphaning on disconnect. Shorter prefills
+    /// cancel normally. Default 8192.
+    pub decouple_prefill_min_tokens: usize,
+    /// `--max-orphaned-prefills` / `MLXCEL_MAX_ORPHANED_PREFILLS`.
+    /// Maximum concurrent orphaned prefills. Beyond this cap, disconnects
+    /// cancel normally. Default 2.
+    pub max_orphaned_prefills: usize,
 }
 
 impl Default for ServerConfig {
@@ -564,6 +578,9 @@ impl Default for ServerConfig {
             max_denoising_steps: None,
             diffusion_sampler: "entropy-bound".to_string(),
             diffusion_threshold: 0.9,
+            decouple_prefill_on_disconnect: false,
+            decouple_prefill_min_tokens: 8192,
+            max_orphaned_prefills: 2,
         }
     }
 }

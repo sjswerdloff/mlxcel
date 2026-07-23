@@ -171,6 +171,7 @@ fn make_seq(
         already_cached_tokens: prefill_start_offset,
         response_tx: tx,
         cancelled: Arc::new(AtomicBool::new(false)),
+            orphaned: false,
         created_at: Instant::now(),
         prefill_start: None,
         first_token_time: None,

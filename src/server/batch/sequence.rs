@@ -294,6 +294,12 @@ pub struct SequenceInfo {
     /// transitions the sequence to `Finished(Cancelled)`.
     pub cancelled: Arc<AtomicBool>,
 
+    // -- Orphaned prefill (Change 2) --
+    /// When true, the client disconnected during chunked prefill but the
+    /// sequence is being kept alive to complete the prefill and donate its
+    /// KV cache. At prefill completion, skip decode and donate the prefix.
+    pub orphaned: bool,
+
     // -- Timing --
     /// Wall-clock time when the request was received.
     pub created_at: Instant,

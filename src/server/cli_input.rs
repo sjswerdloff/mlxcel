@@ -420,6 +420,12 @@ pub struct ServerStartupInput {
     pub diffusion_sampler: String,
     /// `--diffusion-threshold` (issue #217 phase 3). Diffusion models only.
     pub diffusion_threshold: f32,
+    /// `--decouple-prefill-on-disconnect` / `MLXCEL_DECOUPLE_PREFILL_ON_DISCONNECT`.
+    pub decouple_prefill_on_disconnect: bool,
+    /// `--decouple-prefill-min-tokens` / `MLXCEL_DECOUPLE_PREFILL_MIN_TOKENS`.
+    pub decouple_prefill_min_tokens: usize,
+    /// `--max-orphaned-prefills` / `MLXCEL_MAX_ORPHANED_PREFILLS`.
+    pub max_orphaned_prefills: usize,
 }
 
 impl ServerStartupInput {
@@ -647,6 +653,9 @@ impl ServerStartupInput {
             max_denoising_steps: self.max_denoising_steps,
             diffusion_sampler: self.diffusion_sampler,
             diffusion_threshold: self.diffusion_threshold,
+            decouple_prefill_on_disconnect: self.decouple_prefill_on_disconnect,
+            decouple_prefill_min_tokens: self.decouple_prefill_min_tokens,
+            max_orphaned_prefills: self.max_orphaned_prefills,
         })
     }
 }

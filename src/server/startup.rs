@@ -379,6 +379,12 @@ pub struct ServerStartupConfig {
     pub diffusion_sampler: String,
     /// `--diffusion-threshold` (issue #217 phase 3).
     pub diffusion_threshold: f32,
+    /// `--decouple-prefill-on-disconnect` / `MLXCEL_DECOUPLE_PREFILL_ON_DISCONNECT`.
+    pub decouple_prefill_on_disconnect: bool,
+    /// `--decouple-prefill-min-tokens` / `MLXCEL_DECOUPLE_PREFILL_MIN_TOKENS`.
+    pub decouple_prefill_min_tokens: usize,
+    /// `--max-orphaned-prefills` / `MLXCEL_MAX_ORPHANED_PREFILLS`.
+    pub max_orphaned_prefills: usize,
 }
 
 impl Default for ServerStartupConfig {
@@ -494,6 +500,9 @@ impl Default for ServerStartupConfig {
             max_denoising_steps: None,
             diffusion_sampler: "entropy-bound".to_string(),
             diffusion_threshold: 0.9,
+            decouple_prefill_on_disconnect: false,
+            decouple_prefill_min_tokens: 8192,
+            max_orphaned_prefills: 2,
         }
     }
 }
@@ -906,6 +915,9 @@ pub(super) fn build_server_config(
         max_denoising_steps: startup.max_denoising_steps,
         diffusion_sampler: startup.diffusion_sampler.clone(),
         diffusion_threshold: startup.diffusion_threshold,
+        decouple_prefill_on_disconnect: startup.decouple_prefill_on_disconnect,
+        decouple_prefill_min_tokens: startup.decouple_prefill_min_tokens,
+        max_orphaned_prefills: startup.max_orphaned_prefills,
     }
 }
 

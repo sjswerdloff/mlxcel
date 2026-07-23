@@ -306,6 +306,7 @@ fn sequence_info_fields_transport_cache_hit_metadata() {
         already_cached_tokens: 73,
         response_tx: tx,
         cancelled: Arc::new(AtomicBool::new(false)),
+            orphaned: false,
         created_at: Instant::now(),
         prefill_start: None,
         first_token_time: None,
