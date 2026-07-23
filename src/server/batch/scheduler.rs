@@ -103,6 +103,20 @@ const KVARN_PADDING_ABORT: &str = "kvarn cache cannot strip prefill padding: \
     on kvarn sessions — finalize-cap-at-true-length (#36) keeps padded rows \
     in fp16 tail, but this path is uncapped)";
 
+/// Drain action for prefill coalescing (I1.2).
+/// Extracted as a pure-function return type for unit testability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainAction {
+    /// No waiters parked — nothing to drain.
+    NoWaiters,
+    /// Healthy donation — re-dispatch all waiters (they HIT).
+    RedispatchAll,
+    /// Error — promote one waiter to leader, re-park the rest.
+    PromoteOneLeader,
+    /// Shutdown — fail all waiters (don't re-dispatch into closing intake).
+    FailAll,
+}
+
 pub(crate) const DEFAULT_PAGED_BLOCK_SIZE: usize = 32;
 
 /// Decide whether a request may participate in experimental VLM prompt-prefix
@@ -525,56 +539,6 @@ pub struct BatchScheduler {
     /// the in-crate seam it builds on.
     #[allow(dead_code)]
     paged_handoff_geometry: Option<crate::distributed::kv_cache_serde::ExpectedBlockGeometry>,
-}
-
-/// I1.1: RAII guard for prefill coalescing drain.
-/// Arms on creation, drains on drop (covers panic/unwind).
-/// Must be created BEFORE the prefill starts and held until termination.
-struct PrefillCoalesceGuard {
-    token_hash: u64,
-    armed: bool,
-    // Drain action: None = don't drain (guard was defused), Some(healthy, shutting_down).
-    action: Option<(bool, bool)>,
-}
-
-impl PrefillCoalesceGuard {
-    fn new(token_hash: u64) -> Self {
-        Self {
-            token_hash,
-            armed: true,
-            action: None,
-        }
-    }
-
-    /// Mark that the prefill completed successfully.
-    fn set_healthy(&mut self) {
-        self.action = Some((true, false));
-    }
-
-    /// Mark that the prefill errored.
-    fn set_error(&mut self) {
-        self.action = Some((false, false));
-    }
-
-    /// Mark that we're shutting down.
-    fn set_shutdown(&mut self) {
-        self.action = Some((false, true));
-    }
-
-    /// Defuse the guard (don't drain on drop).
-    /// Used when the drain was already performed manually.
-    fn defuse(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PrefillCoalesceGuard {
-    fn drop(&mut self) {
-        // The guard can't hold &mut scheduler, so it stores the action.
-        // The scheduler must check the guard after the prefill and drain
-        // if the action is set. This is a sentinel — the actual drain
-        // happens in `check_prefill_coalesce_guard`.
-    }
 }
 
 impl BatchScheduler {
@@ -1448,6 +1412,40 @@ impl BatchScheduler {
         hasher.finish()
     }
 
+    /// Pure predicate: should a disconnecting prefill be orphaned?
+    /// Extracted for unit testability (Violet's BLOCKER B).
+    #[inline]
+    pub(crate) fn should_orphan_prefill(
+        flag_on: bool,
+        prompt_len: usize,
+        min_tokens: usize,
+        orphaned_count: usize,
+        max_orphaned: usize,
+    ) -> bool {
+        flag_on && prompt_len >= min_tokens && orphaned_count < max_orphaned
+    }
+
+    /// Pure function: what drain action should we take?
+    /// Extracted for unit testability (Violet's BLOCKER B).
+    /// Returns: (should_drain, healthy, shutting_down)
+    #[inline]
+    pub(crate) fn drain_action(
+        has_waiters: bool,
+        healthy: bool,
+        shutting_down: bool,
+    ) -> DrainAction {
+        if !has_waiters {
+            return DrainAction::NoWaiters;
+        }
+        if shutting_down {
+            DrainAction::FailAll
+        } else if healthy {
+            DrainAction::RedispatchAll
+        } else {
+            DrainAction::PromoteOneLeader
+        }
+    }
+
     /// I1 choke-point: drain prefill coalescing waiters for a given token hash.
     /// MUST be called on EVERY terminal path of a prefill that armed `token_hash`
     /// (healthy donation, error/abort, orphan completion, shutdown).
@@ -1458,52 +1456,51 @@ impl BatchScheduler {
     /// - Shutdown: fail all waiters with a clean error (don't re-dispatch into closing intake).
     fn drain_prefill_coalescing(&mut self, token_hash: u64, healthy: bool, shutting_down: bool) {
         if let Some(waiters) = self.prefill_in_progress.remove(&token_hash) {
-            let count = waiters.len();
-            if count == 0 {
-                return;
-            }
-            if shutting_down {
-                // I1.2: On shutdown, fail waiters — don't re-dispatch into closing intake.
-                tracing::info!(
-                    token_hash,
-                    waiter_count = count,
-                    "prefill coalescing: failing waiters (shutdown)"
-                );
-                for req in waiters {
-                    if let Some(tx) = Self::response_tx_from_request(&req) {
-                        let _ = tx.send(GenerateEvent::Error(
-                            "Server shutting down".to_string(),
-                        ));
+            let action = Self::drain_action(!waiters.is_empty(), healthy, shutting_down);
+            match action {
+                DrainAction::NoWaiters => {}
+                DrainAction::FailAll => {
+                    tracing::info!(
+                        token_hash,
+                        waiter_count = waiters.len(),
+                        "prefill coalescing: failing waiters (shutdown)"
+                    );
+                    for req in waiters {
+                        if let Some(tx) = Self::response_tx_from_request(&req) {
+                            let _ = tx.send(GenerateEvent::Error(
+                                "Server shutting down".to_string(),
+                            ));
+                        }
                     }
                 }
-                return;
-            }
-            if healthy {
-                // I1.2: On healthy donation, re-dispatch all — they HIT.
-                tracing::info!(
-                    token_hash,
-                    waiter_count = count,
-                    "prefill coalescing: re-dispatching waiters (healthy)"
-                );
-                for req in waiters {
-                    self.handle_incoming(req);
+                DrainAction::RedispatchAll => {
+                    tracing::info!(
+                        token_hash,
+                        waiter_count = waiters.len(),
+                        "prefill coalescing: re-dispatching waiters (healthy)"
+                    );
+                    for req in waiters {
+                        self.handle_incoming(req);
+                    }
                 }
-            } else {
-                // I1.3: On error, promote ONE waiter to re-arm and lead;
-                // re-park the rest under the new arm.
-                tracing::info!(
-                    token_hash,
-                    waiter_count = count,
-                    "prefill coalescing: promoting one leader (error path)"
-                );
-                let mut waiters = waiters;
-                let leader = waiters.remove(0);
-                // Re-arm with remaining waiters.
-                if !waiters.is_empty() {
-                    self.prefill_in_progress.insert(token_hash, waiters);
+                DrainAction::PromoteOneLeader => {
+                    tracing::info!(
+                        token_hash,
+                        waiter_count = waiters.len(),
+                        "prefill coalescing: promoting one leader (error path)"
+                    );
+                    let mut waiters = waiters;
+                    let leader = waiters.remove(0);
+                    // Dispatch leader FIRST while H is empty — leader will
+                    // re-enter handle_incoming and arm its own prefill.
+                    // If we re-parked the rest first, the leader would find
+                    // H present and park too → deadlock.
+                    self.handle_incoming(leader);
+                    // Now re-park the remaining waiters under the new arm.
+                    if !waiters.is_empty() {
+                        self.prefill_in_progress.insert(token_hash, waiters);
+                    }
                 }
-                // Leader re-enters — will arm its own prefill.
-                self.handle_incoming(leader);
             }
         }
     }
@@ -5716,9 +5713,13 @@ impl BatchScheduler {
             && seq.cancelled.load(Ordering::Relaxed)
         {
             let prompt_len = seq.prompt_tokens.len();
-            let can_orphan = self.decouple_prefill_on_disconnect
-                && prompt_len >= self.decouple_prefill_min_tokens
-                && self.orphaned_prefill_count < self.max_orphaned_prefills;
+            let can_orphan = Self::should_orphan_prefill(
+                self.decouple_prefill_on_disconnect,
+                prompt_len,
+                self.decouple_prefill_min_tokens,
+                self.orphaned_prefill_count,
+                self.max_orphaned_prefills,
+            );
 
             if can_orphan {
                 // Change 2: ORPHAN instead of cancel.

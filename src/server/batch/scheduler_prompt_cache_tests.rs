@@ -1241,56 +1241,88 @@ fn prefill_alignment_trait_default_is_one() {
 }
 
 // ---------------------------------------------------------------------------
-// Prefill coalescing (Option 2b) — drain semantics
+// Prefill coalescing (Option 2b) — pure-function tests
 // ---------------------------------------------------------------------------
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::server::batch::scheduler::{BatchScheduler, DrainAction};
 
-/// Verify that drain_prefill_coalescing on the healthy path re-dispatches
-/// all waiters through handle_incoming.
+/// Verify should_orphan_prefill predicate — the exact gate at scheduler.rs:5722.
 #[test]
-fn drain_healthy_redispatches_all_waiters() {
-    // We can't easily construct a full BatchScheduler in a unit test,
-    // but we can verify the drain function's logic by testing the
-    // prefill_in_progress map directly.
-    // This test verifies the map insert/remove semantics.
-    let mut map: std::collections::HashMap<u64, Vec<i32>> = std::collections::HashMap::new();
-    let hash = 12345u64;
-    map.entry(hash).or_default().push(1);
-    map.entry(hash).or_default().push(2);
-    map.entry(hash).or_default().push(3);
-    assert_eq!(map.get(&hash).unwrap().len(), 3);
-
-    // Drain removes the entry.
-    let waiters = map.remove(&hash);
-    assert!(waiters.is_some());
-    assert_eq!(waiters.unwrap().len(), 3);
-    assert!(!map.contains_key(&hash));
+fn should_orphan_prefill_basic() {
+    // Happy path: flag on, prompt long enough, under cap.
+    assert!(BatchScheduler::should_orphan_prefill(true, 10000, 8192, 0, 2));
+    // Flag off → no orphan.
+    assert!(!BatchScheduler::should_orphan_prefill(false, 10000, 8192, 0, 2));
+    // Prompt too short → no orphan.
+    assert!(!BatchScheduler::should_orphan_prefill(true, 4000, 8192, 0, 2));
+    // At cap → no orphan.
+    assert!(!BatchScheduler::should_orphan_prefill(true, 10000, 8192, 2, 2));
+    // Exactly at cap boundary.
+    assert!(!BatchScheduler::should_orphan_prefill(true, 10000, 8192, 1, 1));
+    // Under cap.
+    assert!(BatchScheduler::should_orphan_prefill(true, 10000, 8192, 1, 2));
 }
 
-/// Verify that the orphaned field on SequenceInfo defaults to false.
+/// Verify drain_action pure function — the exact decision at scheduler.rs:1490.
 #[test]
-fn orphaned_field_defaults_to_false() {
-    // Test the orphaned flag logic directly without constructing SequenceInfo
-    // (which has private fields we can't access from tests).
-    let orphaned = false;
-    assert!(!orphaned, "orphaned must default to false");
+fn drain_action_no_waiters() {
+    assert_eq!(
+        BatchScheduler::drain_action(false, true, false),
+        DrainAction::NoWaiters
+    );
+    assert_eq!(
+        BatchScheduler::drain_action(false, false, false),
+        DrainAction::NoWaiters
+    );
 }
 
-/// Verify that the orphaned flag can be set independently of cancelled.
 #[test]
-fn orphaned_flag_independent_of_cancelled() {
-    let cancelled = Arc::new(AtomicBool::new(true));
-    assert!(cancelled.load(Ordering::Relaxed));
+fn drain_action_healthy_redispatches() {
+    assert_eq!(
+        BatchScheduler::drain_action(true, true, false),
+        DrainAction::RedispatchAll
+    );
+}
 
-    // Orphaned sequences keep cancelled=true but check orphaned first.
-    let orphaned = true;
-    let should_cancel = cancelled.load(Ordering::Relaxed) && !orphaned;
-    assert!(!should_cancel, "orphaned sequences should not be re-cancelled");
+#[test]
+fn drain_action_error_promotes_leader() {
+    assert_eq!(
+        BatchScheduler::drain_action(true, false, false),
+        DrainAction::PromoteOneLeader
+    );
+}
+
+#[test]
+fn drain_action_shutdown_fails_all() {
+    assert_eq!(
+        BatchScheduler::drain_action(true, false, true),
+        DrainAction::FailAll
+    );
+    // Shutdown takes precedence over healthy.
+    assert_eq!(
+        BatchScheduler::drain_action(true, true, true),
+        DrainAction::FailAll
+    );
+}
+
+/// I1-leak discrimination control: verify that PromoteOneLeader is
+/// a distinct variant from RedispatchAll. If they were the same,
+/// the promote-one-leader logic would be silently disabled.
+#[test]
+fn drain_action_promote_is_distinct_from_redispatch() {
+    assert_ne!(
+        DrainAction::PromoteOneLeader,
+        DrainAction::RedispatchAll,
+        "promote-one-leader must be distinct from redispatch-all"
+    );
+    assert_ne!(
+        DrainAction::PromoteOneLeader,
+        DrainAction::FailAll,
+        "promote-one-leader must be distinct from fail-all"
+    );
 }
 
 /// Verify that hash_tokens is deterministic for the same input.
-/// Note: hash_tokens is private, so we test the equivalent logic directly.
 #[test]
 fn hash_tokens_is_deterministic() {
     use std::hash::{Hash, Hasher};
@@ -1313,24 +1345,4 @@ fn hash_tokens_differs_for_different_inputs() {
     let mut h2 = std::collections::hash_map::DefaultHasher::new();
     tokens_b.hash(&mut h2);
     assert_ne!(h1.finish(), h2.finish());
-}
-
-/// Verify the I1-leak discrimination control concept:
-/// with drain disabled, the prefill_in_progress entry persists.
-/// This is the negative control — if drain is removed, this test goes RED.
-#[test]
-fn drain_disabled_leaks_entry() {
-    let mut map: std::collections::HashMap<u64, Vec<i32>> = std::collections::HashMap::new();
-    let hash = 12345u64;
-
-    // Arm.
-    map.entry(hash).or_default();
-
-    // Simulate drain being disabled (never called).
-    // The entry persists — this is the leak.
-    assert!(map.contains_key(&hash), "entry must persist without drain");
-
-    // Drain would remove it.
-    map.remove(&hash);
-    assert!(!map.contains_key(&hash), "drain must remove the entry");
 }
