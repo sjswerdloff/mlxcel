@@ -1496,9 +1496,14 @@ impl BatchScheduler {
                     // If we re-parked the rest first, the leader would find
                     // H present and park too → deadlock.
                     self.handle_incoming(leader);
-                    // Now re-park the remaining waiters under the new arm.
-                    if !waiters.is_empty() {
-                        self.prefill_in_progress.insert(token_hash, waiters);
+                    // Re-dispatch the rest via handle_incoming instead of
+                    // insert. If the leader terminated before arming H
+                    // (e.g. begin_prefill error → abort), the first
+                    // re-entrant arms H and leads; the rest hit the
+                    // park-check and park. Robust whether or not the
+                    // leader armed H.
+                    for req in waiters {
+                        self.handle_incoming(req);
                     }
                 }
             }
