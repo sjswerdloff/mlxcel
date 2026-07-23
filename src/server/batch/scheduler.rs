@@ -33,8 +33,8 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use mlxcel_core::cache::{
-    BatchKvQuantConfig, CachePool, DetachedPagedCacheSet, KVCacheMode, PagedKvLayout, SequenceId,
-    SequenceStateBackend, SequenceStateLayout,
+    BatchKvQuantConfig, CachePool, DetachedCacheSet, DetachedPagedCacheSet, KVCacheMode,
+    PagedKvLayout, SequenceId, SequenceStateBackend, SequenceStateLayout,
 };
 use mlxcel_core::generate::{
     DecodeBatchContext, DecodeStorageBackend as CoreDecodeStorageBackend, LanguageModel,
@@ -1694,82 +1694,74 @@ impl BatchScheduler {
                 }
             }
         }
-        let (entry, matched_len) = match store.lookup_longest_prefix(&key, tokens) {
-            Some(found) => {
-                tracing::info!(
-                    matched_len = found.1,
-                    total = tokens.len(),
-                    "prompt-cache: longest-prefix MATCH (raw, before adoption)"
-                );
-                // Diagnostic: when match is much shorter than total tokens,
-                // dump the divergence point to understand why tokens differ.
-                if found.1 > 0 && found.1 < tokens.len() {
-                    let gap = tokens.len() - found.1;
-                    if gap > 1000 {
-                        let stored = &found.0.tokens;
-                        let div_point = found.1;
-                        let window = 20; // dump 20 tokens around divergence
-                        let s_start = div_point.saturating_sub(window);
-                        let s_end = (div_point + window).min(stored.len());
-                        let r_start = div_point.saturating_sub(window);
-                        let r_end = (div_point + window).min(tokens.len());
-                        tracing::warn!(
-                            matched_len = div_point,
-                            total = tokens.len(),
-                            stored_len = stored.len(),
-                            gap,
-                            stored_around_div = ?&stored[s_start..s_end],
-                            request_around_div = ?&tokens[r_start..r_end],
-                            "prompt-cache: large divergence detected — dumping tokens around mismatch point"
-                        );
-                    }
+        // --- Probe BOTH tiers before adopting ---
+        // Previously, SSD was only consulted when in-memory returned no
+        // candidate. A short in-memory match (e.g. 6K system prompt) would
+        // mask a much longer SSD match (e.g. 130K). Now we probe both tiers,
+        // compare aligned match lengths, and adopt from the winner.
+
+        // Probe in-memory store.
+        let mem_candidate = store.lookup_longest_prefix(&key, tokens);
+        if let Some((entry, matched_len)) = &mem_candidate {
+            tracing::info!(
+                matched_len,
+                total = tokens.len(),
+                "prompt-cache: in-memory longest-prefix MATCH (raw, before adoption)"
+            );
+            if *matched_len > 0 && *matched_len < tokens.len() {
+                let gap = tokens.len() - *matched_len;
+                if gap > 1000 {
+                    let stored = &entry.tokens;
+                    let div_point = *matched_len;
+                    let window = 20;
+                    let s_start = div_point.saturating_sub(window);
+                    let s_end = (div_point + window).min(stored.len());
+                    let r_start = div_point.saturating_sub(window);
+                    let r_end = (div_point + window).min(tokens.len());
+                    tracing::warn!(
+                        matched_len = div_point,
+                        total = tokens.len(),
+                        stored_len = stored.len(),
+                        gap,
+                        stored_around_div = ?&stored[s_start..s_end],
+                        request_around_div = ?&tokens[r_start..r_end],
+                        "prompt-cache: large divergence detected — dumping tokens around mismatch point"
+                    );
                 }
-                found
             }
-            None => {
-                // Store miss — try cold-storage (SSD) fallback.
-                // Content-addressed: finds longest matching token prefix.
-                // The v2 cold-store format does not carry multimodal or LoRA
-                // identity. Decline those requests rather than treating token
-                // placeholders or base-model state as sufficient authority.
-                let cold_identity_supported =
-                    ctx.mm_digest == MultimodalDigest::empty() && ctx.lora_id.is_none();
-                if let Some(cs) = &self.cold_store
-                    && cold_identity_supported
-                {
-                    match cs.load_prefix(&ctx.model_id, &ctx.template_sig, tokens) {
-                        Ok((mut detached, raw_match_len)) => {
-                            let stored_state_len = detached.seq_len();
-                            if detached.num_layers() != self.model.num_layers()
-                                || !detached.has_consistent_seq_len()
-                            {
-                                tracing::warn!(
-                                    stored_layers = detached.num_layers(),
-                                    expected_layers = self.model.num_layers(),
-                                    "cold-store: loaded layer count or state lengths are invalid; falling back to cold prefill"
-                                );
-                                return None;
-                            }
-                            let Some(stored_state_len) =
-                                usize::try_from(stored_state_len).ok().filter(|len| *len > 0)
-                            else {
-                                return None;
-                            };
-                            let Some(match_len) = reusable_prefix_len(
-                                raw_match_len,
-                                stored_state_len,
-                                tokens.len(),
-                                alignment,
-                                store.min_prefix_tokens(),
-                            ) else {
-                                tracing::warn!(
-                                    raw_match_len,
-                                    stored_state_len,
-                                    alignment,
-                                    "cold-store: candidate does not satisfy state-length or alignment gates; falling back to cold prefill"
-                                );
-                                return None;
-                            };
+        }
+
+        // Always probe SSD too, even when in-memory found something.
+        // The SSD may have a longer match from a previous conversation
+        // that was persisted but evicted from the in-memory store.
+        let cold_identity_supported =
+            ctx.mm_digest == MultimodalDigest::empty() && ctx.lora_id.is_none();
+        let mut ssd_match_len = 0usize;
+        let mut ssd_detached: Option<DetachedCacheSet> = None;
+        if let Some(cs) = &self.cold_store
+            && cold_identity_supported
+        {
+            match cs.load_prefix(&ctx.model_id, &ctx.template_sig, tokens) {
+                Ok((mut detached, raw_match_len)) => {
+                    let stored_state_len = detached.seq_len();
+                    if detached.num_layers() != self.model.num_layers()
+                        || !detached.has_consistent_seq_len()
+                    {
+                        tracing::warn!(
+                            stored_layers = detached.num_layers(),
+                            expected_layers = self.model.num_layers(),
+                            "cold-store: loaded layer count or state lengths are invalid; ignoring SSD candidate"
+                        );
+                    } else if let Some(stored_state_len) =
+                        usize::try_from(stored_state_len).ok().filter(|len| *len > 0)
+                    {
+                        if let Some(match_len) = reusable_prefix_len(
+                            raw_match_len,
+                            stored_state_len,
+                            tokens.len(),
+                            alignment,
+                            store.min_prefix_tokens(),
+                        ) {
                             if match_len < stored_state_len
                                 && let Err(err) = detached.truncate_to(match_len as i32)
                             {
@@ -1777,47 +1769,73 @@ impl BatchScheduler {
                                     error = %err,
                                     match_len,
                                     stored_state_len,
-                                    "cold-store: candidate truncation failed; falling back to cold prefill"
+                                    "cold-store: candidate truncation failed; ignoring SSD candidate"
                                 );
-                                return None;
+                            } else {
+                                tracing::info!(
+                                    model_id = %ctx.model_id,
+                                    match_len,
+                                    total = tokens.len(),
+                                    "prompt-cache: SSD cold-store probe HIT (longest prefix match)"
+                                );
+                                ssd_match_len = match_len;
+                                ssd_detached = Some(detached);
                             }
-                            tracing::info!(
-                                model_id = %ctx.model_id,
-                                match_len,
-                                total = tokens.len(),
-                                "prompt-cache: SSD cold-store HIT (longest prefix match)"
-                            );
-                            match self
-                                .cache_pool
-                                .adopt(&self.model as &dyn crate::generate::LanguageModel, detached)
-                            {
-                                Ok(seq_id) => {
-                                    self.batch_observability.record_prompt_cache_hit(match_len);
-                                    return Some((seq_id, match_len));
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        error = %err,
-                                        "cold-store: adopt failed after load; falling back to cold prefill"
-                                    );
-                                }
-                            }
-                        }
-                        Err(mlxcel_core::cache::cold_store::ColdStoreError::NoMatch) => {
-                            // No cold-store entry either — genuine miss.
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "cold-store: load failed (non-fatal, falling back to cold prefill)"
-                            );
                         }
                     }
                 }
+                Err(mlxcel_core::cache::cold_store::ColdStoreError::NoMatch) => {
+                    tracing::debug!("prompt-cache: SSD cold-store probe MISS");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "prompt-cache: SSD cold-store probe failed (non-fatal)"
+                    );
+                }
+            }
+        }
+
+        // Pick the winner based on match length.
+        // Ties prefer memory (faster, no I/O needed).
+        let mem_match_len = mem_candidate.as_ref().map(|(_, len)| *len).unwrap_or(0);
+        let use_ssd = ssd_match_len > mem_match_len;
+
+        if use_ssd {
+            tracing::info!(
+                mem_raw = mem_match_len,
+                ssd_raw = ssd_match_len,
+                alignment,
+                "prompt-cache: SSD cold-store has longer match — using SSD over memory"
+            );
+            let detached = ssd_detached.unwrap();
+            match self
+                .cache_pool
+                .adopt(&self.model as &dyn crate::generate::LanguageModel, detached)
+            {
+                Ok(seq_id) => {
+                    self.batch_observability.record_prompt_cache_hit(ssd_match_len);
+                    return Some((seq_id, ssd_match_len));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "cold-store: adopt failed after load; falling back to in-memory or cold prefill"
+                    );
+                    // Fall through to in-memory adoption below.
+                }
+            }
+        }
+
+        // In-memory winner (or SSD adopt failed). Continue with existing adoption logic.
+        let (entry, matched_len) = match mem_candidate {
+            Some(found) => found,
+            None => {
+                // Both tiers missed.
                 tracing::info!(
                     total = tokens.len(),
                     store_entries = store.len(),
-                    "prompt-cache: longest-prefix MISS (no entry shares any prefix under this key)"
+                    "prompt-cache: both tiers MISS (no entry shares any prefix under this key)"
                 );
                 return None;
             }
