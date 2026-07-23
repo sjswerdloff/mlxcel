@@ -13,6 +13,7 @@ default = []
 metal = []
 accelerate = []
 cuda = []
+coldstore-reference-sync = []
 
 [dependencies]
 cxx = "1.0"

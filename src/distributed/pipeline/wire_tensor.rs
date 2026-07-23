@@ -48,14 +48,9 @@ pub fn deserialize_wire_tensor(wire_bytes: &[u8]) -> Result<UniquePtr<MlxArray>>
             i32::try_from(dim).map_err(|_| anyhow!("tensor shape dimension too large: {}", dim))
         })
         .collect::<Result<_>>()?;
-    match tensor.dtype {
-        TensorDtype::Float16 => Ok(mlxcel_core::from_bytes_f16(&tensor.data, &shape, false)),
-        TensorDtype::BFloat16 => Ok(mlxcel_core::from_bytes_f16(&tensor.data, &shape, true)),
-        other => {
-            let dtype = tensor_dtype_to_mlx(other)?;
-            Ok(mlxcel_core::from_bytes(&tensor.data, &shape, dtype))
-        }
-    }
+    let dtype = tensor_dtype_to_mlx(tensor.dtype)?;
+    mlxcel_core::from_bytes(&tensor.data, &shape, dtype)
+        .map_err(|error| anyhow!("invalid wire tensor payload: {error}"))
 }
 
 pub fn sequence_length(arr: &MlxArray) -> Result<u32> {
@@ -77,5 +72,33 @@ fn tensor_dtype_to_mlx(dtype: TensorDtype) -> Result<i32> {
         TensorDtype::Float32 => Ok(10),
         TensorDtype::BFloat16 => Ok(12),
         TensorDtype::Int4 => bail!("int4 wire tensors are not supported for activation payloads"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forged_wire_shape_is_rejected_before_mlx_construction() {
+        for (dtype, bytes_per_element) in [
+            (TensorDtype::Float32, 4usize),
+            (TensorDtype::Float16, 2usize),
+            (TensorDtype::BFloat16, 2usize),
+        ] {
+            let mut wire =
+                ActivationMessage::serialize_activation(dtype, &[1], &vec![0; bytes_per_element])
+                    .unwrap();
+            wire[8..16].copy_from_slice(&2u64.to_le_bytes());
+
+            let error = match deserialize_wire_tensor(&wire) {
+                Ok(_) => panic!("forged {dtype} wire tensor unexpectedly reconstructed"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("payload does not match"),
+                "unexpected {dtype} error: {error}"
+            );
+        }
     }
 }

@@ -635,6 +635,10 @@ fn tensor_view_to_array(
         })
         .collect::<Result<_, _>>()?;
 
+    let copy_bytes = |dtype| {
+        mlxcel_core::from_bytes(tensor.data(), &shape, dtype)
+            .map_err(|error| format!("Failed to copy tensor {name} into MLX storage: {error}"))
+    };
     let array = match tensor.dtype() {
         SafeTensorDtype::BF16 => {
             if mode == SelectiveLoadMode::Borrowed {
@@ -694,7 +698,7 @@ fn tensor_view_to_array(
             if mode == SelectiveLoadMode::Borrowed {
                 mlxcel_core::from_bytes_nocopy(tensor.data(), &shape, mlxcel_core::dtype::FLOAT32)
             } else {
-                mlxcel_core::from_bytes(tensor.data(), &shape, mlxcel_core::dtype::FLOAT32)
+                copy_bytes(mlxcel_core::dtype::FLOAT32)?
             }
         }
         SafeTensorDtype::U32 => {
@@ -724,35 +728,35 @@ fn tensor_view_to_array(
             if mode == SelectiveLoadMode::Borrowed {
                 mlxcel_core::from_bytes_nocopy(tensor.data(), &shape, mlxcel_core::dtype::UINT64)
             } else {
-                mlxcel_core::from_bytes(tensor.data(), &shape, mlxcel_core::dtype::UINT64)
+                copy_bytes(mlxcel_core::dtype::UINT64)?
             }
         }
         SafeTensorDtype::I32 => {
             if mode == SelectiveLoadMode::Borrowed {
                 mlxcel_core::from_bytes_nocopy(tensor.data(), &shape, mlxcel_core::dtype::INT32)
             } else {
-                mlxcel_core::from_bytes(tensor.data(), &shape, mlxcel_core::dtype::INT32)
+                copy_bytes(mlxcel_core::dtype::INT32)?
             }
         }
         SafeTensorDtype::I64 => {
             if mode == SelectiveLoadMode::Borrowed {
                 mlxcel_core::from_bytes_nocopy(tensor.data(), &shape, mlxcel_core::dtype::INT64)
             } else {
-                mlxcel_core::from_bytes(tensor.data(), &shape, mlxcel_core::dtype::INT64)
+                copy_bytes(mlxcel_core::dtype::INT64)?
             }
         }
         SafeTensorDtype::U8 => {
             if mode == SelectiveLoadMode::Borrowed {
                 mlxcel_core::from_bytes_nocopy(tensor.data(), &shape, mlxcel_core::dtype::UINT8)
             } else {
-                mlxcel_core::from_bytes(tensor.data(), &shape, mlxcel_core::dtype::UINT8)
+                copy_bytes(mlxcel_core::dtype::UINT8)?
             }
         }
         SafeTensorDtype::I8 => {
             if mode == SelectiveLoadMode::Borrowed {
                 mlxcel_core::from_bytes_nocopy(tensor.data(), &shape, mlxcel_core::dtype::INT8)
             } else {
-                mlxcel_core::from_bytes(tensor.data(), &shape, mlxcel_core::dtype::INT8)
+                copy_bytes(mlxcel_core::dtype::INT8)?
             }
         }
         SafeTensorDtype::F8_E4M3 => {
@@ -812,9 +816,8 @@ fn tensor_view_to_array(
     };
 
     if mode == SelectiveLoadMode::Materialize {
-        // from_bytes() borrows the source mmap until evaluation, so
-        // materialized selective loads must force realization before the
-        // shard mapping is dropped.
+        // Borrowed branches may reference the shard mmap, so materialized
+        // selective loads must force realization before that mapping drops.
         mlxcel_core::eval(&array);
     }
     Ok(array)
@@ -1870,6 +1873,7 @@ mod tests {
     /// Build a u8 MLX array from raw bytes.
     fn u8_array(bytes: &[u8], shape: &[i32]) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
         mlxcel_core::from_bytes(bytes, shape, mlxcel_core::dtype::UINT8)
+            .expect("test bytes must match their UINT8 tensor shape")
     }
 
     /// Shared fixture bytes for the repack contract tests: two rows of one
@@ -2001,7 +2005,8 @@ mod tests {
         // An int32 weight is neither raw fp8 bytes nor a float conversion.
         weights.insert(
             "l.weight".to_string(),
-            mlxcel_core::from_bytes(&[0u8; 128], &[1, 32], mlxcel_core::dtype::INT32),
+            mlxcel_core::from_bytes(&[0u8; 128], &[1, 32], mlxcel_core::dtype::INT32)
+                .expect("test bytes must match their INT32 tensor shape"),
         );
         weights.insert("l.weight_scale_inv".to_string(), u8_array(&[127], &[1, 1]));
         let err = repack_hf_mxfp8_weights(&mut weights)

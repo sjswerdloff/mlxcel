@@ -377,20 +377,18 @@ pub(crate) fn split_gate_up_tensor(
         up_bytes.extend_from_slice(&bytes[base + half_bytes..base + 2 * half_bytes]);
     }
     let half_shape = [shape[0], moe_dim, shape[2]];
-    // 16-bit dtypes must go through the f16 constructor: the generic
-    // `from_bytes` path reads half the bytes for them (see
-    // `from_bytes_f16` docs / the #125 serde corruption fix).
-    let build = |data: &[u8]| -> UniquePtr<MlxArray> {
+    let build = |data: &[u8]| -> Result<UniquePtr<MlxArray>, String> {
         if dtype == dtype::BFLOAT16 {
-            mlxcel_core::from_bytes_f16(data, &half_shape, true)
+            Ok(mlxcel_core::from_bytes_f16(data, &half_shape, true))
         } else if dtype == dtype::FLOAT16 {
-            mlxcel_core::from_bytes_f16(data, &half_shape, false)
+            Ok(mlxcel_core::from_bytes_f16(data, &half_shape, false))
         } else {
             mlxcel_core::from_bytes(data, &half_shape, dtype)
+                .map_err(|error| format!("DiffusionGemma: invalid split tensor bytes: {error}"))
         }
     };
-    let gate = build(&gate_bytes);
-    let up = build(&up_bytes);
+    let gate = build(&gate_bytes)?;
+    let up = build(&up_bytes)?;
     mlxcel_core::eval(&gate);
     mlxcel_core::eval(&up);
     Ok((gate, up))

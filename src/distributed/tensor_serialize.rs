@@ -20,14 +20,16 @@
 //! Used by: distributed inference (KV cache transfer, activation relay,
 //! weight shard distribution).
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 
-use super::tensor_compress::{compress_if_beneficial, decompress};
+use super::tensor_compress::{compress_if_beneficial, decompress_limited};
 use super::tensor_protocol::{
     PROTOCOL_VERSION, QuantizationMode, TensorDtype, TensorFlags, TensorHeader, TensorKind,
 };
-use super::tensor_quantize::{dequantize_int4, dequantize_int8, quantize_int4, quantize_int8};
+use super::tensor_quantize::{
+    DEFAULT_GROUP_SIZE, dequantize_int4, dequantize_int8, quantize_int4, quantize_int8,
+};
 
 /// Options controlling how a tensor is serialized for transfer.
 #[derive(Debug, Clone)]
@@ -163,15 +165,29 @@ pub fn deserialize_tensor(buf: &[u8]) -> Result<(DeserializedTensor, usize)> {
     }
 
     let mut payload = buf[data_start..data_end].to_vec();
+    let expected_wire_len = expected_wire_payload_len(
+        header.dtype,
+        &header.shape,
+        header.flags.is_quantized(),
+    )?;
 
     // Step 1: Decompress if compressed.
     if header.flags.is_compressed() {
-        payload = decompress(&payload)?;
+        payload = decompress_limited(&payload, expected_wire_len)?;
+    }
+
+    if header.flags.is_quantized() {
+        validate_quantized_payload(header.dtype, &header.shape, &payload)?;
+    } else {
+        validate_data_size(header.dtype, &header.shape, &payload)
+            .context("wire tensor payload does not match its declared shape and dtype")?;
     }
 
     // Step 2: Dequantize if quantized.
     let original_dtype = if header.flags.is_quantized() {
-        let num_elements = header.num_elements() as usize;
+        let num_elements = checked_num_elements(&header.shape)?;
+        let num_elements = usize::try_from(num_elements)
+            .map_err(|_| anyhow::anyhow!("tensor element count exceeds addressable range"))?;
         match header.dtype {
             TensorDtype::Int8 => {
                 payload = dequantize_int8(&payload, num_elements);
@@ -186,6 +202,8 @@ pub fn deserialize_tensor(buf: &[u8]) -> Result<(DeserializedTensor, usize)> {
     } else {
         header.dtype
     };
+    validate_data_size(original_dtype, &header.shape, &payload)
+        .context("reconstructed tensor payload does not match its declared shape and dtype")?;
 
     let metadata = if header.metadata.is_empty() {
         None
@@ -212,15 +230,7 @@ pub fn deserialize_tensor(buf: &[u8]) -> Result<(DeserializedTensor, usize)> {
 ///
 /// Uses checked arithmetic to prevent integer overflow on crafted inputs.
 fn validate_data_size(dtype: TensorDtype, shape: &[u64], data: &[u8]) -> Result<()> {
-    let num_elements: u64 = if shape.is_empty() {
-        0
-    } else {
-        shape
-            .iter()
-            .copied()
-            .try_fold(1u64, u64::checked_mul)
-            .ok_or_else(|| anyhow::anyhow!("shape product overflow for {shape:?}"))?
-    };
+    let num_elements = checked_num_elements(shape)?;
     let elem_size = dtype.element_size();
 
     if elem_size == 0 {
@@ -249,6 +259,59 @@ fn validate_data_size(dtype: TensorDtype, shape: &[u64], data: &[u8]) -> Result<
         }
     }
 
+    Ok(())
+}
+
+fn checked_num_elements(shape: &[u64]) -> Result<u64> {
+    shape
+        .iter()
+        .copied()
+        .try_fold(1u64, u64::checked_mul)
+        .ok_or_else(|| anyhow::anyhow!("shape product overflow for {shape:?}"))
+}
+
+fn expected_wire_payload_len(
+    dtype: TensorDtype,
+    shape: &[u64],
+    quantized: bool,
+) -> Result<usize> {
+    if !quantized {
+        let elements = checked_num_elements(shape)?;
+        return elements
+            .checked_mul(dtype.element_size() as u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("wire payload size overflow"));
+    }
+
+    let elements = usize::try_from(checked_num_elements(shape)?)
+        .map_err(|_| anyhow::anyhow!("tensor element count exceeds addressable range"))?;
+    let groups = elements.div_ceil(DEFAULT_GROUP_SIZE);
+    let data_len = match dtype {
+        TensorDtype::Int8 => elements,
+        TensorDtype::Int4 => elements.div_ceil(2),
+        other => bail!("unexpected quantized dtype: {other}"),
+    };
+    8usize
+        .checked_add(groups.checked_mul(2).ok_or_else(|| anyhow::anyhow!("scale size overflow"))?)
+        .and_then(|value| value.checked_add(data_len))
+        .ok_or_else(|| anyhow::anyhow!("quantized payload size overflow"))
+}
+
+fn validate_quantized_payload(dtype: TensorDtype, shape: &[u64], data: &[u8]) -> Result<()> {
+    let expected = expected_wire_payload_len(dtype, shape, true)?;
+    if data.len() != expected {
+        bail!("quantized payload expects {expected} bytes, got {}", data.len());
+    }
+    let elements = usize::try_from(checked_num_elements(shape)?)
+        .map_err(|_| anyhow::anyhow!("tensor element count exceeds addressable range"))?;
+    let expected_groups = elements.div_ceil(DEFAULT_GROUP_SIZE);
+    let groups = u32::from_le_bytes(data[0..4].try_into()?) as usize;
+    let group_size = u32::from_le_bytes(data[4..8].try_into()?) as usize;
+    if groups != expected_groups || group_size != DEFAULT_GROUP_SIZE {
+        bail!(
+            "invalid quantization header: groups={groups}, group_size={group_size}, expected groups={expected_groups}, group_size={DEFAULT_GROUP_SIZE}"
+        );
+    }
     Ok(())
 }
 

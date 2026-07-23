@@ -22,6 +22,7 @@ pub mod batch;
 mod chat_request;
 pub mod chat_template;
 pub mod chat_template_kwargs;
+pub mod claude_code_prompt_normalization;
 mod cli_input;
 mod config;
 pub mod conversation_store;
@@ -58,6 +59,7 @@ pub use chat_template_kwargs::{
     ChatTemplateKwargs, ChatTemplateKwargsError, LLAMA_ARG_CHAT_TEMPLATE_KWARGS,
     env_fallback_chat_template_kwargs,
 };
+pub use claude_code_prompt_normalization::ClaudeCodePromptNormalization;
 pub use cli_input::{
     ServerStartupInput, env_fallback_apc_block_size, env_fallback_apc_enabled,
     env_fallback_apc_hash, env_fallback_apc_num_blocks, env_fallback_cache_type_k,

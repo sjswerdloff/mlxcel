@@ -234,7 +234,8 @@ pub fn quantize_v_turbo3(
         &packed_bytes,
         &[shape[0], shape[1], t, bytes_per_token as i32],
         dtype::UINT8,
-    );
+    )
+    .expect("internally packed Turbo3 bytes must match their tensor shape");
 
     // 5. Norms stored in fp16. Use the full-precision norm (not safe_norm)
     //    so dequantize sees the original magnitude.
@@ -304,7 +305,8 @@ pub fn dequantize_v_turbo3(
 
     // 2. Materialize the dense index tensor on-device. UINT8 is the right
     //    dtype for `take()` (matches the 4-bit path).
-    let indices_arr = ffi::from_bytes(&indices_u8, &[b, h, t, d], dtype::UINT8);
+    let indices_arr = ffi::from_bytes(&indices_u8, &[b, h, t, d], dtype::UINT8)
+        .expect("unpacked Turbo3 indices must match their tensor shape");
 
     // 3. Centroid gather: y_hat[b, h, t, k] = centroids[indices[b, h, t, k]].
     let centroids_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();

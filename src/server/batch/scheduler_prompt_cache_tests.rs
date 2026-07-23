@@ -25,8 +25,8 @@
 //! * A second lookup against a consumed entry falls through to a miss even
 //!   though the entry structurally still lives in the store (race semantics).
 //! * Miss paths preserve bit-exact behavior (no hidden cache access).
-//! * Donate-back on a healthy finish produces an entry with
-//!   `tokens = prompt + generated` as the radix-trie key.
+//! * Donate-back token identity covers only state consumed by model forward
+//!   calls, excluding a sampled token that is not yet represented in KV.
 //! * The observability counters on [`BatchObservability`] advance exactly
 //!   once per adopt / donate-back as the scheduler would call them.
 //! * `SequenceInfo::prefill_start_offset` / `already_cached_tokens` transport
@@ -43,7 +43,9 @@ use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::{MlxArray, UniquePtr};
 
 use crate::server::batch::BatchObservability;
-use crate::server::batch::scheduler::align_matched_prefix;
+use crate::server::batch::scheduler::{
+    adoption_leaves_token_for_logits, reusable_prefix_len,
+};
 use crate::server::prompt_cache::{
     ApcConfig, ApcHashAlgo, CacheEntry, DetachedKvSet, InsertError, PromptCacheConfig,
     PromptCacheStore,
@@ -1161,7 +1163,7 @@ fn evicting_cold_prefix_restores_paged_block_budget() {
 }
 
 // ---------------------------------------------------------------------------
-// Prefill-alignment flooring of adopted prefixes (`align_matched_prefix`)
+// Causal and prefill-alignment bounds on adopted prefixes
 //
 // MSA-class models pool prefill queries on a fixed token grid; adopting a
 // cache match that is not a multiple of that grid shifts the pooling
@@ -1170,21 +1172,21 @@ fn evicting_cold_prefix_restores_paged_block_budget() {
 // cannot silently weaken the safety condition.
 // ---------------------------------------------------------------------------
 
-// Pins that alignment == 1 (every non-MSA model) is a bit-exact passthrough
-// of the raw match. The identity path deliberately skips the min_prefix
-// re-check: the store already enforced its minimum prefix at lookup time,
-// so re-checking here would change pre-alignment behavior for existing
-// models. Alignment 0 (a degenerate declaration) is treated as identity
-// rather than a divide-by-zero.
 #[test]
-fn align_matched_prefix_alignment_one_is_identity() {
-    assert_eq!(align_matched_prefix(34, 1, 4), Some(34));
-    // Below min_prefix, still returned untouched — no re-check on the
-    // identity path (store enforced it at lookup).
-    assert_eq!(align_matched_prefix(3, 1, 4), Some(3));
-    assert_eq!(align_matched_prefix(0, 1, 4), Some(0));
-    // alignment 0 is treated as identity, not a panic.
-    assert_eq!(align_matched_prefix(34, 0, 4), Some(34));
+fn reusable_prefix_reserves_one_request_token_for_logits() {
+    assert_eq!(reusable_prefix_len(5, 5, 5, 1, 1), Some(4));
+    assert_eq!(reusable_prefix_len(5, 4, 5, 1, 1), Some(4));
+    assert_eq!(reusable_prefix_len(3, 5, 5, 1, 1), Some(3));
+    assert_eq!(reusable_prefix_len(1, 1, 1, 1, 1), None);
+    assert_eq!(reusable_prefix_len(5, 0, 5, 1, 1), None);
+}
+
+#[test]
+fn adoption_boundary_requires_a_request_token_for_logits() {
+    assert!(adoption_leaves_token_for_logits(4, 5));
+    assert!(!adoption_leaves_token_for_logits(5, 5));
+    assert!(!adoption_leaves_token_for_logits(6, 5));
+    assert!(!adoption_leaves_token_for_logits(0, 0));
 }
 
 // Pins the MSA flooring itself. Motivating live case: a dense whole-entry
@@ -1195,15 +1197,12 @@ fn align_matched_prefix_alignment_one_is_identity() {
 // These asserts are red-capable: deleting the flooring (returning the raw
 // match) turns 160 -> Some(160) and the first assert fails.
 #[test]
-fn align_matched_prefix_floors_to_model_quantum() {
-    // The cycle-83 live case: 160 raw floors to one full 128-quantum.
-    assert_eq!(align_matched_prefix(160, 128, 4), Some(128));
-    // An exact multiple passes through unreduced.
-    assert_eq!(align_matched_prefix(256, 128, 4), Some(256));
-    // Just past a quantum boundary floors back down to it.
-    assert_eq!(align_matched_prefix(130, 128, 4), Some(128));
-    // Exactly one quantum is already aligned.
-    assert_eq!(align_matched_prefix(128, 128, 4), Some(128));
+fn reusable_prefix_floors_to_model_quantum() {
+    assert_eq!(reusable_prefix_len(160, 160, 160, 128, 4), Some(128));
+    assert_eq!(reusable_prefix_len(256, 256, 256, 128, 4), Some(128));
+    assert_eq!(reusable_prefix_len(257, 257, 257, 128, 4), Some(256));
+    assert_eq!(reusable_prefix_len(257, 256, 257, 128, 4), Some(256));
+    assert_eq!(reusable_prefix_len(129, 129, 129, 128, 4), Some(128));
 }
 
 // Pins the fail-safe decline: when flooring leaves nothing usable, the
@@ -1211,16 +1210,16 @@ fn align_matched_prefix_floors_to_model_quantum() {
 // (or below-minimum) prefix. Degraded speed is acceptable; divergent
 // attention is not.
 #[test]
-fn align_matched_prefix_declines_when_floored_below_minimum() {
+fn reusable_prefix_declines_when_floored_below_minimum() {
     // 127 floors to 0 — nothing adoptable, decline.
-    assert_eq!(align_matched_prefix(127, 128, 4), None);
+    assert_eq!(reusable_prefix_len(127, 127, 128, 128, 4), None);
     // A zero raw match with alignment > 1 declines rather than adopting an
     // empty prefix.
-    assert_eq!(align_matched_prefix(0, 128, 4), None);
+    assert_eq!(reusable_prefix_len(0, 128, 129, 128, 4), None);
     // Floored value (128) below the store's min_prefix (200) declines.
-    assert_eq!(align_matched_prefix(128, 128, 200), None);
+    assert_eq!(reusable_prefix_len(128, 128, 129, 128, 200), None);
     // min_prefix 0 clamps to 1, so a full quantum still adopts.
-    assert_eq!(align_matched_prefix(128, 128, 0), Some(128));
+    assert_eq!(reusable_prefix_len(128, 128, 129, 128, 0), Some(128));
 }
 
 // Pins the `LanguageModel::prefill_alignment` trait default of 1 via a stub

@@ -276,6 +276,43 @@ fn serve_command_surgery_flag_defaults_to_none() {
 }
 
 #[test]
+fn serve_claude_code_prompt_normalization_parses_off_and_enabled() {
+    let cli = Cli::try_parse_from([
+        "mlxcel",
+        "serve",
+        "-m",
+        "models/foo",
+        "--claude-code-prompt-normalization",
+        "off",
+    ])
+    .expect("disabled normalization policy should parse");
+    let Commands::Serve(args) = cli.command else {
+        panic!("expected serve command");
+    };
+    assert_eq!(
+        args.claude_code_prompt_normalization,
+        mlxcel::server::ClaudeCodePromptNormalization::Off
+    );
+
+    let cli = Cli::try_parse_from([
+        "mlxcel",
+        "serve",
+        "-m",
+        "models/foo",
+        "--claude-code-prompt-normalization",
+        "stable-prefix-v1",
+    ])
+    .expect("enabled normalization policy should parse");
+    let Commands::Serve(args) = cli.command else {
+        panic!("expected serve command");
+    };
+    assert_eq!(
+        args.claude_code_prompt_normalization,
+        mlxcel::server::ClaudeCodePromptNormalization::StablePrefixV1
+    );
+}
+
+#[test]
 fn list_command_parses_to_list() {
     let cli = Cli::try_parse_from(["mlxcel", "list"]).expect("bare `list` must parse");
     let Commands::List(args) = cli.command else {

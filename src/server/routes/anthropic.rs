@@ -39,8 +39,9 @@ use axum::{
 
 use crate::server::AppState;
 use crate::server::anthropic_translator::{
-    AnthropicTranslated, anthropic_request_to_chat, anthropic_stop_reason, apply_stop_sequences,
-    build_content_blocks, parsed_call_to_tool_use, short_uuid, thinking_enabled,
+    AnthropicTranslated, anthropic_request_to_chat_with_policy, anthropic_stop_reason,
+    apply_stop_sequences, build_content_blocks, parsed_call_to_tool_use, short_uuid,
+    thinking_enabled,
 };
 use crate::server::chat_request::prepare_chat_request_with_cache;
 use crate::server::config::ReasoningBudgetOverride;
@@ -67,7 +68,7 @@ pub async fn anthropic_messages(
     headers: HeaderMap,
     Json(request): Json<AnthropicRequest>,
 ) -> Response {
-    let translated = anthropic_request_to_chat(&request);
+    let translated = translate_request(&state, &request);
 
     // Enforce the tools array size limit to prevent DoS via template
     // rendering, matching the chat-completions route. The check runs on the
@@ -170,7 +171,7 @@ async fn non_stream_messages(
     // after `prepare_chat_request_with_cache` so the digest sees the resolved
     // multimodal bytes; text-only requests yield an empty digest and a key
     // byte-identical to the chat path.
-    options.prompt_cache_ctx = build_prompt_cache_request_context(
+    options.prompt_cache_ctx = build_anthropic_prompt_cache_request_context(
         &state,
         &translated.chat_request,
         &prepared.image_data,
@@ -285,7 +286,7 @@ async fn stream_messages(
     options.reasoning_budget = budget_override;
     // Wire the prompt-prefix KV cache (epic #116) into the streaming Anthropic
     // path too, before `options`/`prepared` move into the spawned task.
-    options.prompt_cache_ctx = build_prompt_cache_request_context(
+    options.prompt_cache_ctx = build_anthropic_prompt_cache_request_context(
         &state,
         &translated.chat_request,
         &prepared.image_data,
@@ -309,7 +310,7 @@ async fn stream_messages(
     // usage). Falls back to 0 if tokenization fails.
     let prompt_tokens = state
         .tokenizer
-        .encode(&prepared.prompt, true)
+        .encode_rendered_prompt(&prepared.prompt)
         .map(|ids| ids.len())
         .unwrap_or(0);
 
@@ -502,7 +503,7 @@ pub async fn anthropic_count_tokens(
     State(state): State<AppState>,
     Json(request): Json<AnthropicRequest>,
 ) -> Response {
-    let translated = anthropic_request_to_chat(&request);
+    let translated = translate_request(&state, &request);
 
     // Enforce the tools array size limit before rendering the chat template.
     // count_tokens expands `tools` into the template just like the main
@@ -532,7 +533,7 @@ pub async fn anthropic_count_tokens(
         Err(err) => return AnthropicErrorResponse::bad_request(err.to_string()).into_response(),
     };
 
-    let token_count = match state.tokenizer.encode(&prepared.prompt, true) {
+    let token_count = match state.tokenizer.encode_rendered_prompt(&prepared.prompt) {
         Ok(ids) => ids.len(),
         Err(e) => {
             return AnthropicErrorResponse::bad_request(format!("Tokenization error: {e}"))
@@ -545,6 +546,28 @@ pub async fn anthropic_count_tokens(
         Json(serde_json::json!({ "input_tokens": token_count })),
     )
         .into_response()
+}
+
+/// Shared policy-aware translation path for generation and token counting.
+fn translate_request(state: &AppState, request: &AnthropicRequest) -> AnthropicTranslated {
+    anthropic_request_to_chat_with_policy(request, state.config.claude_code_prompt_normalization)
+}
+
+/// Build the Anthropic cache context and namespace its rendering identity by
+/// the active normalization policy. The default `Off` policy preserves the
+/// historical template signature.
+fn build_anthropic_prompt_cache_request_context(
+    state: &AppState,
+    request: &crate::server::types::ChatCompletionRequest,
+    image_data: &[Vec<u8>],
+    audio_data: &[Vec<u8>],
+) -> Option<crate::server::config::PromptCacheRequestContext> {
+    let mut context = build_prompt_cache_request_context(state, request, image_data, audio_data)?;
+    context.template_sig = state
+        .config
+        .claude_code_prompt_normalization
+        .namespace_template_sig(&context.template_sig);
+    Some(context)
 }
 
 /// Split the raw generation output into `(visible_text, reasoning?)`.
@@ -597,6 +620,115 @@ fn extract_reasoning_from_raw(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::chat_template::ChatTemplateProcessor;
+    use crate::server::claude_code_prompt_normalization::ClaudeCodePromptNormalization;
+    use crate::server::prompt_cache::{MultimodalDigest, PromptCacheKey};
+    use crate::tokenizer::MlxcelTokenizer;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+    use tokenizers::processors::template::TemplateProcessing;
+    use tokenizers::{AddedToken, Tokenizer};
+
+    fn tokenizer_with_automatic_bos() -> MlxcelTokenizer {
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("<auto-bos>".to_string(), 0),
+                    ("<bos>".to_string(), 1),
+                    ("<s>".to_string(), 2),
+                    ("[UNK]".to_string(), 3),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.add_special_tokens(&[
+            AddedToken::from("<bos>", true),
+            AddedToken::from("<s>", true),
+        ]);
+        tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+        tokenizer.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single("<auto-bos> $A")
+                .unwrap()
+                .special_tokens(vec![("<auto-bos>", 0)])
+                .build()
+                .unwrap(),
+        ));
+        MlxcelTokenizer::HuggingFace(tokenizer)
+    }
+
+    fn cache_identity_tokenizer() -> MlxcelTokenizer {
+        let vocabulary = [
+            "[UNK]",
+            "rules",
+            "Tools",
+            "body",
+            "hello",
+            "Context",
+            "threshold",
+            "alert",
+            "remains",
+            "Changed",
+            "middle",
+            "prose",
+        ];
+        let model = WordLevel::builder()
+            .vocab(
+                vocabulary
+                    .into_iter()
+                    .enumerate()
+                    .map(|(id, token)| (token.to_string(), id as u32))
+                    .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+        MlxcelTokenizer::HuggingFace(tokenizer)
+    }
+
+    async fn anthropic_cache_identity(
+        system: String,
+        policy: ClaudeCodePromptNormalization,
+        tokenizer: &MlxcelTokenizer,
+    ) -> (
+        String,
+        Vec<u32>,
+        crate::server::prompt_cache::PromptCacheKeyDigest,
+    ) {
+        let request: AnthropicRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "system": system,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let translated = anthropic_request_to_chat_with_policy(&request, policy);
+        let processor = ChatTemplateProcessor::with_template(
+            "{% for message in messages %}{{ message.content }}\n{% endfor %}".to_string(),
+        );
+        let prepared =
+            prepare_chat_request_with_cache(&processor, &translated.chat_request, None, true)
+                .await
+                .unwrap();
+        let tokens = tokenizer.encode_rendered_prompt(&prepared.prompt).unwrap();
+        let token_ids: Vec<i32> = tokens.iter().map(|&token| token as i32).collect();
+        let template_sig = policy.namespace_template_sig("template-digest");
+        let digest = PromptCacheKey::new_full(
+            "m",
+            None,
+            &template_sig,
+            None,
+            MultimodalDigest::empty(),
+            &token_ids,
+        )
+        .digest();
+        (prepared.prompt, tokens, digest)
+    }
 
     #[test]
     fn split_no_think_returns_cleaned() {
@@ -623,5 +755,93 @@ mod tests {
     fn extract_reasoning_empty_yields_none() {
         assert_eq!(extract_reasoning_from_raw("</think>x"), None);
         assert_eq!(extract_reasoning_from_raw("<think></think>x"), None);
+    }
+
+    #[tokio::test]
+    async fn anthropic_token_counts_match_generation_for_explicit_bos_templates() {
+        let date_reminder = "The date has changed. Today's date is now 2026-07-20. DO NOT mention this to the user explicitly because they are already aware.";
+        let request: AnthropicRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "system": format!("protected state\n\n{date_reminder}\n\n# Tools\nprotected tools"),
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let tokenizer = tokenizer_with_automatic_bos();
+
+        for prefix in ["<bos>", "<s>"] {
+            for policy in [
+                ClaudeCodePromptNormalization::Off,
+                ClaudeCodePromptNormalization::StablePrefixV1,
+            ] {
+                let translated = anthropic_request_to_chat_with_policy(&request, policy);
+                let processor = ChatTemplateProcessor::with_template(format!(
+                    "{prefix}{{% for message in messages %}}{{{{ message.content }}}}{{% endfor %}}"
+                ));
+                let prepared = prepare_chat_request_with_cache(
+                    &processor,
+                    &translated.chat_request,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+
+                assert!(prepared.prompt.starts_with(prefix));
+                assert_eq!(
+                    prepared.prompt.contains(date_reminder),
+                    policy == ClaudeCodePromptNormalization::Off
+                );
+                let generation_ids = tokenizer.encode_rendered_prompt(&prepared.prompt).unwrap();
+                let streaming_usage_ids =
+                    tokenizer.encode_rendered_prompt(&prepared.prompt).unwrap();
+                let count_tokens_ids = tokenizer.encode_rendered_prompt(&prepared.prompt).unwrap();
+                let without_automatic_bos = tokenizer.encode(&prepared.prompt, false).unwrap();
+                let with_automatic_bos = tokenizer.encode(&prepared.prompt, true).unwrap();
+
+                assert_eq!(generation_ids, streaming_usage_ids);
+                assert_eq!(generation_ids, count_tokens_ids);
+                assert_eq!(generation_ids, without_automatic_bos);
+                assert_ne!(generation_ids, with_automatic_bos);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recognized_injections_share_cache_identity_but_protected_content_does_not() {
+        const TASK_NUDGE: &str = "The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using TaskCreate to add new tasks and TaskUpdate to update task status (set to in_progress when starting, completed when done). Also consider cleaning up the task list if it has become stale. Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable.";
+        const DATE_REMINDER: &str = "The date has changed. Today's date is now 2026-07-22. DO NOT mention this to the user explicitly because they are already aware.";
+
+        let tokenizer = cache_identity_tokenizer();
+        let policy = ClaudeCodePromptNormalization::StablePrefixV1;
+        let baseline = "rules\n\n# Tools\nbody".to_string();
+        let recognized = format!("rules\n\n{TASK_NUDGE}\n\n{DATE_REMINDER}\n\n# Tools\nbody");
+        let protected =
+            "rules\n\nContext threshold alert: 12% remains.\n\n# Tools\nbody".to_string();
+        let near_match = format!(
+            "rules\n\n{}\n\n# Tools\nbody",
+            "The task tools haven't been used recently. Changed middle prose."
+        );
+
+        let baseline_identity = anthropic_cache_identity(baseline, policy, &tokenizer).await;
+        let recognized_identity = anthropic_cache_identity(recognized, policy, &tokenizer).await;
+        let protected_identity = anthropic_cache_identity(protected, policy, &tokenizer).await;
+        let near_match_identity = anthropic_cache_identity(near_match, policy, &tokenizer).await;
+
+        assert_eq!(baseline_identity, recognized_identity);
+        assert_ne!(baseline_identity.0, protected_identity.0);
+        assert_ne!(baseline_identity.1, protected_identity.1);
+        assert_ne!(baseline_identity.2, protected_identity.2);
+        assert_ne!(baseline_identity.0, near_match_identity.0);
+        assert_ne!(baseline_identity.1, near_match_identity.1);
+        assert_ne!(baseline_identity.2, near_match_identity.2);
+
+        let off_identity = anthropic_cache_identity(
+            "rules\n\n# Tools\nbody".to_string(),
+            ClaudeCodePromptNormalization::Off,
+            &tokenizer,
+        )
+        .await;
+        assert_eq!(baseline_identity.1, off_identity.1);
+        assert_ne!(baseline_identity.2, off_identity.2);
     }
 }

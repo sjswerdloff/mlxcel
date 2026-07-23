@@ -34,8 +34,6 @@ namespace mlxcel::turbo {
 
 namespace {
 
-constexpr int SIMD_WIDTH = 32;
-
 // Phase 2 kernel: global softmax reduction.
 //
 // Thread topology:

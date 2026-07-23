@@ -44,6 +44,9 @@
 //! response `content[]`. [`anthropic_stop_reason`] and
 //! [`apply_stop_sequences`] mirror the upstream stop-reason mapping.
 
+use crate::server::claude_code_prompt_normalization::{
+    ClaudeCodePromptNormalization, normalize_top_level_system_text,
+};
 use crate::server::tool_calls::types::ParsedToolCall;
 use crate::server::types::anthropic_request::{
     AnthropicContentBlock, AnthropicMessage, AnthropicMessageContent, AnthropicRequest,
@@ -93,6 +96,15 @@ pub struct AnthropicTranslated {
 /// The route layer applies `state.config.default_max_tokens` when the request
 /// omits `max_tokens`; this function performs only the structural translation.
 pub fn anthropic_request_to_chat(request: &AnthropicRequest) -> AnthropicTranslated {
+    anthropic_request_to_chat_with_policy(request, ClaudeCodePromptNormalization::Off)
+}
+
+/// Flatten an Anthropic request while applying the selected top-level system
+/// text normalization policy before chat-template rendering and tokenization.
+pub fn anthropic_request_to_chat_with_policy(
+    request: &AnthropicRequest,
+    policy: ClaudeCodePromptNormalization,
+) -> AnthropicTranslated {
     let mut messages: Vec<Message> = Vec::new();
 
     // 1. System prompt (string or text-block array) → leading system turn.
@@ -102,7 +114,17 @@ pub fn anthropic_request_to_chat(request: &AnthropicRequest) -> AnthropicTransla
     if let Some(system) = request.system.as_ref()
         && let Some(text) = system.to_text()
     {
+        // Billing-header stripping is legacy unconditional behavior and remains
+        // independent of the opt-in normalization policy.
         let text = strip_billing_headers(&text);
+        let (text, events) = normalize_top_level_system_text(&text, policy);
+        if events.total() > 0 {
+            tracing::info!(
+                task_nudges_removed = events.task_nudges,
+                date_reminders_removed = events.date_reminders,
+                "normalized Claude Code top-level system prompt"
+            );
+        }
         messages.push(Message {
             role: Role::System,
             content: MessageContent::Text(text),
@@ -782,6 +804,72 @@ mod tests {
         assert!(matches!(t.chat_request.messages[1].role, Role::User));
         assert_eq!(t.chat_request.messages[1].content.text(), "hi");
         assert_eq!(t.chat_request.params.max_tokens, Some(8));
+    }
+
+    #[test]
+    fn stable_prefix_normalization_only_changes_top_level_system_text() {
+        let date = "The date has changed. Today's date is now 2026-07-20. DO NOT mention this to the user explicitly because they are already aware.";
+        let body = serde_json::json!({
+            "model": "m",
+            "system": format!("rules\n\n{date}\n\n# Tools"),
+            "messages": [
+                {"role": "user", "content": date},
+                {"role": "system", "content": date},
+                {"role": "user", "content": "continue"}
+            ]
+        });
+        let req: AnthropicRequest = serde_json::from_value(body).unwrap();
+        let translated = anthropic_request_to_chat_with_policy(
+            &req,
+            ClaudeCodePromptNormalization::StablePrefixV1,
+        );
+        let messages = &translated.chat_request.messages;
+
+        assert_eq!(messages[0].content.text(), "rules\n\n# Tools");
+        assert_eq!(messages[1].content.text(), date);
+        assert_eq!(messages[2].content.text(), format!("{date}\n\ncontinue"));
+    }
+
+    #[test]
+    fn array_form_system_normalizes_reminder_without_unrelated_content_loss() {
+        let task_nudge = "The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using TaskCreate to add new tasks and TaskUpdate to update task status (set to in_progress when starting, completed when done). Also consider cleaning up the task list if it has become stale. Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable.";
+        let body = serde_json::json!({
+            "model": "m",
+            "system": [
+                {"type": "text", "text": "protected preface\n"},
+                {"type": "text", "text": format!("{task_nudge}\n\n# Tools\nprotected tools")},
+                {"type": "text", "text": "protected suffix"}
+            ],
+            "messages": []
+        });
+        let req: AnthropicRequest = serde_json::from_value(body).unwrap();
+        let translated = anthropic_request_to_chat_with_policy(
+            &req,
+            ClaudeCodePromptNormalization::StablePrefixV1,
+        );
+
+        assert_eq!(
+            translated.chat_request.messages[0].content.text(),
+            "protected preface\n\n# Tools\nprotected tools\nprotected suffix"
+        );
+    }
+
+    #[test]
+    fn policy_off_keeps_reminders_but_billing_header_stripping_remains_unconditional() {
+        let task_nudge = "The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using TaskCreate to add new tasks and TaskUpdate to update task status (set to in_progress when starting, completed when done). Also consider cleaning up the task list if it has become stale. Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable.";
+        let body = serde_json::json!({
+            "model": "m",
+            "system": format!("x-anthropic-billing-header: volatile\n{task_nudge}\n# Tools"),
+            "messages": []
+        });
+        let req: AnthropicRequest = serde_json::from_value(body).unwrap();
+        let translated =
+            anthropic_request_to_chat_with_policy(&req, ClaudeCodePromptNormalization::Off);
+
+        assert_eq!(
+            translated.chat_request.messages[0].content.text(),
+            format!("{task_nudge}\n# Tools")
+        );
     }
 
     #[test]

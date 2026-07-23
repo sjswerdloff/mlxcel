@@ -379,7 +379,8 @@ fn quantize_into_packed(
         &packed,
         &[shape[0], shape[1], t, bytes_per_token as i32],
         dtype::UINT8,
-    );
+    )
+    .expect("internally packed Turbo4 bytes must match their tensor shape");
 
     // 5. Norms stored in fp16 for the cache. The full-precision norm
     //    (not safe_norm) is what the dequantize path consumes.

@@ -22,6 +22,7 @@ fn sample_args() -> crate::ServeArgs {
         models_dir: None,
         adapter: Some(PathBuf::from("adapters/bar")),
         alias: Some("alias".to_string()),
+        claude_code_prompt_normalization: mlxcel::server::ClaudeCodePromptNormalization::Off,
         host: "127.0.0.1".to_string(),
         port: 9000,
         api_key: Some("secret".to_string()),
@@ -150,6 +151,10 @@ fn build_startup_input_preserves_edge_flags_for_normalization() {
 
     assert_eq!(input.model_path, PathBuf::from("models/foo"));
     assert_eq!(input.adapter_path, Some(PathBuf::from("adapters/bar")));
+    assert_eq!(
+        input.claude_code_prompt_normalization,
+        mlxcel::server::ClaudeCodePromptNormalization::Off
+    );
     assert_eq!(input.draft_model_path, Some(PathBuf::from("models/draft")));
     assert!(input.slots);
     assert!(input.no_slots);
@@ -161,6 +166,19 @@ fn build_startup_input_preserves_edge_flags_for_normalization() {
         vec!["\n".to_string(), "\t".to_string()]
     );
     assert_eq!(input.decode_storage_backend, None);
+}
+
+#[test]
+fn build_startup_input_propagates_claude_code_prompt_normalization() {
+    let mut args = sample_args();
+    args.claude_code_prompt_normalization =
+        mlxcel::server::ClaudeCodePromptNormalization::StablePrefixV1;
+
+    let input = build_startup_input(args).expect("resolve");
+    assert_eq!(
+        input.claude_code_prompt_normalization,
+        mlxcel::server::ClaudeCodePromptNormalization::StablePrefixV1
+    );
 }
 
 #[test]

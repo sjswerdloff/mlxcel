@@ -131,11 +131,8 @@ pub fn reconstruct_mlx_array(
     tensor: &RawTensorData,
 ) -> Result<mlxcel_core::UniquePtr<mlxcel_core::MlxArray>> {
     validate_raw_tensor(tensor)?;
-    Ok(mlxcel_core::from_bytes(
-        &tensor.data,
-        &tensor.shape,
-        tensor.dtype,
-    ))
+    mlxcel_core::from_bytes(&tensor.data, &tensor.shape, tensor.dtype)
+        .context("failed to construct validated MLX tensor")
 }
 
 /// Restore serialized cache entries into a pre-allocated `KVCache` slice.

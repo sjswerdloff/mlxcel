@@ -64,6 +64,7 @@ pub struct ServerStartupConfig {
     pub model_path: PathBuf,
     pub adapter_path: Option<PathBuf>,
     pub model_alias: Option<String>,
+    pub claude_code_prompt_normalization: super::ClaudeCodePromptNormalization,
 
     // Network
     pub host: String,
@@ -386,6 +387,7 @@ impl Default for ServerStartupConfig {
             model_path: PathBuf::new(),
             adapter_path: None,
             model_alias: None,
+            claude_code_prompt_normalization: super::ClaudeCodePromptNormalization::Off,
             host: "127.0.0.1".to_string(),
             port: 8080,
             api_key: None,
@@ -813,6 +815,7 @@ pub(super) fn build_server_config(
         api_key,
         timeout_seconds: startup.timeout,
         model_alias: startup.model_alias.clone(),
+        claude_code_prompt_normalization: startup.claude_code_prompt_normalization,
         context_size,
         n_parallel: startup.n_parallel,
         enable_slots_endpoint: startup.enable_slots,
@@ -1756,12 +1759,20 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
 
     // Cold-storage for persisting detached KV caches to SSD.
     // Enables fast session restart by loading from disk instead of re-prefilling.
-    let model_path_str = startup.model_path.to_string_lossy().to_string();
-    let cold_store = Arc::new(mlxcel_core::cache::cold_store::ColdStore::new(&model_path_str));
-    tracing::info!(
-        base_dir = %cold_store.base_dir().display(),
-        "Cold-storage enabled for KV cache SSD persistence"
-    );
+    let cold_store = if startup.adapter_path.is_some() {
+        tracing::warn!(
+            "Cold-storage disabled: format v2 does not include LoRA adapter identity"
+        );
+        None
+    } else {
+        let model_path_str = startup.model_path.to_string_lossy().to_string();
+        let store = Arc::new(mlxcel_core::cache::cold_store::ColdStore::new(&model_path_str));
+        tracing::info!(
+            base_dir = %store.base_dir().display(),
+            "Cold-storage enabled for KV cache SSD persistence"
+        );
+        Some(store)
+    };
 
     // `--timeout` is validated inside `new_with_server_config_and_prompt_cache` and
     // the resolved `Duration` is stashed on `ModelProvider`, where it flows into the drain loops.
@@ -1771,7 +1782,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         startup.adapter_path.clone(),
         &config,
         prompt_cache_store.clone(),
-        Some(cold_store.clone()),
+        cold_store,
         batch_metrics.clone(),
         batch_observability.clone(),
     )?);

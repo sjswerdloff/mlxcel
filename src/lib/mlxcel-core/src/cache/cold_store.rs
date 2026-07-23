@@ -49,6 +49,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cxx::UniquePtr;
+use sha2::{Digest, Sha256};
 
 use crate::dtype;
 use crate::ffi;
@@ -57,12 +58,19 @@ use crate::ffi::MlxArray;
 use super::detach::{DetachedCacheSet, DetachedKVCache};
 use super::KVCacheMode;
 
+#[cfg(any(test, feature = "coldstore-reference-sync"))]
+#[path = "cold_store_reference.rs"]
+mod reference;
+#[cfg(any(test, feature = "coldstore-reference-sync"))]
+pub use reference::{ReferenceColdStore, ReferenceSnapshot, runtime_fingerprint_from_manifest};
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const FORMAT_VERSION: u32 = 2; // v2: content-addressed, tokens in header
 const DEFAULT_BASE_DIR: &str = ".cache/mlxcel/cold-storage";
+const MAX_SERIALIZED_TENSOR_RANK: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -126,24 +134,37 @@ pub fn compute_content_hash(model_id: &str, template_sig: &str, tokens: &[i32]) 
 
 /// Compute a weight fingerprint for the currently loaded model.
 pub fn compute_weight_fingerprint(model_path: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    model_path.hash(&mut hasher);
+    let mut hasher = Sha256::new();
+    hasher.update(model_path.as_bytes());
     if let Ok(entries) = fs::read_dir(model_path) {
-        let mut sizes: Vec<(String, u64)> = entries
+        let mut files: Vec<_> = entries
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
-            .filter_map(|e| {
-                let size = e.metadata().ok()?.len();
-                Some((e.file_name().to_string_lossy().to_string(), size))
-            })
             .collect();
-        sizes.sort();
-        for (name, size) in &sizes {
-            name.hash(&mut hasher);
-            size.hash(&mut hasher);
+        files.sort_by_key(|entry| entry.file_name());
+        let mut buffer = vec![0u8; 1024 * 1024];
+        for entry in files {
+            hasher.update(entry.file_name().to_string_lossy().as_bytes());
+            match File::open(entry.path()) {
+                Ok(mut file) => loop {
+                    match file.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(count) => hasher.update(&buffer[..count]),
+                        Err(error) => {
+                            hasher.update(format!("read-error:{error}").as_bytes());
+                            break;
+                        }
+                    }
+                },
+                Err(error) => hasher.update(format!("open-error:{error}").as_bytes()),
+            }
         }
     }
-    format!("{:016x}", hasher.finish())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -167,13 +188,37 @@ fn write_array(w: &mut impl Write, arr: &MlxArray) -> io::Result<()> {
 
 fn read_array(r: &mut impl Read) -> io::Result<UniquePtr<MlxArray>> {
     let dt = read_i32(r)?;
-    let ndim = read_i32(r)? as usize;
+    let ndim = usize::try_from(read_i32(r)?).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "negative tensor rank")
+    })?;
+    if ndim > MAX_SERIALIZED_TENSOR_RANK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("tensor rank {ndim} exceeds limit {MAX_SERIALIZED_TENSOR_RANK}"),
+        ));
+    }
     let mut shape = vec![0i32; ndim];
     for s in &mut shape {
         *s = read_i32(r)?;
     }
-    let byte_len = read_u64(r)? as usize;
-    let mut bytes = vec![0u8; byte_len];
+    let byte_len = usize::try_from(read_u64(r)?).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "tensor byte length exceeds usize")
+    })?;
+    validate_array_metadata(byte_len, dt, &shape)?;
+    if byte_len > isize::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot allocate {byte_len}-byte tensor payload"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(byte_len).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot allocate {byte_len}-byte tensor payload: {error}"),
+        )
+    })?;
+    bytes.resize(byte_len, 0);
     r.read_exact(&mut bytes)?;
     array_from_raw_bytes(&bytes, dt, &shape)
 }
@@ -430,7 +475,6 @@ fn read_header(r: &mut impl Read) -> Result<SessionHeader, ColdStoreError> {
 /// the longest matching prefix is found by scanning stored token sequences.
 pub struct ColdStore {
     base_dir: PathBuf,
-    model_path: String,
     weight_fingerprint: String,
     writer_tx: Option<Sender<WriteJob>>,
     writer_handle: Option<JoinHandle<()>>,
@@ -453,7 +497,6 @@ impl ColdStore {
         let (tx, handle) = spawn_writer();
         ColdStore {
             base_dir,
-            model_path: model_path.to_string(),
             weight_fingerprint,
             writer_tx: Some(tx),
             writer_handle: Some(handle),
@@ -462,7 +505,8 @@ impl ColdStore {
 
     /// Persist a DetachedCacheSet to SSD, keyed by token content.
     ///
-    /// `tokens` is the full token sequence that produced this cache.
+    /// `tokens` contains the full model-visible history available at donation;
+    /// persistence records only the prefix covered by every detached layer.
     /// `model_id` and `template_sig` are included in the content hash
     /// so the same tokens under different models/templates get separate entries.
     pub fn persist(
@@ -473,6 +517,28 @@ impl ColdStore {
         cache_set: &DetachedCacheSet,
     ) -> Result<(), ColdStoreError> {
         let tx = self.writer_tx.as_ref().ok_or(ColdStoreError::WorkerDied)?;
+        if cache_set.caches.is_empty() || !cache_set.has_consistent_seq_len() {
+            return Err(ColdStoreError::CorruptLayer {
+                layer: 0,
+                detail: "cache-covered layer offsets are empty or inconsistent".into(),
+            });
+        }
+        let cache_covered_len = usize::try_from(cache_set.seq_len()).map_err(|_| {
+            ColdStoreError::CorruptLayer {
+                layer: 0,
+                detail: "cache-covered layer offset is negative".into(),
+            }
+        })?;
+        if cache_covered_len == 0 || cache_covered_len > tokens.len() {
+            return Err(ColdStoreError::CorruptLayer {
+                layer: 0,
+                detail: format!(
+                    "cache-covered length {cache_covered_len} is invalid for {} model-visible tokens",
+                    tokens.len()
+                ),
+            });
+        }
+        let tokens = &tokens[..cache_covered_len];
         let content_hash = compute_content_hash(model_id, template_sig, tokens);
 
         let header = SessionHeader {
@@ -482,8 +548,8 @@ impl ColdStore {
             model_id: model_id.to_string(),
             template_sig: template_sig.to_string(),
             layer_count: cache_set.caches.len() as u32,
-            prompt_len: cache_set.prompt_len,
-            current_offset: cache_set.current_offset,
+            prompt_len: cache_set.prompt_len.min(cache_covered_len),
+            current_offset: cache_set.seq_len(),
             timestamp_secs: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -754,51 +820,60 @@ fn read_u64(r: &mut impl Read) -> io::Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
-fn array_from_raw_bytes(bytes: &[u8], dt: i32, shape: &[i32]) -> Result<UniquePtr<MlxArray>, io::Error> {
-    let arr = match dt {
-        dtype::FLOAT32 => {
-            let data: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            ffi::from_slice_f32(&data, shape)
+fn validate_array_metadata(
+    byte_len: usize,
+    dt: i32,
+    shape: &[i32],
+) -> io::Result<usize> {
+    let item_size = match dt {
+        dtype::FLOAT32
+        | dtype::FLOAT16
+        | dtype::BFLOAT16
+        | dtype::INT8
+        | dtype::UINT8
+        | dtype::INT32
+        | dtype::UINT32 => dtype::size_bytes(dt).expect("supported dtype has a size"),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported dtype: {dt}"),
+            ));
         }
-        dtype::FLOAT16 => {
-            ffi::from_bytes_f16(bytes, shape, false)
-        }
-        dtype::BFLOAT16 => {
-            ffi::from_bytes_f16(bytes, shape, true)
-        }
-        dtype::INT8 | dtype::UINT8 => {
-            let i32_data: Vec<i32> = bytes.iter().map(|&b| b as i32).collect();
-            let arr = ffi::from_slice_i32(&i32_data, shape);
-            ffi::astype(&arr, dt)
-        }
-        dtype::INT32 => {
-            let data: Vec<i32> = bytes
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            ffi::from_slice_i32(&data, shape)
-        }
-        dtype::UINT32 => {
-            let data: Vec<u32> = bytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            ffi::from_slice_u32(&data, shape)
-        }
-        _ => return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported dtype: {dt}"),
-        )),
     };
-    let arr_dt = ffi::array_dtype(&arr);
-    if arr_dt != dt {
-        Ok(ffi::astype(&arr, dt))
-    } else {
-        Ok(arr)
+
+    let element_count = shape.iter().try_fold(1usize, |count, &dim| {
+        let dim = usize::try_from(dim).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("negative tensor dimension: {dim}"),
+            )
+        })?;
+        count.checked_mul(dim).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "tensor element count overflow")
+        })
+    })?;
+    let expected_len = element_count
+        .checked_mul(item_size)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "tensor byte length overflow"))?;
+    if byte_len != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "tensor byte length mismatch: dtype {dt}, shape {shape:?}, expected {expected_len}, got {}",
+                byte_len
+            ),
+        ));
     }
+    Ok(item_size)
+}
+
+fn array_from_raw_bytes(
+    bytes: &[u8],
+    dt: i32,
+    shape: &[i32],
+) -> Result<UniquePtr<MlxArray>, io::Error> {
+    validate_array_metadata(bytes.len(), dt, shape)?;
+    ffi::from_bytes(bytes, shape, dt).map_err(io::Error::other)
 }
 
 // ---------------------------------------------------------------------------
@@ -928,7 +1003,11 @@ mod tests {
             .collect()
     }
 
-    fn make_test_cache_set(num_layers: usize, seq_len: i32, head_dim: i32) -> DetachedCacheSet {
+    pub(super) fn make_test_cache_set(
+        num_layers: usize,
+        seq_len: i32,
+        head_dim: i32,
+    ) -> DetachedCacheSet {
         use super::super::SequenceStateBackend;
         use std::time::Instant;
 
@@ -1005,6 +1084,71 @@ mod tests {
         assert_eq!(match_len, 5);
         assert_eq!(loaded.caches.len(), 2);
         assert_eq!(loaded.prompt_len, 5);
+    }
+
+    #[test]
+    fn cold_store_persists_only_cache_covered_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model");
+        fs::create_dir_all(&model_path).unwrap();
+        let mut cs = ColdStore::with_base_dir(
+            dir.path().join("cs").to_path_buf(),
+            model_path.to_str().unwrap(),
+        );
+        let tokens = vec![100, 200, 300, 400, 500, 600];
+        let original = make_test_cache_set(2, 5, 32);
+
+        cs.persist("m3", "tmpl", &tokens, &original).unwrap();
+        cs.shutdown();
+
+        let (loaded, match_len) = cs.load_prefix("m3", "tmpl", &tokens).unwrap();
+        assert_eq!(match_len, 5);
+        assert_eq!(loaded.seq_len(), 5);
+        assert_eq!(loaded.current_offset, 5);
+    }
+
+    #[test]
+    fn cold_store_rejects_state_beyond_available_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model");
+        fs::create_dir_all(&model_path).unwrap();
+        let cs = ColdStore::with_base_dir(
+            dir.path().join("cs").to_path_buf(),
+            model_path.to_str().unwrap(),
+        );
+        let original = make_test_cache_set(2, 5, 32);
+
+        let result = cs.persist("m3", "tmpl", &[100, 200, 300, 400], &original);
+
+        assert!(matches!(result, Err(ColdStoreError::CorruptLayer { .. })));
+    }
+
+    #[test]
+    fn cold_store_rejects_inconsistent_or_empty_layer_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model");
+        fs::create_dir_all(&model_path).unwrap();
+        let cs = ColdStore::with_base_dir(
+            dir.path().join("cs").to_path_buf(),
+            model_path.to_str().unwrap(),
+        );
+        let tokens = vec![100, 200, 300, 400, 500];
+
+        let mut inconsistent = make_test_cache_set(2, 5, 32);
+        inconsistent.caches[1].offset = 4;
+        assert!(matches!(
+            cs.persist("m3", "tmpl", &tokens, &inconsistent),
+            Err(ColdStoreError::CorruptLayer { .. })
+        ));
+
+        let mut empty = make_test_cache_set(2, 5, 32);
+        for cache in &mut empty.caches {
+            cache.offset = 0;
+        }
+        assert!(matches!(
+            cs.persist("m3", "tmpl", &tokens, &empty),
+            Err(ColdStoreError::CorruptLayer { .. })
+        ));
     }
 
     #[test]
@@ -1189,5 +1333,131 @@ mod tests {
                 "Layer {layer}: FP16 value tensor bytes differ after round-trip"
             );
         }
+    }
+
+    #[test]
+    fn raw_byte_loader_round_trips_every_persisted_dtype() {
+        let cases = [
+            (dtype::FLOAT32, vec![0, 0, 192, 63, 0, 0, 32, 192]),
+            (dtype::FLOAT16, vec![0, 60, 0, 192]),
+            (dtype::BFLOAT16, vec![128, 63, 0, 192]),
+            (dtype::INT8, vec![0, 127, 128, 255]),
+            (dtype::UINT8, vec![0, 127, 128, 255]),
+            (dtype::INT32, vec![0, 0, 0, 128, 255, 255, 255, 127]),
+            (dtype::UINT32, vec![0, 0, 0, 0, 239, 190, 173, 222]),
+        ];
+
+        for (dt, bytes) in cases {
+            let item_size = dtype::size_bytes(dt).unwrap();
+            let shape = [(bytes.len() / item_size) as i32];
+            let arr = array_from_raw_bytes(&bytes, dt, &shape).unwrap();
+            assert_eq!(ffi::array_dtype(&arr), dt, "dtype {dt}");
+            assert_eq!(ffi::array_shape(&arr), shape, "dtype {dt}");
+            assert_eq!(ffi::array_to_raw_bytes(&arr), bytes, "dtype {dt}");
+        }
+    }
+
+    #[test]
+    fn raw_byte_loader_accepts_misaligned_multibyte_input() {
+        #[repr(align(4))]
+        struct AlignedBytes([u8; 5]);
+
+        let storage = AlignedBytes([0, 239, 190, 173, 222]);
+        let bytes = &storage.0[1..];
+        assert_ne!(bytes.as_ptr() as usize % std::mem::align_of::<u32>(), 0);
+
+        let arr = array_from_raw_bytes(bytes, dtype::UINT32, &[1]).unwrap();
+        assert_eq!(ffi::array_dtype(&arr), dtype::UINT32);
+        assert_eq!(ffi::array_to_raw_bytes(&arr), bytes);
+    }
+
+    #[test]
+    fn raw_byte_loader_rejects_malformed_metadata() {
+        let error = |result: Result<UniquePtr<MlxArray>, io::Error>| match result {
+            Ok(_) => panic!("malformed tensor metadata unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        let short = error(array_from_raw_bytes(&[0; 7], dtype::FLOAT32, &[2]));
+        assert_eq!(short.kind(), io::ErrorKind::InvalidData);
+        assert!(short.to_string().contains("expected 8, got 7"));
+
+        let long = error(array_from_raw_bytes(&[0; 9], dtype::FLOAT32, &[2]));
+        assert_eq!(long.kind(), io::ErrorKind::InvalidData);
+        assert!(long.to_string().contains("expected 8, got 9"));
+
+        let negative = error(array_from_raw_bytes(&[], dtype::UINT8, &[-1]));
+        assert_eq!(negative.kind(), io::ErrorKind::InvalidData);
+        assert!(negative.to_string().contains("negative tensor dimension"));
+
+        let overflow = error(array_from_raw_bytes(&[], dtype::UINT8, &[i32::MAX; 3]));
+        assert_eq!(overflow.kind(), io::ErrorKind::InvalidData);
+        assert!(overflow.to_string().contains("overflow"));
+
+        let unsupported = error(array_from_raw_bytes(&[0], dtype::BOOL, &[1]));
+        assert_eq!(unsupported.kind(), io::ErrorKind::InvalidData);
+        assert!(unsupported.to_string().contains("unsupported dtype"));
+    }
+
+    #[test]
+    fn read_array_rejects_malformed_metadata_before_payload_allocation() {
+        let error = |bytes: &[u8]| match read_array(&mut io::Cursor::new(bytes)) {
+            Ok(_) => panic!("malformed serialized tensor unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        let mut negative_rank = Vec::new();
+        negative_rank.extend_from_slice(&dtype::UINT8.to_le_bytes());
+        negative_rank.extend_from_slice(&(-1i32).to_le_bytes());
+        assert!(error(&negative_rank).to_string().contains("negative tensor rank"));
+
+        let mut excessive_rank = Vec::new();
+        excessive_rank.extend_from_slice(&dtype::UINT8.to_le_bytes());
+        excessive_rank
+            .extend_from_slice(&((MAX_SERIALIZED_TENSOR_RANK + 1) as i32).to_le_bytes());
+        assert!(error(&excessive_rank).to_string().contains("exceeds limit"));
+
+        let mut impossible_payload = Vec::new();
+        impossible_payload.extend_from_slice(&dtype::UINT8.to_le_bytes());
+        impossible_payload.extend_from_slice(&1i32.to_le_bytes());
+        impossible_payload.extend_from_slice(&1i32.to_le_bytes());
+        impossible_payload.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(
+            error(&impossible_payload)
+                .to_string()
+                .contains("tensor byte length")
+        );
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let huge_dim = i32::MAX;
+            let huge_len = (huge_dim as u64) * (huge_dim as u64) * 4;
+            let mut self_consistent_huge = Vec::new();
+            self_consistent_huge.extend_from_slice(&dtype::FLOAT32.to_le_bytes());
+            self_consistent_huge.extend_from_slice(&2i32.to_le_bytes());
+            self_consistent_huge.extend_from_slice(&huge_dim.to_le_bytes());
+            self_consistent_huge.extend_from_slice(&huge_dim.to_le_bytes());
+            self_consistent_huge.extend_from_slice(&huge_len.to_le_bytes());
+            assert!(
+                error(&self_consistent_huge)
+                    .to_string()
+                    .contains("cannot allocate")
+            );
+        }
+    }
+
+    #[test]
+    fn kvarn4_cache_serialization_round_trip_is_bit_exact() {
+        let mut cache =
+            super::super::KVCache::synth_kvarn_state(1, 1, 32, 300, 16, 7, 4);
+        let original = cache.clone_handle();
+        let mut encoded = Vec::new();
+        write_kv_cache(&mut encoded, &original).unwrap();
+
+        let restored = read_kv_cache(&mut io::Cursor::new(&encoded), 0).unwrap();
+        let mut reencoded = Vec::new();
+        write_kv_cache(&mut reencoded, &restored).unwrap();
+
+        assert_eq!(reencoded, encoded);
     }
 }

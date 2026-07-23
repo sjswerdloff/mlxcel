@@ -215,6 +215,7 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         model_path: args.model,
         adapter_path: args.adapter,
         model_alias: args.alias,
+        claude_code_prompt_normalization: args.claude_code_prompt_normalization,
         host: args.host,
         port: args.port,
         api_key: args.api_key,

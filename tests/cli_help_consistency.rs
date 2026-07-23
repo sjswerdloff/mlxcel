@@ -84,7 +84,12 @@ const FORBIDDEN_SUBSTRINGS: &[&str] = &["issue #", "epic #", "B-step #", "Issue 
 /// Only the env vars consumed by `TurboKvCacheArgs` itself need to be
 /// cleared, the broader llama-server compatibility env vars are scoped to
 /// other flag groups whose help isn't asserted here.
-const ENV_TO_CLEAR_FOR_HELP: &[&str] = &["LLAMA_ARG_CACHE_TYPE_K", "LLAMA_ARG_CACHE_TYPE_V"];
+const PROMPT_NORMALIZATION_ENV: &str = "MLXCEL_CLAUDE_CODE_PROMPT_NORMALIZATION";
+const ENV_TO_CLEAR_FOR_HELP: &[&str] = &[
+    "LLAMA_ARG_CACHE_TYPE_K",
+    "LLAMA_ARG_CACHE_TYPE_V",
+    PROMPT_NORMALIZATION_ENV,
+];
 
 /// Run `--help` on a binary and return the resulting stdout. Panics with a
 /// descriptive message when the binary fails to execute.
@@ -211,6 +216,42 @@ fn mlxcel_serve_help_lists_all_turbo_flags_and_modes() {
 fn mlxcel_server_help_lists_all_turbo_flags_and_modes() {
     let help = help_output("mlxcel-server", &["--help"]);
     assert_invariants("mlxcel-server", &help);
+}
+
+#[test]
+fn both_server_binaries_expose_claude_code_prompt_normalization_policy() {
+    let serve_help = help_output("mlxcel", &["serve", "--help"]);
+    let server_help = help_output("mlxcel-server", &["--help"]);
+    for (label, help) in [("mlxcel serve", serve_help), ("mlxcel-server", server_help)] {
+        assert!(
+            help.contains("--claude-code-prompt-normalization"),
+            "{label} is missing the normalization flag"
+        );
+        assert!(
+            help.contains("off") && help.contains("stable-prefix-v1"),
+            "{label} is missing normalization policy values"
+        );
+        assert!(
+            help.contains("[default: off]"),
+            "{label} is missing the deterministic off default"
+        );
+    }
+}
+
+#[test]
+fn mlxcel_server_help_reads_claude_code_prompt_normalization_environment() {
+    let path = repo_binary_path("mlxcel-server");
+    let output = Command::new(&path)
+        .arg("--help")
+        .env(PROMPT_NORMALIZATION_ENV, "stable-prefix-v1")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn mlxcel-server from {:?}: {e}", path));
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("[env: MLXCEL_CLAUDE_CODE_PROMPT_NORMALIZATION=stable-prefix-v1]"),
+        "mlxcel-server help did not expose the child-process environment value:\n{help}"
+    );
 }
 
 /// Issue #95: `mlxcel run` flattens the same `GenerationOptions` group as

@@ -113,7 +113,11 @@ mod ffi {
         fn from_slice_i64(data: &[i64], shape: &[i32]) -> UniquePtr<MlxArray>;
 
         /// Create array from raw bytes with specified dtype
-        fn from_bytes(data: &[u8], shape: &[i32], dtype: i32) -> UniquePtr<MlxArray>;
+        fn from_bytes(
+            data: &[u8],
+            shape: &[i32],
+            dtype: i32,
+        ) -> Result<UniquePtr<MlxArray>>;
 
         /// Create array from raw bytes without copying.
         ///

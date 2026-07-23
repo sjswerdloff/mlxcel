@@ -126,6 +126,13 @@ impl MlxcelTokenizer {
         }
     }
 
+    /// Encode an already-rendered prompt without duplicating an explicit BOS
+    /// emitted by its chat template.
+    pub(crate) fn encode_rendered_prompt(&self, prompt: &str) -> Result<Vec<u32>> {
+        let add_special_tokens = !prompt.starts_with("<bos>") && !prompt.starts_with("<s>");
+        self.encode(prompt, add_special_tokens)
+    }
+
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         match self {
             Self::HuggingFace(t) => t

@@ -158,6 +158,21 @@ fn build_server_config_applies_normalized_startup_values() {
 }
 
 #[test]
+fn build_server_config_propagates_claude_code_prompt_normalization() {
+    let startup = ServerStartupConfig {
+        claude_code_prompt_normalization:
+            crate::server::ClaudeCodePromptNormalization::StablePrefixV1,
+        ..ServerStartupConfig::default()
+    };
+
+    let config = build_server_config(&startup, None);
+    assert_eq!(
+        config.claude_code_prompt_normalization,
+        crate::server::ClaudeCodePromptNormalization::StablePrefixV1
+    );
+}
+
+#[test]
 fn build_server_config_max_batch_size_is_at_least_one() {
     // n_parallel=0 is nonsensical but must not produce a zero batch size
     let startup = ServerStartupConfig {

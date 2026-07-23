@@ -45,13 +45,33 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
 /// Expects the format produced by [`compress`]: a u64 LE original length
 /// prefix followed by LZ4 block data.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+    decompress_limited(data, 256 * 1024 * 1024)
+}
+
+pub fn decompress_limited(data: &[u8], max_output_len: usize) -> Result<Vec<u8>> {
     if data.len() < 8 {
         anyhow::bail!("compressed data too short for length prefix");
     }
-    let _original_len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+    let original_len = usize::try_from(u64::from_le_bytes(data[0..8].try_into().unwrap()))
+        .map_err(|_| anyhow::anyhow!("decompressed length exceeds addressable range"))?;
+    if original_len > max_output_len {
+        anyhow::bail!(
+            "decompressed length {original_len} exceeds limit {max_output_len}"
+        );
+    }
+    if data.len() < 12 {
+        anyhow::bail!("compressed data too short for LZ4 size prefix");
+    }
+    let lz4_len = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    if lz4_len != original_len {
+        anyhow::bail!("compressed length prefixes disagree: {original_len} vs {lz4_len}");
+    }
     let decompressed = lz4_flex::decompress_size_prepended(&data[8..])
         .map_err(|e| anyhow::anyhow!("LZ4 decompression failed: {e}"))
         .context("decompressing tensor data")?;
+    if decompressed.len() != original_len {
+        anyhow::bail!("decompressed length mismatch");
+    }
     Ok(decompressed)
 }
 

@@ -231,6 +231,46 @@ fn test_deserialize_truncated_data() {
 }
 
 #[test]
+fn deserialize_rejects_shape_payload_mismatch() {
+    let options = SerializeOptions::default();
+    for (shape, replacement, expected, got) in [(&[1u64][..], 2u64, 8, 4), (&[2][..], 1, 4, 8)] {
+        let data = vec![0u8; shape[0] as usize * 4];
+        let mut wire = serialize_tensor(TensorDtype::Float32, shape, &data, &options).unwrap();
+        wire[8..16].copy_from_slice(&replacement.to_le_bytes());
+
+        let error = format!("{:#}", deserialize_tensor(&wire).unwrap_err());
+        assert!(
+            error.contains(&format!("expects {expected} bytes, got {got}")),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn serialize_deserialize_zero_element_tensor() {
+    let options = SerializeOptions::default();
+    let wire = serialize_tensor(TensorDtype::Float32, &[2, 0, 3], &[], &options).unwrap();
+    let (tensor, _) = deserialize_tensor(&wire).unwrap();
+    assert_eq!(tensor.shape, vec![2, 0, 3]);
+    assert!(tensor.data.is_empty());
+}
+
+#[test]
+fn rank_zero_wire_tensor_is_scalar() {
+    let options = SerializeOptions::default();
+    let value = 1.25f32.to_le_bytes();
+    let wire = serialize_tensor(TensorDtype::Float32, &[], &value, &options).unwrap();
+    let (tensor, _) = deserialize_tensor(&wire).unwrap();
+    assert!(tensor.shape.is_empty());
+    assert_eq!(tensor.data, value);
+
+    let error = serialize_tensor(TensorDtype::Float32, &[], &[], &options)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("expects 4 bytes, got 0"));
+}
+
+#[test]
 fn test_serialize_to_bytes() {
     let data = make_f32_data(&[1.0; 4]);
     let options = SerializeOptions::default();

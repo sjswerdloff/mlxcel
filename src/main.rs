@@ -775,6 +775,16 @@ pub(crate) struct ServeArgs {
     #[arg(short = 'a', long, env = "LLAMA_ARG_ALIAS", value_name = "NAME")]
     alias: Option<String>,
 
+    /// Normalize known volatile Claude Code top-level Anthropic system
+    /// reminders before rendering (default: off).
+    #[arg(
+        long = "claude-code-prompt-normalization",
+        env = "MLXCEL_CLAUDE_CODE_PROMPT_NORMALIZATION",
+        value_enum,
+        default_value = "off"
+    )]
+    claude_code_prompt_normalization: mlxcel::server::ClaudeCodePromptNormalization,
+
     /// Host address to bind to (or Unix socket path when --port 0)
     #[arg(long, env = "LLAMA_ARG_HOST", default_value = "127.0.0.1")]
     host: String,

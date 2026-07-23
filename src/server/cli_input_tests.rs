@@ -21,6 +21,7 @@ use super::{
     resolve_kv_cache_mode, resolve_max_kv_size, resolve_prefill_chunk_size, resolve_seed,
 };
 use crate::lang_bias::LangBiasCliArgs;
+use crate::server::ClaudeCodePromptNormalization;
 // Tests that mutate env vars (via `EnvGuard` or directly) must acquire the
 // crate-wide `ENV_LOCK` *before* the guard so the lock outlives the
 // guard's `Drop` (which calls `remove_var`). — a per-module
@@ -33,6 +34,7 @@ fn sample_input() -> ServerStartupInput {
         model_path: PathBuf::from("models/foo"),
         adapter_path: Some(PathBuf::from("adapters/bar")),
         model_alias: Some("alias".to_string()),
+        claude_code_prompt_normalization: ClaudeCodePromptNormalization::Off,
         host: "127.0.0.1".to_string(),
         port: 8080,
         api_key: Some("secret".to_string()),
@@ -192,10 +194,26 @@ fn into_startup_config_normalizes_edge_only_flags() {
     assert_eq!(startup.seed, None);
     assert_eq!(startup.adapter_path, Some(PathBuf::from("adapters/bar")));
     assert_eq!(
+        startup.claude_code_prompt_normalization,
+        ClaudeCodePromptNormalization::Off
+    );
+    assert_eq!(
         startup.draft_model_path,
         Some(PathBuf::from("models/draft"))
     );
     assert_eq!(startup.log_file, Some(PathBuf::from("server.log")));
+}
+
+#[test]
+fn into_startup_config_propagates_claude_code_prompt_normalization() {
+    let mut input = sample_input();
+    input.claude_code_prompt_normalization = ClaudeCodePromptNormalization::StablePrefixV1;
+
+    let startup = input.into_startup_config().expect("valid startup input");
+    assert_eq!(
+        startup.claude_code_prompt_normalization,
+        ClaudeCodePromptNormalization::StablePrefixV1
+    );
 }
 
 #[test]

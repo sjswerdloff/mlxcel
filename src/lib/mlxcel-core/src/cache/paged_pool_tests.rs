@@ -101,6 +101,7 @@ fn make_int8_block(base: i8, n_slots: i32) -> UniquePtr<MlxArray> {
         }
     }
     ffi::from_bytes(&bytes, &[1, H, n_slots, D], dtype::INT8)
+        .expect("generated INT8 block bytes must match their tensor shape")
 }
 
 /// Flatten any tensor to a row-major Vec<f32> (after an FP32 cast) so contents
@@ -1025,12 +1026,14 @@ fn assert_byte_roundtrip_preserves_content(cast_dtype: i32) {
                 &ffi::array_to_raw_bytes(&k),
                 &ffi::array_shape(&k),
                 ffi::array_dtype(&k),
-            );
+            )
+            .expect("serialized key block must reconstruct");
             let vv = ffi::from_bytes(
                 &ffi::array_to_raw_bytes(&v),
                 &ffi::array_shape(&v),
                 ffi::array_dtype(&v),
-            );
+            )
+            .expect("serialized value block must reconstruct");
             (block_id.as_u64(), kk, vv)
         })
         .collect();

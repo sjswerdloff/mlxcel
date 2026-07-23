@@ -245,12 +245,9 @@ impl TensorHeader {
 
     /// Compute the total number of elements described by the shape.
     ///
-    /// Returns 0 for an empty (scalar) shape. Uses checked arithmetic
+    /// Returns 1 for an empty (scalar) shape. Uses checked arithmetic
     /// to avoid silent overflow on malicious inputs.
     pub fn num_elements(&self) -> u64 {
-        if self.shape.is_empty() {
-            return 0;
-        }
         self.shape
             .iter()
             .copied()

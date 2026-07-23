@@ -107,40 +107,76 @@ std::unique_ptr<MlxArray> from_slice_i64(rust::Slice<const int64_t> data, rust::
     return std::make_unique<MlxArray>(array(data.data(), to_shape(shape)));
 }
 
-// Helper to create array from typed pointer
-// Does NOT call eval - caller is responsible for ensuring data remains valid until eval
-template<typename T>
-static std::unique_ptr<MlxArray> make_array_typed(const uint8_t* data, const Shape& shape, Dtype dtype) {
-    auto result = array(reinterpret_cast<const T*>(data), shape, dtype);
-    return std::make_unique<MlxArray>(result);
-}
-
 // Create array from raw bytes with specified dtype
-// Uses MLX's array constructor with typed pointer cast
-// IMPORTANT: Caller must call eval() on the result before source data goes out of scope
+// Copy directly into MLX-owned storage. This preserves raw representations
+// without typed-pointer aliasing or dtype-expanding intermediate vectors.
 std::unique_ptr<MlxArray> from_bytes(rust::Slice<const uint8_t> data, rust::Slice<const int32_t> shape, int32_t dtype) {
+    size_t item_size;
+    switch (dtype) {
+        case 0:
+        case 1:
+        case 5:
+            item_size = 1;
+            break;
+        case 2:
+        case 6:
+        case 9:
+        case 12:
+            item_size = 2;
+            break;
+        case 3:
+        case 7:
+        case 10:
+            item_size = 4;
+            break;
+        case 4:
+        case 8:
+        case 11:
+        case 13:
+            item_size = 8;
+            break;
+        default:
+            throw std::invalid_argument("from_bytes: unsupported dtype code " + std::to_string(dtype));
+    }
+
+    size_t element_count = 1;
+    for (size_t axis = 0; axis < shape.size(); ++axis) {
+        const int32_t dim = shape[axis];
+        if (dim < 0) {
+            throw std::invalid_argument(
+                "from_bytes: negative dimension at axis " + std::to_string(axis) + ": " + std::to_string(dim));
+        }
+        const size_t unsigned_dim = static_cast<size_t>(dim);
+        if (unsigned_dim != 0 && element_count > std::numeric_limits<size_t>::max() / unsigned_dim) {
+            throw std::overflow_error("from_bytes: shape element count overflow");
+        }
+        element_count *= unsigned_dim;
+    }
+    if (item_size != 0 && element_count > std::numeric_limits<size_t>::max() / item_size) {
+        throw std::overflow_error("from_bytes: byte count overflow");
+    }
+    const size_t expected_bytes = element_count * item_size;
+    if (data.size() != expected_bytes) {
+        throw std::invalid_argument(
+            "from_bytes: data length mismatch: expected " + std::to_string(expected_bytes) +
+            ", got " + std::to_string(data.size()));
+    }
+
     auto mlx_dtype = to_dtype(dtype);
     auto mlx_shape = to_shape(shape);
-
-    // Create array from raw data with correct pointer type
-    switch (dtype) {
-        case 3:  // UINT32
-            return make_array_typed<uint32_t>(data.data(), mlx_shape, mlx_dtype);
-        case 4:  // UINT64
-            return make_array_typed<uint64_t>(data.data(), mlx_shape, mlx_dtype);
-        case 7:  // INT32
-            return make_array_typed<int32_t>(data.data(), mlx_shape, mlx_dtype);
-        case 8:  // INT64
-            return make_array_typed<int64_t>(data.data(), mlx_shape, mlx_dtype);
-        case 10:  // FLOAT32
-            return make_array_typed<float>(data.data(), mlx_shape, mlx_dtype);
-        case 9:  // FLOAT16: reinterpret 2-byte halfs, not per-byte uint8 casts
-            return make_array_typed<mlx::core::float16_t>(data.data(), mlx_shape, mlx_dtype);
-        case 12:  // BFLOAT16: reinterpret 2-byte bf16, not per-byte uint8 casts
-            return make_array_typed<mlx::core::bfloat16_t>(data.data(), mlx_shape, mlx_dtype);
-        case 1:  // UINT8
-        default:
-            return std::make_unique<MlxArray>(array(data.data(), mlx_shape, mlx_dtype));
+    auto buffer = mlx::core::allocator::malloc(expected_bytes);
+    if (expected_bytes != 0) {
+        if (buffer.raw_ptr() == nullptr) {
+            throw std::runtime_error(
+                "from_bytes: allocator returned null for " + std::to_string(expected_bytes) + " bytes");
+        }
+        std::memcpy(buffer.raw_ptr(), data.data(), expected_bytes);
+    }
+    try {
+        return std::make_unique<MlxArray>(array(buffer, mlx_shape, mlx_dtype));
+    } catch (...) {
+        mlx::core::allocator::free(buffer);
+        throw;
     }
 }
 

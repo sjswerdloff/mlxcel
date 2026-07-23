@@ -199,6 +199,16 @@ struct ServerArgs {
     )]
     alias: Option<String>,
 
+    /// Normalize known volatile Claude Code top-level Anthropic system
+    /// reminders before rendering (default: off).
+    #[arg(
+        long = "claude-code-prompt-normalization",
+        env = "MLXCEL_CLAUDE_CODE_PROMPT_NORMALIZATION",
+        value_enum,
+        default_value = "off"
+    )]
+    claude_code_prompt_normalization: mlxcel::server::ClaudeCodePromptNormalization,
+
     /// Path to LoRA adapter directory
     #[arg(long = "lora", value_name = "PATH")]
     lora: Option<PathBuf>,
@@ -1225,6 +1235,7 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         model_path,
         adapter_path: args.lora,
         model_alias: args.alias,
+        claude_code_prompt_normalization: args.claude_code_prompt_normalization,
         host: args.host,
         port: args.port,
         api_key: args.api_key,
@@ -1441,5 +1452,25 @@ mod tests {
         let input = build_startup_input(args).expect("existing path should be accepted");
 
         assert_eq!(input.model_path, local_model);
+    }
+
+    #[test]
+    fn claude_code_prompt_normalization_parses_off_and_enabled() {
+        let default_args =
+            parse_server_args(&["mlxcel-server", "--claude-code-prompt-normalization", "off"]);
+        assert_eq!(
+            default_args.claude_code_prompt_normalization,
+            mlxcel::server::ClaudeCodePromptNormalization::Off
+        );
+
+        let enabled = parse_server_args(&[
+            "mlxcel-server",
+            "--claude-code-prompt-normalization",
+            "stable-prefix-v1",
+        ]);
+        assert_eq!(
+            enabled.claude_code_prompt_normalization,
+            mlxcel::server::ClaudeCodePromptNormalization::StablePrefixV1
+        );
     }
 }

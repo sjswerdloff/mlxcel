@@ -510,7 +510,8 @@ mod tests {
     fn bitlinear_matmul_known_ternary_case() {
         let x = mlxcel_core::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
         let packed =
-            mlxcel_core::from_bytes(&[134u8, 137, 100, 97], &[1, 4], mlxcel_core::dtype::UINT8);
+            mlxcel_core::from_bytes(&[134u8, 137, 100, 97], &[1, 4], mlxcel_core::dtype::UINT8)
+                .expect("test bytes must match their UINT8 tensor shape");
         let scale = mlxcel_core::from_slice_f32(&[2.0], &[1]);
         let y = mlxcel_core::bitlinear_matmul(&x, &packed, &scale, 4, 4, false);
         let expected = mlxcel_core::from_slice_f32(&[-4.0, -4.0, 8.0, 6.0], &[1, 4]);

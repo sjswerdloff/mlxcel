@@ -54,6 +54,12 @@ path = "src/bin/mxfp8_repack.rs"
 name = "kvarn-decode-bench"
 path = "src/bin/kvarn_decode_bench.rs"
 
+# Model-free cold-store benchmark. Synthesizes production-layout FP16/KVarN
+# state and measures serialization, buffered write drain, and warm restore.
+[[bin]]
+name = "cold-store-bench"
+path = "src/bin/cold_store_bench.rs"
+
 [features]
 default = ["surgery"]
 metal = ["mlxcel-core/metal"]

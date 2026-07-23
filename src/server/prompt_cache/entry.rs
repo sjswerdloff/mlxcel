@@ -84,6 +84,21 @@ impl DetachedKvSet {
             DetachedKvSet::Paged(p) => p.seq_len() == 0 || p.retained_block_count() == 0,
         }
     }
+
+    /// Common causal prefix length represented by every layer, or `None` if
+    /// the detached state is empty, inconsistent, or not representable as a
+    /// non-negative token count.
+    pub fn consistent_seq_len(&self) -> Option<usize> {
+        match self {
+            DetachedKvSet::Dense(d) => {
+                if d.caches.is_empty() || !d.has_consistent_seq_len() {
+                    return None;
+                }
+                usize::try_from(d.seq_len()).ok().filter(|len| *len > 0)
+            }
+            DetachedKvSet::Paged(p) => (p.seq_len() > 0).then(|| p.seq_len()),
+        }
+    }
 }
 
 /// Send/Sync holder for a [`DetachedKvSet`].

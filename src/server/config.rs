@@ -246,6 +246,8 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     pub timeout_seconds: u64,
     pub model_alias: Option<String>,
+    /// Opt-in normalization policy for Claude Code Anthropic system prompts.
+    pub claude_code_prompt_normalization: super::ClaudeCodePromptNormalization,
     /// Effective per-slot context window in tokens (`0` = model default).
     ///
     /// Startup lowers `--ctx-size C --parallel N` to `C / N` for continuous
@@ -503,6 +505,7 @@ impl Default for ServerConfig {
             api_key: None,
             timeout_seconds: 600,
             model_alias: None,
+            claude_code_prompt_normalization: super::ClaudeCodePromptNormalization::Off,
             context_size: 0,
             n_parallel: 1,
             enable_slots_endpoint: true,

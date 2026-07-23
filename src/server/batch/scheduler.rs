@@ -64,7 +64,7 @@ use crate::server::model_provider::model_worker::{
     prepare_request_vlm_embeddings,
 };
 use crate::server::model_provider::{GenerateEvent, ModelRequest};
-use crate::server::prompt_cache::key::PromptCacheKey;
+use crate::server::prompt_cache::key::{MultimodalDigest, PromptCacheKey};
 use crate::server::prompt_cache::{
     CacheEntry, DetachedKvSet, ModelSnapshotEntry, PromptCacheStore,
 };
@@ -134,7 +134,7 @@ fn vlm_prefix_sharing_allowed(enabled: bool, is_multimodal: bool, has_videos: bo
 /// a value that resolves differently in the report than in the code).
 ///
 /// Kept as one pure function (same pattern as
-/// [`vlm_prefix_sharing_allowed`] and [`align_matched_prefix`]) so the
+/// [`vlm_prefix_sharing_allowed`] and [`reusable_prefix_len`]) so the
 /// precedence is pinned by unit tests a future edit cannot silently
 /// invert.
 #[inline]
@@ -173,38 +173,37 @@ pub(crate) fn apply_kvarn_v_bits(caches: &mut [mlxcel_core::cache::KVCache], v_b
     }
 }
 
-/// Floor a raw longest-prefix cache match to the model's prefill-alignment
-/// quantum (see [`LanguageModel::prefill_alignment`]).
+/// Derive the causal prefix that may actually be adopted.
 ///
-/// Returns the token length an adoption may cover, or `None` to decline to
-/// a cold prefill.
-///
-/// `alignment <= 1` is the identity: the raw match is returned untouched,
-/// preserving bit-exact pre-alignment behavior for every position-agnostic
-/// model (the store already enforced its minimum prefix at lookup time, so
-/// no re-check happens on this path). For `alignment > 1` (MSA-class
-/// models) the match floors to the quantum; a floored result below
-/// `min_prefix` (or zero) declines, because adopting a misaligned prefix
-/// would shift the model's pooling grid for every resumed prefill dispatch
-/// — degraded speed is acceptable, divergent attention is not.
+/// The result is bounded by matching tokens, state actually present, and one
+/// token less than the request so prefill always recomputes sampling logits.
+/// It is then floored to the model's prefill-alignment quantum. Empty,
+/// below-minimum, and exact single-token requests decline to cold prefill.
 ///
 /// Kept as one pure function (same pattern as
 /// [`vlm_prefix_sharing_allowed`]) so the safety condition is pinned by
 /// unit tests a future edit cannot silently weaken.
 #[inline]
-pub(crate) fn align_matched_prefix(
+pub(crate) fn reusable_prefix_len(
     raw_matched: usize,
+    state_len: usize,
+    request_len: usize,
     alignment: usize,
     min_prefix: usize,
 ) -> Option<usize> {
-    if alignment <= 1 {
-        return Some(raw_matched);
-    }
-    let floored = (raw_matched / alignment) * alignment;
+    let request_cap = request_len.checked_sub(1)?;
+    let candidate = raw_matched.min(state_len).min(request_cap);
+    let alignment = alignment.max(1);
+    let floored = (candidate / alignment) * alignment;
     if floored < min_prefix.max(1) {
         return None;
     }
     Some(floored)
+}
+
+#[inline]
+pub(crate) fn adoption_leaves_token_for_logits(adopted_len: usize, request_len: usize) -> bool {
+    adopted_len < request_len
 }
 
 fn effective_decode_storage_backend(
@@ -1347,7 +1346,10 @@ impl BatchScheduler {
     }
 
     /// Install a cold-storage backend for persisting detached KV caches to SSD.
-    pub fn with_cold_store(mut self, store: Option<Arc<mlxcel_core::cache::cold_store::ColdStore>>) -> Self {
+    pub fn with_cold_store(
+        mut self,
+        store: Option<Arc<mlxcel_core::cache::cold_store::ColdStore>>,
+    ) -> Self {
         self.cold_store = store;
         self
     }
@@ -1484,11 +1486,13 @@ impl BatchScheduler {
             // prefill is always correct). Defensive today: no current model
             // sets both (M3 is KV-path; snapshot users are recurrent-state
             // families with alignment 1).
-            if alignment > 1 && matched_len % alignment != 0 {
+            if matched_len >= tokens.len()
+                || (alignment > 1 && matched_len % alignment != 0)
+            {
                 tracing::info!(
                     matched = matched_len,
                     alignment,
-                    "prompt-cache: snapshot match off the model's prefill alignment; skipping snapshot reuse"
+                    "prompt-cache: snapshot match cannot produce fresh logits or is off the model's prefill alignment; skipping snapshot reuse"
                 );
                 return None;
             }
@@ -1565,45 +1569,69 @@ impl BatchScheduler {
             None => {
                 // Store miss — try cold-storage (SSD) fallback.
                 // Content-addressed: finds longest matching token prefix.
-                if let Some(cs) = &self.cold_store {
+                // The v2 cold-store format does not carry multimodal or LoRA
+                // identity. Decline those requests rather than treating token
+                // placeholders or base-model state as sufficient authority.
+                let cold_identity_supported =
+                    ctx.mm_digest == MultimodalDigest::empty() && ctx.lora_id.is_none();
+                if let Some(cs) = &self.cold_store
+                    && cold_identity_supported
+                {
                     match cs.load_prefix(&ctx.model_id, &ctx.template_sig, tokens) {
-                        Ok((detached, match_len)) => {
+                        Ok((mut detached, raw_match_len)) => {
+                            let stored_state_len = detached.seq_len();
+                            if detached.num_layers() != self.model.num_layers()
+                                || !detached.has_consistent_seq_len()
+                            {
+                                tracing::warn!(
+                                    stored_layers = detached.num_layers(),
+                                    expected_layers = self.model.num_layers(),
+                                    "cold-store: loaded layer count or state lengths are invalid; falling back to cold prefill"
+                                );
+                                return None;
+                            }
+                            let Some(stored_state_len) =
+                                usize::try_from(stored_state_len).ok().filter(|len| *len > 0)
+                            else {
+                                return None;
+                            };
+                            let Some(match_len) = reusable_prefix_len(
+                                raw_match_len,
+                                stored_state_len,
+                                tokens.len(),
+                                alignment,
+                                store.min_prefix_tokens(),
+                            ) else {
+                                tracing::warn!(
+                                    raw_match_len,
+                                    stored_state_len,
+                                    alignment,
+                                    "cold-store: candidate does not satisfy state-length or alignment gates; falling back to cold prefill"
+                                );
+                                return None;
+                            };
+                            if match_len < stored_state_len
+                                && let Err(err) = detached.truncate_to(match_len as i32)
+                            {
+                                tracing::warn!(
+                                    error = %err,
+                                    match_len,
+                                    stored_state_len,
+                                    "cold-store: candidate truncation failed; falling back to cold prefill"
+                                );
+                                return None;
+                            }
                             tracing::info!(
                                 model_id = %ctx.model_id,
                                 match_len,
                                 total = tokens.len(),
                                 "prompt-cache: SSD cold-store HIT (longest prefix match)"
                             );
-                            match self.cache_pool.adopt(
-                                &self.model as &dyn crate::generate::LanguageModel,
-                                detached,
-                            ) {
+                            match self
+                                .cache_pool
+                                .adopt(&self.model as &dyn crate::generate::LanguageModel, detached)
+                            {
                                 Ok(seq_id) => {
-                                    // Truncate the adopted cache to the matched length.
-                                    // The cold-store entry may have more tokens than matched
-                                    // (e.g., from accumulated prefill continuations).
-                                    let target = match_len as i32;
-                                    if let Some(caches) = self.cache_pool.get_caches_mut(seq_id) {
-                                        let needs_truncate = caches.first()
-                                            .map_or(false, |c| c.offset > target);
-                                        if needs_truncate {
-                                            let from = caches.first().map_or(0, |c| c.offset);
-                                            for cache in caches.iter_mut() {
-                                                if let Err(err) = cache.trim_to(target) {
-                                                    tracing::warn!(
-                                                        "cold-store adopt: truncate to {target} failed ({err}); falling back to cold prefill"
-                                                    );
-                                                    self.release_sequence_caches(seq_id);
-                                                    return None;
-                                                }
-                                            }
-                                            tracing::debug!(
-                                                from,
-                                                to = target,
-                                                "cold-store adopt: truncated adopted cache to matched prefix length"
-                                            );
-                                        }
-                                    }
                                     self.batch_observability.record_prompt_cache_hit(match_len);
                                     return Some((seq_id, match_len));
                                 }
@@ -1634,19 +1662,20 @@ impl BatchScheduler {
                 return None;
             }
         };
-        // Floor the raw match to the model's prefill alignment BEFORE any
-        // consumer sees it. This covers BOTH unaligned entry points on the
-        // dense path: a partial match (floored value flows into the existing
-        // `truncate_to` branch) and a whole-entry match on an entry whose
-        // stored length is itself unaligned (the cycle-83 `cached=160` case:
-        // pre-floor, `matched_len == seq_len` skipped truncation and adopted
-        // the misaligned prefix bit-exact). `alignment == 1` (every
-        // non-MSA model) takes the untouched value and preserves today's
-        // behavior exactly, including the bit-exact whole-entry skip. A
-        // match floored below the store's minimum prefix declines to a cold
-        // prefill — degraded speed, never a misaligned pooling grid.
-        let matched_len = match align_matched_prefix(
+        // Bound the raw match by state actually present and reserve at least
+        // one request token for fresh logits before applying model alignment.
+        // This makes the adopted state, prefill cursor, and hit accounting one
+        // causal length. A result below the store minimum declines safely.
+        let Some(state_len) = entry
+            .with_detached(DetachedKvSet::consistent_seq_len)
+            .flatten()
+        else {
+            return None;
+        };
+        let matched_len = match reusable_prefix_len(
             matched_len,
+            state_len,
+            tokens.len(),
             alignment,
             store.min_prefix_tokens(),
         ) {
@@ -1676,7 +1705,7 @@ impl BatchScheduler {
         // in the suffix, which the token-path suffix prefill would mis-handle.
         // Decline here (falling back to a cold prefill) before consuming
         // anything; the entry stays available for a later exact match.
-        if require_whole_entry && matched_len < entry.tokens.len() {
+        if require_whole_entry && matched_len != entry.tokens.len() {
             return None;
         }
         // Length the adopted cache actually covers. The dense path truncates
@@ -1713,10 +1742,14 @@ impl BatchScheduler {
                 // (128 | 128 today; V4-class models are also expected to
                 // declare 128). A model breaking this invariant needs an
                 // LCM floor here instead — catch it in debug builds.
-                debug_assert!(
-                    alignment == 1 || block_size.is_multiple_of(alignment) || alignment.is_multiple_of(block_size),
-                    "prefill_alignment {alignment} and pool block size {block_size} must divide one another"
-                );
+                if alignment > 1
+                    && !block_size.is_multiple_of(alignment)
+                    && !alignment.is_multiple_of(block_size)
+                {
+                    return PagedCloneOutcome::Decline(format!(
+                        "prefill alignment {alignment} and pool block size {block_size} are incompatible"
+                    ));
+                }
                 // Floor BOTH the partial and the whole-entry match to the
                 // pool block boundary: a donated entry's length
                 // (prompt + generated tokens) is almost never block-aligned,
@@ -1828,12 +1861,18 @@ impl BatchScheduler {
                 // Same divisibility invariant as the clone path above: the
                 // pool-block floor must not un-align a value already floored
                 // to the model's prefill alignment.
-                debug_assert!(
-                    alignment == 1
-                        || block_size.is_multiple_of(alignment)
-                        || alignment.is_multiple_of(block_size),
-                    "prefill_alignment {alignment} and pool block size {block_size} must divide one another"
-                );
+                if alignment > 1
+                    && !block_size.is_multiple_of(alignment)
+                    && !alignment.is_multiple_of(block_size)
+                {
+                    tracing::warn!(
+                        alignment,
+                        block_size,
+                        "prompt-cache adopt: model and pool alignments are incompatible; falling back to cold prefill"
+                    );
+                    self.cache_pool.release_detached_paged(paged);
+                    return None;
+                }
                 let adoptable = if matched_len < paged_seq_len {
                     (matched_len / block_size) * block_size
                 } else {
@@ -1983,10 +2022,11 @@ impl BatchScheduler {
             None => return,
         };
 
-        // Tokens stored against both KV entries and recurrent snapshots are
-        // the full prompt + generated tail, so the next turn can restore the
-        // exact previous conversation prefix and prefill only the appended
-        // user turn.
+        // Assemble every model-visible token available to this request. Dense
+        // and paged KV donations are truncated below to the common state
+        // offset because the newest sampled token may not have been consumed
+        // by a forward pass yet. Model-owned snapshots keep their own explicit
+        // state contract.
         let mut tokens = Vec::with_capacity(prompt_tokens.len() + generated_tokens.len());
         tokens.extend_from_slice(prompt_tokens);
         tokens.extend_from_slice(generated_tokens);
@@ -2102,6 +2142,26 @@ impl BatchScheduler {
             return;
         }
 
+        let Some(cache_covered_len) = kv_set.consistent_seq_len() else {
+            tracing::warn!(
+                seq_id = %seq_id,
+                "prompt-cache donate skipped: detached layer lengths are empty or inconsistent"
+            );
+            self.release_unused_detached(kv_set);
+            return;
+        };
+        if cache_covered_len > tokens.len() {
+            tracing::warn!(
+                seq_id = %seq_id,
+                cache_covered_len,
+                available_tokens = tokens.len(),
+                "prompt-cache donate skipped: detached state exceeds model-visible token history"
+            );
+            self.release_unused_detached(kv_set);
+            return;
+        }
+        tokens.truncate(cache_covered_len);
+
         // Mark donation as in-progress so new requests for the same token
         // sequence wait instead of starting a redundant prefill.
         let token_hash = Self::hash_tokens(&tokens);
@@ -2109,7 +2169,10 @@ impl BatchScheduler {
 
         // Persist to cold-storage (SSD) before wrapping in CacheEntry.
         // Content-addressed: keyed by token prefix, not session.
-        if let Some(cs) = &self.cold_store {
+        if let Some(cs) = &self.cold_store
+            && ctx.mm_digest == MultimodalDigest::empty()
+            && ctx.lora_id.is_none()
+        {
             if let DetachedKvSet::Dense(dense) = &kv_set {
                 if let Err(e) = cs.persist(&ctx.model_id, &ctx.template_sig, &tokens, dense) {
                     tracing::warn!(
@@ -2742,8 +2805,7 @@ impl BatchScheduler {
         response_tx: mpsc::Sender<GenerateEvent>,
         cancelled: Arc<AtomicBool>,
     ) {
-        let add_special = !prompt.starts_with("<bos>") && !prompt.starts_with("<s>");
-        let token_ids = match self.tokenizer.encode(&prompt, add_special) {
+        let token_ids = match self.tokenizer.encode_rendered_prompt(&prompt) {
             Ok(ids) => ids,
             Err(err) => {
                 let _ =
@@ -2886,9 +2948,24 @@ impl BatchScheduler {
         } else {
             options.prompt_cache_ctx.as_ref()
         };
-        let (seq_id, prefill_start_offset, already_cached_tokens) = match ctx_ref
-            .and_then(|ctx| self.try_adopt_cached_prefix(ctx, &prompt_tokens, is_multimodal))
-        {
+        let adopted = ctx_ref
+            .and_then(|ctx| self.try_adopt_cached_prefix(ctx, &prompt_tokens, is_multimodal));
+        let adopted = match adopted {
+            Some((adopted_id, adopted_len))
+                if !adoption_leaves_token_for_logits(adopted_len, prompt_tokens.len()) =>
+            {
+                tracing::warn!(
+                    seq_id = %adopted_id,
+                    adopted_len,
+                    prompt_len = prompt_tokens.len(),
+                    "prompt-cache adoption left no request token for fresh logits; releasing state and falling back to cold prefill"
+                );
+                self.release_sequence_caches(adopted_id);
+                None
+            }
+            other => other,
+        };
+        let (seq_id, prefill_start_offset, already_cached_tokens) = match adopted {
             Some((adopted_id, adopted_len)) => (adopted_id, adopted_len, adopted_len),
             None => {
                 // Miss or feature disabled → regular allocate.
@@ -3006,21 +3083,11 @@ impl BatchScheduler {
             self.prompt_cache_seq_ctx.insert(seq_id, ctx);
         }
 
-        // Guard against a degenerate cache hit where the adopted prefix
-        // covers the entire tokenized prompt. This can legitimately happen
-        // when a client replays an identical prompt. Back off one token so
-        // the prefill path still runs and the sampler sees fresh logits.
-        let prefill_start_offset =
-            if prefill_start_offset >= prompt_tokens.len() && !prompt_tokens.is_empty() {
-                tracing::debug!(
-                    seq_id = %seq_id,
-                    "prompt-cache hit covered the entire prompt; re-running the \
-                     last token through prefill to produce a sampling logit"
-                );
-                prompt_tokens.len() - 1
-            } else {
-                prefill_start_offset
-            };
+        debug_assert!(
+            prompt_tokens.is_empty()
+                || adoption_leaves_token_for_logits(prefill_start_offset, prompt_tokens.len()),
+            "cache adoption must leave at least one request token for logits"
+        );
 
         let seq = SequenceInfo {
             seq_id,

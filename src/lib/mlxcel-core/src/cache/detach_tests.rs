@@ -422,6 +422,29 @@ fn cache_pool_detach_returns_none_for_unknown_seq() {
 }
 
 #[test]
+fn cache_pool_detach_declines_front_trimmed_dense_state() {
+    let model = RecordingModel::new(1);
+    let mut pool = CachePool::new(4);
+    let seq = pool.allocate(&model).unwrap();
+    {
+        let caches = pool.get_caches_mut(seq).unwrap();
+        caches[0].update(
+            fp32_tokens(&[1.0, 2.0, 3.0]),
+            fp32_tokens(&[10.0, 20.0, 30.0]),
+        );
+        assert_eq!(caches[0].trim_front(1), 1);
+        assert!(caches[0].is_front_trimmed());
+    }
+
+    assert!(pool.detach(seq).is_none());
+    assert_eq!(
+        pool.active_count(),
+        1,
+        "declining detach must be non-destructive"
+    );
+}
+
+#[test]
 fn cache_pool_detach_adopt_round_trip_preserves_contents() {
     let model = RecordingModel::new(2);
     let mut pool = CachePool::new(4);

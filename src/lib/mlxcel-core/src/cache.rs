@@ -1037,6 +1037,15 @@ impl KVCache {
         self.offset - self.live_start
     }
 
+    /// Whether this cache no longer contains the causal prefix from position
+    /// zero. Detached prompt-cache state cannot represent `live_start` yet,
+    /// so callers must decline detach rather than relabel the live suffix as a
+    /// complete prefix.
+    #[inline]
+    pub fn is_front_trimmed(&self) -> bool {
+        self.live_start != 0
+    }
+
     /// Buffer slot index where the next K/V token will be written.
     ///
     /// Slot `i` in the on-device buffer maps to monotonic position

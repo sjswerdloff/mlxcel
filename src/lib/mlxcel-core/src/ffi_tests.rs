@@ -1209,7 +1209,8 @@ fn from_bytes_round_trips_16bit_floats_bit_exactly() {
         let orig = astype(&from_slice_f32(&vals, &shape), dt);
         eval(&orig);
         let bytes = array_to_raw_bytes(&orig);
-        let recon = from_bytes(&bytes, &array_shape(&orig), array_dtype(&orig));
+        let recon = from_bytes(&bytes, &array_shape(&orig), array_dtype(&orig))
+            .expect("array bytes produced by MLX must reconstruct");
         eval(&recon);
         assert_eq!(array_dtype(&recon), dt, "dtype {dt} must be preserved");
         assert_eq!(
@@ -1223,6 +1224,93 @@ fn from_bytes_round_trips_16bit_floats_bit_exactly() {
             "from_bytes must reproduce the exact bytes for dtype {dt}; 16-bit types must be reinterpreted, not read one value per byte"
         );
     }
+}
+
+fn from_bytes_error(data: &[u8], shape: &[i32], dt: i32) -> String {
+    match from_bytes(data, shape, dt) {
+        Ok(_) => panic!("malformed raw tensor unexpectedly succeeded"),
+        Err(error) => error.to_string(),
+    }
+}
+
+#[test]
+fn from_bytes_rejects_short_and_long_payloads() {
+    for len in [7, 9] {
+        let error = from_bytes_error(&vec![0; len], &[2], dtype::FLOAT32);
+        assert!(error.contains("expected 8"), "unexpected error: {error}");
+    }
+}
+
+#[test]
+fn from_bytes_rejects_invalid_shape_and_dtype() {
+    let negative = from_bytes_error(&[], &[-1], dtype::UINT8);
+    assert!(negative.contains("negative dimension"));
+
+    let overflow = from_bytes_error(&[], &[i32::MAX; 3], dtype::UINT8);
+    assert!(overflow.contains("element count overflow"));
+
+    let unsupported = from_bytes_error(&[0], &[1], 99);
+    assert!(unsupported.contains("unsupported dtype code 99"));
+}
+
+#[test]
+fn from_bytes_round_trips_zero_element_array() {
+    let array = from_bytes(&[], &[2, 0, 3], dtype::FLOAT32)
+        .expect("a shape with a zero dimension is a valid empty tensor");
+    assert_eq!(array_shape(&array), vec![2, 0, 3]);
+    assert_eq!(array_dtype(&array), dtype::FLOAT32);
+    assert_eq!(array_size(&array), 0);
+    assert_eq!(array_nbytes(&array), 0);
+    assert!(array_to_raw_bytes(&array).is_empty());
+}
+
+#[test]
+fn from_bytes_rank_zero_shape_is_scalar() {
+    let value = 1.25f32.to_le_bytes();
+    let scalar = from_bytes(&value, &[], dtype::FLOAT32)
+        .expect("rank-zero shape with one value is a scalar");
+    assert!(array_shape(&scalar).is_empty());
+    assert_eq!(array_size(&scalar), 1);
+    assert_eq!(array_nbytes(&scalar), 4);
+
+    let error = from_bytes_error(&[], &[], dtype::FLOAT32);
+    assert!(error.contains("expected 4"), "unexpected error: {error}");
+}
+
+#[test]
+fn immutable_mlx_array_cross_thread_read_probe() {
+    // This wrapper is deliberately local to the probe. A green result is
+    // runtime evidence for a future ownership design, not a declaration that
+    // arbitrary MLX operations are Send + Sync.
+    struct SharedReadOnlyArray(UniquePtr<MlxArray>);
+    unsafe impl Send for SharedReadOnlyArray {}
+    unsafe impl Sync for SharedReadOnlyArray {}
+
+    let values = [1.0f32, -0.0, f32::INFINITY, f32::from_bits(0x7fc0_1234)];
+    let expected: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let array = from_bytes(&expected, &[2, 2], dtype::FLOAT32).unwrap();
+    eval(&array);
+    let shared = std::sync::Arc::new(SharedReadOnlyArray(array));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+    let thread_array = shared.clone();
+    let thread_barrier = barrier.clone();
+    let expected_from_thread = expected.clone();
+    let reader = std::thread::spawn(move || {
+        for _ in 0..64 {
+            thread_barrier.wait();
+            assert_eq!(array_to_raw_bytes(&thread_array.0), expected_from_thread);
+        }
+    });
+
+    for _ in 0..64 {
+        barrier.wait();
+        assert_eq!(array_to_raw_bytes(&shared.0), expected);
+    }
+    reader.join().expect("cross-thread MLX reader must not panic");
+
+    assert_eq!(array_to_raw_bytes(&shared.0), expected);
+    assert_eq!(std::sync::Arc::strong_count(&shared), 1);
 }
 
 #[test]

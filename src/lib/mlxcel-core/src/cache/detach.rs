@@ -1065,6 +1065,14 @@ impl DetachedCacheSet {
         self.caches.first().map(|c| c.offset).unwrap_or(0)
     }
 
+    /// Whether every layer carries the same logical token length.
+    pub fn has_consistent_seq_len(&self) -> bool {
+        let Some(first) = self.caches.first() else {
+            return false;
+        };
+        self.caches.iter().all(|cache| cache.offset == first.offset)
+    }
+
     /// Shrink every per-layer detached cache to exactly `new_len` tokens.
     ///
     /// Walks each [`DetachedKVCache`] and calls [`DetachedKVCache::trim_to`]
@@ -1106,7 +1114,7 @@ impl DetachedCacheSet {
         // sequence layout.
         let head = self.caches[0].offset;
         debug_assert!(
-            self.caches.iter().all(|c| c.offset == head),
+            self.has_consistent_seq_len(),
             "DetachedCacheSet::truncate_to: layers disagree on seq_len: {:?}",
             self.caches.iter().map(|c| c.offset).collect::<Vec<_>>()
         );
@@ -1203,7 +1211,9 @@ impl CachePool {
     ///
     /// Returns `None` if:
     /// * `seq_id` is not currently active, or
-    /// * the sequence uses the paged backend (paged detach is's responsibility — this method deliberately rejects it).
+    /// * the sequence uses the paged backend (paged detach is's responsibility — this method deliberately rejects it), or
+    /// * any dense layer has front-trimmed state that the detached format
+    ///   cannot represent without its monotonic `live_start`.
     ///
     /// The caller is responsible for re-homing the detached set, either by
     /// passing it to [`CachePool::adopt`] or by parking it via
@@ -1218,6 +1228,9 @@ impl CachePool {
         {
             let sequence = self.active.get(&seq_id)?;
             if sequence.backend != SequenceStateBackend::DenseKvCache {
+                return None;
+            }
+            if sequence.caches.iter().any(KVCache::is_front_trimmed) {
                 return None;
             }
         }

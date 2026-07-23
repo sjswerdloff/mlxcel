@@ -84,6 +84,7 @@ pub(crate) fn mlx_f32(values: &[f32], shape: &[usize]) -> UniquePtr<MlxArray> {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
     from_bytes(&bytes, &shape_i32, mlx_dtype::FLOAT32)
+        .expect("test f32 bytes must match their tensor shape")
 }
 
 /// Read an f32 MLX array back to a `Vec<f32>` so tests can assert
