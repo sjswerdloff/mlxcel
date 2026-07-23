@@ -179,6 +179,10 @@ pub(crate) struct WorkerSchedulerConfig {
     /// serve-level `--diffusion-threshold` for the confidence-threshold
     /// sampler (diffusion models only). Ignored by non-diffusion models.
     pub diffusion_threshold: f32,
+    /// decoupled prefill coalescing (Option 2b).
+    pub decouple_prefill_on_disconnect: bool,
+    pub decouple_prefill_min_tokens: usize,
+    pub max_orphaned_prefills: usize,
 }
 
 pub(crate) fn spawn_model_worker_with_batch_config(
@@ -488,6 +492,12 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             .with_paged_block_budget(paged_block_budget)
             // experimental VLM prompt-prefix cache sharing (#124 step c).
             .with_vlm_prefix_cache(sched_config.enable_vlm_prefix_cache)
+            // decoupled prefill coalescing (Option 2b).
+            .with_decouple_prefill(
+                sched_config.decouple_prefill_on_disconnect,
+                sched_config.decouple_prefill_min_tokens,
+                sched_config.max_orphaned_prefills,
+            )
             // attach the resolved speculative dispatch so the
             // scheduler can branch per-request once the round-loop dispatch
             // hook is wired in `decode_single_step`.

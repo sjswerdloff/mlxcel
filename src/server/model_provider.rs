@@ -268,6 +268,9 @@ impl ModelProvider {
                 config.max_denoising_steps,
                 config.diffusion_sampler.clone(),
                 config.diffusion_threshold,
+                config.decouple_prefill_on_disconnect,
+                config.decouple_prefill_min_tokens,
+                config.max_orphaned_prefills,
                 batch_metrics,
                 batch_observability,
             )?;
@@ -499,6 +502,10 @@ impl ModelProvider {
             None,
             "entropy-bound".to_string(),
             0.9,
+            // decouple defaults to off in this wrapper.
+            false,
+            8192,
+            2,
             batch_metrics,
             batch_observability,
         )
@@ -542,6 +549,9 @@ impl ModelProvider {
         max_denoising_steps: Option<usize>,
         diffusion_sampler: String,
         diffusion_threshold: f32,
+        decouple_prefill_on_disconnect: bool,
+        decouple_prefill_min_tokens: usize,
+        max_orphaned_prefills: usize,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -600,6 +610,9 @@ impl ModelProvider {
             max_denoising_steps,
             diffusion_sampler,
             diffusion_threshold,
+            decouple_prefill_on_disconnect,
+            decouple_prefill_min_tokens,
+            max_orphaned_prefills,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
@@ -687,6 +700,9 @@ impl ModelProvider {
             max_denoising_steps: None,
             diffusion_sampler: "entropy-bound".to_string(),
             diffusion_threshold: 0.9,
+            decouple_prefill_on_disconnect: false,
+            decouple_prefill_min_tokens: 8192,
+            max_orphaned_prefills: 2,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(

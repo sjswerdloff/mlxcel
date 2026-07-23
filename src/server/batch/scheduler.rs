@@ -1193,6 +1193,20 @@ impl BatchScheduler {
         self
     }
 
+    /// Enable decoupled prefill coalescing (Option 2b).
+    /// When true, arm at prefill start and orphan on disconnect.
+    pub fn with_decouple_prefill(
+        mut self,
+        enabled: bool,
+        min_tokens: usize,
+        max_orphaned: usize,
+    ) -> Self {
+        self.decouple_prefill_on_disconnect = enabled;
+        self.decouple_prefill_min_tokens = min_tokens;
+        self.max_orphaned_prefills = max_orphaned;
+        self
+    }
+
     /// Attach the resolved speculative-decoding dispatch.
     ///
     /// Default (constructed by [`Self::with_config`]) is
