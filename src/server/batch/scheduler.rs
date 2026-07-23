@@ -2322,10 +2322,16 @@ impl BatchScheduler {
         }
         tokens.truncate(cache_covered_len);
 
+        // Compute the prompt-only hash for donation tracking.
+        // The arm at prefill start uses hash_tokens(prompt_tokens), so
+        // the drain must use the same key to find waiting retries.
+        // Using the full donated tokens (prompt + generated) would produce
+        // a different hash if cache_covered_len != prompt_len.
+        let prompt_hash = Self::hash_tokens(prompt_tokens);
+
         // Mark donation as in-progress so new requests for the same token
         // sequence wait instead of starting a redundant prefill.
-        let token_hash = Self::hash_tokens(&tokens);
-        self.donation_in_progress.entry(token_hash).or_default();
+        self.donation_in_progress.entry(prompt_hash).or_default();
 
         // Persist to cold-storage (SSD) before wrapping in CacheEntry.
         // Content-addressed: keyed by token prefix, not session.
@@ -2396,11 +2402,11 @@ impl BatchScheduler {
 
         // Donation complete — remove tracking entry and re-enqueue any
         // requests that arrived while the donation was in progress.
-        if let Some(waiting) = self.donation_in_progress.remove(&token_hash) {
+        if let Some(waiting) = self.donation_in_progress.remove(&prompt_hash) {
             let count = waiting.len();
             if count > 0 {
                 tracing::info!(
-                    token_hash,
+                    prompt_hash,
                     waiting_count = count,
                     "donation complete: re-enqueuing waiting requests"
                 );
@@ -2412,7 +2418,7 @@ impl BatchScheduler {
 
         // Also drain prefill coalescing waiters (Change 1).
         // Healthy path: re-dispatch all — they HIT the just-donated cache.
-        self.drain_prefill_coalescing(token_hash, true, false);
+        self.drain_prefill_coalescing(prompt_hash, true, false);
     }
 
     /// Apply thinking-budget enforcement to a freshly sampled
