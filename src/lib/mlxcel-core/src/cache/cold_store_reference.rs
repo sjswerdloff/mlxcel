@@ -77,12 +77,26 @@ pub struct ReferenceSnapshot {
     pub path: PathBuf,
 }
 
+/// Cold-store prune mode for ancestor snapshot cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PruneMode {
+    /// Prune disabled — no scanning, no logging, no deletion.
+    Off,
+    /// Observe mode — log what WOULD be pruned, do not delete.
+    /// Default: validate on real data before enabling deletion.
+    #[default]
+    Observe,
+    /// Delete mode — log and delete unreachable ancestors.
+    Delete,
+}
+
 /// Synchronous, one-layer-at-a-time v3 writer and reader used only by tests,
 /// benchmarks, and the fresh-process fidelity harness.
 pub struct ReferenceColdStore {
     base_dir: PathBuf,
     runtime_fingerprint: [u8; 32],
     persist_lock: Mutex<()>,
+    prune_mode: PruneMode,
 }
 
 impl ReferenceColdStore {
@@ -91,7 +105,13 @@ impl ReferenceColdStore {
             base_dir,
             runtime_fingerprint,
             persist_lock: Mutex::new(()),
+            prune_mode: PruneMode::default(),
         }
+    }
+
+    pub fn with_prune_mode(mut self, mode: PruneMode) -> Self {
+        self.prune_mode = mode;
+        self
     }
 
     pub fn root_dir(&self) -> PathBuf {
@@ -306,6 +326,19 @@ impl ReferenceColdStore {
         new_tokens: &[i32],
         new_identity_hex: &str,
     ) {
+        let prune_mode = match std::env::var("MLXCEL_COLD_STORE_PRUNE_MODE")
+            .as_deref()
+            .unwrap_or("observe")
+        {
+            "off" => PruneMode::Off,
+            "observe" => PruneMode::Observe,
+            "delete" => PruneMode::Delete,
+            _ => PruneMode::Observe,
+        };
+        if prune_mode == PruneMode::Off {
+            return;
+        }
+        let is_observe = prune_mode == PruneMode::Observe;
         let root = self.root_dir();
         if !root.exists() {
             return;
@@ -364,22 +397,31 @@ impl ReferenceColdStore {
                 continue;
             }
             // This entry's tokens are a strict prefix of the new entry.
-            // load_prefix will never select it. Delete the entire identity dir.
-            match fs::remove_dir_all(entry.path()) {
-                Ok(()) => {
-                    tracing::info!(
-                        pruned = %identity_name,
-                        old_token_count = header.tokens.len(),
-                        new_token_count = new_tokens.len(),
-                        "COLD-STORE pruned ancestor snapshot"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        pruned = %identity_name,
-                        error = %e,
-                        "COLD-STORE failed to prune ancestor snapshot"
-                    );
+            // load_prefix will never select it.
+            if is_observe {
+                tracing::info!(
+                    would_prune = %identity_name,
+                    old_token_count = header.tokens.len(),
+                    new_token_count = new_tokens.len(),
+                    "COLD-STORE observe: would prune ancestor snapshot"
+                );
+            } else {
+                match fs::remove_dir_all(entry.path()) {
+                    Ok(()) => {
+                        tracing::info!(
+                            pruned = %identity_name,
+                            old_token_count = header.tokens.len(),
+                            new_token_count = new_tokens.len(),
+                            "COLD-STORE pruned ancestor snapshot"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            pruned = %identity_name,
+                            error = %e,
+                            "COLD-STORE failed to prune ancestor snapshot"
+                        );
+                    }
                 }
             }
         }
@@ -1085,6 +1127,8 @@ mod tests {
 
     #[test]
     fn prune_deletes_strict_prefix_ancestor() {
+        // Set env var to enable deletion for this test
+        std::env::set_var("MLXCEL_COLD_STORE_PRUNE_MODE", "delete");
         let dir = tempfile::tempdir().unwrap();
         let store = ReferenceColdStore::new(
             dir.path().to_path_buf(),
@@ -1127,11 +1171,17 @@ mod tests {
         );
         let tokens_a = vec![1, 2, 3];
         let tokens_b = vec![1, 2, 3, 4, 5];
+        // Same layout for both (seq_len=5, trim short to 3)
+        let cache_b = make_test_cache_set(1, 5, 16);
+        let mut cache_a = make_test_cache_set(1, 5, 16);
+        for c in &mut cache_a.caches {
+            c.offset = 3;
+        }
         let snap_a = store
-            .persist("model-a", "tmpl", &tokens_a, &make_test_cache_set(1, 3, 16))
+            .persist("model-a", "tmpl", &tokens_a, &cache_a)
             .unwrap();
         store
-            .persist("model-b", "tmpl", &tokens_b, &make_test_cache_set(1, 5, 16))
+            .persist("model-b", "tmpl", &tokens_b, &cache_b)
             .unwrap();
 
         // Entry from model-a should NOT be pruned (different model_id)
@@ -1160,6 +1210,35 @@ mod tests {
         // Neither should be pruned (same length, different content)
         let dir_a = dir.path().join("cold-storage-v3").join(&snap_a.identity_hex);
         assert!(dir_a.exists(), "same-length entry should not be pruned");
+        let entries: Vec<_> = fs::read_dir(store.root_dir()).unwrap().collect();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn prune_keeps_shorter_but_not_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReferenceColdStore::new(
+            dir.path().to_path_buf(),
+            runtime_fingerprint_from_manifest(b"runtime"),
+        );
+        // [1,2,9] is shorter than [1,2,3,4,5] but NOT a prefix (diverges at index 2)
+        let short_tokens = vec![1, 2, 9];
+        let long_tokens = vec![1, 2, 3, 4, 5];
+        let cache_long = make_test_cache_set(1, 5, 16);
+        let mut cache_short = make_test_cache_set(1, 5, 16);
+        for c in &mut cache_short.caches {
+            c.offset = 3;
+        }
+        let short_snap = store
+            .persist("m3", "tmpl", &short_tokens, &cache_short)
+            .unwrap();
+        store
+            .persist("m3", "tmpl", &long_tokens, &cache_long)
+            .unwrap();
+
+        // Short entry should NOT be pruned (not a prefix — diverges at index 2)
+        let short_dir = dir.path().join("cold-storage-v3").join(&short_snap.identity_hex);
+        assert!(short_dir.exists(), "non-prefix shorter entry should not be pruned");
         let entries: Vec<_> = fs::read_dir(store.root_dir()).unwrap().collect();
         assert_eq!(entries.len(), 2);
     }
@@ -1199,8 +1278,14 @@ mod tests {
         );
         let short_tokens = vec![1, 2, 3];
         let long_tokens = vec![1, 2, 3, 4, 5];
+        // Same layout for both (seq_len=5, trim short to 3)
+        let cache_long = make_test_cache_set(1, 5, 16);
+        let mut cache_short = make_test_cache_set(1, 5, 16);
+        for c in &mut cache_short.caches {
+            c.offset = 3;
+        }
         let short_snap = store
-            .persist("m3", "tmpl", &short_tokens, &make_test_cache_set(1, 3, 16))
+            .persist("m3", "tmpl", &short_tokens, &cache_short)
             .unwrap();
         // Corrupt the COMMITTED file
         let committed = dir
@@ -1211,7 +1296,7 @@ mod tests {
             .join("COMMITTED");
         fs::write(&committed, b"corrupt").unwrap();
         store
-            .persist("m3", "tmpl", &long_tokens, &make_test_cache_set(1, 5, 16))
+            .persist("m3", "tmpl", &long_tokens, &cache_long)
             .unwrap();
 
         // Corrupt entry should be skipped (not deleted, not crashing)
