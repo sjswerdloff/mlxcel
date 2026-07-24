@@ -43,6 +43,15 @@ ALIAS="${MLXCEL_ALIAS:-minimax-m3}"               # cosmetic client-addressing l
 KV_CACHE_MODE="${MLXCEL_KV_CACHE_MODE:-k8v4}"     # fp16 | kvarn8 | k8v4  (k8v4 = 8-bit K / 4-bit V; DEFAULT for live Kindled serving. Retrieval-validated == fp16 on 2026-07-13 semantic-at-depth test — quant adds ZERO retrieval loss, MSA coverage sets the fidelity floor, not the quant. See VERDICT_k8v4_MSA_20260713.md. kvarn8 = prior boot-night default (8-bit V); fp16 = lossless control)
 THINKING_MODE="${MLXCEL_THINKING_MODE:-adaptive}" # disabled | adaptive | enabled  (adaptive = normal serving)
 
+export MLXCEL_CLAUDE_CODE_PROMPT_NORMALIZATION="${MLXCEL_CLAUDE_CODE_PROMPT_NORMALIZATION:-stable-prefix-v1}"
+
+####
+#--decouple-prefill-on-disconnect     (or MLXCEL_DECOUPLE_PREFILL_ON_DISCONNECT=true)
+#--decouple-prefill-min-tokens 8192   (or MLXCEL_DECOUPLE_PREFILL_MIN_TOKENS=8192)
+#--max-orphaned-prefills 2            (or MLXCEL_MAX_ORPHANED_PREFILLS=2)
+
+export MLXCEL_DECOUPLE_PREFILL_ON_DISCONNECT="${MLXCEL_DECOUPLE_PREFILL_ON_DISCONNECT:-true}"
+
 # THE flag whose absence wasted 2026-07-12. Our default 128 GiB; the
 # binary's intrinsic default is 2 GiB. Passed explicitly, always.
 PROMPT_CACHE_CAPACITY_BYTES="${MLXCEL_PROMPT_CACHE_CAPACITY_BYTES:-137438953472}"
@@ -59,7 +68,7 @@ TEMP="${MLXCEL_TEMP:-1.0}"
 TOP_K="${MLXCEL_TOP_K:-40}"
 TOP_P="${MLXCEL_TOP_P:-0.95}"
 
-DECODE_HANG_TIMEOUT="${MLXCEL_DECODE_HANG_TIMEOUT:-600}"  # --timeout SECONDS; 600 = 10 min (long prefills at depth need headroom)
+DECODE_HANG_TIMEOUT="${MLXCEL_DECODE_HANG_TIMEOUT:-6000}"  # --timeout SECONDS; 6000 = 100 min (very long prefills at depth need headroom)
 
 # msa-fetch (boot-frozen construction key, engine env var). Mode-aware
 # default because the modes REQUIRE different fetch paths (both verified):

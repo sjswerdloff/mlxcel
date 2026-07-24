@@ -236,6 +236,18 @@ impl ReferenceColdStore {
             layers = header.layers.len(),
             "COLD-STORE v3 published a committed generation"
         );
+
+        // Prune ancestors: entries whose tokens are a strict prefix of the
+        // newly persisted entry. These are unreachable by load_prefix (the
+        // longest-match invariant guarantees the new entry always wins).
+        self.prune_ancestor_snapshots(
+            model_id,
+            template_sig,
+            &layout_fingerprint,
+            covered_tokens,
+            &identity_hex,
+        );
+
         Ok(ReferenceSnapshot {
             identity_hex,
             generation,
@@ -268,6 +280,109 @@ impl ReferenceColdStore {
             }
         }
         Err(ColdStoreError::NoMatch)
+    }
+
+    /// Delete cold-store entries whose tokens are a strict prefix of
+    /// `new_tokens`. Best-effort: failures are logged, not propagated.
+    ///
+    /// **Invariant:** `load_prefix` sorts by `matched_tokens` DESC, then
+    /// `timestamp_nanos` DESC (lines 257-262). If A's tokens are a strict
+    /// prefix of B's tokens, B always has `matched_tokens >= A`. When equal
+    /// (request diverges exactly at `len(A)`), the timestamp tiebreak keeps
+    /// B ahead (B is newest). This invariant depends on the sort order.
+    ///
+    /// **Fallback tradeoff:** Pruning A removes the shorter-prefix fallback
+    /// that `load_prefix` uses if B fails to load (lines 246-247, 265-269).
+    /// The cold-store is a CACHE — worst case is re-prefill, not data loss.
+    ///
+    /// **Concurrent read safety:** `load_prefix`/`collect_candidates` do NOT
+    /// take `persist_lock`. A concurrent read during `remove_dir_all` sees a
+    /// vanished file → returns `None` → skips. Fail-safe.
+    fn prune_ancestor_snapshots(
+        &self,
+        new_model_id: &str,
+        new_template_sig: &str,
+        new_layout_fingerprint: &[u8; 32],
+        new_tokens: &[i32],
+        new_identity_hex: &str,
+    ) {
+        let root = self.root_dir();
+        if !root.exists() {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(&root) else {
+            return;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let Ok(ft) = entry.file_type() else { continue };
+            // Symlink guard: skip non-directory entries and symlinks
+            if !ft.is_dir() || entry.path().is_symlink() {
+                continue;
+            }
+            let identity_name = match entry.file_name().into_string() {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+            if identity_name == new_identity_hex {
+                continue; // don't delete self
+            }
+            // Find the latest COMMITTED generation
+            let mut latest: Option<V3Header> = None;
+            let Ok(gen_entries) = fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for gen_entry in gen_entries {
+                let Ok(gen_entry) = gen_entry else { continue };
+                let Ok(gen_ft) = gen_entry.file_type() else { continue };
+                if !gen_ft.is_dir() {
+                    continue;
+                }
+                if let Some(header) = read_committed_header(&gen_entry.path()) {
+                    match &latest {
+                        Some(prev) if header.timestamp_nanos <= prev.timestamp_nanos => {}
+                        _ => latest = Some(header),
+                    }
+                }
+            }
+            let Some(header) = latest else {
+                continue;
+            };
+            // Filter: same identity EXCEPT tokens
+            if header.model_id != new_model_id
+                || header.template_sig != new_template_sig
+                || header.runtime_fingerprint != self.runtime_fingerprint
+                || header.layout_fingerprint != *new_layout_fingerprint
+            {
+                continue;
+            }
+            // Filter: strict prefix (candidate tokens are a prefix of new tokens)
+            if header.tokens.len() >= new_tokens.len() {
+                continue;
+            }
+            if header.tokens[..] != new_tokens[..header.tokens.len()] {
+                continue;
+            }
+            // This entry's tokens are a strict prefix of the new entry.
+            // load_prefix will never select it. Delete the entire identity dir.
+            match fs::remove_dir_all(entry.path()) {
+                Ok(()) => {
+                    tracing::info!(
+                        pruned = %identity_name,
+                        old_token_count = header.tokens.len(),
+                        new_token_count = new_tokens.len(),
+                        "COLD-STORE pruned ancestor snapshot"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pruned = %identity_name,
+                        error = %e,
+                        "COLD-STORE failed to prune ancestor snapshot"
+                    );
+                }
+            }
+        }
     }
 
     fn collect_candidates(
@@ -966,5 +1081,141 @@ mod tests {
         assert_eq!(candidates.len(), MAX_CANDIDATES);
         assert_eq!(candidates.first().unwrap().matched_tokens, MAX_CANDIDATES + 1);
         assert_eq!(candidates.last().unwrap().matched_tokens, 2);
+    }
+
+    #[test]
+    fn prune_deletes_strict_prefix_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReferenceColdStore::new(
+            dir.path().to_path_buf(),
+            runtime_fingerprint_from_manifest(b"runtime"),
+        );
+        let short_tokens = vec![1, 2, 3];
+        let long_tokens = vec![1, 2, 3, 4, 5];
+        // Use the same seq_len for both cache sets so layout_fingerprint matches.
+        // The short entry covers fewer tokens but the tensors have the same shape.
+        let cache_long = make_test_cache_set(1, 5, 16);
+        let mut cache_short = make_test_cache_set(1, 5, 16);
+        // Trim the short cache to only cover 3 tokens (trim_to adjusts offset)
+        for c in &mut cache_short.caches {
+            c.offset = 3;
+        }
+        let short_snap = store
+            .persist("m3", "tmpl", &short_tokens, &cache_short)
+            .unwrap();
+        let long_snap = store
+            .persist("m3", "tmpl", &long_tokens, &cache_long)
+            .unwrap();
+
+        // Short entry's identity dir should be deleted
+        let short_dir = dir.path().join("cold-storage-v3").join(&short_snap.identity_hex);
+        assert!(!short_dir.exists(), "strict-prefix ancestor should be pruned");
+        // Long entry's identity dir should still exist
+        let long_dir = dir.path().join("cold-storage-v3").join(&long_snap.identity_hex);
+        assert!(long_dir.exists(), "new entry should not be pruned");
+        // Only one entry remains
+        let entries: Vec<_> = fs::read_dir(store.root_dir()).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn prune_keeps_different_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReferenceColdStore::new(
+            dir.path().to_path_buf(),
+            runtime_fingerprint_from_manifest(b"runtime"),
+        );
+        let tokens_a = vec![1, 2, 3];
+        let tokens_b = vec![1, 2, 3, 4, 5];
+        let snap_a = store
+            .persist("model-a", "tmpl", &tokens_a, &make_test_cache_set(1, 3, 16))
+            .unwrap();
+        store
+            .persist("model-b", "tmpl", &tokens_b, &make_test_cache_set(1, 5, 16))
+            .unwrap();
+
+        // Entry from model-a should NOT be pruned (different model_id)
+        let dir_a = dir.path().join("cold-storage-v3").join(&snap_a.identity_hex);
+        assert!(dir_a.exists(), "different-model entry should not be pruned");
+        let entries: Vec<_> = fs::read_dir(store.root_dir()).unwrap().collect();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn prune_keeps_same_length_different_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReferenceColdStore::new(
+            dir.path().to_path_buf(),
+            runtime_fingerprint_from_manifest(b"runtime"),
+        );
+        let tokens_a = vec![1, 2, 3];
+        let tokens_b = vec![4, 5, 6];
+        let snap_a = store
+            .persist("m3", "tmpl", &tokens_a, &make_test_cache_set(1, 3, 16))
+            .unwrap();
+        store
+            .persist("m3", "tmpl", &tokens_b, &make_test_cache_set(1, 3, 16))
+            .unwrap();
+
+        // Neither should be pruned (same length, different content)
+        let dir_a = dir.path().join("cold-storage-v3").join(&snap_a.identity_hex);
+        assert!(dir_a.exists(), "same-length entry should not be pruned");
+        let entries: Vec<_> = fs::read_dir(store.root_dir()).unwrap().collect();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn prune_keeps_different_layout_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReferenceColdStore::new(
+            dir.path().to_path_buf(),
+            runtime_fingerprint_from_manifest(b"runtime"),
+        );
+        let short_tokens = vec![1, 2, 3];
+        let long_tokens = vec![1, 2, 3, 4, 5];
+        // Create two cache sets with different layouts (different layer counts)
+        let cache_3 = make_test_cache_set(1, 3, 16);
+        let cache_5_diff = make_test_cache_set(2, 5, 16);
+        let snap_a = store
+            .persist("m3", "tmpl", &short_tokens, &cache_3)
+            .unwrap();
+        store
+            .persist("m3", "tmpl", &long_tokens, &cache_5_diff)
+            .unwrap();
+
+        // Entry should NOT be pruned (different layout_fingerprint)
+        let dir_a = dir.path().join("cold-storage-v3").join(&snap_a.identity_hex);
+        assert!(dir_a.exists(), "different-layout entry should not be pruned");
+        let entries: Vec<_> = fs::read_dir(store.root_dir()).unwrap().collect();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn prune_skips_corrupt_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReferenceColdStore::new(
+            dir.path().to_path_buf(),
+            runtime_fingerprint_from_manifest(b"runtime"),
+        );
+        let short_tokens = vec![1, 2, 3];
+        let long_tokens = vec![1, 2, 3, 4, 5];
+        let short_snap = store
+            .persist("m3", "tmpl", &short_tokens, &make_test_cache_set(1, 3, 16))
+            .unwrap();
+        // Corrupt the COMMITTED file
+        let committed = dir
+            .path()
+            .join("cold-storage-v3")
+            .join(&short_snap.identity_hex)
+            .join(&short_snap.generation)
+            .join("COMMITTED");
+        fs::write(&committed, b"corrupt").unwrap();
+        store
+            .persist("m3", "tmpl", &long_tokens, &make_test_cache_set(1, 5, 16))
+            .unwrap();
+
+        // Corrupt entry should be skipped (not deleted, not crashing)
+        let short_dir = dir.path().join("cold-storage-v3").join(&short_snap.identity_hex);
+        assert!(short_dir.exists(), "corrupt entry should be skipped, not deleted");
     }
 }
