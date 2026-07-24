@@ -101,11 +101,20 @@ pub struct ReferenceColdStore {
 
 impl ReferenceColdStore {
     pub fn new(base_dir: PathBuf, runtime_fingerprint: [u8; 32]) -> Self {
+        let prune_mode = match std::env::var("MLXCEL_COLD_STORE_PRUNE_MODE")
+            .as_deref()
+            .unwrap_or("observe")
+        {
+            "off" => PruneMode::Off,
+            "observe" => PruneMode::Observe,
+            "delete" => PruneMode::Delete,
+            _ => PruneMode::Observe,
+        };
         Self {
             base_dir,
             runtime_fingerprint,
             persist_lock: Mutex::new(()),
-            prune_mode: PruneMode::default(),
+            prune_mode,
         }
     }
 
@@ -326,19 +335,10 @@ impl ReferenceColdStore {
         new_tokens: &[i32],
         new_identity_hex: &str,
     ) {
-        let prune_mode = match std::env::var("MLXCEL_COLD_STORE_PRUNE_MODE")
-            .as_deref()
-            .unwrap_or("observe")
-        {
-            "off" => PruneMode::Off,
-            "observe" => PruneMode::Observe,
-            "delete" => PruneMode::Delete,
-            _ => PruneMode::Observe,
-        };
-        if prune_mode == PruneMode::Off {
+        if self.prune_mode == PruneMode::Off {
             return;
         }
-        let is_observe = prune_mode == PruneMode::Observe;
+        let is_observe = self.prune_mode == PruneMode::Observe;
         let root = self.root_dir();
         if !root.exists() {
             return;
@@ -1127,13 +1127,12 @@ mod tests {
 
     #[test]
     fn prune_deletes_strict_prefix_ancestor() {
-        // Set env var to enable deletion for this test
-        std::env::set_var("MLXCEL_COLD_STORE_PRUNE_MODE", "delete");
         let dir = tempfile::tempdir().unwrap();
         let store = ReferenceColdStore::new(
             dir.path().to_path_buf(),
             runtime_fingerprint_from_manifest(b"runtime"),
-        );
+        )
+        .with_prune_mode(PruneMode::Delete);
         let short_tokens = vec![1, 2, 3];
         let long_tokens = vec![1, 2, 3, 4, 5];
         // Use the same seq_len for both cache sets so layout_fingerprint matches.
@@ -1168,7 +1167,8 @@ mod tests {
         let store = ReferenceColdStore::new(
             dir.path().to_path_buf(),
             runtime_fingerprint_from_manifest(b"runtime"),
-        );
+        )
+        .with_prune_mode(PruneMode::Delete);
         let tokens_a = vec![1, 2, 3];
         let tokens_b = vec![1, 2, 3, 4, 5];
         // Same layout for both (seq_len=5, trim short to 3)
@@ -1197,7 +1197,8 @@ mod tests {
         let store = ReferenceColdStore::new(
             dir.path().to_path_buf(),
             runtime_fingerprint_from_manifest(b"runtime"),
-        );
+        )
+        .with_prune_mode(PruneMode::Delete);
         let tokens_a = vec![1, 2, 3];
         let tokens_b = vec![4, 5, 6];
         let snap_a = store
@@ -1220,7 +1221,8 @@ mod tests {
         let store = ReferenceColdStore::new(
             dir.path().to_path_buf(),
             runtime_fingerprint_from_manifest(b"runtime"),
-        );
+        )
+        .with_prune_mode(PruneMode::Delete);
         // [1,2,9] is shorter than [1,2,3,4,5] but NOT a prefix (diverges at index 2)
         let short_tokens = vec![1, 2, 9];
         let long_tokens = vec![1, 2, 3, 4, 5];
@@ -1249,7 +1251,8 @@ mod tests {
         let store = ReferenceColdStore::new(
             dir.path().to_path_buf(),
             runtime_fingerprint_from_manifest(b"runtime"),
-        );
+        )
+        .with_prune_mode(PruneMode::Delete);
         let short_tokens = vec![1, 2, 3];
         let long_tokens = vec![1, 2, 3, 4, 5];
         // Create two cache sets with different layouts (different layer counts)
@@ -1275,7 +1278,8 @@ mod tests {
         let store = ReferenceColdStore::new(
             dir.path().to_path_buf(),
             runtime_fingerprint_from_manifest(b"runtime"),
-        );
+        )
+        .with_prune_mode(PruneMode::Delete);
         let short_tokens = vec![1, 2, 3];
         let long_tokens = vec![1, 2, 3, 4, 5];
         // Same layout for both (seq_len=5, trim short to 3)
@@ -1302,5 +1306,34 @@ mod tests {
         // Corrupt entry should be skipped (not deleted, not crashing)
         let short_dir = dir.path().join("cold-storage-v3").join(&short_snap.identity_hex);
         assert!(short_dir.exists(), "corrupt entry should be skipped, not deleted");
+    }
+
+    #[test]
+    fn prune_observe_mode_does_not_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReferenceColdStore::new(
+            dir.path().to_path_buf(),
+            runtime_fingerprint_from_manifest(b"runtime"),
+        )
+        .with_prune_mode(PruneMode::Observe);
+        let short_tokens = vec![1, 2, 3];
+        let long_tokens = vec![1, 2, 3, 4, 5];
+        let cache_long = make_test_cache_set(1, 5, 16);
+        let mut cache_short = make_test_cache_set(1, 5, 16);
+        for c in &mut cache_short.caches {
+            c.offset = 3;
+        }
+        let short_snap = store
+            .persist("m3", "tmpl", &short_tokens, &cache_short)
+            .unwrap();
+        store
+            .persist("m3", "tmpl", &long_tokens, &cache_long)
+            .unwrap();
+
+        // In observe mode, the ancestor should NOT be deleted
+        let short_dir = dir.path().join("cold-storage-v3").join(&short_snap.identity_hex);
+        assert!(short_dir.exists(), "observe mode should not delete");
+        let entries: Vec<_> = fs::read_dir(store.root_dir()).unwrap().collect();
+        assert_eq!(entries.len(), 2, "both entries should survive in observe mode");
     }
 }
