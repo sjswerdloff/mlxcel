@@ -272,7 +272,6 @@ impl ReferenceColdStore {
         self.prune_ancestor_snapshots(
             model_id,
             template_sig,
-            &layout_fingerprint,
             covered_tokens,
             &identity_hex,
         );
@@ -331,7 +330,6 @@ impl ReferenceColdStore {
         &self,
         new_model_id: &str,
         new_template_sig: &str,
-        new_layout_fingerprint: &[u8; 32],
         new_tokens: &[i32],
         new_identity_hex: &str,
     ) {
@@ -381,27 +379,34 @@ impl ReferenceColdStore {
             let Some(header) = latest else {
                 continue;
             };
-            // Filter: same identity EXCEPT tokens
+            // Filter: same identity EXCEPT tokens and layout.
+            // layout_fingerprint includes tensor shapes (which include seq_len),
+            // so different conversation lengths produce different fingerprints.
+            // Mode protection (k8v4 vs fp16) is better handled at load time.
             if header.model_id != new_model_id
                 || header.template_sig != new_template_sig
                 || header.runtime_fingerprint != self.runtime_fingerprint
-                || header.layout_fingerprint != *new_layout_fingerprint
             {
                 continue;
             }
-            // Filter: strict prefix (candidate tokens are a prefix of new tokens)
-            if header.tokens.len() >= new_tokens.len() {
+            // Filter: strict prefix (candidate prompt is a prefix of new tokens)
+            // The entry's tokens include generated tokens (prompt + output),
+            // but the next request's tokens are prompt-only. Compare using
+            // prompt_len to isolate the shared prefix portion.
+            let candidate_prompt = &header.tokens[..header.prompt_len];
+            if candidate_prompt.len() >= new_tokens.len() {
                 continue;
             }
-            if header.tokens[..] != new_tokens[..header.tokens.len()] {
+            if candidate_prompt[..] != new_tokens[..candidate_prompt.len()] {
                 continue;
             }
-            // This entry's tokens are a strict prefix of the new entry.
-            // load_prefix will never select it.
+            // This entry's prompt is a strict prefix of the new entry.
+            // load_prefix will never select it (the new entry always has
+            // more matched tokens).
             if is_observe {
                 tracing::info!(
                     would_prune = %identity_name,
-                    old_token_count = header.tokens.len(),
+                    old_token_count = header.prompt_len,
                     new_token_count = new_tokens.len(),
                     "COLD-STORE observe: would prune ancestor snapshot"
                 );
@@ -410,7 +415,7 @@ impl ReferenceColdStore {
                     Ok(()) => {
                         tracing::info!(
                             pruned = %identity_name,
-                            old_token_count = header.tokens.len(),
+                            old_token_count = header.prompt_len,
                             new_token_count = new_tokens.len(),
                             "COLD-STORE pruned ancestor snapshot"
                         );
@@ -1126,37 +1131,39 @@ mod tests {
     }
 
     #[test]
-    fn prune_deletes_strict_prefix_ancestor() {
+    fn prune_deletes_ancestor_with_generated_tokens() {
+        // Real scenario: entry has prompt + generated tokens. Next request
+        // has prompt + more generated tokens. The entry's prompt portion
+        // is a strict prefix of the next request's tokens.
         let dir = tempfile::tempdir().unwrap();
         let store = ReferenceColdStore::new(
             dir.path().to_path_buf(),
             runtime_fingerprint_from_manifest(b"runtime"),
         )
         .with_prune_mode(PruneMode::Delete);
-        let short_tokens = vec![1, 2, 3];
-        let long_tokens = vec![1, 2, 3, 4, 5];
-        // Use the same seq_len for both cache sets so layout_fingerprint matches.
-        // The short entry covers fewer tokens but the tensors have the same shape.
-        let cache_long = make_test_cache_set(1, 5, 16);
-        let mut cache_short = make_test_cache_set(1, 5, 16);
-        // Trim the short cache to only cover 3 tokens (trim_to adjusts offset)
-        for c in &mut cache_short.caches {
-            c.offset = 3;
-        }
-        let short_snap = store
-            .persist("m3", "tmpl", &short_tokens, &cache_short)
-            .unwrap();
-        let long_snap = store
-            .persist("m3", "tmpl", &long_tokens, &cache_long)
+
+        // Entry 1: prompt=[1,2,3], generated=[4,5], stored tokens=[1,2,3,4,5]
+        // prompt_len=3, cache covers all 5 tokens
+        let entry1_tokens = vec![1, 2, 3, 4, 5];
+        let mut cache1 = make_test_cache_set(1, 5, 16);
+        cache1.prompt_len = 3; // only first 3 are prompt, rest are generated
+        let snap1 = store
+            .persist("m3", "tmpl", &entry1_tokens, &cache1)
             .unwrap();
 
-        // Short entry's identity dir should be deleted
-        let short_dir = dir.path().join("cold-storage-v3").join(&short_snap.identity_hex);
-        assert!(!short_dir.exists(), "strict-prefix ancestor should be pruned");
-        // Long entry's identity dir should still exist
-        let long_dir = dir.path().join("cold-storage-v3").join(&long_snap.identity_hex);
-        assert!(long_dir.exists(), "new entry should not be pruned");
-        // Only one entry remains
+        // Entry 2: prompt=[1,2,3,4,5], generated=[6,7], stored tokens=[1,2,3,4,5,6,7]
+        // prompt_len=5
+        let entry2_tokens = vec![1, 2, 3, 4, 5, 6, 7];
+        let mut cache2 = make_test_cache_set(1, 7, 16);
+        cache2.prompt_len = 5;
+        store
+            .persist("m3", "tmpl", &entry2_tokens, &cache2)
+            .unwrap();
+
+        // Entry 1's prompt [1,2,3] is a strict prefix of entry 2's tokens [1,2,3,4,5,6,7]
+        // Entry 1 should be pruned
+        let dir1 = dir.path().join("cold-storage-v3").join(&snap1.identity_hex);
+        assert!(!dir1.exists(), "ancestor with generated tokens should be pruned");
         let entries: Vec<_> = fs::read_dir(store.root_dir()).unwrap().collect();
         assert_eq!(entries.len(), 1);
     }
@@ -1247,6 +1254,12 @@ mod tests {
 
     #[test]
     fn prune_keeps_different_layout_fingerprint() {
+        // With layout_fingerprint removed from the prune filter, entries
+        // with different layouts (different layer counts) can still be
+        // pruned if their prompts are strict prefixes. This test verifies
+        // that the prune fires even with different layouts.
+        // The protection against cross-mode pruning (k8v4 vs fp16) is
+        // handled at load time, not prune time.
         let dir = tempfile::tempdir().unwrap();
         let store = ReferenceColdStore::new(
             dir.path().to_path_buf(),
@@ -1255,7 +1268,7 @@ mod tests {
         .with_prune_mode(PruneMode::Delete);
         let short_tokens = vec![1, 2, 3];
         let long_tokens = vec![1, 2, 3, 4, 5];
-        // Create two cache sets with different layouts (different layer counts)
+        // Different layouts (1 vs 2 layers)
         let cache_3 = make_test_cache_set(1, 3, 16);
         let cache_5_diff = make_test_cache_set(2, 5, 16);
         let snap_a = store
@@ -1265,11 +1278,11 @@ mod tests {
             .persist("m3", "tmpl", &long_tokens, &cache_5_diff)
             .unwrap();
 
-        // Entry should NOT be pruned (different layout_fingerprint)
+        // Entry IS pruned (layout_fingerprint no longer blocks pruning)
         let dir_a = dir.path().join("cold-storage-v3").join(&snap_a.identity_hex);
-        assert!(dir_a.exists(), "different-layout entry should not be pruned");
+        assert!(!dir_a.exists(), "different-layout entry should be pruned when prompt is prefix");
         let entries: Vec<_> = fs::read_dir(store.root_dir()).unwrap().collect();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]
@@ -1335,5 +1348,42 @@ mod tests {
         assert!(short_dir.exists(), "observe mode should not delete");
         let entries: Vec<_> = fs::read_dir(store.root_dir()).unwrap().collect();
         assert_eq!(entries.len(), 2, "both entries should survive in observe mode");
+    }
+
+    #[test]
+    fn prune_would_not_fire_without_prompt_len_fix() {
+        // This test verifies that the prompt_len fix is load-bearing.
+        // Without the fix (comparing full tokens including generated),
+        // the entry's tokens [1,2,3,4,5] would NOT be a strict prefix
+        // of the new tokens [1,2,3,4,5,6,7] because the entry has
+        // generated tokens beyond its prompt. With the fix, we compare
+        // only the prompt portion [1,2,3] which IS a strict prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReferenceColdStore::new(
+            dir.path().to_path_buf(),
+            runtime_fingerprint_from_manifest(b"runtime"),
+        )
+        .with_prune_mode(PruneMode::Delete);
+
+        // Entry: prompt=[1,2,3], generated=[4,5], stored tokens=[1,2,3,4,5]
+        let entry_tokens = vec![1, 2, 3, 4, 5];
+        let mut cache = make_test_cache_set(1, 5, 16);
+        cache.prompt_len = 3;
+        let snap = store
+            .persist("m3", "tmpl", &entry_tokens, &cache)
+            .unwrap();
+
+        // New entry: tokens=[1,2,3,4,5,6,7] (prompt + more generated)
+        let new_tokens = vec![1, 2, 3, 4, 5, 6, 7];
+        let mut new_cache = make_test_cache_set(1, 7, 16);
+        new_cache.prompt_len = 5;
+        store
+            .persist("m3", "tmpl", &new_tokens, &new_cache)
+            .unwrap();
+
+        // With the prompt_len fix: entry's prompt [1,2,3] is a strict
+        // prefix of new tokens [1,2,3,4,5,6,7] → pruned
+        let snap_dir = dir.path().join("cold-storage-v3").join(&snap.identity_hex);
+        assert!(!snap_dir.exists(), "prompt_len fix should enable pruning");
     }
 }
