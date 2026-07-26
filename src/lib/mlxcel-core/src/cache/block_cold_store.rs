@@ -762,9 +762,17 @@ impl BlockColdStore {
     /// entries instead of `L`. `read_block` (`:277-294`) iterates
     /// `header.layers.iter().enumerate()` and pushes one cache per layer, so
     /// `caches` IS layer-indexed and the bug was real on every multi-block
-    /// load — which is every sequence longer than `block_size` (2048). It was
-    /// invisible to single-block manifests, and `load_prefix` (`:672`) is the
-    /// production caller, so a wrong assembly here is a wrong adopted prefix.
+    /// load — any sequence longer than `block_size` (2048). It was invisible to
+    /// single-block manifests.
+    ///
+    /// **Scope, corrected:** an earlier revision of this comment called that a
+    /// *production* defect. It was not. `BlockColdStore` has no non-test callers
+    /// — the scheduler holds `cold_store::ColdStore`, which delegates to the v3
+    /// `ReferenceColdStore` — so v4 is complete but UNWIRED. A wrong assembly
+    /// here would become a wrong adopted prefix the moment v4 is wired in; it
+    /// never was one. The within-module fact (`load_prefix` calls this) does not
+    /// establish reachability from the server, and the earlier wording conflated
+    /// the two.
     fn assemble_blocks(&self, manifest: &Manifest) -> Result<DetachedCacheSet, ColdStoreError> {
         if manifest.block_hashes.is_empty() {
             return Err(invalid_data("manifest has no blocks".into()));
