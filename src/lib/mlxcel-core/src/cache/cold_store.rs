@@ -65,7 +65,8 @@ use super::KVCacheMode;
 
 #[path = "cold_store_reference.rs"]
 mod reference;
-pub use reference::{ReferenceColdStore, ReferenceSnapshot, runtime_fingerprint_from_manifest};
+pub use reference::{ReferenceColdStore, ReferenceSnapshot, runtime_fingerprint_from_manifest, PruneMode};
+pub(crate) use reference::serialize_cache_set_layers;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -337,7 +338,7 @@ fn write_kv_cache(w: &mut impl Write, cache: &DetachedKVCache) -> io::Result<()>
     Ok(())
 }
 
-fn read_kv_cache(r: &mut impl Read, layer_idx: usize) -> Result<DetachedKVCache, ColdStoreError> {
+pub fn read_kv_cache(r: &mut impl Read, layer_idx: usize) -> Result<DetachedKVCache, ColdStoreError> {
     let mode_tag = read_u8(r)?;
     let offset = read_i32(r)?;
     let step = read_i32(r)?;
@@ -1338,7 +1339,7 @@ fn array_from_raw_bytes(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use super::super::SequenceStateBackend;
 
@@ -1460,7 +1461,7 @@ mod tests {
             .collect()
     }
 
-    pub(super) fn make_test_cache_set(
+    pub(crate) fn make_test_cache_set(
         num_layers: usize,
         seq_len: i32,
         head_dim: i32,
