@@ -1282,7 +1282,11 @@ fn fp16_set(num_layers: usize, len: i32) -> DetachedCacheSet {
 /// **SCOPE, stated so this green is not read as wider than it is:** this
 /// covers **Fp16 only**. It does NOT catch the `KVCacheMode::Fp16` hardcode in
 /// `load_prefix` (handoff §7.5), because under Fp16 that hardcode is
-/// coincidentally correct. The k8v4 half is pinned by the test below.
+/// coincidentally correct. The k8v4 half is pinned by
+/// `defect_present__kvarn8_load_prefix_uses_fp16_address__delete_when_s7_5_fixed`
+/// below — **when that test reddens, extend THIS one to cover KVarN8 and delete
+/// it.** (Reciprocal pointer: that test names this one too, so a fixer who
+/// opens either finds the other.)
 #[test]
 fn persist_then_load_prefix_reports_a_hit_fp16() {
     const LAYERS: usize = 2;
@@ -1337,8 +1341,19 @@ fn persist_then_load_prefix_reports_a_hit_fp16() {
 /// assertion is the one worth keeping.
 ///
 /// It is NOT an endorsement of the miss. See §7.5 for the two fix options.
+///
+/// **RED here means §7.5 CHANGED, not necessarily that it was fixed
+/// CORRECTLY.** This pins the bug's SYMPTOM (`NoMatch`), not its CAUSE (the
+/// address computed under the wrong mode). A "fix" that produces a *different*
+/// wrong behaviour — hits, but assembles wrong bytes — also reddens this test.
+/// **Verify the fix before deleting this**, or you will have removed the
+/// tripwire for a reason it was not reporting. (Violet.)
+///
+/// The `defect_present__` prefix is load-bearing: a reader scanning names and
+/// statuses at speed must be able to read this green correctly without opening
+/// the comment.
 #[test]
-fn kvarn8_persist_then_load_prefix_misses_pending_the_fp16_hardcode_fix() {
+fn defect_present__kvarn8_load_prefix_uses_fp16_address__delete_when_s7_5_fixed() {
     // 128 sink + 15 tiles * 128 + 0 tail = 2048 = exactly one block.
     const N_TILES: i32 = 15;
     let depth = TILE + N_TILES * TILE;
