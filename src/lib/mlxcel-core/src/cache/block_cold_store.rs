@@ -926,6 +926,129 @@ fn axis2_of(o: &Option<UniquePtr<MlxArray>>) -> i32 {
         .map_or(0, |a| crate::ffi::array_shape(a.as_ref().unwrap())[2])
 }
 
+/// Per-token history fields: axis-2 extent is the history token count.
+const HIST_PER_TOKEN_FIELDS: &[(&str, LayerField)] = &[
+    ("kvarn_hist_k", |c| &c.kvarn_hist_k),
+    ("kvarn_hist_v", |c| &c.kvarn_hist_v),
+    ("kvarn_k_scale", |c| &c.kvarn_k_scale),
+    ("kvarn_k_zp", |c| &c.kvarn_k_zp),
+    ("kvarn_k_s_row", |c| &c.kvarn_k_s_row),
+    ("kvarn_v_scale", |c| &c.kvarn_v_scale),
+    ("kvarn_v_zp", |c| &c.kvarn_v_zp),
+    ("kvarn_v_s_row", |c| &c.kvarn_v_s_row),
+];
+
+/// Per-TILE column scales: axis-2 extent is the tile count, not the token count.
+const HIST_PER_TILE_FIELDS: &[(&str, LayerField)] = &[
+    ("kvarn_k_s_col", |c| &c.kvarn_k_s_col),
+    ("kvarn_v_s_col", |c| &c.kvarn_v_s_col),
+];
+
+/// Prove an assembled layer is internally coherent before any extent claim is
+/// made about it.
+///
+/// ## Why this exists (Violet, review of 2eedf84)
+///
+/// [`concat_across`] SKIPS blocks where a field is absent. Absence is a
+/// legitimate layout fact for exactly two things — a mid-sequence block has no
+/// sink and no tail. For every other field, absence in a block that covers
+/// history is a BUG (an extract fault, a partial write, a future refactor), and
+/// skipping it silently yields a field SHORTER than the history it describes:
+/// per-token zero-points or scales misaligned against the tokens they apply to.
+/// That is silent wrong inference, and it is exactly the class the mode and
+/// `v_bits` consistency checks already guard against — same failure, different
+/// field, previously no guard.
+///
+/// The extent check that follows this one used to sum `sink_k + hist_k + tail_k`
+/// and report "layer {n} assembled to N tokens" — measuring three K fields and
+/// certifying the LAYER. A dropped or short `hist_v`, `sink_v` or `tail_v`
+/// passed clean, and ten fields were never measured at all. K and V are
+/// symmetric in the layout and were asymmetric in the check. This runs in the
+/// production path (`load_prefix`), so unlike the end-to-end test it is what
+/// guards real conversations.
+///
+/// ## Residual, stated rather than implied
+///
+/// A field absent from EVERY block passes here, because uniform absence is
+/// legitimate for at least one field: v4 folds `v_s_row` into `s_col` and leaves
+/// it `None`. Distinguishing "correctly absent" from "the extractor dropped it
+/// everywhere" needs knowledge of the quantization variant that the assembler
+/// does not have; that case is covered by the end-to-end payload gate, not here.
+/// What this catches is a PARTIAL skip — some blocks contributing, some not —
+/// which is the failure `concat_across` can actually cause.
+fn check_region_coherence(
+    merged: &DetachedKVCache,
+    layer_idx: usize,
+    block_count: usize,
+) -> Result<(), ColdStoreError> {
+    if merged.mode != KVCacheMode::KVarN8 {
+        // Dense: K and V must describe the same tokens.
+        let (k, v) = (axis2_of(&merged.keys), axis2_of(&merged.values));
+        if k != v {
+            return Err(invalid_data(format!(
+                "assemble_blocks: layer {layer_idx} assembled keys ({k} tokens) and values \
+                 ({v} tokens) disagree — a block was skipped on one side ({block_count} blocks)"
+            )));
+        }
+        return Ok(());
+    }
+
+    let sink_len = axis2_of(&merged.kvarn_sink_k);
+    let hist_len = axis2_of(&merged.kvarn_hist_k);
+    let tail_len = axis2_of(&merged.kvarn_tail_k);
+
+    // K/V symmetry on the regions that carry both sides.
+    for (name, k_len, v_len) in [
+        ("sink", sink_len, axis2_of(&merged.kvarn_sink_v)),
+        ("tail", tail_len, axis2_of(&merged.kvarn_tail_v)),
+    ] {
+        if k_len != v_len {
+            return Err(invalid_data(format!(
+                "assemble_blocks: layer {layer_idx} {name} K side is {k_len} tokens but the V \
+                 side is {v_len} — a block was skipped on one side only ({block_count} blocks \
+                 merged). K and V describe the same tokens; a mismatch means the V side is \
+                 misaligned against the tokens it applies to."
+            )));
+        }
+    }
+
+    // Per-token history fields: present ⇒ exactly the history length.
+    for &(name, sel) in HIST_PER_TOKEN_FIELDS {
+        let n = axis2_of(sel(merged));
+        if n != 0 && n != hist_len {
+            return Err(invalid_data(format!(
+                "assemble_blocks: layer {layer_idx} field `{name}` has {n} history entries but \
+                 the history is {hist_len} tokens — a block was silently skipped for this field \
+                 ({block_count} blocks merged). A short per-token field is misaligned against \
+                 the tokens it describes: silent wrong inference, not a crash."
+            )));
+        }
+    }
+
+    // Per-TILE column scales: present ⇒ exactly the tile count.
+    if hist_len % crate::cache::kvarn::KVARN_TILE_TOKENS != 0 {
+        return Err(invalid_data(format!(
+            "assemble_blocks: layer {layer_idx} assembled history is {hist_len} tokens, not a \
+             multiple of the tile size {} — blocks were merged across a partial tile",
+            crate::cache::kvarn::KVARN_TILE_TOKENS
+        )));
+    }
+    let n_tiles = hist_len / crate::cache::kvarn::KVARN_TILE_TOKENS;
+    for &(name, sel) in HIST_PER_TILE_FIELDS {
+        let n = axis2_of(sel(merged));
+        if n != 0 && n != n_tiles {
+            return Err(invalid_data(format!(
+                "assemble_blocks: layer {layer_idx} field `{name}` has {n} entries but the \
+                 history is {n_tiles} tiles ({hist_len} tokens) — these are PER-TILE scales, and \
+                 a count that is neither 0 nor the tile count means a block was skipped \
+                 ({block_count} blocks merged)"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Merge one layer's state across every block of a manifest.
 ///
 /// Produces ONE cache carrying that layer concatenated along the token axis —
@@ -1019,11 +1142,14 @@ fn merge_layer_across_blocks(
         kvarn_v_bits: first.kvarn_v_bits,
     };
 
-    // Token-extent check, DERIVED FROM THE DATA rather than read from a stored
-    // header field — a stored length can go stale against the bytes it
-    // describes; a measured one cannot. This is the loud failure for a dropped
-    // or duplicated block: the assembled layer would otherwise be short or long
-    // and nothing downstream would say so.
+    // Region coherence, then extent. Both are DERIVED FROM THE DATA rather than
+    // read from a stored header length — a stored length is a second source of
+    // truth that can drift from the bytes it describes; a measured one cannot.
+    check_region_coherence(&merged, layer_idx, layers.len())?;
+
+    // Extent must now be measured on a layer already proven internally
+    // coherent, so summing the K-side regions is a statement about the LAYER
+    // rather than about three of its fields.
     let assembled = if merged.mode == KVCacheMode::KVarN8 {
         axis2_of(&merged.kvarn_sink_k) + axis2_of(&merged.kvarn_hist_k) + axis2_of(&merged.kvarn_tail_k)
     } else {

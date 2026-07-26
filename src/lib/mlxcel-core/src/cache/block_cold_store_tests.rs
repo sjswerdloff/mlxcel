@@ -1097,6 +1097,67 @@ fn end_to_end_extract_write_read_assemble_preserves_payload_bytes() {
     );
 }
 
+/// CONTROL for the region-coherence guard: a block silently missing ONE
+/// per-token field must make `assemble_blocks` ERROR, not quietly return a
+/// layer whose `k_zp` is shorter than its history.
+///
+/// Without this the guard is a claim rather than a gate. The failure it models
+/// is real: `concat_across` skips blocks where a field is absent — correct for
+/// sink and tail, a silent misalignment for everything else. A `k_zp` covering
+/// half the history means per-token zero-points applied to the wrong tokens:
+/// wrong inference, no crash, nothing on the console.
+#[test]
+fn assemble_rejects_block_with_a_dropped_per_token_field() {
+    const N_TILES: i32 = 4;
+    let t = N_TILES * TILE;
+    let total = TILE + t; // no tail; two tile-aligned blocks
+
+    let src = kvarn_v4_set_distinct(1, N_TILES, 0);
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
+
+    let plan: &[(usize, usize)] = &[
+        (0, (TILE + 2 * TILE) as usize),
+        ((TILE + 2 * TILE) as usize, total as usize),
+    ];
+
+    let mut hashes: Vec<[u8; 32]> = Vec::new();
+    for (i, &(s, e)) in plan.iter().enumerate() {
+        let mut ex = extract_block(&src, s, e).expect("extract_block ok");
+        // The injected fault: the SECOND block loses k_zp entirely, exactly as
+        // a partial write or an extract regression would leave it.
+        if i == 1 {
+            ex.caches[0].kvarn_k_zp = None;
+        }
+        let toks: Vec<i32> = (s as i32..e as i32).collect();
+        let mut h = [0u8; 32];
+        h[0] = 100 + i as u8;
+        store.write_block(&h, &toks, &ex).expect("write_block ok");
+        hashes.push(h);
+    }
+
+    let manifest = Manifest {
+        runtime_fingerprint: [9u8; 32],
+        model_id: "test-model".to_string(),
+        template_sig: "test-template".to_string(),
+        block_size: 2048,
+        block_hashes: hashes,
+        prompt_len: total as usize,
+        total_tokens: total as usize,
+        timestamp_nanos: 0,
+    };
+
+    let err = store
+        .assemble_blocks(&manifest)
+        .expect_err("a block missing k_zp must be REFUSED, not silently concatenated short");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("kvarn_k_zp"),
+        "the error must name the offending field so an operator can act on it \
+         without a debugger; got: {msg}"
+    );
+}
+
 /// Violet's finding 4: misalignment was tested only at the END boundary.
 /// A misaligned START is a DISTINCT code path — it exercises the sink-offset
 /// arithmetic rather than the end clamp — and is equally uncomputable, because
