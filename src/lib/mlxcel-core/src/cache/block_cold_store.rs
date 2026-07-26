@@ -1255,3 +1255,7 @@ mod tests {
         assert!(extract_block(&cache, 8, 4).is_err()); // start > end
     }
 }
+
+#[cfg(test)]
+#[path = "block_cold_store_tests.rs"]
+mod block_cold_store_tests;
