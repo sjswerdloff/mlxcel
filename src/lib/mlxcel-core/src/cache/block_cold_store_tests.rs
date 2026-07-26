@@ -335,6 +335,64 @@ fn kvarn_v4_layer(n_tiles: i32, tail_len: i32) -> DetachedKVCache {
     c
 }
 
+/// Build a k8v4 layer whose field bases are shifted by `layer_shift`, so two
+/// layers of the same shape carry DIFFERENT bytes.
+///
+/// Violet's finding 5: with identical layers, a layer-indexing bug — a swap, or
+/// every layer being handed layer 0's data — passes every byte assertion. The
+/// shift must be coprime with 8, because the FLOAT16 pattern keys on
+/// `base mod 8`; a shift of 8 would leave the f16 fields byte-identical across
+/// layers and re-open exactly the hole it is meant to close. 3 is coprime with
+/// 8; `layers_are_distinguishable_control` proves the result rather than
+/// trusting this comment.
+fn kvarn_v4_layer_shifted(n_tiles: i32, tail_len: i32, layer_shift: i32) -> DetachedKVCache {
+    let t = n_tiles * TILE;
+    let mut c = blank(KVCacheMode::KVarN8);
+    c.kvarn_v_bits = 4;
+    let b = |base: i32| base + layer_shift;
+
+    c.kvarn_sink_k = some_arr(b(B_SINK_K), TILE, VD, dtype::FLOAT16);
+    c.kvarn_sink_v = some_arr(b(B_SINK_V), TILE, VD, dtype::FLOAT16);
+
+    c.kvarn_hist_k = some_arr(b(B_HIST_K), t, VD, dtype::UINT8);
+    c.kvarn_hist_v = some_arr(b(B_HIST_V), t, VD / 8, dtype::UINT32);
+    c.kvarn_k_scale = some_arr(b(B_K_SCALE), t, 1, dtype::FLOAT32);
+    c.kvarn_k_zp = some_arr(b(B_K_ZP), t, 1, dtype::FLOAT32);
+    c.kvarn_k_s_row = some_arr(b(B_K_S_ROW), t, 1, dtype::FLOAT32);
+    c.kvarn_v_scale = some_arr(b(B_V_SCALE), t, VD / 32, dtype::FLOAT32);
+    c.kvarn_v_zp = some_arr(b(B_V_ZP), t, VD / 32, dtype::FLOAT32);
+
+    c.kvarn_k_s_col = some_arr(b(B_K_S_COL), n_tiles, VD, dtype::FLOAT32);
+    c.kvarn_v_s_col = some_arr(b(B_V_S_COL), n_tiles, VD, dtype::FLOAT32);
+
+    if tail_len > 0 {
+        c.kvarn_tail_k = some_arr(b(B_TAIL_K), tail_len, VD, dtype::FLOAT16);
+        c.kvarn_tail_v = some_arr(b(B_TAIL_V), tail_len, VD, dtype::FLOAT16);
+    }
+
+    c.offset = TILE + t + tail_len;
+    c
+}
+
+/// Cache-set of `num_layers` MUTUALLY DISTINGUISHABLE k8v4 layers.
+fn kvarn_v4_set_distinct(num_layers: usize, n_tiles: i32, tail_len: i32) -> DetachedCacheSet {
+    let mut caches = Vec::with_capacity(num_layers);
+    for i in 0..num_layers {
+        caches.push(kvarn_v4_layer_shifted(n_tiles, tail_len, i as i32 * 3));
+    }
+    let offset = TILE + n_tiles * TILE + tail_len;
+    let now = Instant::now();
+    DetachedCacheSet {
+        caches,
+        backend: SequenceStateBackend::DenseKvCache,
+        prompt_len: offset as usize,
+        current_offset: offset,
+        created_at: now,
+        detached_at: now,
+        origin_seq_id: SequenceId::from_raw(7),
+    }
+}
+
 /// Build a whole cache-set of `num_layers` identical k8v4 layers.
 /// Deterministic: identical args yield byte-identical sets.
 fn kvarn_v4_set(num_layers: usize, n_tiles: i32, tail_len: i32) -> DetachedCacheSet {
@@ -921,6 +979,141 @@ fn float16_fields_are_pairwise_distinct() {
         "hist_k must respond to `base` — otherwise \
          reassembly_roundtrip_red_control_perturbed_tile_mismatches is asserting \
          that two identical byte images differ, which it can never do"
+    );
+}
+
+/// CONTROL for the end-to-end gate: two layers of a `kvarn_v4_set_distinct`
+/// must carry DIFFERENT bytes for the same field.
+///
+/// Violet's finding 5. With identical layers, a layer-indexing bug — a swap, or
+/// every layer being handed layer 0's data — passes every byte assertion in the
+/// end-to-end test. This is what licenses those assertions to mean anything
+/// about layer indexing.
+#[test]
+fn layers_are_distinguishable_control() {
+    let src = kvarn_v4_set_distinct(2, 2, 10);
+    for (name, sel) in all_k8v4_fields() {
+        assert_ne!(
+            bytes_of(sel(&src.caches[0]), name),
+            bytes_of(sel(&src.caches[1]), name),
+            "layer 0 and layer 1 have IDENTICAL bytes for `{name}` — a layer-indexing bug \
+             would pass the end-to-end gate unnoticed. (The base shift must stay coprime \
+             with 8: the FLOAT16 pattern keys on base mod 8.)"
+        );
+    }
+}
+
+/// THE END-TO-END GATE: extract -> write -> read -> assemble, through the real
+/// `BlockColdStore` and the real serializer, asserting PAYLOAD byte-equality.
+///
+/// ## Why payload and not mode
+///
+/// A mode assertion goes GREEN on a completely empty result: `extract_block`
+/// copies `mode: layer.mode` faithfully (`:902`) regardless of whether any
+/// `kvarn_*` array survived. The label is not evidence. Every populated field
+/// must come back byte-identical, per layer.
+///
+/// ## What this catches that nothing else did
+///
+/// `assemble_blocks` previously flat-appended each block's per-layer caches
+/// into one `Vec`, producing `B*L` entries instead of `L` concatenated along
+/// the token axis. Single-block manifests hide it completely, and
+/// `load_prefix` is the production caller — so every multi-block adopt (any
+/// sequence longer than `block_size`) was affected. The layer-count assertion
+/// below is the direct control for it.
+#[test]
+fn end_to_end_extract_write_read_assemble_preserves_payload_bytes() {
+    const N_TILES: i32 = 4;
+    const TAIL: i32 = 10;
+    const LAYERS: usize = 2;
+    let t = N_TILES * TILE;
+    let total = TILE + t + TAIL; // 650
+
+    let src = kvarn_v4_set_distinct(LAYERS, N_TILES, TAIL);
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+
+    // Three blocks spanning the whole sequence, crossing tile boundaries and
+    // putting sink in the first and tail in the last.
+    let plan: &[(usize, usize)] = &[
+        (0, (TILE + 2 * TILE) as usize),                   // sink + tiles 0..2
+        ((TILE + 2 * TILE) as usize, (TILE + t) as usize), // tiles 2..4
+        ((TILE + t) as usize, total as usize),             // tail
+    ];
+
+    let mut hashes: Vec<[u8; 32]> = Vec::new();
+    for (i, &(s, e)) in plan.iter().enumerate() {
+        let ex = extract_block(&src, s, e).expect("extract_block ok");
+        let toks: Vec<i32> = (s as i32..e as i32).collect();
+        let mut h = [0u8; 32];
+        h[0] = (i + 1) as u8;
+        store.write_block(&h, &toks, &ex).expect("write_block ok");
+        hashes.push(h);
+    }
+
+    let manifest = Manifest {
+        runtime_fingerprint: [7u8; 32],
+        model_id: "test-model".to_string(),
+        template_sig: "test-template".to_string(),
+        block_size: 2048,
+        block_hashes: hashes,
+        prompt_len: total as usize,
+        total_tokens: total as usize,
+        timestamp_nanos: 0,
+    };
+
+    let assembled = store.assemble_blocks(&manifest).expect("assemble_blocks ok");
+
+    // Structural: one cache per LAYER, not one per (block, layer).
+    assert_eq!(
+        assembled.caches.len(),
+        LAYERS,
+        "assembled cache must have one entry per LAYER ({LAYERS}), got {} — \
+         {} blocks x {LAYERS} layers is the flat-append bug",
+        assembled.caches.len(),
+        plan.len()
+    );
+
+    // Payload: every populated field, every layer, byte-identical to source.
+    for layer in 0..LAYERS {
+        let s = &src.caches[layer];
+        let a = &assembled.caches[layer];
+        assert_eq!(a.mode, KVCacheMode::KVarN8, "layer {layer} lost its mode");
+        assert_eq!(a.kvarn_v_bits, 4, "layer {layer} lost v_bits");
+        for (name, sel) in all_k8v4_fields() {
+            assert_eq!(
+                bytes_of(sel(a), name),
+                bytes_of(sel(s), name),
+                "layer {layer} field `{name}` did not survive \
+                 extract -> write -> read -> assemble bytewise"
+            );
+        }
+    }
+
+    assert_eq!(
+        assembled.current_offset, total,
+        "assembled current_offset must be the manifest's total token count"
+    );
+}
+
+/// Violet's finding 4: misalignment was tested only at the END boundary.
+/// A misaligned START is a DISTINCT code path — it exercises the sink-offset
+/// arithmetic rather than the end clamp — and is equally uncomputable, because
+/// a half tile cannot be re-quantized without the original fp16 data.
+#[test]
+fn misaligned_hist_start_boundary_errors() {
+    const N_TILES: i32 = 4;
+    let src = kvarn_v4_set(1, N_TILES, 0);
+
+    // Global [TILE+50, TILE+256) -> hist-local [50, 256): START is mid-tile.
+    let err = extract_block(&src, (TILE + 50) as usize, (TILE + 256) as usize)
+        .expect_err("a mid-tile history START must be refused, not approximated");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("START") && msg.contains("tile-aligned"),
+        "the error must name the START boundary specifically, so the distinct \
+         sink-offset path is identifiable from the message alone; got: {msg}"
     );
 }
 

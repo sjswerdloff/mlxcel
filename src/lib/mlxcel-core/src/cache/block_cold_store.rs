@@ -752,27 +752,52 @@ impl BlockColdStore {
     }
 
     /// Assemble blocks from a manifest into a DetachedCacheSet.
+    ///
+    /// The result must have ONE cache per LAYER, each carrying that layer's
+    /// state concatenated along the token axis across every block — NOT one
+    /// cache per (block, layer) pair.
+    ///
+    /// The previous implementation flat-appended each block's per-layer caches
+    /// onto a single `Vec`, so a B-block, L-layer manifest assembled to `B*L`
+    /// entries instead of `L`. `read_block` (`:277-294`) iterates
+    /// `header.layers.iter().enumerate()` and pushes one cache per layer, so
+    /// `caches` IS layer-indexed and the bug was real on every multi-block
+    /// load — which is every sequence longer than `block_size` (2048). It was
+    /// invisible to single-block manifests, and `load_prefix` (`:672`) is the
+    /// production caller, so a wrong assembly here is a wrong adopted prefix.
     fn assemble_blocks(&self, manifest: &Manifest) -> Result<DetachedCacheSet, ColdStoreError> {
-        let mut all_caches: Vec<DetachedKVCache> = Vec::new();
-
-        for (i, block_hash) in manifest.block_hashes.iter().enumerate() {
-            let (tokens, cache_set) = self.read_block(block_hash)?;
-            let token_count = tokens.len();
-
-            // For each layer in this block, adjust the offset to reflect
-            // the block's position in the full sequence
-            for cache in cache_set.caches {
-                // The block's cache has offset = token_count (block-local).
-                // We don't need to adjust it — the assembled cache's
-                // current_offset will be set from the manifest's total_tokens.
-                all_caches.push(cache);
-            }
-
-            let _ = (i, token_count); // suppress unused warnings
+        if manifest.block_hashes.is_empty() {
+            return Err(invalid_data("manifest has no blocks".into()));
         }
 
-        if all_caches.is_empty() {
-            return Err(invalid_data("manifest has no blocks".into()));
+        // Read every block up front: merging is per LAYER across ALL blocks,
+        // so no layer can be finished until every block has been read.
+        let mut blocks: Vec<DetachedCacheSet> = Vec::with_capacity(manifest.block_hashes.len());
+        for block_hash in &manifest.block_hashes {
+            let (_tokens, cache_set) = self.read_block(block_hash)?;
+            blocks.push(cache_set);
+        }
+
+        let layer_count = blocks[0].caches.len();
+        for (i, b) in blocks.iter().enumerate() {
+            if b.caches.len() != layer_count {
+                return Err(invalid_data(format!(
+                    "assemble_blocks: block {i} has {} layers but block 0 has {layer_count} — \
+                     the manifest mixes structurally incompatible blocks",
+                    b.caches.len()
+                )));
+            }
+        }
+
+        let mut all_caches: Vec<DetachedKVCache> = Vec::with_capacity(layer_count);
+        for layer_idx in 0..layer_count {
+            let layers: Vec<&DetachedKVCache> =
+                blocks.iter().map(|b| &b.caches[layer_idx]).collect();
+            all_caches.push(merge_layer_across_blocks(
+                &layers,
+                layer_idx,
+                manifest.total_tokens as i32,
+            )?);
         }
 
         let cache_set = DetachedCacheSet {
@@ -860,6 +885,160 @@ fn decode_block_header(bytes: &[u8]) -> Result<BlockHeader, ColdStoreError> {
         layer_count,
         layers,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Block assembly (per-layer merge across blocks)
+// ---------------------------------------------------------------------------
+
+/// Selector for one optional array field of a layer.
+type LayerField = fn(&DetachedKVCache) -> &Option<UniquePtr<MlxArray>>;
+
+/// Concatenate one field along axis 2 (the token axis) across blocks, in
+/// manifest order, skipping blocks where it is absent.
+///
+/// Absence is meaningful and uniform here: a mid-sequence block has no sink and
+/// no tail, so those fields concatenate to exactly the one block that carries
+/// them. That is why sink/tail need no special case — only the placement
+/// ASSERTIONS in [`merge_layer_across_blocks`], which catch a sink or tail
+/// appearing where the sequence layout says it cannot.
+fn concat_across(layers: &[&DetachedKVCache], sel: LayerField) -> Option<UniquePtr<MlxArray>> {
+    let present: Vec<&MlxArray> = layers
+        .iter()
+        .filter_map(|l| sel(l).as_ref().map(|a| a.as_ref().unwrap()))
+        .collect();
+    let (first, rest) = present.split_first()?;
+    if rest.is_empty() {
+        // Single contributor: full-range slice to obtain an owned array.
+        let len = crate::ffi::array_shape(first)[2];
+        return Some(slice_axis(first, 2, 0, len));
+    }
+    let mut acc = crate::utils::concatenate(first, rest[0], 2);
+    for a in &rest[1..] {
+        acc = crate::utils::concatenate(acc.as_ref().unwrap(), a, 2);
+    }
+    Some(acc)
+}
+
+/// axis-2 extent of an optional field, or 0 when absent.
+fn axis2_of(o: &Option<UniquePtr<MlxArray>>) -> i32 {
+    o.as_ref()
+        .map_or(0, |a| crate::ffi::array_shape(a.as_ref().unwrap())[2])
+}
+
+/// Merge one layer's state across every block of a manifest.
+///
+/// Produces ONE cache carrying that layer concatenated along the token axis —
+/// the thing `assemble_blocks` needs and previously did not do.
+fn merge_layer_across_blocks(
+    layers: &[&DetachedKVCache],
+    layer_idx: usize,
+    total_tokens: i32,
+) -> Result<DetachedKVCache, ColdStoreError> {
+    let first = layers[0];
+
+    // Config consistency. A mismatch means the manifest mixes blocks quantized
+    // under different schemes; assembling them would produce a cache whose
+    // bytes are then interpreted under the wrong one — silent wrong inference,
+    // not a crash.
+    for (i, l) in layers.iter().enumerate() {
+        if l.mode != first.mode {
+            return Err(invalid_data(format!(
+                "assemble_blocks: layer {layer_idx} block {i} has mode {:?}, block 0 has {:?} — \
+                 manifest mixes blocks from different KV modes",
+                l.mode, first.mode
+            )));
+        }
+        if l.kvarn_v_bits != first.kvarn_v_bits {
+            return Err(invalid_data(format!(
+                "assemble_blocks: layer {layer_idx} block {i} has kvarn_v_bits {}, block 0 has {} \
+                 — manifest mixes blocks quantized at different V widths",
+                l.kvarn_v_bits, first.kvarn_v_bits
+            )));
+        }
+    }
+
+    // Region placement. The sink is the head of the sequence and the tail is
+    // its end, so under KVarN8 they can appear only in the first and last
+    // block. A sink in block 3 means the manifest is mis-ordered or its blocks
+    // come from different sequences — either way, concatenating would produce a
+    // plausible-looking cache with the wrong tokens in it.
+    if first.mode == KVCacheMode::KVarN8 {
+        let last = layers.len() - 1;
+        for (i, l) in layers.iter().enumerate() {
+            if i != 0 && (l.kvarn_sink_k.is_some() || l.kvarn_sink_v.is_some()) {
+                return Err(invalid_data(format!(
+                    "assemble_blocks: layer {layer_idx} block {i} carries a sink, but only the \
+                     first block may — manifest order is wrong, or these blocks are from \
+                     different sequences"
+                )));
+            }
+            if i != last && (l.kvarn_tail_k.is_some() || l.kvarn_tail_v.is_some()) {
+                return Err(invalid_data(format!(
+                    "assemble_blocks: layer {layer_idx} block {i} carries a tail, but only the \
+                     last block ({last}) may — see above"
+                )));
+            }
+        }
+    }
+
+    let merged = DetachedKVCache {
+        keys: concat_across(layers, |c| &c.keys),
+        values: concat_across(layers, |c| &c.values),
+        offset: total_tokens,
+        step: first.step,
+        mode: first.mode,
+        key_scales: concat_across(layers, |c| &c.key_scales),
+        val_scales: concat_across(layers, |c| &c.val_scales),
+        v_packed: None,
+        v_norms: None,
+        v_rescale: None,
+        k_packed: None,
+        k_norms: None,
+        turbo_seed: first.turbo_seed,
+        cold_offset: 0,
+        hot_threshold: first.hot_threshold,
+        delegated_fp16_fast_path: first.delegated_fp16_fast_path,
+        delegated_fp16_sidecar_policy: first.delegated_fp16_sidecar_policy,
+        m3_idx_k: concat_across(layers, |c| &c.m3_idx_k),
+        m3_idx_offset: total_tokens,
+        kvarn_sink_k: concat_across(layers, |c| &c.kvarn_sink_k),
+        kvarn_sink_v: concat_across(layers, |c| &c.kvarn_sink_v),
+        kvarn_tail_k: concat_across(layers, |c| &c.kvarn_tail_k),
+        kvarn_tail_v: concat_across(layers, |c| &c.kvarn_tail_v),
+        kvarn_hist_k: concat_across(layers, |c| &c.kvarn_hist_k),
+        kvarn_hist_v: concat_across(layers, |c| &c.kvarn_hist_v),
+        kvarn_k_scale: concat_across(layers, |c| &c.kvarn_k_scale),
+        kvarn_k_zp: concat_across(layers, |c| &c.kvarn_k_zp),
+        kvarn_k_s_row: concat_across(layers, |c| &c.kvarn_k_s_row),
+        kvarn_k_s_col: concat_across(layers, |c| &c.kvarn_k_s_col),
+        kvarn_v_scale: concat_across(layers, |c| &c.kvarn_v_scale),
+        kvarn_v_zp: concat_across(layers, |c| &c.kvarn_v_zp),
+        kvarn_v_s_row: concat_across(layers, |c| &c.kvarn_v_s_row),
+        kvarn_v_s_col: concat_across(layers, |c| &c.kvarn_v_s_col),
+        kvarn_v_bits: first.kvarn_v_bits,
+    };
+
+    // Token-extent check, DERIVED FROM THE DATA rather than read from a stored
+    // header field — a stored length can go stale against the bytes it
+    // describes; a measured one cannot. This is the loud failure for a dropped
+    // or duplicated block: the assembled layer would otherwise be short or long
+    // and nothing downstream would say so.
+    let assembled = if merged.mode == KVCacheMode::KVarN8 {
+        axis2_of(&merged.kvarn_sink_k) + axis2_of(&merged.kvarn_hist_k) + axis2_of(&merged.kvarn_tail_k)
+    } else {
+        axis2_of(&merged.keys)
+    };
+    if assembled != total_tokens {
+        return Err(invalid_data(format!(
+            "assemble_blocks: layer {layer_idx} assembled to {assembled} tokens but the manifest \
+             says {total_tokens} — a block was dropped, duplicated, or is the wrong size \
+             ({} blocks merged)",
+            layers.len()
+        )));
+    }
+
+    Ok(merged)
 }
 
 // ---------------------------------------------------------------------------
