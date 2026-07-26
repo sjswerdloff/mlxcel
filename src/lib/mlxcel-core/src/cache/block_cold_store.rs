@@ -967,6 +967,8 @@ mod tests {
 
     #[test]
     fn block_hash_merkle_chain_prefix_dependent() {
+        // Unit test: pure function incorporates prev_hash.
+        // NOT a discrimination control — the caller's chain logic is tested below.
         let tokens_a = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let tokens_b = vec![9, 10, 11, 12, 5, 6, 7, 8];
         let kv_mode = kv_mode_config_string(KVCacheMode::Fp16);
@@ -981,6 +983,28 @@ mod tests {
         assert_ne!(
             hash_a1, hash_b1,
             "block 1 hashes must differ despite same own tokens"
+        );
+    }
+
+    #[test]
+    fn compute_block_hashes_prefix_dependent() {
+        // RED CONTROL: the caller's chunk-and-chain path must produce
+        // different block addresses for conversations with different
+        // prefixes but identical mid-block tokens.
+        // Under own-token hashing (no chain), addrs_a[1] == addrs_b[1].
+        // Under Merkle-chain, they differ.
+        let tokens_a = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let tokens_b = vec![9, 10, 11, 12, 5, 6, 7, 8];
+        let kv_mode = kv_mode_config_string(KVCacheMode::Fp16);
+        let block_size = 4;
+
+        let addrs_a = compute_block_hashes(&tokens_a, block_size, &kv_mode);
+        let addrs_b = compute_block_hashes(&tokens_b, block_size, &kv_mode);
+
+        assert_ne!(addrs_a[0], addrs_b[0], "block 0 must differ");
+        assert_ne!(
+            addrs_a[1], addrs_b[1],
+            "block 1 must differ — chain carries prefix"
         );
     }
 
