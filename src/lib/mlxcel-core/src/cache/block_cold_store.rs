@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 use super::cold_store::{ColdStoreError, PruneMode, serialize_cache_set_layers, read_kv_cache};
 use super::{DetachedCacheSet, DetachedKVCache, KVCacheMode, SequenceId, SequenceStateBackend};
+use crate::utils::slice_axis;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -800,6 +801,89 @@ fn decode_block_header(bytes: &[u8]) -> Result<BlockHeader, ColdStoreError> {
 }
 
 // ---------------------------------------------------------------------------
+// Block extraction
+// ---------------------------------------------------------------------------
+
+/// Extract a block from a DetachedCacheSet.
+///
+/// For dense (fp16/kvarn8) mode: slices K/V tensors along the seq_len
+/// dimension (axis 2) for the token range [start, end).
+///
+/// For KVarN8 mode: the block boundaries are tile-aligned (2048 = 16 tiles),
+/// so the slice produces whole tiles. The resulting block stores whatever
+/// tile state actually exists (quantized hist tiles are lossy).
+///
+/// Must be called on the inference thread (Metal thread affinity).
+pub fn extract_block(
+    cache_set: &DetachedCacheSet,
+    start: usize,
+    end: usize,
+) -> Result<DetachedCacheSet, ColdStoreError> {
+    if start >= end {
+        return Err(invalid_data(format!(
+            "extract_block: start {start} >= end {end}"
+        )));
+    }
+    let token_count = end - start;
+
+    let mut caches = Vec::with_capacity(cache_set.caches.len());
+    for layer in &cache_set.caches {
+        let keys = layer.keys.as_ref().map(|k| slice_axis(k, 2, start as i32, end as i32));
+        let values = layer.values.as_ref().map(|v| slice_axis(v, 2, start as i32, end as i32));
+        let key_scales = layer.key_scales.as_ref().map(|s| slice_axis(s, 2, start as i32, end as i32));
+        let val_scales = layer.val_scales.as_ref().map(|s| slice_axis(s, 2, start as i32, end as i32));
+        let m3_idx_k = layer.m3_idx_k.as_ref().map(|m| slice_axis(m, 2, start as i32, end as i32));
+
+        caches.push(DetachedKVCache {
+            keys,
+            values,
+            offset: token_count as i32,
+            step: layer.step,
+            mode: layer.mode,
+            key_scales,
+            val_scales,
+            v_packed: None, // Turbo sidecars not extracted for blocks
+            v_norms: None,
+            v_rescale: None,
+            k_packed: None,
+            k_norms: None,
+            turbo_seed: layer.turbo_seed,
+            cold_offset: 0,
+            hot_threshold: layer.hot_threshold,
+            delegated_fp16_fast_path: layer.delegated_fp16_fast_path,
+            delegated_fp16_sidecar_policy: layer.delegated_fp16_sidecar_policy,
+            m3_idx_k,
+            m3_idx_offset: token_count as i32,
+            kvarn_sink_k: None,
+            kvarn_sink_v: None,
+            kvarn_tail_k: None,
+            kvarn_tail_v: None,
+            kvarn_hist_k: None,
+            kvarn_hist_v: None,
+            kvarn_k_scale: None,
+            kvarn_k_zp: None,
+            kvarn_k_s_row: None,
+            kvarn_k_s_col: None,
+            kvarn_v_scale: None,
+            kvarn_v_zp: None,
+            kvarn_v_s_row: None,
+            kvarn_v_s_col: None,
+            kvarn_v_bits: layer.kvarn_v_bits,
+        });
+    }
+
+    Ok(DetachedCacheSet {
+        caches,
+        backend: SequenceStateBackend::DenseKvCache,
+        prompt_len: token_count,
+        current_offset: token_count as i32,
+        created_at: std::time::Instant::now(),
+        detached_at: std::time::Instant::now(),
+        origin_seq_id: SequenceId(0),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Manifest encoding
 // ---------------------------------------------------------------------------
 
@@ -1067,5 +1151,40 @@ mod tests {
         let hashes = compute_block_hashes(&tokens, 4, &kv_mode);
         assert_eq!(hashes.len(), 2);
         assert_ne!(hashes[0], hashes[1]);
+    }
+
+    #[test]
+    fn extract_block_basic() {
+        // Extract a block from a cache set and verify token count.
+        let cache = make_test_cache_set(1, 8, 16);
+        let block = extract_block(&cache, 0, 4).unwrap();
+        assert_eq!(block.caches.len(), 1);
+        assert_eq!(block.caches[0].offset, 4);
+        assert_eq!(block.prompt_len, 4);
+        assert_eq!(block.current_offset, 4);
+    }
+
+    #[test]
+    fn extract_block_partial() {
+        // Extract a partial block (token_count < block_size).
+        let cache = make_test_cache_set(1, 10, 16);
+        let block = extract_block(&cache, 8, 10).unwrap();
+        assert_eq!(block.caches[0].offset, 2);
+        assert_eq!(block.prompt_len, 2);
+    }
+
+    #[test]
+    fn extract_block_boundary() {
+        // Extract at block_size boundary.
+        let cache = make_test_cache_set(1, 2048, 16);
+        let block = extract_block(&cache, 0, 2048).unwrap();
+        assert_eq!(block.caches[0].offset, 2048);
+    }
+
+    #[test]
+    fn extract_block_invalid_range() {
+        let cache = make_test_cache_set(1, 8, 16);
+        assert!(extract_block(&cache, 4, 4).is_err()); // start >= end
+        assert!(extract_block(&cache, 8, 4).is_err()); // start > end
     }
 }
