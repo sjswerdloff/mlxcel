@@ -1017,10 +1017,15 @@ fn layers_are_distinguishable_control() {
 ///
 /// `assemble_blocks` previously flat-appended each block's per-layer caches
 /// into one `Vec`, producing `B*L` entries instead of `L` concatenated along
-/// the token axis. Single-block manifests hide it completely, and
-/// `load_prefix` is the production caller — so every multi-block adopt (any
-/// sequence longer than `block_size`) was affected. The layer-count assertion
-/// below is the direct control for it.
+/// the token axis. Single-block manifests hide it completely, so any
+/// multi-block adopt — any sequence longer than `block_size` — would have been
+/// affected. The layer-count assertion below is the direct control for it.
+///
+/// **Scope, corrected:** an earlier revision said "`load_prefix` is the
+/// production caller", which conflated a within-module call with reachability
+/// from the server. `BlockColdStore` has no non-test callers; the scheduler
+/// holds `cold_store::ColdStore`, which delegates to the v3 `ReferenceColdStore`.
+/// v4 is complete but UNWIRED, so this was a latent defect, never a live one.
 #[test]
 fn end_to_end_extract_write_read_assemble_preserves_payload_bytes() {
     const N_TILES: i32 = 4;
@@ -1204,4 +1209,157 @@ fn data_is_distinct_per_axis2_after_astype() {
              — else a mis-slice passes vacuously (value collapsed under conversion)"
         );
     }
+}
+
+// ===========================================================================
+// PUBLIC-API ROUND TRIP — does the store actually get USED?
+//
+// Every other test in this file exercises a PIECE (`extract_block`,
+// `write_block`, `read_block`, `assemble_blocks`) and asserts BYTES. Until
+// these two, nothing called `persist` or `load_prefix` at all — the public
+// API had zero coverage — so nothing asserted that a persisted entry is ever
+// found again.
+//
+// That gap has a specific shape, named by Violet reviewing the pre-deploy
+// gate: a cache test whose only assertion is on OUTPUT is blind to the cache
+// being BYPASSED. A generation-equivalence test (persist, drop, reload,
+// assert the tokens match) passes identically on a perfect store and on a
+// store that never hits, because re-prefilling the same prompt reproduces the
+// same tokens. It certifies the MODEL, not the CACHE.
+//
+// The control that closes it must assert a HIT, and must be able to go RED
+// when the store is not used. That is what these two tests are.
+// ===========================================================================
+
+/// Flat `[1, VH, len, width]` fill — deliberately NOT the distinct-per-position
+/// `patt_f32` pattern, which caps FLOAT16 at 128 positions to keep its
+/// distinctness guarantee (it fails loud past that; see `patt_f32`). These two
+/// tests assert MATCH COUNTS and LAYER COUNTS, never bytes, so per-position
+/// distinctness buys nothing here and the byte-level contracts are covered by
+/// the tests above.
+fn flat_arr(len: i32, width: i32, fill: f32) -> Option<UniquePtr<MlxArray>> {
+    let data = vec![fill; (VH * len * width) as usize];
+    let f = ffi::from_slice_f32(&data, &[1, VH, len, width]);
+    Some(astype(&f, dtype::FLOAT16))
+}
+
+/// Dense fp16 layer of `len` tokens, distinguishable across layers via `shift`.
+fn fp16_layer(len: i32, shift: i32) -> DetachedKVCache {
+    let mut c = blank(KVCacheMode::Fp16);
+    c.keys = flat_arr(len, VD, 0.25 + shift as f32);
+    c.values = flat_arr(len, VD, 0.75 + shift as f32);
+    c.offset = len;
+    c
+}
+
+fn fp16_set(num_layers: usize, len: i32) -> DetachedCacheSet {
+    let caches = (0..num_layers)
+        .map(|i| fp16_layer(len, i as i32 * 5))
+        .collect();
+    let now = Instant::now();
+    DetachedCacheSet {
+        caches,
+        backend: SequenceStateBackend::DenseKvCache,
+        prompt_len: len as usize,
+        current_offset: len,
+        created_at: now,
+        detached_at: now,
+        origin_seq_id: SequenceId::from_raw(11),
+    }
+}
+
+/// THE MISSING CONTROL: a persisted entry must be FOUND again.
+///
+/// Spans two blocks (2 x DEFAULT_BLOCK_SIZE) so it also exercises the
+/// multi-block assembly path through the public API rather than by calling
+/// `assemble_blocks` directly.
+///
+/// Goes RED if `load_prefix` stops matching what `persist` wrote — which is
+/// exactly the failure mode that is invisible to any output-only assertion,
+/// because a miss is silently soft (`scheduler.rs:1787`) and simply
+/// re-prefills.
+///
+/// **SCOPE, stated so this green is not read as wider than it is:** this
+/// covers **Fp16 only**. It does NOT catch the `KVCacheMode::Fp16` hardcode in
+/// `load_prefix` (handoff §7.5), because under Fp16 that hardcode is
+/// coincidentally correct. The k8v4 half is pinned by the test below.
+#[test]
+fn persist_then_load_prefix_reports_a_hit_fp16() {
+    const LAYERS: usize = 2;
+    const DEPTH: i32 = 2 * DEFAULT_BLOCK_SIZE as i32;
+
+    let set = fp16_set(LAYERS, DEPTH);
+    let tokens: Vec<i32> = (0..DEPTH).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
+
+    store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+
+    let (loaded, matched) = store
+        .load_prefix("m3", "tmpl", &tokens)
+        .expect("load_prefix MUST HIT the entry just persisted — a miss here is a write-only store");
+
+    assert!(
+        matched > 0,
+        "matched_tokens must be > 0: a zero match means the store was written and never used"
+    );
+    assert_eq!(
+        matched,
+        tokens.len(),
+        "the full prefix was persisted, so the full prefix must match"
+    );
+    assert_eq!(
+        loaded.caches.len(),
+        LAYERS,
+        "assembled set must have ONE cache per LAYER, not one per (block, layer) — \
+         a B*L length here is the flat-append bug reached through the public API"
+    );
+}
+
+/// PINNING TEST for handoff §7.5 — this asserts a BUG, deliberately.
+///
+/// `persist` addresses blocks with the REAL mode (`:562`); `load_prefix`
+/// hardcodes `KVCacheMode::Fp16` (`:715`). `kv_mode_config_string` is
+/// `format!("{:?}", mode)`, and `block_hash_includes_kv_mode` already pins that
+/// the two hashes differ. So under KVarN8 the store is **write-only**: the
+/// addresses computed at load can never equal the ones in its own manifest,
+/// `matched_blocks` is 0, the candidate is dropped, and the caller sees
+/// `NoMatch` — indistinguishable from a legitimately cold cache.
+///
+/// **This test is GREEN today because the bug is present, and it will go RED
+/// the moment §7.5 is fixed.** That is intended: it makes the defect
+/// executable rather than a paragraph in a document, and it makes the fix
+/// impossible to land silently. When it reddens, DELETE it and extend
+/// `persist_then_load_prefix_reports_a_hit_fp16` to cover KVarN8 — the hit
+/// assertion is the one worth keeping.
+///
+/// It is NOT an endorsement of the miss. See §7.5 for the two fix options.
+#[test]
+fn kvarn8_persist_then_load_prefix_misses_pending_the_fp16_hardcode_fix() {
+    // 128 sink + 15 tiles * 128 + 0 tail = 2048 = exactly one block.
+    const N_TILES: i32 = 15;
+    let depth = TILE + N_TILES * TILE;
+    assert_eq!(depth as usize, DEFAULT_BLOCK_SIZE, "one whole block");
+
+    let set = kvarn_v4_set_distinct(2, N_TILES, 0);
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
+
+    store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed — the WRITE half works, which is why this is invisible");
+
+    let outcome = store.load_prefix("m3", "tmpl", &tokens);
+
+    assert!(
+        matches!(outcome, Err(ColdStoreError::NoMatch)),
+        "EXPECTED the §7.5 write-only bug (NoMatch under KVarN8). If this line \
+         failed, the Fp16 hardcode at load_prefix:715 has been FIXED — delete \
+         this test and extend the fp16 hit test to KVarN8 instead."
+    );
 }
