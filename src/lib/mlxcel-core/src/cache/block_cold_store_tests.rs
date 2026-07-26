@@ -196,6 +196,66 @@ const B_V_S_COL: i32 = 11; // per-tile
 const B_TAIL_K: i32 = 12;
 const B_TAIL_V: i32 = 13;
 
+// ---------------------------------------------------------------------------
+// The field LIST — every KVarN8 array a k8v4 layer carries, grouped by the
+// region whose extraction arithmetic governs it.
+//
+// This is a list rather than thirteen hand-written assertions ON PURPOSE, and
+// the reason is Violet's, not brevity: a hand-written set is HOW `k_zp` and
+// `k_s_row` went missing. Before her review (Finding 3), four of thirteen
+// fields — `k_zp`, `k_s_row`, `v_scale`, `v_zp` — had no byte assertion
+// ANYWHERE in this file, and two more (`sink_v`, `tail_v`) were presence-only.
+// A missing field is invisible when the assertions are hand-written (an absent
+// assert looks like nothing); it is visible when they are a list (a short list
+// looks short). All four bare fields are per-token history fields — exactly the
+// class the sink-offset arithmetic can silently mis-slice, where a wrong offset
+// is not a crash but wrong inference.
+//
+// Adding a field to a k8v4 layer means adding it here. That is the point.
+type FieldSel = fn(&DetachedKVCache) -> &Option<UniquePtr<MlxArray>>;
+
+/// Sink region: 128 tokens, lives ENTIRELY in the first block.
+const SINK_FIELDS: &[(&str, FieldSel)] = &[
+    ("sink_k", |c| &c.kvarn_sink_k),
+    ("sink_v", |c| &c.kvarn_sink_v),
+];
+
+/// History, PER-TOKEN: axis-2 length `T`, concatenated across blocks in order.
+const HIST_PER_TOKEN_FIELDS: &[(&str, FieldSel)] = &[
+    ("hist_k", |c| &c.kvarn_hist_k),
+    ("hist_v", |c| &c.kvarn_hist_v),
+    ("k_scale", |c| &c.kvarn_k_scale),
+    ("k_zp", |c| &c.kvarn_k_zp),
+    ("k_s_row", |c| &c.kvarn_k_s_row),
+    ("v_scale", |c| &c.kvarn_v_scale),
+    ("v_zp", |c| &c.kvarn_v_zp),
+];
+
+/// History, PER-TILE: axis-2 length `n_tiles` — the corruption trap. These
+/// slice by TILE index, never by token count.
+const HIST_PER_TILE_FIELDS: &[(&str, FieldSel)] = &[
+    ("k_s_col", |c| &c.kvarn_k_s_col),
+    ("v_s_col", |c| &c.kvarn_v_s_col),
+];
+
+/// Tail region: `tail_len` tokens, lives ENTIRELY in the last block.
+const TAIL_FIELDS: &[(&str, FieldSel)] = &[
+    ("tail_k", |c| &c.kvarn_tail_k),
+    ("tail_v", |c| &c.kvarn_tail_v),
+];
+
+/// Every field a k8v4 layer populates (`v_s_row` is `None` in v4 by design —
+/// the fold is its storage — so it is deliberately absent from this list).
+fn all_k8v4_fields() -> Vec<(&'static str, FieldSel)> {
+    SINK_FIELDS
+        .iter()
+        .chain(HIST_PER_TOKEN_FIELDS)
+        .chain(HIST_PER_TILE_FIELDS)
+        .chain(TAIL_FIELDS)
+        .copied()
+        .collect()
+}
+
 /// Build one k8v4 (v_bits = 4) layer with `n_tiles` history tiles and a tail
 /// of `tail_len` tokens. `T = n_tiles * 128`. Deterministic: identical args
 /// yield byte-identical arrays.
@@ -312,60 +372,122 @@ fn reassembly_roundtrip_bit_identical() {
         .map(|&(s, e)| extract_block(&src, s, e).expect("extract_block ok"))
         .collect();
 
-    // --- sink: entirely inside block 0. ---
-    let sink_k = bytes_of(&extracted[0].caches[0].kvarn_sink_k, "sink_k");
-    assert_eq!(
-        sink_k,
-        src_token_slice_bytes(&src_layer.kvarn_sink_k, 0, TILE),
-        "reassembled sink_k must equal source sink_k bytewise"
-    );
+    // Concat one field across two adjacent blocks along axis 2 and return the
+    // byte image. `unwrap_or_else` rather than `unwrap` so a dropped field
+    // names ITSELF — this is the failure mode `extract_block` currently has
+    // (all fourteen kvarn_* arrays nulled at :917-930), and a bare unwrap
+    // would report only "called Option::unwrap on a None value".
+    let concat_two = |i0: usize, i1: usize, name: &str, sel: FieldSel| -> Vec<u8> {
+        let a = sel(&extracted[i0].caches[0])
+            .as_ref()
+            .unwrap_or_else(|| panic!("block{i0} dropped field `{name}` (extraction returned None)"))
+            .as_ref()
+            .unwrap();
+        let b = sel(&extracted[i1].caches[0])
+            .as_ref()
+            .unwrap_or_else(|| panic!("block{i1} dropped field `{name}` (extraction returned None)"))
+            .as_ref()
+            .unwrap();
+        bytes(&crate::utils::concatenate(a, b, 2))
+    };
 
-    // --- hist_k: concat block0 hist (tiles 0..2) then block1 hist (tiles 2..4). ---
-    let hk0 = extracted[0].caches[0]
-        .kvarn_hist_k
-        .as_ref()
-        .expect("block0 hist_k")
-        .as_ref()
-        .unwrap();
-    let hk1 = extracted[1].caches[0]
-        .kvarn_hist_k
-        .as_ref()
-        .expect("block1 hist_k")
-        .as_ref()
-        .unwrap();
-    let hk_cat = crate::utils::concatenate(hk0, hk1, 2);
-    assert_eq!(
-        bytes(&hk_cat),
-        src_token_slice_bytes(&src_layer.kvarn_hist_k, 0, t),
-        "reassembled hist_k must equal the full source history bytewise"
-    );
+    // --- sink: 128 tokens, entirely inside block 0. ---
+    for &(name, sel) in SINK_FIELDS {
+        assert_eq!(
+            bytes_of(sel(&extracted[0].caches[0]), name),
+            src_token_slice_bytes(sel(src_layer), 0, TILE),
+            "reassembled `{name}` must equal source `{name}` bytewise (sink region)"
+        );
+    }
 
-    // --- k_s_col: per-TILE. block0 tiles 0..2, block1 tiles 2..4. ---
-    let sc0 = extracted[0].caches[0]
-        .kvarn_k_s_col
-        .as_ref()
-        .expect("block0 k_s_col")
-        .as_ref()
-        .unwrap();
-    let sc1 = extracted[1].caches[0]
-        .kvarn_k_s_col
-        .as_ref()
-        .expect("block1 k_s_col")
-        .as_ref()
-        .unwrap();
-    let sc_cat = crate::utils::concatenate(sc0, sc1, 2);
-    assert_eq!(
-        bytes(&sc_cat),
-        src_token_slice_bytes(&src_layer.kvarn_k_s_col, 0, N_TILES),
-        "reassembled k_s_col must equal source per-tile s_col bytewise"
-    );
+    // --- history, PER-TOKEN: block0 tiles 0..2 ++ block1 tiles 2..4 == [0, T). ---
+    for &(name, sel) in HIST_PER_TOKEN_FIELDS {
+        assert_eq!(
+            concat_two(0, 1, name, sel),
+            src_token_slice_bytes(sel(src_layer), 0, t),
+            "reassembled `{name}` must equal the full source history bytewise"
+        );
+    }
+
+    // --- history, PER-TILE: sliced by TILE index, never by token count. ---
+    for &(name, sel) in HIST_PER_TILE_FIELDS {
+        assert_eq!(
+            concat_two(0, 1, name, sel),
+            src_token_slice_bytes(sel(src_layer), 0, N_TILES),
+            "reassembled `{name}` must equal source per-tile scales bytewise \
+             (per-TILE axis-2 length {N_TILES}, NOT token count)"
+        );
+    }
 
     // --- tail: entirely inside the last block. ---
-    let tail_k = bytes_of(&extracted[2].caches[0].kvarn_tail_k, "tail_k");
-    assert_eq!(
-        tail_k,
-        src_token_slice_bytes(&src_layer.kvarn_tail_k, 0, TAIL),
-        "reassembled tail_k must equal source tail_k bytewise"
+    for &(name, sel) in TAIL_FIELDS {
+        assert_eq!(
+            bytes_of(sel(&extracted[2].caches[0]), name),
+            src_token_slice_bytes(sel(src_layer), 0, TAIL),
+            "reassembled `{name}` must equal source `{name}` bytewise (tail region)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1b. PAYLOAD SURVIVAL — the assertion that replaces the one I got wrong
+// ---------------------------------------------------------------------------
+
+/// Every field that is `Some` in the source layer must be `Some` in the
+/// extraction. Nothing about labels.
+///
+/// ## Why this test exists, and why it is not a mode assertion
+///
+/// My spec originally proposed `assert_eq!(mode, KVCacheMode::KVarN8)` as the
+/// blocking control for KVarN8 extraction. That assertion **passes on exactly
+/// the failure it was written to catch.** `extract_block:902` copies
+/// `mode: layer.mode` faithfully, while `:917-930` sets all fourteen
+/// `kvarn_*` arrays to `None`. So an extracted KVarN8 block reports
+/// `mode == KVarN8` and `v_bits == 4` while carrying ZERO KVarN8 data: the
+/// label survives, the payload does not, and a label assertion checks the
+/// label. The proposed fix carried the same defect as the thing it fixed.
+/// (Violet, Finding 1.)
+///
+/// Likewise there is nothing to assert about the backend. `SequenceStateBackend`
+/// (`cache.rs:7347`) has exactly three variants — `DenseKvCache`, `PagedKvCache`,
+/// `ModelOwned` — and no KVarN8 variant, nor should it: KVarN8 is a per-layer
+/// `KVCacheMode`, orthogonal to set-level storage. The detach path is dense-ONLY
+/// by contract (`detach.rs:2147` rejects a non-Dense set; paged has its own type),
+/// so the `DenseKvCache` literals at `:298`/`:778`/`:937` stamp an invariant that
+/// genuinely holds. They are correct and must not be "fixed."
+///
+/// So the real gate is PAYLOAD: presence here, byte-equality in the anchor.
+#[test]
+fn kvarn_payload_survives_extraction() {
+    const N_TILES: i32 = 4;
+    const TAIL: i32 = 10;
+    let total = TILE + N_TILES * TILE + TAIL;
+
+    let src = kvarn_v4_set(1, N_TILES, TAIL);
+    let src_layer = &src.caches[0];
+
+    // One block spanning the whole sequence: every region is in scope, so
+    // every field that is Some in the source must be Some in the extraction.
+    let ex = extract_block(&src, 0, total as usize).expect("extract_block ok");
+    let out_layer = &ex.caches[0];
+
+    let mut dropped: Vec<&str> = Vec::new();
+    for (name, sel) in all_k8v4_fields() {
+        if sel(src_layer).is_some() && sel(out_layer).is_none() {
+            dropped.push(name);
+        }
+    }
+
+    assert!(
+        dropped.is_empty(),
+        "extraction DROPPED {} of {} populated KVarN8 fields: {:?}\n\
+         The layer still reports mode={:?} and v_bits={} — the label survived \
+         and the payload did not. This is why the gate is payload, not label.",
+        dropped.len(),
+        all_k8v4_fields().len(),
+        dropped,
+        out_layer.mode,
+        out_layer.kvarn_v_bits,
     );
 }
 
@@ -529,58 +651,29 @@ fn s_col_sliced_by_tile_not_token() {
     );
 }
 
-/// RED control for the trap: prove the TILE interpretation and the TOKEN
-/// interpretation of the mid-block `s_col` slice yield DIFFERENT bytes, so an
-/// impl that (wrongly) sliced `s_col` by token count instead of tile count is
-/// distinguishable. This demonstrates `s_col_sliced_by_tile_not_token` can go
-/// red under the specific token-vs-tile bug (not vacuously green).
-///
-/// For the mid block global `[256, 512)` -> hist-local `[128, 384)`:
-///   * CORRECT (per-tile):  `k_s_col[1..3)`  — 2 rows, width VD
-///   * BUGGY  (per-token):  a `[128..384)`-indexed read of a token-length
-///     tensor — 256 rows. We stand in `k_scale` (which IS token-length, width
-///     1) as the shape a token-count slice would have.
-/// The two byte images differ in both length and content, so the comparison
-/// bites.
-#[test]
-fn s_col_red_control_token_slice_would_mismatch() {
-    const N_TILES: i32 = 4;
-    let src = kvarn_v4_set(1, N_TILES, 0);
-
-    // CORRECT per-tile slice: tiles [1..3) of the per-tile s_col tensor.
-    let per_tile = src_token_slice_bytes(&src.caches[0].kvarn_k_s_col, 1, 3);
-    // BUGGY token-indexed slice: tokens [128..384) of a token-length tensor.
-    let per_token = src_token_slice_bytes(&src.caches[0].kvarn_k_scale, 128, 384);
-
-    // Sanity on the two shapes.
-    let sc = src.caches[0]
-        .kvarn_k_s_col
-        .as_ref()
-        .unwrap()
-        .as_ref()
-        .unwrap();
-    assert_eq!(axis2_len(sc), N_TILES, "source s_col is per-tile (N_TILES rows)");
-    let ks = src.caches[0]
-        .kvarn_k_scale
-        .as_ref()
-        .unwrap()
-        .as_ref()
-        .unwrap();
-    assert_eq!(axis2_len(ks), N_TILES * TILE, "source k_scale is per-token");
-
-    // The discriminating claim: the tile-sliced bytes are NOT equal to the
-    // token-sliced bytes — a token-vs-tile bug changes both length and value.
-    assert_ne!(
-        per_tile, per_token,
-        "per-tile s_col slice MUST differ from a per-token slice — proves the \
-         token-vs-tile trap is discriminating, not vacuous"
-    );
-    assert_ne!(
-        per_tile.len(),
-        per_token.len(),
-        "per-tile (2 rows x VD) and per-token (256 rows x 1) byte counts differ"
-    );
-}
+// DELETED 2026-07-26: `s_col_red_control_token_slice_would_mismatch`.
+//
+// It was a control that COULD NOT FAIL. It never called `extract_block` at
+// all — it compared `k_s_col[1..3)` against `k_scale[128..384)`, two different
+// source tensors that differ BY CONSTRUCTION (different base, different width,
+// different axis-2 length) for every possible implementation, including one
+// that returns `None` for every field. `assert_ne!` on two things built to be
+// unequal certifies nothing about the code under test.
+//
+// It also mis-modelled the bug it claimed to guard. With `N_TILES = 4`,
+// `k_s_col` has FOUR rows on axis 2, so a token-count slice `[128..384)` is
+// OUT OF RANGE. The token-vs-tile bug therefore manifests as an out-of-range
+// slice — a panic or a clamp — not as wrong bytes. The control asserted the
+// wrong failure mode.
+//
+// `s_col_sliced_by_tile_not_token`'s `axis2_len` assertions already catch the
+// trap under every failure mode, so nothing is lost. A genuine second control
+// is a mutation test against a deliberately token-slicing stub, and that
+// belongs AFTER the implementation exists.
+//
+// Found by Violet (REVIEW_kvarn8_block_extraction_tests_20260726.md, Finding 2).
+// Recorded rather than silently removed: this file's entire premise is that a
+// control must be able to fail, and it shipped with one that couldn't.
 
 // ---------------------------------------------------------------------------
 // 4. sink only in the first block
