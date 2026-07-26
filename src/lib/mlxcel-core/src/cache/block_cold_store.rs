@@ -971,11 +971,26 @@ const HIST_PER_TILE_FIELDS: &[(&str, LayerField)] = &[
 ///
 /// A field absent from EVERY block passes here, because uniform absence is
 /// legitimate for at least one field: v4 folds `v_s_row` into `s_col` and leaves
-/// it `None`. Distinguishing "correctly absent" from "the extractor dropped it
-/// everywhere" needs knowledge of the quantization variant that the assembler
-/// does not have; that case is covered by the end-to-end payload gate, not here.
-/// What this catches is a PARTIAL skip — some blocks contributing, some not —
-/// which is the failure `concat_across` can actually cause.
+/// it `None`.
+///
+/// It would be wrong to say this is because the assembler lacks the information
+/// — it has `kvarn_v_bits` right here, and mode consistency is enforced above.
+/// The accurate statement is that **the contract is missing from the codebase,
+/// not from this function.** Nothing anywhere declares "under `v_bits = 4`,
+/// `v_s_row` is absent and these nine fields are mandatory." `trim_to`'s KVarN8
+/// branch slices `v_s_row` unconditionally (`slice_seq` no-ops on `None`) and
+/// does not branch on `v_bits` either. That knowledge lives only in the
+/// quantizer's behaviour, and three places — this assembler, `trim_to`, and the
+/// extractor — each trust it independently. The fix is therefore a declared
+/// `mandatory_fields(mode, v_bits)` giving all three one source of truth, NOT a
+/// cleverer inference here. (Violet, review of `fa50cd6`.)
+///
+/// Deferring that is a calibration, not an oversight: a PARTIAL skip is
+/// SILENT-wrong — misaligned scales against the tokens they apply to, computing
+/// a plausible wrong answer — while UNIFORM absence is LOUD-wrong, a missing
+/// input that panics or visibly fails downstream. This guard catches the silent
+/// class, which is the class that needed catching. The loud one can wait for a
+/// contract, and it should be a contract rather than a fourth local check.
 fn check_region_coherence(
     merged: &DetachedKVCache,
     layer_idx: usize,
