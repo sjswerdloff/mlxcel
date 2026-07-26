@@ -18,7 +18,9 @@ use sha2::{Digest, Sha256};
 
 use super::cold_store::{ColdStoreError, PruneMode, serialize_cache_set_layers, read_kv_cache};
 use super::{DetachedCacheSet, DetachedKVCache, KVCacheMode, SequenceId, SequenceStateBackend};
+use crate::ffi::MlxArray;
 use crate::utils::slice_axis;
+use cxx::UniquePtr;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -861,6 +863,149 @@ fn decode_block_header(bytes: &[u8]) -> Result<BlockHeader, ColdStoreError> {
 }
 
 // ---------------------------------------------------------------------------
+// KVarN8 region-aware block extraction
+// ---------------------------------------------------------------------------
+
+/// The KVarN8 tile state carried by one extracted block.
+///
+/// `v_s_row` is carried even though v4 folds it into `s_col` and leaves it
+/// `None`: `trim_to` slices it when present (`detach.rs:560`), so this must
+/// too, or a k8v8 layer would silently lose it.
+#[derive(Default)]
+struct Kvarn8Regions {
+    sink_k: Option<UniquePtr<MlxArray>>,
+    sink_v: Option<UniquePtr<MlxArray>>,
+    hist_k: Option<UniquePtr<MlxArray>>,
+    hist_v: Option<UniquePtr<MlxArray>>,
+    k_scale: Option<UniquePtr<MlxArray>>,
+    k_zp: Option<UniquePtr<MlxArray>>,
+    k_s_row: Option<UniquePtr<MlxArray>>,
+    k_s_col: Option<UniquePtr<MlxArray>>,
+    v_scale: Option<UniquePtr<MlxArray>>,
+    v_zp: Option<UniquePtr<MlxArray>>,
+    v_s_row: Option<UniquePtr<MlxArray>>,
+    v_s_col: Option<UniquePtr<MlxArray>>,
+    tail_k: Option<UniquePtr<MlxArray>>,
+    tail_v: Option<UniquePtr<MlxArray>>,
+}
+
+/// Slice one KVarN8 layer's tile state to the token range `[start, end)`.
+///
+/// KVarN8 lays a sequence out along axis 2 as
+/// `[ sink (128) | history tiles (T, a multiple of 128) | tail (< 128) ]`,
+/// and the three regions live in SEPARATE tensors — so a block's token range
+/// must be split across them, not sliced out of one contiguous buffer. That
+/// is why `extract_block`'s dense path (a single `slice_axis` per tensor)
+/// cannot serve KVarN8, and why it previously returned `None` for all of it.
+///
+/// This mirrors `DetachedKVCache::trim_to`'s KVarN8 branch
+/// (`detach.rs:507-572`), generalized from a prefix `[0, new_len)` to an
+/// arbitrary block `[start, end)`. Three properties are carried over
+/// deliberately:
+///
+/// * **`k_s_col`/`v_s_col` slice by TILE INDEX, never by token count.** Their
+///   axis-2 length is `n_tiles`, not `T` — `trim_to` uses
+///   `n_tiles_keep = hist_keep / tile` (`detach.rs:552,561-562`). Slicing them
+///   by tokens is the corruption trap this whole suite is built around: for a
+///   small cache it is an out-of-range slice, and for a large one it silently
+///   returns the wrong column scales for the block, which is wrong inference
+///   rather than a crash.
+/// * **A history boundary that is not tile-aligned FAILS LOUDLY**, rather than
+///   approximating — a half tile cannot be re-quantized without the original
+///   fp16 data (`detach.rs:505-506`). BOTH boundaries are checked. The START
+///   is a distinct code path from the END: it exercises the sink-offset
+///   arithmetic rather than the end clamp, and it is equally uncomputable.
+/// * **The sink is indivisible.** It is taken whole or not at all; a block
+///   that would split it is a caller bug and says so.
+fn extract_kvarn8_regions(
+    layer: &DetachedKVCache,
+    start: usize,
+    end: usize,
+) -> Result<Kvarn8Regions, ColdStoreError> {
+    let tile = crate::cache::kvarn::KVARN_TILE_TOKENS;
+    let axis2 = |a: &UniquePtr<MlxArray>| crate::ffi::array_shape(a)[2];
+
+    let sink_len = layer.kvarn_sink_k.as_ref().map_or(0, axis2);
+    let hist_len = layer.kvarn_hist_k.as_ref().map_or(0, axis2);
+    let tail_len = layer.kvarn_tail_k.as_ref().map_or(0, axis2);
+    let total = sink_len + hist_len + tail_len;
+
+    let (start_i, end_i) = (start as i32, end as i32);
+    if end_i > total {
+        return Err(invalid_data(format!(
+            "extract_block: KVarN8 block [{start}, {end}) exceeds the layer's extent \
+             {total} (sink {sink_len} + hist {hist_len} + tail {tail_len})"
+        )));
+    }
+
+    let cut = |t: &Option<UniquePtr<MlxArray>>, lo: i32, hi: i32| {
+        t.as_ref().map(|a| slice_axis(a, 2, lo, hi))
+    };
+    let mut out = Kvarn8Regions::default();
+
+    // --- sink: global [0, sink_len). Indivisible. ---
+    let sink_lo = start_i.clamp(0, sink_len);
+    let sink_hi = end_i.clamp(0, sink_len);
+    if sink_hi > sink_lo {
+        if sink_lo != 0 || sink_hi != sink_len {
+            return Err(invalid_data(format!(
+                "extract_block: KVarN8 block [{start}, {end}) would split the sink \
+                 [0, {sink_len}). The sink is indivisible — a block takes it whole \
+                 or not at all."
+            )));
+        }
+        out.sink_k = cut(&layer.kvarn_sink_k, 0, sink_len);
+        out.sink_v = cut(&layer.kvarn_sink_v, 0, sink_len);
+    }
+
+    // --- history: global [sink_len, sink_len + hist_len), in hist-local coords. ---
+    let h_lo = (start_i - sink_len).clamp(0, hist_len);
+    let h_hi = (end_i - sink_len).clamp(0, hist_len);
+    if h_hi > h_lo {
+        if h_lo % tile != 0 {
+            return Err(invalid_data(format!(
+                "extract_block: KVarN8 history START {h_lo} is not tile-aligned \
+                 (tile = {tile}); block [{start}, {end}), sink {sink_len}. A half \
+                 tile cannot be re-quantized without the original fp16 data."
+            )));
+        }
+        if h_hi % tile != 0 {
+            return Err(invalid_data(format!(
+                "extract_block: KVarN8 history END {h_hi} is not tile-aligned \
+                 (tile = {tile}); block [{start}, {end}), sink {sink_len}. A half \
+                 tile cannot be re-quantized without the original fp16 data."
+            )));
+        }
+
+        // Per-TOKEN history fields.
+        out.hist_k = cut(&layer.kvarn_hist_k, h_lo, h_hi);
+        out.hist_v = cut(&layer.kvarn_hist_v, h_lo, h_hi);
+        out.k_scale = cut(&layer.kvarn_k_scale, h_lo, h_hi);
+        out.k_zp = cut(&layer.kvarn_k_zp, h_lo, h_hi);
+        out.k_s_row = cut(&layer.kvarn_k_s_row, h_lo, h_hi);
+        out.v_scale = cut(&layer.kvarn_v_scale, h_lo, h_hi);
+        out.v_zp = cut(&layer.kvarn_v_zp, h_lo, h_hi);
+        out.v_s_row = cut(&layer.kvarn_v_s_row, h_lo, h_hi);
+
+        // Per-TILE column scales. TILE INDEX, NOT TOKEN COUNT. See doc above.
+        let (n_lo, n_hi) = (h_lo / tile, h_hi / tile);
+        out.k_s_col = cut(&layer.kvarn_k_s_col, n_lo, n_hi);
+        out.v_s_col = cut(&layer.kvarn_v_s_col, n_lo, n_hi);
+    }
+
+    // --- tail: global [sink_len + hist_len, total), in tail-local coords. ---
+    let t_base = sink_len + hist_len;
+    let t_lo = (start_i - t_base).clamp(0, tail_len);
+    let t_hi = (end_i - t_base).clamp(0, tail_len);
+    if t_hi > t_lo {
+        out.tail_k = cut(&layer.kvarn_tail_k, t_lo, t_hi);
+        out.tail_v = cut(&layer.kvarn_tail_v, t_lo, t_hi);
+    }
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Block extraction
 // ---------------------------------------------------------------------------
 
@@ -894,6 +1039,18 @@ pub fn extract_block(
         let val_scales = layer.val_scales.as_ref().map(|s| slice_axis(s, 2, start as i32, end as i32));
         let m3_idx_k = layer.m3_idx_k.as_ref().map(|m| slice_axis(m, 2, start as i32, end as i32));
 
+        // KVarN8 keeps its state in three separate region tensors
+        // ([sink | history tiles | tail]), so it cannot be served by the dense
+        // path's single slice per tensor. For every other mode these fields
+        // are already None, and `Default` reproduces exactly the previous
+        // behaviour — so this branch adds the KVarN8 case without touching
+        // what dense extraction did.
+        let kvarn = if layer.mode == KVCacheMode::KVarN8 {
+            extract_kvarn8_regions(layer, start, end)?
+        } else {
+            Kvarn8Regions::default()
+        };
+
         caches.push(DetachedKVCache {
             keys,
             values,
@@ -914,20 +1071,20 @@ pub fn extract_block(
             delegated_fp16_sidecar_policy: layer.delegated_fp16_sidecar_policy,
             m3_idx_k,
             m3_idx_offset: token_count as i32,
-            kvarn_sink_k: None,
-            kvarn_sink_v: None,
-            kvarn_tail_k: None,
-            kvarn_tail_v: None,
-            kvarn_hist_k: None,
-            kvarn_hist_v: None,
-            kvarn_k_scale: None,
-            kvarn_k_zp: None,
-            kvarn_k_s_row: None,
-            kvarn_k_s_col: None,
-            kvarn_v_scale: None,
-            kvarn_v_zp: None,
-            kvarn_v_s_row: None,
-            kvarn_v_s_col: None,
+            kvarn_sink_k: kvarn.sink_k,
+            kvarn_sink_v: kvarn.sink_v,
+            kvarn_tail_k: kvarn.tail_k,
+            kvarn_tail_v: kvarn.tail_v,
+            kvarn_hist_k: kvarn.hist_k,
+            kvarn_hist_v: kvarn.hist_v,
+            kvarn_k_scale: kvarn.k_scale,
+            kvarn_k_zp: kvarn.k_zp,
+            kvarn_k_s_row: kvarn.k_s_row,
+            kvarn_k_s_col: kvarn.k_s_col,
+            kvarn_v_scale: kvarn.v_scale,
+            kvarn_v_zp: kvarn.v_zp,
+            kvarn_v_s_row: kvarn.v_s_row,
+            kvarn_v_s_col: kvarn.v_s_col,
             kvarn_v_bits: layer.kvarn_v_bits,
         });
     }

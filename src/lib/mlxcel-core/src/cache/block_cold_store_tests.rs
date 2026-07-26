@@ -70,14 +70,45 @@ const TILE: i32 = 128; // KVARN_TILE_TOKENS (kvarn.rs:77)
 ///     (base,t,h,w) so no two fields ever share bytes either.
 /// `data_is_distinct_per_axis2_after_astype` is the control that proves this.
 fn patt_f32(base: i32, len: i32, width: i32, dt: i32) -> Vec<f32> {
+    // The FLOAT16 packing below needs `h*128 + t < 256`. Assert once rather
+    // than per element; a violation would silently alias two fields.
+    if dt == dtype::FLOAT16 {
+        assert!(
+            len <= TILE && VH <= 2,
+            "f16 pattern packs (h, t) into 256 slots: needs len <= {TILE} and VH <= 2, \
+             got len={len}, VH={VH}"
+        );
+    }
     let mut v = Vec::with_capacity((VH * len * width) as usize);
     for h in 0..VH {
         for t in 0..len {
             for w in 0..width {
                 let val: f32 = if dt == dtype::FLOAT16 {
-                    ((t + 1) * 3 + h) as f32
+                    // `base` MUST enter this value. It did not until
+                    // 2026-07-26, and the consequence was severe: sink_k and
+                    // sink_v have identical shape and dtype, so they had
+                    // IDENTICAL BYTES — as did tail_k and tail_v. A k<->v
+                    // swap in either region was undetectable by any assertion
+                    // in this file, and the perturbed-tile RED control could
+                    // not perturb anything at all. Caught by that control
+                    // failing once extract_block was implemented: it reported,
+                    // correctly, that it could not tell perturbed from
+                    // pristine.
+                    //
+                    // f16 is exact only for integers <= 2048, and the f16
+                    // fields are sink (len 128) and tail (len < 128), so pack
+                    // into disjoint ranges under that ceiling:
+                    //     (base mod 8)*256 + h*128 + t     (max 2047, exact)
+                    // Bases must therefore be DISTINCT MOD 8 for f16 fields —
+                    // `float16_fields_are_pairwise_distinct` is the control
+                    // that proves it rather than trusting the comment.
+                    (base.rem_euclid(8) * 256 + h * TILE + t) as f32
                 } else if dt == dtype::UINT8 {
-                    (t * 7 + w * 3 + h).rem_euclid(251) as f32
+                    // `base` enters for the same reason. 61 is coprime with
+                    // 251 so any base difference changes the value; the step
+                    // of 7 keeps `t` injective across our 128/256 block
+                    // offsets (128*7 and 256*7 are both non-zero mod 251).
+                    (base * 61 + t * 7 + w * 3 + h).rem_euclid(251) as f32
                 } else {
                     (base as f32) * 1_000_000.0
                         + ((t + 1) as f32) * 1000.0
@@ -347,6 +378,20 @@ fn src_token_slice_bytes(o: &Option<UniquePtr<MlxArray>>, lo: i32, hi: i32) -> V
 /// Layout: sink 128 + 4 hist tiles (T = 512) + tail 10 = offset 650.
 /// Blocks are 2 hist-tiles wide (256 tokens of history) so we cross tile
 /// boundaries; the last block carries the tail.
+///
+/// ## KNOWN BOUNDARY — this anchor does NOT catch the token-vs-tile s_col bug
+///
+/// Measured, not assumed: mutating `extract_kvarn8_regions` to slice `s_col`
+/// by token count instead of tile index reddens
+/// `s_col_sliced_by_tile_not_token` and `prefix_extract_matches_trim_to`, but
+/// leaves THIS test GREEN. The clamping masks it for this particular block
+/// plan — block 0 asks for s_col rows `[0, 256)` of a 4-row tensor and gets
+/// all 4, block 1 asks for `[256, 512)` and gets none, and the concatenation
+/// is coincidentally the correct 4 rows.
+///
+/// So: green here does NOT mean the per-tile arithmetic is right. The two
+/// tests named above are what carry that. Recorded so nobody reads this
+/// anchor's coverage as wider than it is.
 #[test]
 fn reassembly_roundtrip_bit_identical() {
     const N_TILES: i32 = 4;
@@ -835,6 +880,50 @@ fn builder_is_deterministic() {
 /// UINT8 saturation → constant), which would silently make the byte comparisons
 /// in the contract tests pass no matter how `extract_block` slices. If this
 /// fails, the contract tests below cannot be trusted.
+/// CONTROL: same-shape, same-dtype fields must have DIFFERENT bytes.
+///
+/// `data_is_distinct_per_axis2_after_astype` proves a mis-slice ALONG axis 2
+/// is visible. This proves a mix-up BETWEEN FIELDS is visible — the other way
+/// an assertion can be vacuous, and the one that actually bit.
+///
+/// Until 2026-07-26 `patt_f32` ignored `base` for FLOAT16 and UINT8, so
+/// `sink_k` == `sink_v` and `tail_k` == `tail_v` bytewise. Every byte
+/// assertion on those fields would have passed on an implementation that
+/// swapped K and V. The header comment on the base offsets claimed "no two
+/// fields ever share bytes"; that claim was true only of the FLOAT32/UINT32
+/// branch. This test is that claim made falsifiable.
+#[test]
+fn float16_fields_are_pairwise_distinct() {
+    // The confusable pairs: identical shape AND dtype.
+    let sink_k = bytes(&arr(B_SINK_K, TILE, VD, dtype::FLOAT16));
+    let sink_v = bytes(&arr(B_SINK_V, TILE, VD, dtype::FLOAT16));
+    assert_ne!(
+        sink_k, sink_v,
+        "sink_k and sink_v have identical shape and dtype — if their bytes match, \
+         an implementation that swapped K and V in the sink would pass every \
+         assertion in this file"
+    );
+
+    const TAIL: i32 = 10;
+    let tail_k = bytes(&arr(B_TAIL_K, TAIL, VD, dtype::FLOAT16));
+    let tail_v = bytes(&arr(B_TAIL_V, TAIL, VD, dtype::FLOAT16));
+    assert_ne!(
+        tail_k, tail_v,
+        "tail_k and tail_v have identical shape and dtype — see above"
+    );
+
+    // And the UINT8 field must respond to `base`, or the perturbed-tile RED
+    // control cannot perturb anything.
+    let hist = bytes(&arr(B_HIST_K, 2 * TILE, VD, dtype::UINT8));
+    let hist_perturbed = bytes(&arr(B_HIST_K + 100, 2 * TILE, VD, dtype::UINT8));
+    assert_ne!(
+        hist, hist_perturbed,
+        "hist_k must respond to `base` — otherwise \
+         reassembly_roundtrip_red_control_perturbed_tile_mismatches is asserting \
+         that two identical byte images differ, which it can never do"
+    );
+}
+
 #[test]
 fn data_is_distinct_per_axis2_after_astype() {
     let c = kvarn_v4_layer(2, 5);
