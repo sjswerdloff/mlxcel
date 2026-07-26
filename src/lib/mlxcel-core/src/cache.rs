@@ -84,6 +84,9 @@ pub mod kvarn;
 #[cfg(test)]
 #[path = "cache/kvarn_golden_tests.rs"]
 mod kvarn_golden_tests;
+#[cfg(test)]
+#[path = "cache/kvarn_content_addressing_tests.rs"]
+mod kvarn_content_addressing_tests;
 mod paged;
 mod paged_detach;
 #[cfg(test)]

@@ -125,32 +125,65 @@ fn clipped_std_along(x: &MlxArray, axis: i32, n: i32) -> UniquePtr<MlxArray> {
     )
 }
 
-/// Scalar imbalance metric of a `[N, R, C]` batch: `col_max/col_min +
-/// row_max/row_min` over the GLOBAL batch (a perfectly balanced batch scores
-/// 2.0).
+/// PER-TILE imbalance metric of a `[N, R, C]` batch: for each tile `n`,
+/// `col_max/col_min + row_max/row_min` reduced WITHIN that tile only. Result
+/// shape `[N, 1, 1]` — one score per tile, zero coupling across tiles (a
+/// perfectly balanced tile scores 2.0).
 ///
-/// Faithful-to-reference quirk, kept deliberately: the reference's batched
-/// path annotates this `[N, 1, 1]` but computes `mx.max(...)` with no axis —
-/// a GLOBAL scalar — so best-so-far selection is batch-global, not per-tile.
-/// The pinned fixtures encode that behavior; changing it to per-tile would
-/// be a (possibly better) deviation to take consciously, with regenerated
-/// fixtures, not by accident.
+/// ## Changed from batch-global to per-tile — 2026-07-26 (Clement)
+///
+/// The prior implementation reduced with `max_all`/`min_all` to a single
+/// GLOBAL scalar, so Sinkhorn best-so-far selection (see [`sinkhorn_normalize`],
+/// where this feeds `where_cond`) depended on every tile in the batch handed to
+/// [`kvarn_quantize`] — `n_full` up to ~64 in live prefill. That made a tile's
+/// quantized bytes depend on the whole batch grouping, which (a) is not what the
+/// method prescribes and (b) breaks batch-invariance, the precondition for
+/// content-addressing KVarN8 blocks by tokens (v4 block storage).
+///
+/// ### Why per-tile is the correct behavior, not a whim
+/// - **The KVarN paper (arXiv:2606.03458, Huawei CSL) prescribes per-chunk,
+///   online normalization.** The base unit of work is a single
+///   `head-dim × token-chunk` tile (§3.1); normalization is applied "whenever a
+///   new chunk of KV-Cache is stored (e.g., every 128 tokens)" for a fixed 8
+///   iterations (§ overhead analysis). The paper describes NO metric coupling
+///   multiple tiles.
+/// - **The reference MLX port does the same** — Sinkhorn-normalizes one tile as
+///   it fills (`When a tile fills: Sinkhorn normalize -> RTN quantize`).
+/// - **The old global behavior was an artifact, admitted in the prior comment
+///   here:** the reference's own type annotation was `[N, 1, 1]` (per-tile)
+///   while its code did `mx.max(...)` with no axis (a global scalar). The
+///   Sinkhorn loop was already written to broadcast a `[N, 1, 1]` selection
+///   per tile; only this metric collapsed it to a scalar. Restoring per-tile
+///   here honors the annotation and needs no change to the loop.
+///
+/// ### Consequence (intended)
+/// A tile's quantized bytes now depend only on that tile's own values (+ config)
+/// → BATCH-INVARIANT quantization. This changes the produced bytes vs. the old
+/// global path, so **golden fixtures pinned to the global behavior will go red
+/// and must be regenerated against a per-tile reference** — a conscious
+/// deviation (exactly the one the prior comment flagged as "possibly better"),
+/// not a silent one. End-to-end k8v4 fidelity is validated separately by the
+/// 300K copy-precision gate.
 fn imbalance(x: &MlxArray) -> UniquePtr<MlxArray> {
     let shape = ffi::array_shape(x);
     let (r, c) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+    // col_std: `[N, 1, C]` (std over the R/token axis); row_std: `[N, R, 1]`
+    // (std over the C/channel axis). Both are already per-tile.
     let col_std = clipped_std_raw(x, -2, r);
     let row_std = clipped_std_raw(x, -1, c);
+    // Reduce over the REMAINING non-batch axis only, keepdims → `[N, 1, 1]`.
+    // (Was `max_all`/`min_all` = a single GLOBAL scalar; see doc above.)
     let col_ratio = ffi::divide(
-        &ffi::max_all(&col_std),
+        &ffi::max_axis(&col_std, -1, true),
         &ffi::maximum(
-            &ffi::min_all(&col_std),
+            &ffi::min_axis(&col_std, -1, true),
             &ffi::full_f32(&[], 1e-8, dtype::FLOAT32),
         ),
     );
     let row_ratio = ffi::divide(
-        &ffi::max_all(&row_std),
+        &ffi::max_axis(&row_std, -2, true),
         &ffi::maximum(
-            &ffi::min_all(&row_std),
+            &ffi::min_axis(&row_std, -2, true),
             &ffi::full_f32(&[], 1e-8, dtype::FLOAT32),
         ),
     );
