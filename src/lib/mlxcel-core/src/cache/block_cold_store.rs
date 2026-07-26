@@ -539,6 +539,66 @@ impl BlockColdStore {
     }
 
     // -----------------------------------------------------------------------
+    // Persist
+    // -----------------------------------------------------------------------
+
+    /// Persist a DetachedCacheSet to the block cold-store.
+    ///
+    /// Splits the token sequence into blocks, extracts block KV data,
+    /// writes blocks (skipping existing ones), creates a manifest,
+    /// and prunes old manifests whose block hashes are a prefix.
+    ///
+    /// Must be called on the inference thread (Metal thread affinity)
+    /// because extract_block slices MLX arrays.
+    pub fn persist(
+        &self,
+        model_id: &str,
+        template_sig: &str,
+        tokens: &[i32],
+        cache_set: &DetachedCacheSet,
+    ) -> Result<Manifest, ColdStoreError> {
+        let kv_mode = kv_mode_config_string(cache_set.caches[0].mode);
+        let block_hashes = compute_block_hashes(tokens, self.block_size, &kv_mode);
+
+        // Extract and write each block
+        for (i, chunk) in tokens.chunks(self.block_size).enumerate() {
+            let block_hash = block_hashes[i];
+            let start = i * self.block_size;
+            let end = (start + chunk.len()).min(tokens.len());
+
+            // Check if block already exists
+            if self.blocks_dir().join(hex_digest(&block_hash)).exists() {
+                continue;
+            }
+
+            // Extract block from cache set
+            let block_cache = extract_block(cache_set, start, end)?;
+            self.write_block(&block_hash, chunk, &block_cache)?;
+        }
+
+        // Create manifest
+        let manifest = Manifest {
+            runtime_fingerprint: self.runtime_fingerprint,
+            model_id: model_id.to_string(),
+            template_sig: template_sig.to_string(),
+            block_size: self.block_size,
+            block_hashes,
+            prompt_len: cache_set.prompt_len,
+            total_tokens: tokens.len(),
+            timestamp_nanos: now_nanos(),
+        };
+
+        self.write_manifest(&manifest)?;
+
+        // Prune old manifests whose block hashes are a prefix
+        if self.prune_mode != PruneMode::Off {
+            self.prune_prefix_manifests(&manifest)?;
+        }
+
+        Ok(manifest)
+    }
+
+    // -----------------------------------------------------------------------
     // Garbage collection
     // -----------------------------------------------------------------------
 
@@ -943,6 +1003,13 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ColdStoreError> {
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 fn hex_digest(digest: &[u8; 32]) -> String {
