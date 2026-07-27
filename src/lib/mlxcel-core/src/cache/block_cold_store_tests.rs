@@ -2098,6 +2098,62 @@ fn an_active_load_lease_holds_off_the_sweep_until_it_is_released() {
     );
 }
 
+/// NEGATIVE CONTROL — a v_bits MISMATCH must fail CLOSED (Alden's G1 list:
+/// "mismatched runtime/mode/v_bits must fail closed").
+///
+/// This is the k8v4-vs-k8v8 collision that `cache_computation_id` was
+/// introduced to close (handoff 7.5). Both are `KVCacheMode::KVarN8`, so mode
+/// alone does not separate them; only `v_bits` does. Before the identity fix
+/// they could share a block address, which means a cache quantized at 4 bits
+/// could be adopted by a runtime expecting 8 — same bytes, different meaning,
+/// and no error anywhere. Silent wrong adoption, not a crash.
+///
+/// The suite has `v_bits_preserved`, but preservation is not discrimination: it
+/// proves the label survives a round trip, not that a WRONG label is refused.
+/// Nothing tested the refusal until now.
+///
+/// A miss here is the correct outcome. Re-prefilling costs time; adopting a
+/// cache computed under different quantization costs correctness silently.
+#[test]
+fn a_v_bits_mismatch_is_a_clean_miss_never_a_wrong_adoption() {
+    const N_TILES: i32 = 31;
+    let depth = TILE + N_TILES * TILE;
+    let set = kvarn_v4_set_distinct(2, N_TILES, 0);
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
+
+    store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+
+    // Precondition: the SAME v_bits must hit, or a miss below proves nothing —
+    // it would be indistinguishable from a store that never matches anything.
+    let (_hit, matched) = store
+        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+        .expect("same-identity load must HIT, or this control is vacuous");
+    assert_eq!(matched, tokens.len(), "precondition: full prefix matches");
+
+    // Same mode, same tokens, same model, same template, same runtime — only
+    // v_bits differs. This must NOT adopt.
+    let result = store.load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 8);
+    match result {
+        Err(ColdStoreError::NoMatch) => {}
+        Err(other) => panic!(
+            "a v_bits mismatch should be a clean NoMatch, not {other:?} — failing \
+             closed is right, but it should fail as a miss so the caller simply \
+             re-prefills"
+        ),
+        Ok((_, n)) => panic!(
+            "ADOPTED a cache quantized at v_bits=4 while asking for v_bits=8, \
+             matching {n} tokens. Both are KVCacheMode::KVarN8, so mode does not \
+             separate them — only the cache-computation identity does. This is \
+             silent wrong adoption: same bytes, different meaning, no error."
+        ),
+    }
+}
+
 /// A mode MISMATCH must be a clean miss, never a wrong adoption.
 ///
 /// Persist under KVarN8, load under Fp16. Because block addresses commit to the
