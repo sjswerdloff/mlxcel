@@ -6171,6 +6171,348 @@ mod tests {
         );
     }
 
+    /// K8V4 FEASIBILITY WITNESS — Alden's full bar, as an artifact rather than
+    /// a claim I make in a message.
+    ///
+    /// He listed the preconditions G1.2 needs before its assertions can mean
+    /// anything: "b=1, l=1, d128, v_bits=4, enough tokens for sink + at least
+    /// one finalized history tile + tail, supports_block_fetch true,
+    /// nkb > top_k, and actual gathered sparse dispatch witnessed."
+    ///
+    /// I had reported feasibility from the d4 harness. That was a narrower
+    /// claim than his bar — v_bits was not part of what I checked at all — so
+    /// this test exists to settle it by measurement. Every element is a
+    /// separate assertion, so a failure names which precondition is missing
+    /// instead of reading as "K8V4 does not work".
+    ///
+    /// The decode step goes through `attn.forward`, NOT a hand-driven
+    /// replication of its pipeline. The existing qmm-vs-gathered gate drives
+    /// the decode by hand, which is right for comparing two cores but cannot
+    /// witness what `forward` DISPATCHES — and dispatch is exactly the last
+    /// element of the bar.
+    #[test]
+    fn k8v4_d128_gathered_decode_is_reachable_feasibility_witness() {
+        let attn = make_test_sparse_attention_d128();
+        let hidden = attn.num_heads * attn.head_dim;
+
+        // Geometry, asserted rather than inherited from a comment.
+        assert_eq!(attn.head_dim, 128, "bar: production width");
+        assert_eq!(
+            attn.block_size, 128,
+            "bar: the MSA quantum must be the production 128, or nkb below is \
+             computed against a different geometry than production uses"
+        );
+
+        // sink(128) + 2 tiles(256) + tail(45) = 429 prior tokens; with the
+        // decode token, nkb = ceil(430/128) = 4 > top_k = 2 (unsaturated).
+        let kv_len_prior = 429;
+        let l = 1;
+        let nkb = (kv_len_prior + l + attn.block_size - 1) / attn.block_size;
+        assert!(
+            nkb > attn.top_k,
+            "bar: nkb ({nkb}) must exceed top_k ({}) or selection saturates and \
+             the dispatch is dense by definition",
+            attn.top_k
+        );
+
+        let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        cache.set_kvarn_v_bits(4);
+        assert_eq!(cache.kvarn_v_bits(), 4, "bar: v_bits=4");
+        assert!(
+            cache.supports_block_fetch(),
+            "bar: supports_block_fetch must be true, else the gathered path \
+             cannot be taken at all"
+        );
+
+        // Prefill through the production path.
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let _ = attn.forward(&x_prefill, &mut cache, None);
+        assert_eq!(cache.offset, kv_len_prior);
+        assert_eq!(
+            cache.m3_idx_offset(),
+            kv_len_prior,
+            "bar: indexer must be in lockstep after prefill, or the decode \
+             below dense-falls-back for a reason unrelated to K8V4"
+        );
+
+        // At least one FINALIZED history tile — the precondition
+        // `kvarn_qmm_state` gates on, and the thing 429 tokens was chosen to
+        // produce.
+        assert!(
+            cache.kvarn_qmm_state().is_some(),
+            "bar: at least one finalized history tile. Without it the cache is \
+             still in its staging representation and the gathered decode path \
+             is not the shape under test."
+        );
+
+        // THE LAST ELEMENT: dispatch, witnessed at the branch rather than
+        // inferred from the preconditions.
+        let x_decode = make_test_input(1, l, hidden);
+        reset_dispatch_witness();
+        let out = attn.forward(&x_decode, &mut cache, None);
+        mlxcel_core::eval(&out);
+        let (sparse, dense) = dispatch_witness();
+
+        assert_eq!(
+            (sparse, dense),
+            (1, 0),
+            "bar: the b=1 l=1 decode on a d128 K8V4 cache must take the SPARSE \
+             branch. Got ({sparse} sparse, {dense} dense). Every precondition \
+             above passed, so a dense count here means the harness reaches the \
+             state but not the path, and G1.2 needs a targeted K8V4 harness \
+             rather than this one."
+        );
+
+        assert_eq!(cache.offset, kv_len_prior + l, "the decode token is cached");
+        assert_eq!(
+            cache.m3_idx_offset(),
+            kv_len_prior + l,
+            "indexer stays in lockstep across the decode"
+        );
+    }
+
+    /// Build a d128 K8V4 cache prefilled to `kv_len_prior` through the
+    /// production forward path. Shared by the G1.2 arms so all three start from
+    /// an identical state by construction rather than by three copies of the
+    /// same code drifting apart.
+    fn k8v4_prefilled(attn: &SparseAttention, kv_len_prior: i32, hidden: i32) -> KVCache {
+        let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        cache.set_kvarn_v_bits(4);
+        let x = make_test_input(1, kv_len_prior, hidden);
+        let _ = attn.forward(&x, &mut cache, None);
+        cache
+    }
+
+    /// Wrap one layer cache as a single-layer set for the cold store.
+    fn one_layer_set(cache: &mut KVCache, len: i32) -> mlxcel_core::cache::DetachedCacheSet {
+        use mlxcel_core::cache::{DetachedCacheSet, SequenceId, SequenceStateBackend};
+        let now = std::time::Instant::now();
+        DetachedCacheSet {
+            caches: vec![cache.clone_handle()],
+            backend: SequenceStateBackend::DenseKvCache,
+            prompt_len: len as usize,
+            current_offset: len,
+            created_at: now,
+            detached_at: now,
+            origin_seq_id: SequenceId::from_raw(1),
+        }
+    }
+
+    /// G1.2a — K8V4 DISK-ADOPTION ATTENTION-LAYER EQUIVALENCE.
+    ///
+    /// The mode that actually ships. Same three arms as G1.1 (continuous /
+    /// in-memory adopt / real disk with the store dropped and recreated), at
+    /// d128 with `v_bits = 4`, on the gathered sparse decode path whose
+    /// reachability `k8v4_d128_gathered_decode_is_reachable_feasibility_witness`
+    /// establishes.
+    ///
+    /// Why this is not covered by G1.1: under Fp16 the V payload is a plain
+    /// tensor. Under K8V4 it is packed u32 codes plus a scale/sidecar layout,
+    /// and `detach.rs:164` names the failure this guards — "a v4 donation
+    /// re-installed into a fresh slot without this field would resurrect as
+    /// v_bits=8 — packed-u32 V codes silently mislabeled as u8, passing the
+    /// reader guards they exist to trip."
+    #[test]
+    fn g1_2a_k8v4_disk_adoption_attention_layer_equivalence() {
+        use mlxcel_core::cache::KVCacheMode;
+        use mlxcel_core::cache::block_cold_store::BlockColdStore;
+
+        let attn = make_test_sparse_attention_d128();
+        let hidden = attn.num_heads * attn.head_dim;
+        let kv_len_prior = 429; // sink(128) + 2 tiles(256) + tail(45)
+        let l = 1;
+
+        let x_decode = make_test_input(1, l, hidden);
+
+        // ---- ARM A: continuous -------------------------------------------
+        let mut cache_a = k8v4_prefilled(&attn, kv_len_prior, hidden);
+        reset_dispatch_witness();
+        let out_a = attn.forward(&x_decode, &mut cache_a, None);
+        mlxcel_core::eval(&out_a);
+        let witness_a = dispatch_witness();
+
+        // ---- ARM B: in-memory detach / adopt ------------------------------
+        let mut cache_b_src = k8v4_prefilled(&attn, kv_len_prior, hidden);
+        let mut cache_b = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        cache_b.set_kvarn_v_bits(4);
+        cache_b
+            .install_detached(cache_b_src.clone_handle())
+            .expect("in-memory adoption must succeed");
+        assert_eq!(
+            cache_b.kvarn_v_bits(),
+            4,
+            "in-memory adoption must carry v_bits=4 — a resurrection as 8 reads \
+             packed u32 codes as u8"
+        );
+        reset_dispatch_witness();
+        let out_b = attn.forward(&x_decode, &mut cache_b, None);
+        mlxcel_core::eval(&out_b);
+        let witness_b = dispatch_witness();
+
+        // ---- ARM C: real disk round trip ----------------------------------
+        let mut cache_c_src = k8v4_prefilled(&attn, kv_len_prior, hidden);
+        let set = one_layer_set(&mut cache_c_src, kv_len_prior);
+        let tokens: Vec<i32> = (0..kv_len_prior).collect();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+
+        let manifest = {
+            let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+            store.persist("m3-g12", "tmpl", &tokens, &set).expect(
+                "persist must accept a LIVE K8V4 cache — sink, finalized tiles \
+                 and a staged partial tail. Every real cache looks like this; a \
+                 store that only takes tile-aligned lengths cannot persist one.",
+            )
+        };
+        assert!(!manifest.block_hashes.is_empty());
+
+        let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+        let (mut loaded, matched) = store
+            .load_prefix("m3-g12", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+            .expect("W1: the K8V4 candidate just committed must be found");
+        assert_eq!(matched, tokens.len(), "W1: full prefix");
+        assert_eq!(loaded.caches.len(), 1, "W2a: one cache per layer");
+
+        let mut cache_c = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        cache_c.set_kvarn_v_bits(4);
+        cache_c
+            .install_detached(loaded.caches.remove(0))
+            .expect("W2b: adoption of the disk-loaded K8V4 state");
+
+        // KVarN field/sidecar layout survived, and the width label with it.
+        assert_eq!(
+            cache_c.kvarn_v_bits(),
+            4,
+            "the adopted cache must still be v4. A silent 8 here is the \
+             mislabelling detach.rs:164 describes, and it passes every reader \
+             guard because the guards trust the label."
+        );
+        assert!(
+            cache_c.supports_block_fetch(),
+            "the adopted cache must still support block fetch, or the gathered \
+             path is unreachable and the comparison below is dense-vs-sparse"
+        );
+        assert!(
+            cache_c.kvarn_qmm_state().is_some(),
+            "finalized tile state must survive the round trip — without it the \
+             adopted cache is a different representation than the reference"
+        );
+        assert_eq!(cache_c.offset, kv_len_prior, "W3: main cursor");
+        assert_eq!(
+            cache_c.m3_idx_offset(),
+            kv_len_prior,
+            "W3: indexer cursor in lockstep"
+        );
+
+        reset_dispatch_witness();
+        let out_c = attn.forward(&x_decode, &mut cache_c, None);
+        mlxcel_core::eval(&out_c);
+        let witness_c = dispatch_witness();
+
+        // ---- W4: sparse dispatch on every arm -----------------------------
+        for (label, w) in [("A", witness_a), ("B", witness_b), ("C", witness_c)] {
+            assert_eq!(
+                w,
+                (1, 0),
+                "W4 arm {label}: the K8V4 decode must take the SPARSE branch. \
+                 {w:?} with a dense count means the state was accepted but is \
+                 not usable as MSA state."
+            );
+        }
+
+        // ---- W5: output equivalence, exact first --------------------------
+        // NON-DEGENERACY FIRST. Bit-identity between three all-zero arrays is
+        // trivially true, so the comparison below means nothing until the
+        // output is shown to carry signal.
+        assert!(
+            l2_norm(&out_a) > 1e-3,
+            "the reference output is degenerate (L2 {}), so bit-identity across \
+             the arms would be vacuous",
+            l2_norm(&out_a)
+        );
+
+        // Exactness is asserted deliberately. If K8V4's packed representation
+        // makes any arm differ, CLASSIFY it before introducing a tolerance —
+        // the qmm-vs-gathered gate needs one because it compares two different
+        // cores, which is not the situation here: all three arms run the same
+        // core over state that should be identical.
+        assert!(
+            arrays_bit_identical(&out_b, &out_c),
+            "B vs C: the disk round trip changed the K8V4 computation. Adoption \
+             is identical on both arms, so this isolates serialization of the \
+             packed V codes and their sidecar."
+        );
+        assert!(
+            arrays_bit_identical(&out_a, &out_b),
+            "A vs B: in-memory K8V4 adoption perturbed the computation relative \
+             to a cache that never left memory."
+        );
+        assert!(
+            arrays_bit_identical(&out_a, &out_c),
+            "A vs C: end-to-end K8V4 disk adoption diverged from the continuous \
+             reference."
+        );
+
+        // Append-clean: the decode token landed and lockstep held on every arm.
+        for (label, c) in [("A", &cache_a), ("B", &cache_b), ("C", &cache_c)] {
+            assert_eq!(c.offset, kv_len_prior + l, "arm {label}: decode cached");
+            assert_eq!(
+                c.m3_idx_offset(),
+                kv_len_prior + l,
+                "arm {label}: indexer in lockstep after the appended token"
+            );
+        }
+    }
+
+    /// G1.2 CONTROL — does `v_bits` travel WITH the state, or is it the
+    /// target's own setting?
+    ///
+    /// G1.2a sets `v_bits = 4` on each target cache before adopting, then
+    /// asserts the adopted cache is v4. If the target's setting is what
+    /// survives, that assertion is near-vacuous: it would read 4 whatever the
+    /// donated state actually was, which is precisely the mislabelling
+    /// `detach.rs:164` warns about — "a v4 donation re-installed into a fresh
+    /// slot without this field would resurrect as v_bits=8 — packed-u32 V codes
+    /// silently mislabeled as u8, passing the reader guards they exist to trip."
+    ///
+    /// So: adopt a v4 donation into a target left at the DEFAULT 8 and record
+    /// what happens. Whichever way it goes, the answer is worth pinning —
+    /// if the field travels, G1.2a's assertion is real; if it does not, the
+    /// silent-resurrection hazard is live and this test names it.
+    #[test]
+    fn a_v4_donation_adopted_into_a_default_target_keeps_its_own_width() {
+        use mlxcel_core::cache::KVCacheMode;
+
+        let attn = make_test_sparse_attention_d128();
+        let hidden = attn.num_heads * attn.head_dim;
+
+        let mut src = k8v4_prefilled(&attn, 429, hidden);
+        assert_eq!(src.kvarn_v_bits(), 4, "precondition: the donation is v4");
+
+        // Target left at the constructor default — NOT set to 4.
+        let mut target = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        assert_eq!(
+            target.kvarn_v_bits(),
+            8,
+            "precondition: the default target is v8, so this test can \
+             distinguish 'the field travelled' from 'the target was already \
+             right'"
+        );
+
+        target
+            .install_detached(src.clone_handle())
+            .expect("adoption must succeed");
+
+        assert_eq!(
+            target.kvarn_v_bits(),
+            4,
+            "A v4 donation adopted into a v8 target came back as v8. The packed \
+             u32 V codes are now labelled u8 and every reader guard will trust \
+             that label. This is detach.rs:164's silent resurrection, live — \
+             and it also means G1.2a's v_bits assertion is only reading back \
+             the value it set."
+        );
+    }
+
     /// Read one element from a block-scores tensor at
     /// (kv_head, q_block, k_block) for batch 0.
     fn block_score_at(scores: &MlxArray, head: i32, q_block: i32, k_block: i32) -> f32 {
