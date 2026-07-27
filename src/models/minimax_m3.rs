@@ -6562,6 +6562,188 @@ mod tests {
         }
     }
 
+    /// THE MECHANISM — same core, same q, same indices, same positions, and
+    /// k/v that are BYTE-IDENTICAL but differently PRODUCED.
+    ///
+    /// `sparse_decode_core` is stock MLX (`matmul` -> `softmax` -> `matmul`),
+    /// not a custom kernel of ours. Both decode paths call it. Every input
+    /// VALUE is already proven identical. This test holds literally everything
+    /// constant except how the k/v arrays were built:
+    ///
+    ///   A: `concatenate(full_window, zero_pad)`   — the full-window path
+    ///   B: `fetch_msa_blocks(all blocks)`         — the gathered path
+    ///
+    /// and passes the SAME `q`, the SAME `selected`, the SAME `pos_full` and
+    /// the SAME block count to both calls.
+    ///
+    /// DIFFERS => provenance/layout is the mechanism. Two arrays with
+    ///            identical bytes but different strides/contiguity make MLX
+    ///            dispatch differently and accumulate in a different order.
+    ///            Nothing in mlxcel is at fault; the K1 gate's atol=0 premise
+    ///            is simply not satisfiable across the two constructions.
+    /// AGREES  => provenance is NOT the mechanism and the divergence is
+    ///            elsewhere in the two wrappers.
+    #[test]
+    #[ignore = "MECHANISM probe, not a gate. Run with: cargo test --lib -- --ignored --test-threads=1"]
+    fn core_output_depends_on_kv_provenance_not_kv_values() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+        let b = 1;
+        let bs = attn.block_size;
+        let num_key_blocks = (kv_len + bs - 1) / bs;
+        let padded_k_len = num_key_blocks * bs;
+        let pad_amt = padded_k_len - kv_len;
+
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let x_decode = make_test_input(1, l, hidden);
+
+        let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let _ = attn.forward(&x_prefill, &mut cache, None);
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = if let Some(ref n) = attn.k_norm {
+            n.forward(&k)
+        } else {
+            k
+        };
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let (full_k, full_v) = cache.update_and_fetch(k, v);
+
+        // A: the full-window path's construction.
+        let kv_dtype = mlxcel_core::array_dtype(&full_k);
+        let pad = mlxcel_core::full_f32(
+            &[1, attn.num_kv_heads, pad_amt, attn.head_dim],
+            0.0,
+            kv_dtype,
+        );
+        let k_a = mlxcel_core::concatenate(&full_k, &pad, 2);
+        let v_a = mlxcel_core::concatenate(&full_v, &pad, 2);
+
+        // B: the gathered path's construction.
+        let all_blocks: Vec<i32> = (0..num_key_blocks).collect();
+        let (k_b, v_b) = cache.fetch_msa_blocks(&all_blocks);
+        mlxcel_core::eval(&k_a);
+        mlxcel_core::eval(&v_a);
+        mlxcel_core::eval(&k_b);
+        mlxcel_core::eval(&v_b);
+
+        // Precondition: the two constructions are byte-identical.
+        for (name, x, y) in [("K", &k_a, &k_b), ("V", &v_a, &v_b)] {
+            let xb = mlxcel_core::array_to_raw_bytes(x);
+            let yb = mlxcel_core::array_to_raw_bytes(y);
+            assert_eq!(
+                xb, yb,
+                "{name}: the two constructions are NOT byte-identical, so this \
+                 test cannot isolate provenance"
+            );
+        }
+
+        // Everything else is literally the same object in both calls.
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(&x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = if let Some(ref n) = attn.index_k_norm {
+            n.forward(&idx_k)
+        } else {
+            idx_k
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let idx_k_full = cache.m3_idx_k_update_and_fetch(&idx_k);
+        let idx_q = attn.project_index_queries(&x_decode, b, l, offset);
+        let selected = attn.per_token_block_selection(&idx_q, &idx_k_full, b, l, kv_len, offset);
+
+        let q_raw = attn.q_proj.forward(&x_decode);
+        let q = mlxcel_core::reshape(&q_raw, &[1, l, attn.num_heads, attn.head_dim]);
+        let q = if let Some(ref n) = attn.q_norm {
+            n.forward(&q)
+        } else {
+            q
+        };
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let q = mlxcel_core::fast_rope(&q, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+
+        let pos_full = mlxcel_core::arange_f32(0.0, padded_k_len as f32, 1.0);
+
+        // The ONE input verified only as a PLAN, never as a TENSOR: the
+        // gathered path passes  (absolute -> compact slot, applied
+        // on device) where the full path passes  (absolute). Under
+        // a saturated union the map is the identity, so they should be equal.
+        {
+            let (abs_to_slot, _) = plan_compact_window(&all_blocks, kv_len, bs);
+            let table = mlxcel_core::from_slice_f32(&abs_to_slot, &[1, 1, 1, num_key_blocks]);
+            let table_b =
+                mlxcel_core::broadcast_to(&table, &[b, attn.num_kv_heads, l, num_key_blocks]);
+            let sel_dtype = mlxcel_core::array_dtype(&selected);
+            let remapped = mlxcel_core::astype(
+                &mlxcel_core::take_along_axis(&table_b, &selected, 3),
+                sel_dtype,
+            );
+            mlxcel_core::eval(&remapped);
+            let sb = mlxcel_core::array_to_raw_bytes(&selected);
+            let rb = mlxcel_core::array_to_raw_bytes(&remapped);
+            let nd = sb.iter().zip(rb.iter()).filter(|(x, y)| x != y).count();
+            eprintln!(
+                "DIAG REMAP selected={:?} remapped={:?} bytes_differing={nd}",
+                host_i32(&selected),
+                host_i32(&remapped)
+            );
+        }
+
+        let out_a = attn.sparse_decode_core(
+            &q,
+            &k_a,
+            &v_a,
+            &selected,
+            &pos_full,
+            num_key_blocks,
+            b,
+            l,
+            offset,
+        );
+        let out_b = attn.sparse_decode_core(
+            &q,
+            &k_b,
+            &v_b,
+            &selected,
+            &pos_full,
+            num_key_blocks,
+            b,
+            l,
+            offset,
+        );
+        mlxcel_core::eval(&out_a);
+        mlxcel_core::eval(&out_b);
+
+        let ab = mlxcel_core::array_to_raw_bytes(&out_a);
+        let bb = mlxcel_core::array_to_raw_bytes(&out_b);
+        let ndiff = ab.iter().zip(bb.iter()).filter(|(x, y)| x != y).count();
+        eprintln!(
+            "DIAG PROVENANCE bytes={} differing={ndiff} l2={:e}",
+            ab.len(),
+            output_l2_diff(&out_a, &out_b)
+        );
+        assert_eq!(
+            ndiff, 0,
+            "PROVENANCE CONFIRMED: sparse_decode_core returned different output \
+             for k/v that are BYTE-IDENTICAL, with the same q, the same selected, \
+             the same positions and the same block count. The only difference is \
+             how the arrays were constructed (concatenate vs block-fetch), so \
+             identical values delivered through different array provenance do not \
+             yield bit-identical MLX output. The K1 gate's atol=0 premise is not \
+             satisfiable across these two constructions."
+        );
+    }
+
     /// THE SETTLEMENT — drive BOTH decode paths from the SAME `q`.
     ///
     /// Everything upstream is now proven identical on one cache: selection,
