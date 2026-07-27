@@ -2154,6 +2154,55 @@ fn a_v_bits_mismatch_is_a_clean_miss_never_a_wrong_adoption() {
     }
 }
 
+/// A MIXED-WIDTH set must be REFUSED, not stored under layer 0's label.
+///
+/// `persist` derives the cache-computation identity from `caches[0]` and applies
+/// it to the whole set. That is only sound if layer 0 speaks for the rest, and
+/// nothing checked it. A set with mixed `kvarn_v_bits` would be addressed k8v4
+/// while its later layers were k8v8 — an address that is true about the first
+/// layer and false about the others, trusted by every later reader.
+///
+/// Same shape as the `m3_idx_offset` defect: layer 0 standing in for all layers.
+/// Refusing is right until the identity is genuinely per-layer; silently
+/// mislabelling is the failure that survives every byte assertion.
+#[test]
+fn a_mixed_v_bits_set_is_refused_rather_than_addressed_by_layer_zero() {
+    const N_TILES: i32 = 31;
+    let depth = TILE + N_TILES * TILE;
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
+
+    // Homogeneous first: proves the refusal below is about the MIXTURE and not
+    // about this fixture being unstorable for some other reason.
+    let ok_set = kvarn_v4_set_distinct(2, N_TILES, 0);
+    store
+        .persist("m3", "tmpl", &tokens, &ok_set)
+        .expect("a homogeneous set must persist");
+
+    // Now the same set with layer 1 claiming a different V width.
+    let mut mixed = kvarn_v4_set_distinct(2, N_TILES, 0);
+    assert_eq!(mixed.caches[0].kvarn_v_bits, 4, "fixture precondition");
+    mixed.caches[1].kvarn_v_bits = 8;
+
+    let dir2 = tempfile::TempDir::new().expect("tempdir");
+    let store2 = BlockColdStore::new(dir2.path().to_path_buf(), [9u8; 32]);
+    let err = store2
+        .persist("m3", "tmpl", &tokens, &mixed)
+        .expect_err(
+            "a set whose layers disagree on v_bits must be REFUSED — storing it \
+             addresses the whole set by layer 0's width, mislabelling every other \
+             layer",
+        );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("layer 1") && msg.contains("v_bits"),
+        "the refusal must name the offending layer and the field, or an operator \
+         cannot act on it — got: {msg}"
+    );
+}
+
 /// A mode MISMATCH must be a clean miss, never a wrong adoption.
 ///
 /// Persist under KVarN8, load under Fp16. Because block addresses commit to the

@@ -1047,6 +1047,41 @@ impl BlockColdStore {
     ) -> Result<Manifest, ColdStoreError> {
         // WRITE side of the cache-computation identity. Must stay symmetric
         // with the READ side in load_prefix or the store becomes write-only.
+        //
+        // The identity is taken from layer 0 and applied to the WHOLE set, so
+        // layer 0 must actually speak for the rest. Nothing enforced that. A
+        // set with mixed widths would be addressed "k8v4" while layers 1..n
+        // were something else — the address would be a true statement about the
+        // first layer and a lie about the others, and every later reader would
+        // trust it. That is the same shape as the m3_idx_offset defect (116924f):
+        // layer 0 standing in for all layers, unchecked.
+        //
+        // Homogeneity is the real precondition of a single per-set identity, so
+        // it is asserted here rather than assumed. If a genuinely heterogeneous
+        // set ever needs storing, the identity must become per-layer — this
+        // refuses rather than silently mislabels in the meantime.
+        if let Some((i, bad)) = cache_set
+            .caches
+            .iter()
+            .enumerate()
+            .find(|(_, c)| {
+                c.mode != cache_set.caches[0].mode
+                    || c.kvarn_v_bits != cache_set.caches[0].kvarn_v_bits
+            })
+        {
+            return Err(invalid_data(format!(
+                "persist: layer {i} has ({:?}, v_bits={}) but layer 0 has ({:?}, \
+                 v_bits={}). The cache-computation identity is derived from layer 0 \
+                 and addresses the ENTIRE set, so a mixed set would be stored under \
+                 an address that describes only its first layer. Refusing rather \
+                 than mislabelling.",
+                bad.mode,
+                bad.kvarn_v_bits,
+                cache_set.caches[0].mode,
+                cache_set.caches[0].kvarn_v_bits
+            )));
+        }
+
         let cache_id = cache_computation_id(
             &self.runtime_fingerprint,
             cache_set.caches[0].mode,
