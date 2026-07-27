@@ -241,6 +241,46 @@ impl BlockColdStore {
         self.base_dir.join(V4_ROOT).join(BLOCKS_DIR)
     }
 
+    /// Monotonic count of manifest PUBLICATIONS (Alden finding 4, 2026-07-27).
+    ///
+    /// GC's mark phase is a point-in-time snapshot. The unsafe interleaving is:
+    /// GC marks block X unreferenced, a writer commits a manifest referencing X,
+    /// GC deletes X on its stale mark, and a live manifest now points at missing
+    /// data. Refcount increments do not close this, because the delete decision
+    /// came from the earlier scan.
+    ///
+    /// This counter makes the staleness DETECTABLE: read it before marking, read
+    /// it again before deleting, and a change means some manifest was published
+    /// since the mark, so the mark cannot be trusted. "With an epoch design, any
+    /// manifest/root publication since mark invalidates the mark and requires a
+    /// rescan."
+    fn epoch_path(&self) -> PathBuf {
+        self.base_dir.join("publication.epoch")
+    }
+
+    fn read_publication_epoch(&self) -> u64 {
+        match fs::read(self.epoch_path()) {
+            Ok(b) if b.len() == 8 => u64::from_le_bytes(b.try_into().unwrap()),
+            // Missing or malformed reads as a SENTINEL that never compares equal
+            // to a later read, so an unreadable epoch degrades to "assume
+            // published" rather than to "assume quiet".
+            _ => u64::MAX,
+        }
+    }
+
+    /// Bumped AFTER a manifest becomes visible. Ordering matters: a bump before
+    /// the rename would let GC believe it had observed a publication that had
+    /// not happened yet, which is the safe direction, but a bump that never
+    /// happens because the rename failed would be a false quiet.
+    fn bump_publication_epoch(&self) -> Result<(), ColdStoreError> {
+        let cur = self.read_publication_epoch();
+        let next = if cur == u64::MAX { 1 } else { cur.wrapping_add(1) };
+        let tmp = self.base_dir.join(".tmp.publication.epoch");
+        write_file(&tmp, &next.to_le_bytes())?;
+        fs::rename(&tmp, self.epoch_path())?;
+        Ok(())
+    }
+
     pub fn manifests_dir(&self) -> PathBuf {
         self.base_dir.join(V4_ROOT).join(MANIFESTS_DIR)
     }
@@ -417,8 +457,16 @@ impl BlockColdStore {
         let manifest_bytes = encode_manifest(manifest)?;
         write_file(&tmp_dir.join("manifest.bin"), &manifest_bytes)?;
 
-        // Atomic rename
+        // Atomic rename — the manifest becomes VISIBLE here, so this is the
+        // publication point.
         fs::rename(&tmp_dir, &manifest_dir)?;
+
+        // Announce the publication so a concurrent GC can tell its mark is
+        // stale. After the rename, never before: a bump that preceded a rename
+        // which then failed would be a false alarm (harmless), but the reverse
+        // ordering — visible manifest, un-bumped epoch — is a false QUIET, and
+        // that is the one that gets a live block deleted.
+        self.bump_publication_epoch()?;
 
         tracing::info!(
             manifest_hash = %hex_digest(&manifest_hash),
@@ -827,7 +875,49 @@ impl BlockColdStore {
         }
 
         // Authority comes from here, not from refcount files.
-        let live = self.mark_reachable_blocks()?;
+        //
+        // EPOCH-GUARDED MARK. Read the publication counter, mark, then confirm
+        // nothing was published while we marked. A change means some manifest
+        // became visible after we started reading them, so the live set we just
+        // built may be missing its blocks — rescan rather than act on it.
+        //
+        // Bounded, because an unbounded retry under a busy writer is a hang, and
+        // a GC that never runs is safer than one that acts on a stale mark. On
+        // exhaustion this returns Ok WITHOUT deleting: declining to collect is
+        // always safe, and the next pass will try again.
+        const MAX_MARK_ATTEMPTS: usize = 4;
+        let mut live: HashSet<[u8; 32]> = HashSet::new();
+        let mut stable = false;
+        for attempt in 0..MAX_MARK_ATTEMPTS {
+            let before = self.read_publication_epoch();
+            let marked = self.mark_reachable_blocks()?;
+            let after = self.read_publication_epoch();
+            if before == after && before != u64::MAX {
+                live = marked;
+                stable = true;
+                break;
+            }
+            tracing::info!(
+                attempt = attempt + 1,
+                epoch_before = before,
+                epoch_after = after,
+                "COLD-STORE v4 GC: a manifest was published during the mark phase — \
+                 the mark is stale, rescanning"
+            );
+        }
+        if !stable {
+            tracing::warn!(
+                attempts = MAX_MARK_ATTEMPTS,
+                "COLD-STORE v4 GC: could not obtain a stable mark under concurrent \
+                 publication; collecting NOTHING this pass. Declining to collect is \
+                 safe; acting on a stale mark is not."
+            );
+            return Ok(());
+        }
+
+        // The epoch as observed under a stable mark. Re-checked before any
+        // delete below, so a publication between here and the sweep aborts.
+        let marked_epoch = self.read_publication_epoch();
 
         let entries: Vec<_> = fs::read_dir(&blocks_dir)?
             .filter_map(|e| e.ok())
@@ -883,6 +973,26 @@ impl BlockColdStore {
                     "COLD-STORE v4 observe: would GC unreferenced block"
                 );
             } else {
+                // RE-VERIFY BEFORE DELETING. Everything above was decided from a
+                // snapshot. If any manifest was published since that snapshot,
+                // this candidate may have just been referenced, and the delete
+                // would leave a live manifest pointing at missing data. Abort the
+                // whole sweep rather than this one block: the epoch tells us the
+                // mark is stale, and a stale mark taints every remaining
+                // candidate, not just the current one.
+                let now = self.read_publication_epoch();
+                if now != marked_epoch {
+                    tracing::warn!(
+                        epoch_at_mark = marked_epoch,
+                        epoch_now = now,
+                        stopped_before = %name,
+                        "COLD-STORE v4 GC: a manifest was published after the mark — \
+                         ABORTING the sweep before deleting anything further. The \
+                         remaining candidates were nominated against a snapshot that \
+                         is no longer true."
+                    );
+                    return Ok(());
+                }
                 match self.delete_block(&block_hash) {
                     Ok(()) => {
                         tracing::info!(
