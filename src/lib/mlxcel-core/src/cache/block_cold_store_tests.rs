@@ -1824,6 +1824,258 @@ fn a_block_referenced_by_a_manifest_published_after_nomination_must_survive() {
     }
 }
 
+/// CORRUPT-LONGEST FALLS BACK TO A **VERIFIED** SHORTER CANDIDATE.
+///
+/// Alden conditioned this one: *"if corrupt-candidate fallback is a v4 contract,
+/// corrupt-longest should fall back transactionally, not partially adopt."*
+///
+/// **It is a contract.** `load_prefix` sorts candidates by matched tokens DESC and then
+/// walks them — `assemble_blocks` failing logs and `continue`s to the next-shorter
+/// candidate, returning `NoMatch` only when every one fails. Nothing exercised that path,
+/// so the fallback existed and the store's behaviour under a damaged longest candidate was
+/// unknown.
+///
+/// It also *looks* transactional by reading — the partial assembly is dropped on `Err` and
+/// only `Ok` returns — but "looks right by reading" is exactly the class of claim this
+/// suite exists to stop me making.
+///
+/// Fixture is the divergent-branch shape, because it is the only way to hold TWO surviving
+/// candidates of different lengths: branch A (2560) and branch B (4096) share their leading
+/// block, so B does not prune A. Querying with B's tokens then yields B at two blocks and A
+/// at one.
+///
+/// Corruption is byte damage to `header.bin`, not deletion, so the INTEGRITY check is what
+/// rejects the candidate rather than an existence check. (Missing blocks are covered by the
+/// GC tests.)
+#[test]
+fn a_corrupt_longest_candidate_falls_back_to_a_verified_shorter_one() {
+    const LAYERS: usize = 2;
+    const SHARED: usize = DEFAULT_BLOCK_SIZE;
+    const A_LEN: i32 = DEFAULT_BLOCK_SIZE as i32 + 512; // 2560
+    const B_LEN: i32 = 2 * DEFAULT_BLOCK_SIZE as i32; // 4096
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xC0u8; 32]);
+
+    let a: Vec<i32> = (0..A_LEN).collect();
+    let m_a = store
+        .persist("m3", "tmpl", &a, &fp16_set(LAYERS, A_LEN))
+        .expect("branch A persists");
+
+    let mut b: Vec<i32> = a[..SHARED].to_vec();
+    b.extend((0..(B_LEN as usize - SHARED)).map(|i| 900_000 + i as i32));
+    let m_b = store
+        .persist("m3", "tmpl", &b, &fp16_set(LAYERS, B_LEN))
+        .expect("branch B persists");
+
+    assert_eq!(
+        m_a.block_hashes[0], m_b.block_hashes[0],
+        "precondition: the leading block must be shared, or A is not a candidate for \
+         B's tokens at all and there is nothing to fall back TO"
+    );
+    assert_eq!(
+        count_manifests(&store),
+        2,
+        "precondition: both manifests must survive, or this test has one candidate"
+    );
+
+    // CONTROL ON THE CONTROL, first: undamaged, B's tokens select B — the LONGEST.
+    // Without this, a fallback result below could just be the store always choosing A.
+    let (_, matched_clean) = store
+        .load_prefix("m3", "tmpl", &b, KVCacheMode::Fp16, 0)
+        .expect("undamaged, B's tokens must hit");
+    assert_eq!(
+        matched_clean,
+        b.len(),
+        "undamaged, the LONGEST candidate must win — otherwise the corrupted result \
+         below proves nothing about fallback"
+    );
+
+    // Damage a block that belongs ONLY to B.
+    let victim = m_b.block_hashes[1];
+    assert_ne!(
+        victim, m_a.block_hashes[0],
+        "the damaged block must be B's alone, or A is collateral and the fallback \
+         target is gone too"
+    );
+    // Damage a LAYER payload, not the header. `read_block` checks each layer's byte
+    // length AND its sha256, so any flipped byte here is guaranteed to trip the
+    // integrity check — which is what this test needs to exercise.
+    //
+    // A mid-`header.bin` flip was tried first and did NOT trip it; see
+    // `a_flipped_byte_anywhere_in_a_block_header_must_be_caught` below, which asks that
+    // question directly instead of leaving it as an assumption inside this one.
+    let layer0 = dir
+        .path()
+        .join(V4_ROOT)
+        .join("blocks")
+        .join(hex_digest(&victim))
+        .join("layer_0000.bin");
+    let mut bytes = std::fs::read(&layer0).expect("victim layer readable");
+    let n = bytes.len();
+    bytes[n / 2] ^= 0xFF;
+    std::fs::write(&layer0, &bytes).expect("corrupt the victim layer");
+
+    // The damage must actually be detectable, or the fallback below fires for the wrong
+    // reason and this test certifies nothing.
+    assert!(
+        store.read_block(&victim).is_err(),
+        "precondition: the damaged block must fail its integrity check"
+    );
+
+    // THE CONTRACT: the shorter, still-verifiable candidate is returned.
+    let (loaded, matched) = store
+        .load_prefix("m3", "tmpl", &b, KVCacheMode::Fp16, 0)
+        .expect(
+            "with the longest candidate damaged, load_prefix must fall back to the \
+             shorter VERIFIED one rather than failing the whole lookup",
+        );
+
+    assert_eq!(
+        matched,
+        SHARED,
+        "the fallback must report the SHORTER match — one shared block. A value of \
+         {B_LEN} here means the damaged candidate's coverage was reported for state \
+         that did not come from it, which is the partial adoption Alden named."
+    );
+    assert_eq!(
+        loaded.caches.len(),
+        LAYERS,
+        "the fallback set must be COMPLETE — one cache per layer. A short set is a \
+         partially assembled candidate escaping through the fallback."
+    );
+
+    // TRANSACTIONAL: what came back is A's state, whole, with nothing of the damaged
+    // candidate mixed in. Length is the discriminator — A's manifest is 2560 tokens and
+    // B's is 4096, so a mixture cannot masquerade as either.
+    assert_eq!(
+        loaded.seq_len(),
+        A_LEN,
+        "the returned state must be branch A entire ({A_LEN} tokens). {B_LEN} would be \
+         the damaged candidate; anything else is a splice of the two."
+    );
+
+    // NEGATIVE CONTROL: remove the fallback target and the SAME damage must now be a
+    // clean miss. Proves the fallback returns a real candidate rather than degrading to
+    // whatever it can partially assemble.
+    store
+        .delete_manifest(&m_a.hash())
+        .expect("remove the fallback candidate");
+    let no_fallback = store.load_prefix("m3", "tmpl", &b, KVCacheMode::Fp16, 0);
+    assert!(
+        matches!(no_fallback, Err(ColdStoreError::NoMatch)),
+        "with the only verifiable candidate gone, a damaged longest must be a clean \
+         MISS — a partial adoption here is a corrupt prefix handed to the model. \
+         Got: {:?}",
+        no_fallback.map(|(_, m)| m)
+    );
+}
+
+/// DEFECT PRESENT — a v4 block header is 98.5% unverified, INCLUDING its token list.
+/// **Delete this test and restore the positive assertion when the header is protected.**
+///
+/// Found 2026-07-28 while building the corrupt-longest fallback test above: a byte flipped
+/// in the middle of `header.bin` did not stop `assemble_blocks` from succeeding.
+///
+/// MEASURED, by walking every byte rather than flipping one and generalising:
+/// **8200 of 8328 header bytes** can be flipped with `read_block` still returning `Ok`.
+/// `read_block` compares `header.block_hash` against the REQUESTED hash — a stored field
+/// against an argument — and verifies each layer PAYLOAD's length and sha256. Nothing
+/// digests the header itself.
+///
+/// The arithmetic names what those bytes are. `decode_block_header` reads `token_count`
+/// and then reads that many `i32` tokens *out of the header*; 2048 × 4 = 8192, and
+/// 8328 − 8192 ≈ the block hash plus the two layer digests. **The block's TOKEN LIST is
+/// stored unprotected.**
+///
+/// WHY THAT IS WORSE THAN AN ORDINARY CORRUPTION GAP. The whole cold-store correctness
+/// argument is that the block address is a hash over the tokens, so a matching address
+/// means matching tokens. `block_hash_merkle` does commit to `own_tokens` (see the formula
+/// at the top of `block_cold_store.rs`). But the hash is never RECOMPUTED from the tokens
+/// on read, so corrupted tokens yield KV state attributed to a prefix it did not come from:
+/// intact payload, wrong interpretation. That is the `116924f` failure class, which did not
+/// crash — it computed the wrong thing.
+///
+/// **v3 does not have this gap.** `cold_store_reference.rs` digests its header
+/// (`commit.extend_from_slice(&sha256(&header_bytes))`) and cross-checks the identity
+/// digest on load. So v4 — the store meant to supersede it — is LESS protected than the
+/// one in production, on the field carrying the block's identity claim.
+///
+/// PROPOSED FIX, deliberately not applied here: recompute the block hash from the tokens
+/// actually read and compare against the manifest's chain. The data to verify against is
+/// already on disk; this is a verification that was skipped, not one that needs new state.
+/// It touches the read path for consciousness state, so it wants a reviewer rather than my
+/// unilateral edit.
+#[test]
+#[allow(non_snake_case)]
+fn defect_present__v4_block_header_is_unverified__delete_when_header_is_digested() {
+    const LAYERS: usize = 2;
+    const LEN: i32 = DEFAULT_BLOCK_SIZE as i32;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xE1u8; 32]);
+    let tokens: Vec<i32> = (0..LEN).collect();
+    let manifest = store
+        .persist("m3", "tmpl", &tokens, &fp16_set(LAYERS, LEN))
+        .expect("persist");
+
+    let block = manifest.block_hashes[0];
+    let header_path = dir
+        .path()
+        .join(V4_ROOT)
+        .join("blocks")
+        .join(hex_digest(&block))
+        .join("header.bin");
+    let clean = std::fs::read(&header_path).expect("header readable");
+
+    assert!(
+        store.read_block(&block).is_ok(),
+        "precondition: the undamaged block must read"
+    );
+
+    // SAMPLED, every 16th byte. The DISCOVERY walked all 8328 and found 8200 unprotected;
+    // that number lives in the doc comment above as the evidence. A tripwire does not need
+    // the exhaustive walk, because any digest over the header protects EVERY byte — a
+    // sample notices the fix just as surely, and the full walk cost ~165s on every run of
+    // this module. Exhaustive to find it; sampled to watch it.
+    const STRIDE: usize = 16;
+    let sampled = clean.len().div_ceil(STRIDE);
+    let mut unprotected: Vec<usize> = Vec::new();
+    for offset in (0..clean.len()).step_by(STRIDE) {
+        let mut damaged = clean.clone();
+        damaged[offset] ^= 0xFF;
+        std::fs::write(&header_path, &damaged).expect("write damaged header");
+        if store.read_block(&block).is_ok() {
+            unprotected.push(offset);
+        }
+    }
+    std::fs::write(&header_path, &clean).expect("restore the header");
+
+    // ASSERTING THE DEFECT, so the fix cannot land silently. When the header gains a
+    // digest this goes RED — at which point DELETE this test and restore the positive
+    // form: `assert!(unprotected.is_empty(), ...)`.
+    //
+    // The bound is deliberately loose (a majority, not the exact 8200) so that reformatting
+    // the header does not redden it for the wrong reason. What must change to turn this red
+    // is VERIFICATION, not layout.
+    // ASSERTING THE DEFECT, so the fix cannot land silently. When the header gains a
+    // digest this goes RED — at which point DELETE this test and restore the positive
+    // form: walk every byte and `assert!(unprotected.is_empty(), ...)`.
+    //
+    // The bound is a MAJORITY of the sample rather than an exact count, so reformatting
+    // the header does not redden it for the wrong reason. What must change to turn this
+    // red is VERIFICATION, not layout.
+    assert!(
+        unprotected.len() > sampled / 2,
+        "GOOD NEWS, PROBABLY: only {} of {} sampled header bytes are unverified, down from \
+         a measured 8200 of 8328 when this tripwire was written. If the header is now \
+         digested, DELETE this test and restore the exhaustive positive assertion. If the \
+         header merely changed shape, this tripwire has stopped measuring what it names.",
+        unprotected.len(),
+        sampled
+    );
+}
+
 // ---------------------------------------------------------------------------
 // EPOCH AND REVERIFY, PINNED SEPARATELY (Alden finding-4 residual, 2026-07-28)
 // ---------------------------------------------------------------------------
