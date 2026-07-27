@@ -2547,6 +2547,445 @@ fn a_killed_lock_holder_releases_the_store_lock_without_sentinel_recovery() {
     );
 }
 
+// ===========================================================================
+// END-TO-END CROSS-PROCESS WRITER vs GC (Alden finding 4, item 2)
+//
+// His words: *"the strongest final evidence if practical."* Two halves already
+// existed and had never met:
+//
+//   - `a_writer_that_dedup_observed_a_block_cannot_publish_across_its_deletion`
+//     constructs the interleaving exactly, single-threaded, IN ONE PROCESS. It
+//     proves the under-lock revalidation refuses. It cannot prove the lock
+//     excludes anything, because there is only one process to exclude.
+//   - `a_killed_lock_holder_releases_the_store_lock_without_sentinel_recovery`
+//     proves the `flock` genuinely excludes ACROSS processes. It says nothing
+//     about publication.
+//
+// "Compose logically" is a reasoning claim about two tested halves; it is not
+// itself tested. This exercises them together: a real sweep in this process, a
+// real `persist` in another, contending the same on-disk lock.
+//
+// AND IT USES THE PRODUCTION PATH. The in-process test hand-calls `write_block`
+// then `write_manifest`. The child here calls `persist`, which is what the
+// engine calls — so the dedup early-return is reached the way production
+// reaches it rather than the way a test can arrange it.
+// ===========================================================================
+
+const XPROC_FINGERPRINT: [u8; 32] = [0xB7u8; 32];
+const XPROC_LAYERS: usize = 2;
+const XPROC_N_TILES: i32 = 31;
+
+fn xproc_depth() -> i32 {
+    TILE + XPROC_N_TILES * TILE
+}
+
+/// Bounded wait for a rendezvous file. Returns whether it appeared, rather than
+/// panicking, so each call site states what ITS timeout means. A rendezvous that
+/// silently waits forever turns a failed child into a hung suite, and a hang is
+/// not an assertion.
+fn wait_for_file(p: &std::path::Path, limit: std::time::Duration) -> bool {
+    let step = std::time::Duration::from_millis(10);
+    let mut waited = std::time::Duration::ZERO;
+    while !p.exists() && waited < limit {
+        std::thread::sleep(step);
+        waited += step;
+    }
+    p.exists()
+}
+
+fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// THE INVARIANT, checked over the whole store rather than over the one manifest
+/// a test happens to know about: no COMMITTED manifest references a block that
+/// is not on disk. Stated this way it holds regardless of which side won the
+/// lock, which is the point — the test must not need to know the interleaving in
+/// order to be able to fail.
+fn assert_no_committed_manifest_dangles(store: &BlockColdStore, context: &str) {
+    let dir = store.manifests_dir();
+    if !dir.exists() {
+        return;
+    }
+    for entry in std::fs::read_dir(&dir).expect("read manifests dir") {
+        let entry = entry.expect("manifest dir entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(".tmp.") || !entry.path().is_dir() {
+            continue;
+        }
+        let Some(hash) = parse_hex32(&name) else {
+            panic!("manifest directory name is not a 32-byte hex digest: {name}");
+        };
+        let m = store
+            .read_manifest(&hash)
+            .unwrap_or_else(|e| panic!("committed manifest {name} must be readable ({e})"));
+        for b in &m.block_hashes {
+            store.read_block(b).unwrap_or_else(|e| {
+                panic!(
+                    "COMMITTED manifest {name} references block {} which is not \
+                     readable ({e}). {context} A committed manifest pointing at \
+                     missing data is exactly the state the publication protocol \
+                     exists to make impossible.",
+                    hex_digest(b)
+                )
+            });
+        }
+    }
+}
+
+/// CHILD-PROCESS HELPER — the SWEEPER. Inert unless `MLXCEL_TEST_GC_DIR` is set.
+///
+/// Runs a real `gc_blocks()` in its own process, taking the `flock` from its own
+/// kernel file-table entry. That is the part an in-process test cannot stage: a
+/// same-process sweep shares every lock and every in-memory guard with the
+/// writer, so a passing in-process test says nothing about what survives a
+/// process boundary.
+#[test]
+fn gc_child_process() {
+    let Ok(dir) = std::env::var("MLXCEL_TEST_GC_DIR") else {
+        return; // normal suite run: nothing to do
+    };
+    let base = std::path::PathBuf::from(&dir);
+    let store = BlockColdStore::new(base.clone(), XPROC_FINGERPRINT)
+        .with_prune_mode(PruneMode::Delete)
+        .with_min_gc_age(std::time::Duration::ZERO);
+
+    let outcome = match store.gc_blocks() {
+        Ok(()) => "swept".to_string(),
+        Err(e) => format!("error: {e}"),
+    };
+    std::fs::write(base.join("gc.result"), outcome.as_bytes()).expect("write gc result");
+}
+
+/// ALDEN FINDING 4, ITEM 2 — the composition, CONSTRUCTED rather than raced.
+///
+/// This is the primary evidence. The two halves that had never met:
+///
+/// - the in-process interleaving proves the under-lock revalidation refuses, but
+///   both sides share one process, so it cannot show the refusal survives a
+///   process boundary;
+/// - the killed-lock-holder test proves `flock` excludes across processes, but
+///   says nothing about publication.
+///
+/// Here the writer's stale observation is made in THIS process and the sweep
+/// that invalidates it runs in ANOTHER, each taking the store lock from its own
+/// kernel file-table entry. The ordering is exact — the parent waits for the
+/// child to exit before publishing — so there is no timing assumption to be
+/// flaky about, matching the standard the rest of this module holds.
+///
+/// 1. persist → blocks written, manifest committed
+/// 2. delete the manifest → the blocks are orphans a sweep will nominate
+/// 3. **this process dedup-observes**: `write_block` early-returns `Ok` on the
+///    existing directory, holding no lock
+/// 4. **another process** sweeps them away and exits
+/// 5. this process publishes the manifest it built on that observation
+///
+/// Step 5 must FAIL, and it must fail because of the under-lock revalidation
+/// rather than because anything was left in memory from step 3.
+#[test]
+fn a_writer_cannot_publish_across_a_sweep_that_ran_in_another_process() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let base = dir.path().to_path_buf();
+    let store = BlockColdStore::new(base.clone(), XPROC_FINGERPRINT)
+        .with_prune_mode(PruneMode::Delete)
+        .with_min_gc_age(std::time::Duration::ZERO);
+
+    let set = kvarn_v4_set_distinct(XPROC_LAYERS, XPROC_N_TILES, 0);
+    let tokens: Vec<i32> = (0..xproc_depth()).collect();
+    let manifest = store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+    let blocks = manifest.block_hashes.clone();
+    assert!(
+        !blocks.is_empty(),
+        "precondition: the manifest must have blocks"
+    );
+
+    store
+        .delete_manifest(&manifest.hash())
+        .expect("delete manifest to orphan the blocks");
+
+    // STEP 3 — THE DEDUP OBSERVATION, in this process.
+    store
+        .write_block(&blocks[0], &tokens[..TILE as usize], &set)
+        .expect("precondition: the writer must take the dedup early-return");
+
+    // STEP 4 — the sweep, in a DIFFERENT process, run to completion.
+    let exe = std::env::current_exe().expect("current exe");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "cache::block_cold_store::block_cold_store_tests::gc_child_process",
+            "--nocapture",
+        ])
+        .env("MLXCEL_TEST_GC_DIR", &base)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn gc child");
+    let status = child.wait().expect("wait for gc child");
+    assert!(
+        status.success(),
+        "the sweeping child process failed ({status}); nothing below is attributable"
+    );
+
+    let gc_result = std::fs::read_to_string(base.join("gc.result"))
+        .expect("the sweeping child must report an outcome, or it never ran the sweep");
+    assert_eq!(
+        gc_result, "swept",
+        "the child process did not complete a sweep: {gc_result}"
+    );
+
+    assert!(
+        store.read_block(&blocks[0]).is_err(),
+        "precondition: the OTHER PROCESS must actually have removed the observed \
+         block. If it is still readable, step 5 below fails or succeeds for the \
+         boring reason and this test certifies nothing."
+    );
+
+    // STEP 5 — publication across a deletion performed by another process.
+    let published = store.write_manifest(&manifest);
+    assert!(
+        published.is_err(),
+        "a manifest was COMMITTED referencing a block that a DIFFERENT PROCESS had \
+         already swept. The writer's observation was stale, and revalidation under \
+         the store lock did not catch it across the process boundary — which is the \
+         composition of the two halves failing, exactly where reasoning said it \
+         would hold."
+    );
+
+    // Branch-independent: the store itself is clean, and no manifest slipped
+    // through a partial refusal.
+    assert_no_committed_manifest_dangles(&store, "After a cross-process sweep.");
+    assert_eq!(
+        count_manifests(&store),
+        0,
+        "no manifest may be committed: the only publication attempted referenced a \
+         block another process had swept, and it had to be refused. A manifest here \
+         means the refusal was partial."
+    );
+    assert!(
+        store.read_block(&blocks[0]).is_err(),
+        "the swept block must remain absent after the refused publication"
+    );
+}
+
+/// CHILD-PROCESS HELPER — the WRITER. Inert unless `MLXCEL_TEST_WRITER_DIR` is
+/// set, so it is a no-op in a normal suite run.
+///
+/// It reports its outcome through `child.result` rather than through its exit
+/// status: both outcomes here are legal, so an exit code could not distinguish
+/// "refused correctly" from "crashed", and the parent must be able to tell.
+#[test]
+fn writer_child_process() {
+    let Ok(dir) = std::env::var("MLXCEL_TEST_WRITER_DIR") else {
+        return; // normal suite run: nothing to do
+    };
+    let base = std::path::PathBuf::from(&dir);
+    let store = BlockColdStore::new(base.clone(), XPROC_FINGERPRINT)
+        .with_prune_mode(PruneMode::Delete)
+        .with_min_gc_age(std::time::Duration::ZERO);
+
+    let set = kvarn_v4_set_distinct(XPROC_LAYERS, XPROC_N_TILES, 0);
+    let tokens: Vec<i32> = (0..xproc_depth()).collect();
+
+    // Wait for NOMINATION. Before the parent has nominated, the blocks are not
+    // sweep candidates and the hazard this test is about does not exist yet —
+    // publishing early would pass for the boring reason.
+    if !wait_for_file(&base.join("gc.nominated"), std::time::Duration::from_secs(30)) {
+        std::fs::write(base.join("child.result"), b"error: parent never nominated").ok();
+        return;
+    }
+
+    // Release the parent into its lock acquisition, then immediately take the
+    // production path. `persist` = write_block for each block (every one of
+    // which dedup-observes an existing directory and early-returns `Ok` on a
+    // path check, holding no lock) followed by `write_manifest`.
+    std::fs::write(base.join("child.publishing"), b"1").expect("signal publishing");
+
+    let outcome = match store.persist("m3", "tmpl", &tokens, &set) {
+        Ok(_) => "published".to_string(),
+        Err(e) => format!("refused: {e}"),
+    };
+    std::fs::write(base.join("child.result"), outcome.as_bytes()).expect("write result");
+}
+
+/// ALDEN FINDING 4, ITEM 2 — end-to-end cross-process writer vs GC.
+///
+/// THE INTERLEAVING. The seam fires after GC has chosen candidates and BEFORE it
+/// takes the store lock, which is precisely the window a publisher occupies:
+///
+/// 1. parent persists, then deletes the manifest → the blocks are orphans
+/// 2. parent starts a sweep; at nomination it signals `gc.nominated` and waits
+/// 3. child (another PROCESS) sees it, signals `child.publishing`, calls `persist`
+/// 4. parent returns from the seam and races the child for the store lock
+///
+/// BOTH OUTCOMES ARE CORRECT, and the test asserts the invariant rather than the
+/// ordering:
+///
+/// - **parent wins** (the dangerous window, and the expected one — the child
+///   still has refcounts and a temp manifest to write before it reaches the
+///   lock): GC deletes the blocks the child already dedup-observed, and the
+///   child's under-lock revalidation must REFUSE.
+/// - **child wins**: the manifest is committed and the epoch bumped, so GC's
+///   staleness check declines the pass and collects nothing.
+///
+/// A test that demanded one ordering would be flaky by construction. This one
+/// records which branch it took, so a run that never reaches the dangerous
+/// window is VISIBLE rather than silently green.
+///
+/// ⚠️ **WHAT THIS TEST DOES NOT CERTIFY, measured rather than assumed.** Probe:
+/// `write_manifest`'s under-lock revalidation disabled (`if false && !dir.exists()`),
+/// full suite, unfiltered — **1160 passed, 2 failed of 1165**. The two that
+/// reddened were `a_writer_that_dedup_observed_a_block_cannot_publish_across_its_deletion`
+/// and `a_writer_cannot_publish_across_a_sweep_that_ran_in_another_process`.
+/// **This test stayed GREEN.** It takes the child-wins branch in practice, where
+/// the invariant holds without revalidation ever being consulted, so it is *not*
+/// a control for the refusal — the deterministic test above is.
+///
+/// What it does certify, and nothing else does: two processes genuinely
+/// contending the same on-disk publication lock leave the store consistent.
+/// Named for that, not for the refusal.
+#[test]
+fn two_processes_contending_the_publication_lock_preserve_the_invariant() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let base = dir.path().to_path_buf();
+    let store = BlockColdStore::new(base.clone(), XPROC_FINGERPRINT)
+        .with_prune_mode(PruneMode::Delete)
+        // Required, not incidental — under the production age floor these
+        // freshly-orphaned blocks are too young to nominate, GC collects
+        // nothing, and the test passes on its own precondition.
+        .with_min_gc_age(std::time::Duration::ZERO);
+
+    let set = kvarn_v4_set_distinct(XPROC_LAYERS, XPROC_N_TILES, 0);
+    let tokens: Vec<i32> = (0..xproc_depth()).collect();
+    let manifest = store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+    let blocks = manifest.block_hashes.clone();
+    assert!(
+        !blocks.is_empty(),
+        "precondition: the manifest must have blocks"
+    );
+
+    store
+        .delete_manifest(&manifest.hash())
+        .expect("delete manifest to orphan the blocks");
+
+    let exe = std::env::current_exe().expect("current exe");
+    let mut child = std::process::Command::new(exe)
+        // FULLY QUALIFIED — `--exact` matches the whole test path, so a bare
+        // function name selects nothing and the child exits having run zero
+        // tests, which looks identical to a child that ran and did nothing.
+        .args([
+            "--exact",
+            "cache::block_cold_store::block_cold_store_tests::writer_child_process",
+            "--nocapture",
+        ])
+        .env("MLXCEL_TEST_WRITER_DIR", &base)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn writer child");
+
+    // Arm the seam. Only plain data crosses into the closure.
+    {
+        let b = base.clone();
+        *crate::cache::block_cold_store::GC_NOMINATION_SEAM
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Box::new(move || {
+            std::fs::write(b.join("gc.nominated"), b"1").expect("signal nominated");
+            // Bounded: a child that died must not hang the suite. The parent's
+            // assertions below report its absence loudly.
+            wait_for_file(
+                &b.join("child.publishing"),
+                std::time::Duration::from_secs(30),
+            );
+        }));
+    }
+
+    let gc_result = store.gc_blocks();
+
+    // Disarm before asserting, so a failure cannot leak the seam into another
+    // test and turn one red into a confusing several.
+    *crate::cache::block_cold_store::GC_NOMINATION_SEAM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+
+    gc_result.expect("gc must not error");
+
+    let _ = child.wait();
+
+    let result_path = base.join("child.result");
+    assert!(
+        result_path.exists(),
+        "the writer child never reported an outcome. It could not run, could not \
+         reach `persist`, or died — in every one of those cases this test proved \
+         nothing about the cross-process protocol and must not pass."
+    );
+    let result = std::fs::read_to_string(&result_path).expect("read child result");
+
+    // THE INVARIANT — branch-independent, and checked over the whole store.
+    assert_no_committed_manifest_dangles(
+        &store,
+        &format!("The writer child reported: {result}."),
+    );
+
+    if result == "published" {
+        // The child won the lock. Its manifest is committed, so GC must have
+        // declined the pass — every referenced block still present. The
+        // invariant above already proved that; what is checked here is that the
+        // sweep did not partially collect underneath a legal publication.
+        for b in &blocks {
+            store.read_block(b).unwrap_or_else(|e| {
+                panic!(
+                    "block {} was collected even though the writer's manifest was \
+                     COMMITTED ({e}). Publication bumps the epoch before the manifest \
+                     becomes visible precisely so a concurrent sweep declines; this \
+                     is that ordering failing across a process boundary.",
+                    hex_digest(b)
+                )
+            });
+        }
+        eprintln!(
+            "xproc writer-vs-GC: CHILD won the lock — publication committed, sweep declined. \
+             (The dangerous window was not reached on this run.)"
+        );
+    } else {
+        assert!(
+            result.starts_with("refused: "),
+            "the writer child neither published nor refused; it reported: {result}"
+        );
+        // The parent won the lock — the dangerous window. GC swept blocks the
+        // child had already dedup-observed, and the child's under-lock
+        // revalidation had to refuse.
+        assert_eq!(
+            count_manifests(&store),
+            0,
+            "the writer refused to publish, so no manifest may be committed. One here \
+             means the refusal was partial — a manifest reached the manifests \
+             directory after its own revalidation had already rejected it."
+        );
+        assert!(
+            store.read_block(&blocks[0]).is_err(),
+            "the writer refused because a block was absent at publication time, so \
+             that block must still be absent. If it is readable, the refusal was \
+             for some other reason and this test is green on the wrong cause."
+        );
+        eprintln!(
+            "xproc writer-vs-GC: PARENT won the lock — dangerous window reached, \
+             publication correctly refused."
+        );
+    }
+}
+
 /// ALDEN CROSS-PROCESS CASE — crash AFTER the tombstone rename, BEFORE the
 /// unlink: "final may be rewritten safely; stale tombstone is never treated as
 /// the live block."
