@@ -306,6 +306,45 @@ pub struct TextConfig {
     pub routed_scaling_factor: f32,
     pub sparse_attention_config: SparseAttentionConfig,
 }
+/// Sorted-unique union of a host-side per-token block selection.
+///
+/// Pure: no MLX, no device work, no `self`. Extracted from
+/// `sparse_decode_attention_gathered` so a test can exercise **the same
+/// function production calls** rather than a re-implementation of the rule
+/// (Alden, 2026-07-27 — a test-only logger would prove the test's copy
+/// correct, which is not the claim anyone needs).
+fn union_from_selection(sel_host: &[i32]) -> Vec<i32> {
+    let mut u = sel_host.to_vec();
+    u.sort_unstable();
+    u.dedup();
+    u
+}
+
+/// The compact-window PLAN for one gathered decode step.
+///
+/// * `abs_to_slot[a]` — compact slot holding absolute block `a`, or `-1.0` if
+///   `a` is not in the union. Poisoned entries are never referenced when
+///   `union` is the value set of the selection, which it is by construction.
+/// * `positions[s * block_size + j]` — the ABSOLUTE token position of slot
+///   `s`'s `j`-th token, i.e. `union[s] * block_size + j`. Tail slots produce
+///   positions `>= kv_len`, masked downstream by the core's `pos <= q_pos`
+///   rule exactly as the full-window path masks its padding.
+///
+/// Pure, and the single source of truth for both production and tests.
+fn plan_compact_window(union: &[i32], kv_len: i32, block_size: i32) -> (Vec<f32>, Vec<f32>) {
+    let num_key_blocks = (kv_len + block_size - 1) / block_size;
+    let mut abs_to_slot = vec![-1.0f32; num_key_blocks as usize];
+    for (slot, &blk) in union.iter().enumerate() {
+        abs_to_slot[blk as usize] = slot as f32;
+    }
+    let mut positions = Vec::with_capacity(union.len() * block_size as usize);
+    for &blk in union {
+        for p in (blk * block_size)..((blk + 1) * block_size) {
+            positions.push(p as f32);
+        }
+    }
+    (abs_to_slot, positions)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SparseAttentionConfig {
@@ -1343,9 +1382,7 @@ impl SparseAttention {
                 .chunks_exact(4)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            let mut u = raw.clone();
-            u.sort_unstable();
-            u.dedup();
+            let u = union_from_selection(&raw);
             (Some(raw), u)
         };
         if profiling {
@@ -1477,10 +1514,8 @@ impl SparseAttention {
         // for correctness — the union is BY CONSTRUCTION the value set of
         // `selected`, so every lookup hits a real slot.
         let num_key_blocks = (kv_len + self.block_size - 1) / self.block_size;
-        let mut table = vec![-1.0f32; num_key_blocks as usize];
-        for (slot, &blk) in union.iter().enumerate() {
-            table[blk as usize] = slot as f32;
-        }
+        // Plan built by the shared pure helper — see `plan_compact_window`.
+        let (table, plan_positions) = plan_compact_window(&union, kv_len, self.block_size);
         let table = mlxcel_core::from_slice_f32(&table, &[1, 1, 1, num_key_blocks]);
         let table_b = mlxcel_core::broadcast_to(&table, &[b, self.num_kv_heads, l, num_key_blocks]);
         let sel_dtype = mlxcel_core::array_dtype(&selected);
@@ -1495,13 +1530,7 @@ impl SparseAttention {
         // positions are >= kv_len and are therefore masked by the core's
         // unified `pos <= q_pos` rule exactly as v1 masks its padding.
         let bs = self.block_size;
-        let mut pos: Vec<f32> = Vec::with_capacity((n_blocks * bs) as usize);
-        for &blk in &union {
-            for p in (blk * bs)..((blk + 1) * bs) {
-                pos.push(p as f32);
-            }
-        }
-        let pos_compact = mlxcel_core::from_slice_f32(&pos, &[n_blocks * bs]);
+        let pos_compact = mlxcel_core::from_slice_f32(&plan_positions, &[n_blocks * bs]);
 
         // G (harness plan §H1): same compact (window, indices, positions)
         // triple, two interchangeable cores. The blocked-gather core is the
@@ -5896,19 +5925,35 @@ mod tests {
     ///   L2: their sorted-unique unions must be identical.
     ///
     /// Both paths call the SAME `per_token_block_selection` with an `idx_q`
-    /// derived from the same `x_decode`, so the ONLY way the selections can
-    /// diverge is if the two caches' `idx_k` state differs after identical
-    /// prefill. That makes this a direct, tolerance-free test of the K1
-    /// gate's unstated "identical KVarN8 state" premise.
+    /// derived from the same `x_decode`, so the selections can only diverge if
+    /// the two caches' `idx_k` state differs after identical prefill in a way
+    /// this selector is sensitive to.
     ///
     /// Reading the result:
     ///   FAILS  => selector/cache-state issue. The K1 float diff is a
     ///             consequence, and "union/remap/positions" is the wrong
     ///             suspect list.
-    ///   PASSES => selection is bit-exact and the fault is DOWNSTREAM of index
-    ///             construction — payload or arithmetic, not which blocks were
-    ///             chosen. Combined with `fresh_k == 0` from the earlier
-    ///             harness, that points at the V quantize/dequantize path.
+    ///   PASSES => block CHOICE is identical, so the fault is DOWNSTREAM of
+    ///             selection.
+    ///
+    /// # What a PASS does NOT prove (Alden, 2026-07-27 — correcting an
+    /// overstatement in the first version of this comment)
+    ///
+    /// **Identical top-k absolute indices do NOT prove the two caches are
+    /// bit-identical.** They prove only that whatever differences the caches
+    /// may hold did not change THIS selector's result. top-k is a lossy,
+    /// heavily quantising function of the cache: many distinct `idx_k` states
+    /// map to the same two winning blocks. So this test does not establish the
+    /// "identical KVarN8 state" premise — it fails to falsify it, which is a
+    /// weaker and different thing, and the premise remains OPEN.
+    ///
+    /// Still open after a pass: the two cache states themselves, the
+    /// production union/remap/positions, the gathered K/V payload, the masks,
+    /// and the actual operation order at the `sparse_decode_core` boundary.
+    /// Proving the premise needs one frozen detached prefill state adopted
+    /// independently into both paths, then raw evaluated-byte comparison of
+    /// the exact K, V, remap, position and mask inputs presented at that
+    /// boundary.
     ///
     /// NOT COVERED (Alden's level 3, stated so absence is not read as
     /// coverage): the compact-index remap and compact position table are built
@@ -5996,6 +6041,115 @@ mod tests {
         assert_eq!(
             ua, ub,
             "ALDEN L2: unions differ though raw selections matched"
+        );
+    }
+
+    /// ALDEN'S LEVEL 3 — remap round-trip and compact position table,
+    /// integer-exact, against the SAME pure planners production calls.
+    ///
+    /// `union_from_selection` and `plan_compact_window` were extracted from
+    /// `sparse_decode_attention_gathered` for exactly this reason: Alden's
+    /// point was that a test-only logger proves the TEST's copy of the rule
+    /// correct, which is not the claim anyone needs. These ARE the production
+    /// functions — the gathered path builds its device tensors from their
+    /// output. The extraction was verified behaviour-preserving: the K1 gate's
+    /// l2 is bit-identical before and after (1.0516112e-8).
+    ///
+    ///   L3a: every SELECTED absolute block maps to a real slot (no poisoned -1)
+    ///   L3b: the remap ROUND-TRIPS — union[abs_to_slot[a]] == a
+    ///   L3c: positions[s*bs + j] == union[s]*bs + j, exactly
+    ///   L3d: the two caches produce identical plans
+    ///
+    /// A pass localizes the fault AWAY from union/remap/positions and onto the
+    /// payload or the arithmetic at the `sparse_decode_core` boundary. It does
+    /// NOT prove the caches bit-identical — see the note on the L1/L2 test.
+    #[test]
+    fn gathered_remap_round_trips_and_positions_are_exact() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+        let b = 1;
+        let bs = attn.block_size;
+
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let x_decode = make_test_input(1, l, hidden);
+
+        let mut cache_a = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let _ = attn.forward(&x_prefill, &mut cache_a, None);
+        let mut cache_b = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let _ = attn.forward(&x_prefill, &mut cache_b, None);
+
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(&x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = if let Some(ref n) = attn.index_k_norm {
+            n.forward(&idx_k)
+        } else {
+            idx_k
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let ika = cache_a.m3_idx_k_update_and_fetch(&idx_k);
+        let ikb = cache_b.m3_idx_k_update_and_fetch(&idx_k);
+        let idx_q = attn.project_index_queries(&x_decode, b, l, offset);
+
+        let sel_a = host_i32(&attn.per_token_block_selection(&idx_q, &ika, b, l, kv_len, offset));
+        let sel_b = host_i32(&attn.per_token_block_selection(&idx_q, &ikb, b, l, kv_len, offset));
+
+        // PRODUCTION planners — not a re-implementation.
+        let union_a = union_from_selection(&sel_a);
+        let union_b = union_from_selection(&sel_b);
+        let (abs_to_slot_a, positions_a) = plan_compact_window(&union_a, kv_len, bs);
+        let (abs_to_slot_b, positions_b) = plan_compact_window(&union_b, kv_len, bs);
+
+        eprintln!(
+            "DIAG L3 union_a={union_a:?} abs_to_slot_a={abs_to_slot_a:?} n_pos={}",
+            positions_a.len()
+        );
+
+        for &a in &sel_a {
+            assert!(
+                abs_to_slot_a[a as usize] >= 0.0,
+                "ALDEN L3a: selected absolute block {a} maps to a POISONED slot (-1)"
+            );
+        }
+
+        for &a in &sel_a {
+            let slot = abs_to_slot_a[a as usize] as usize;
+            assert_eq!(
+                union_a[slot], a,
+                "ALDEN L3b: remap does NOT round-trip for absolute block {a} at slot {slot}"
+            );
+        }
+
+        assert_eq!(
+            positions_a.len(),
+            union_a.len() * bs as usize,
+            "ALDEN L3c: position table length must be n_blocks * block_size"
+        );
+        for (s, &blk) in union_a.iter().enumerate() {
+            for j in 0..bs {
+                let got = positions_a[s * bs as usize + j as usize];
+                let want = (blk * bs + j) as f32;
+                assert_eq!(
+                    got, want,
+                    "ALDEN L3c: compact slot {s} token {j} carries absolute position {got}, expected {want}"
+                );
+            }
+        }
+
+        assert_eq!(union_a, union_b, "ALDEN L3d: unions differ between caches");
+        assert_eq!(
+            abs_to_slot_a, abs_to_slot_b,
+            "ALDEN L3d: remap tables differ between caches"
+        );
+        assert_eq!(
+            positions_a, positions_b,
+            "ALDEN L3d: compact position tables differ between caches"
         );
     }
 
