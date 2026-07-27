@@ -6744,6 +6744,166 @@ mod tests {
         );
     }
 
+    /// ALDEN'S 2x2 — position provenance x selection materialization.
+    ///
+    /// Two graph differences survive every value-level comparison:
+    ///   * positions: full builds `pos_full` with LAZY `arange_f32` (1320);
+    ///     gathered builds `pos_compact` from a host Vec via `from_slice_f32`
+    ///     (1533).
+    ///   * selection: gathered FORCES `selected` through `array_to_raw_bytes`
+    ///     (1379-1386) to compute the host union — a mandatory eval/host-sync
+    ///     barrier. Full passes its LAZY `selected` graph straight in (1294).
+    ///
+    /// So "both paths share the core, therefore op order is identical" was
+    /// never established at the graph level.
+    ///
+    /// METHOD (Alden's warning, honoured): the tensors under test are NOT
+    /// byte-read before the core calls — that would force evaluation and could
+    /// erase the very mechanism. Values are proven with DUPLICATE tensors
+    /// afterwards.
+    ///
+    /// Cells, all with the same q/k/v and the same block geometry:
+    ///   A  arange positions   + lazy selected      (the full-window shape)
+    ///   B  from_slice pos     + lazy selected      (position provenance only)
+    ///   C  arange positions   + materialized sel   (host-sync only)
+    ///   D  from_slice pos     + materialized sel   (the gathered shape)
+    /// plus E: every core input explicitly eval'd in both cells (Alden's
+    /// final control).
+    #[test]
+    #[ignore = "MECHANISM probe, not a gate. Run with: cargo test --lib -- --ignored --test-threads=1"]
+    fn position_provenance_and_selection_materialization_2x2() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+        let b = 1;
+        let bs = attn.block_size;
+        let num_key_blocks = (kv_len + bs - 1) / bs;
+        let padded_k_len = num_key_blocks * bs;
+
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let x_decode = make_test_input(1, l, hidden);
+
+        let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let _ = attn.forward(&x_prefill, &mut cache, None);
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = if let Some(ref n) = attn.k_norm {
+            n.forward(&k)
+        } else {
+            k
+        };
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let _ = cache.update_and_fetch(k, v);
+
+        // One already-evaluated window, shared by every cell.
+        let all_blocks: Vec<i32> = (0..num_key_blocks).collect();
+        let (kw, vw) = cache.fetch_msa_blocks(&all_blocks);
+        mlxcel_core::eval(&kw);
+        mlxcel_core::eval(&vw);
+
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(&x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = if let Some(ref n) = attn.index_k_norm {
+            n.forward(&idx_k)
+        } else {
+            idx_k
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let idx_k_full = cache.m3_idx_k_update_and_fetch(&idx_k);
+        let idx_q = attn.project_index_queries(&x_decode, b, l, offset);
+
+        let q_raw = attn.q_proj.forward(&x_decode);
+        let q = mlxcel_core::reshape(&q_raw, &[1, l, attn.num_heads, attn.head_dim]);
+        let q = if let Some(ref n) = attn.q_norm {
+            n.forward(&q)
+        } else {
+            q
+        };
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let q = mlxcel_core::fast_rope(&q, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        mlxcel_core::eval(&q);
+
+        // Independent selection graphs — same values, separate objects, so
+        // materializing one does not evaluate the other.
+        let sel_lazy = attn.per_token_block_selection(&idx_q, &idx_k_full, b, l, kv_len, offset);
+        let sel_mat = attn.per_token_block_selection(&idx_q, &idx_k_full, b, l, kv_len, offset);
+        // The gathered path's mandatory host-sync barrier, on sel_mat ONLY.
+        let sel_host = {
+            let as_i32 = mlxcel_core::astype(&sel_mat, mlxcel_core::dtype::INT32);
+            mlxcel_core::array_to_raw_bytes(&as_i32)
+        };
+        assert!(!sel_host.is_empty());
+
+        let (_, plan_positions) = plan_compact_window(&all_blocks, kv_len, bs);
+        let mk_pos_arange = || mlxcel_core::arange_f32(0.0, padded_k_len as f32, 1.0);
+        let mk_pos_slice = || mlxcel_core::from_slice_f32(&plan_positions, &[padded_k_len]);
+
+        let run = |pos: &MlxArray, sel: &MlxArray| {
+            let o = attn.sparse_decode_core(&q, &kw, &vw, sel, pos, num_key_blocks, b, l, offset);
+            mlxcel_core::eval(&o);
+            mlxcel_core::array_to_raw_bytes(&o)
+        };
+
+        let pa = mk_pos_arange();
+        let pb = mk_pos_slice();
+        let pc = mk_pos_arange();
+        let pd = mk_pos_slice();
+        let a = run(&pa, &sel_lazy);
+        let b_ = run(&pb, &sel_lazy);
+        let c = run(&pc, &sel_mat);
+        let d = run(&pd, &sel_mat);
+
+        let nd = |x: &Vec<u8>, y: &Vec<u8>| x.iter().zip(y.iter()).filter(|(p, r)| p != r).count();
+        eprintln!(
+            "DIAG 2x2  A(arange,lazy) vs B(slice,lazy)={}  A vs C(arange,mat)={}  \
+             A vs D(slice,mat)={}  C vs D={}  B vs D={}",
+            nd(&a, &b_),
+            nd(&a, &c),
+            nd(&a, &d),
+            nd(&c, &d),
+            nd(&b_, &d)
+        );
+
+        // Alden's final control: eval every core input in both cells.
+        let pe = mk_pos_arange();
+        let pf = mk_pos_slice();
+        mlxcel_core::eval(&pe);
+        mlxcel_core::eval(&pf);
+        let se1 = attn.per_token_block_selection(&idx_q, &idx_k_full, b, l, kv_len, offset);
+        let se2 = attn.per_token_block_selection(&idx_q, &idx_k_full, b, l, kv_len, offset);
+        mlxcel_core::eval(&se1);
+        mlxcel_core::eval(&se2);
+        let e1 = run(&pe, &se1);
+        let e2 = run(&pf, &se2);
+        eprintln!(
+            "DIAG 2x2  E: all-inputs-eval'd, arange vs slice = {}",
+            nd(&e1, &e2)
+        );
+
+        // Prove the position VALUES were equal, using duplicates, AFTER the cells.
+        let dup_a = mk_pos_arange();
+        let dup_s = mk_pos_slice();
+        mlxcel_core::eval(&dup_a);
+        mlxcel_core::eval(&dup_s);
+        let ba = mlxcel_core::array_to_raw_bytes(&dup_a);
+        let bsl = mlxcel_core::array_to_raw_bytes(&dup_s);
+        eprintln!(
+            "DIAG 2x2  position VALUES differ in {} of {} bytes (duplicates, post-hoc)",
+            nd(&ba, &bsl),
+            ba.len()
+        );
+    }
+
     /// THE SETTLEMENT — drive BOTH decode paths from the SAME `q`.
     ///
     /// Everything upstream is now proven identical on one cache: selection,
@@ -6825,6 +6985,12 @@ mod tests {
         let q = mlxcel_core::fast_rope(&q, attn.rope_dims, false, attn.rope_base, 1.0, offset);
         mlxcel_core::eval(&q);
 
+        eprintln!(
+            "DIAG DISPATCH msa_core_sdpa={} msa_fetch_qmm={} kv_outer={}",
+            msa_core_sdpa_enabled(),
+            msa_fetch_qmm_enabled(),
+            kv_outer_enabled()
+        );
         let gathered = attn.sparse_decode_attention_gathered(
             &x_decode,
             &q,
@@ -6963,6 +7129,12 @@ mod tests {
         let q = mlxcel_core::fast_rope(&q, attn.rope_dims, false, attn.rope_base, 1.0, offset);
         mlxcel_core::eval(&q);
 
+        eprintln!(
+            "DIAG DISPATCH msa_core_sdpa={} msa_fetch_qmm={} kv_outer={}",
+            msa_core_sdpa_enabled(),
+            msa_fetch_qmm_enabled(),
+            kv_outer_enabled()
+        );
         let gathered = attn.sparse_decode_attention_gathered(
             &x_decode,
             &q,
