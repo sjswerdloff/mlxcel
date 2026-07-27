@@ -1824,6 +1824,121 @@ fn a_block_referenced_by_a_manifest_published_after_nomination_must_survive() {
     }
 }
 
+/// CHILD-PROCESS HELPER for the cross-process lock tests. Inert unless
+/// `MLXCEL_TEST_LOCK_DIR` is set, so it is a no-op in a normal suite run and the
+/// parent test drives it by re-executing this same binary.
+///
+/// Holds the store lock and blocks forever. The parent kills it.
+#[test]
+fn lock_holder_child_process() {
+    let Ok(dir) = std::env::var("MLXCEL_TEST_LOCK_DIR") else {
+        return; // normal suite run: nothing to do
+    };
+    let store = BlockColdStore::new(std::path::PathBuf::from(&dir), [7u8; 32]);
+    let _lock = store
+        .acquire_store_lock()
+        .expect("child must acquire the store lock");
+    // Tell the parent the lock is held. Written AFTER acquisition, so the
+    // parent never races ahead of the thing it is waiting for.
+    std::fs::write(std::path::Path::new(&dir).join("child.ready"), b"1").expect("ready");
+    // Block until killed. The point of the test is that we never release
+    // voluntarily.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// ALDEN'S CROSS-PROCESS CASE — "Kill lock holder; another process acquires the
+/// advisory lock without deleting/recovering a sentinel."
+///
+/// This is the whole argument for `flock` over an `O_EXCL` lockfile. With a
+/// sentinel, a SIGKILLed holder leaves a file nobody can clear without a
+/// staleness heuristic, and every such heuristic fails toward either permanent
+/// deadlock (never steal) or unsafe stealing (steal too early, two sweepers).
+/// With a kernel advisory lock the ownership dies with the process and the file
+/// itself is inert.
+///
+/// The lock file must still EXIST afterwards — if recovery required unlinking
+/// it, that would be the sentinel behaviour this design rejects.
+#[test]
+fn a_killed_lock_holder_releases_the_store_lock_without_sentinel_recovery() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    std::fs::create_dir_all(&path).expect("mkdir");
+
+    let exe = std::env::current_exe().expect("current exe");
+    let mut child = std::process::Command::new(exe)
+        // FULLY QUALIFIED. `--exact` matches the whole test path, so the bare
+        // function name selects nothing and the child exits having run zero
+        // tests — which looks identical to a child that started and failed.
+        .args([
+            "--exact",
+            "cache::block_cold_store::block_cold_store_tests::lock_holder_child_process",
+            "--nocapture",
+        ])
+        .env("MLXCEL_TEST_LOCK_DIR", &path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn child");
+
+    // Wait for the child to actually hold it. Bounded, so a child that dies
+    // early fails this test loudly instead of hanging the suite.
+    let ready = path.join("child.ready");
+    let mut waited = std::time::Duration::ZERO;
+    let step = std::time::Duration::from_millis(25);
+    while !ready.exists() && waited < std::time::Duration::from_secs(30) {
+        std::thread::sleep(step);
+        waited += step;
+    }
+    assert!(
+        ready.exists(),
+        "child never signalled that it holds the lock — the test cannot \
+         discriminate, so this is a failure, not a skip"
+    );
+
+    // PROVE THE LOCK EXCLUDES, while the child is still alive. Without this the
+    // test passes identically against a lock that never excluded anything — the
+    // parent would simply acquire, and "it acquired after the kill" would be
+    // meaningless. Non-blocking, because a blocking acquire here would hang and
+    // a hang is not an assertion.
+    {
+        let probe = BlockColdStore::new(path.clone(), [7u8; 32]);
+        let held = probe
+            .try_acquire_store_lock()
+            .expect("try-acquire must not error");
+        assert!(
+            held.is_none(),
+            "acquired the store lock while another PROCESS held it — the advisory \
+             lock is not excluding, so every cross-process guarantee built on it \
+             (publication vs sweep) is decorative"
+        );
+    }
+
+    // SIGKILL: no unwinding, no Drop, no chance to release politely. Exactly
+    // the crash case a sentinel cannot recover from.
+    child.kill().expect("kill child");
+    let _ = child.wait();
+
+    let store = BlockColdStore::new(path.clone(), [7u8; 32]);
+    let lock = store.acquire_store_lock().unwrap_or_else(|e| {
+        panic!(
+            "could not acquire the store lock after its holder was SIGKILLed ({e}). \
+             The kernel is supposed to release an flock when the owning process \
+             dies; if this needs manual recovery the design has become the \
+             stale-sentinel problem it was chosen to avoid."
+        )
+    });
+    drop(lock);
+
+    assert!(
+        path.join("store.lock").exists(),
+        "the lock FILE must survive — recovery that requires unlinking it is \
+         sentinel behaviour, and a second process could unlink it while a third \
+         legitimately holds the lock"
+    );
+}
+
 /// A mode MISMATCH must be a clean miss, never a wrong adoption.
 ///
 /// Persist under KVarN8, load under Fp16. Because block addresses commit to the

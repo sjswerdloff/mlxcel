@@ -389,6 +389,41 @@ impl BlockColdStore {
         })
     }
 
+    /// Non-blocking variant. Returns `Ok(None)` when another holder has it.
+    ///
+    /// Exists so a test can PROVE exclusion rather than assume it: a blocking
+    /// acquire against a live holder hangs, and "it hung" is not an assertion.
+    /// Not used by the sweep — GC wants to wait for the lock, not skip its pass
+    /// because a publisher happened to hold it for a millisecond.
+    #[cfg(test)]
+    fn try_acquire_store_lock(&self) -> Result<Option<StoreLock<'static>>, ColdStoreError> {
+        let process_guard = STORE_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        fs::create_dir_all(&self.base_dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.lock_path())?;
+        // SAFETY: fd valid for the duration; the guard keeps it alive.
+        let rc = unsafe {
+            libc::flock(
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
+            return Err(ColdStoreError::Io(err));
+        }
+        Ok(Some(StoreLock {
+            _process: process_guard,
+            file,
+        }))
+    }
+
     /// Monotonic count of manifest PUBLICATIONS (Alden finding 4, 2026-07-27).
     ///
     /// GC's mark phase is a point-in-time snapshot. The unsafe interleaving is:
