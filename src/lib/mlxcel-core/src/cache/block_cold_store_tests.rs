@@ -1876,3 +1876,279 @@ fn different_runtimes_sharing_a_block_pool_do_not_collide() {
         .expect("A must still hit its own blocks");
     assert_eq!(matched_a, tokens.len(), "A's entry must survive B's persist");
 }
+
+// ===========================================================================
+// ALDEN'S FINDING 2 — prefix pruning and the partial tail block
+//
+// Alden, 2026-07-27 (docs-only read, against the spec rather than the code):
+//
+//   "Block-hash-list prefix pruning fails for ordinary growth when the old
+//    manifest ends in a partial block: extending that block changes its hash,
+//    so the old hash list is not a prefix and its manifest keeps the old tail
+//    rooted."
+//
+// Evaluated against the implementation, and it is REAL. `persist` chunks with
+// `tokens.chunks(block_size)`, which yields a PARTIAL final chunk whenever the
+// token count is not a multiple of the block size — and `block_hash_merkle`
+// commits to that chunk's own token count and tokens. So when the next turn
+// fills that block, its hash changes, the old hash list is no longer a prefix
+// of the new one, `prune_prefix_manifests` skips it, and the superseded
+// manifest survives holding refcounts on an orphaned block.
+//
+// A conversation only lands on an exact multiple of 2048 tokens by accident,
+// so this is the ORDINARY path, not an edge case.
+// ===========================================================================
+
+fn count_manifests(store: &BlockColdStore) -> usize {
+    let dir = store.manifests_dir();
+    if !dir.exists() {
+        return 0;
+    }
+    std::fs::read_dir(&dir)
+        .expect("read manifests dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .filter(|e| !e.file_name().to_string_lossy().starts_with(".tmp."))
+        .count()
+}
+
+/// CONTROL — growth from an EXACT multiple of the block size prunes correctly.
+///
+/// Establishes that the pruning path works at all, so the partial-tail failure
+/// below is attributable to the tail and not to pruning being broken outright.
+/// Without this control, a red test proves nothing about the cause.
+#[test]
+fn growth_from_an_exact_block_multiple_prunes_the_old_manifest() {
+    const LAYERS: usize = 2;
+    const TURN1: i32 = DEFAULT_BLOCK_SIZE as i32; // exactly one full block
+    const TURN2: i32 = 2 * DEFAULT_BLOCK_SIZE as i32; // exactly two full blocks
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xC1u8; 32])
+        .with_prune_mode(PruneMode::Delete);
+
+    let t1: Vec<i32> = (0..TURN1).collect();
+    store
+        .persist("m3", "tmpl", &t1, &fp16_set(LAYERS, TURN1))
+        .expect("turn 1 persists");
+    assert_eq!(count_manifests(&store), 1, "one manifest after turn 1");
+
+    let t2: Vec<i32> = (0..TURN2).collect();
+    store
+        .persist("m3", "tmpl", &t2, &fp16_set(LAYERS, TURN2))
+        .expect("turn 2 persists");
+
+    assert_eq!(
+        count_manifests(&store),
+        1,
+        "turn 1's manifest must be pruned: its single full block is an exact \
+         prefix of turn 2's two blocks, so the prefix check succeeds"
+    );
+}
+
+/// ALDEN'S FINDING 2, DEMONSTRATED.
+///
+/// Same growth, but turn 1 ends mid-block. Turn 1's tail block covers 512
+/// tokens; turn 2 fills it to 2048. `block_hash_merkle` commits to the block's
+/// own tokens, so that block's hash changes, turn 1's hash list stops being a
+/// prefix of turn 2's, and the superseded manifest is never pruned.
+///
+/// The mutation that must redden this test: none — it reddens on the DEFECT.
+/// It goes green only when prune gains a token-prefix proof rather than a
+/// hash-list prefix check.
+#[test]
+fn growth_from_a_partial_tail_block_still_prunes_the_old_manifest() {
+    const LAYERS: usize = 2;
+    const TURN1: i32 = DEFAULT_BLOCK_SIZE as i32 + 512; // 2048 + 512 -> tail block
+    const TURN2: i32 = 2 * DEFAULT_BLOCK_SIZE as i32; // tail block now full
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xC2u8; 32])
+        .with_prune_mode(PruneMode::Delete);
+
+    let t1: Vec<i32> = (0..TURN1).collect();
+    let m1 = store
+        .persist("m3", "tmpl", &t1, &fp16_set(LAYERS, TURN1))
+        .expect("turn 1 persists");
+    assert_eq!(m1.block_hashes.len(), 2, "turn 1 must have a partial 2nd block");
+    assert_eq!(count_manifests(&store), 1, "one manifest after turn 1");
+
+    // Turn 2 continues the SAME conversation — t1 is a strict token prefix of t2.
+    let t2: Vec<i32> = (0..TURN2).collect();
+    assert_eq!(&t2[..t1.len()], &t1[..], "turn 2 must extend turn 1's tokens");
+    let m2 = store
+        .persist("m3", "tmpl", &t2, &fp16_set(LAYERS, TURN2))
+        .expect("turn 2 persists");
+
+    // The mechanism, asserted directly so a failure names the cause.
+    assert_ne!(
+        m1.block_hashes[1], m2.block_hashes[1],
+        "the tail block's hash MUST change when it fills — this is why the \
+         hash-list prefix check fails"
+    );
+    assert_eq!(
+        m1.block_hashes[0], m2.block_hashes[0],
+        "the full leading block is unchanged, so this is genuine linear growth"
+    );
+
+    assert_eq!(
+        count_manifests(&store),
+        1,
+        "ALDEN FINDING 2: turn 1's manifest survived. It is superseded by turn \
+         2 on the same conversation, but its tail block hash changed when the \
+         block filled, so the hash-list prefix check skipped it. Every \
+         non-boundary turn leaks a manifest plus an orphaned tail block."
+    );
+}
+
+/// SAFETY — the token-prefix proof must REFUSE a divergent branch.
+///
+/// This is the direction that matters. Failing to prune costs disk; pruning
+/// wrongly destroys a live manifest and forces a full re-prefill. The old
+/// manifest here shares a complete leading block with the new one and is
+/// strictly shorter — so it passes every cheap pre-filter — but its tokens
+/// diverge inside the tail block, so it is NOT a prefix of this conversation
+/// and must survive.
+///
+/// The mutation that must redden this test: drop the `expected !=
+/// old_manifest.block_hashes` comparison in `prune_prefix_manifests`, or
+/// weaken it to compare only the full leading blocks.
+#[test]
+fn a_divergent_branch_sharing_a_leading_block_is_never_pruned() {
+    const LAYERS: usize = 2;
+    const SHARED: usize = DEFAULT_BLOCK_SIZE; // one full identical block
+    const OLD_LEN: i32 = DEFAULT_BLOCK_SIZE as i32 + 512;
+    const NEW_LEN: i32 = 2 * DEFAULT_BLOCK_SIZE as i32;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xD1u8; 32])
+        .with_prune_mode(PruneMode::Delete);
+
+    // Branch A: 0..2560
+    let a: Vec<i32> = (0..OLD_LEN).collect();
+    let m_a = store
+        .persist("m3", "tmpl", &a, &fp16_set(LAYERS, OLD_LEN))
+        .expect("branch A persists");
+
+    // Branch B: identical for the first full block, then DIVERGENT, and longer.
+    let mut b: Vec<i32> = a[..SHARED].to_vec();
+    b.extend((0..(NEW_LEN as usize - SHARED)).map(|i| 900_000 + i as i32));
+    assert_eq!(b.len(), NEW_LEN as usize);
+    assert_eq!(&b[..SHARED], &a[..SHARED], "leading block must be shared");
+    assert_ne!(&b[..a.len()], &a[..], "B must NOT extend A");
+
+    let m_b = store
+        .persist("m3", "tmpl", &b, &fp16_set(LAYERS, NEW_LEN))
+        .expect("branch B persists");
+
+    assert_eq!(
+        m_a.block_hashes[0], m_b.block_hashes[0],
+        "shared leading block must hash identically — otherwise this test is \
+         not exercising the case it claims to"
+    );
+    assert!(
+        m_a.total_tokens < m_b.total_tokens,
+        "A must be strictly shorter, so it reaches the token-prefix proof"
+    );
+
+    assert_eq!(
+        count_manifests(&store),
+        2,
+        "branch A was pruned by a longer, divergent conversation. A shared \
+         leading block and a shorter length are NOT proof of a prefix; only \
+         recomputing A's hashes over B's first A.total_tokens tokens is."
+    );
+}
+
+/// The point of pruning: the superseded tail block becomes collectable.
+///
+/// Asserts the CONSEQUENCE, not just the manifest count — pruning that left
+/// refcounts pinned would satisfy the count assertions above while still
+/// leaking every orphaned tail block forever.
+#[test]
+fn pruning_a_partial_tail_manifest_releases_the_orphaned_block() {
+    const LAYERS: usize = 2;
+    const TURN1: i32 = DEFAULT_BLOCK_SIZE as i32 + 512;
+    const TURN2: i32 = 2 * DEFAULT_BLOCK_SIZE as i32;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xD2u8; 32])
+        .with_prune_mode(PruneMode::Delete);
+
+    let t1: Vec<i32> = (0..TURN1).collect();
+    let m1 = store
+        .persist("m3", "tmpl", &t1, &fp16_set(LAYERS, TURN1))
+        .expect("turn 1 persists");
+    let orphan = m1.block_hashes[1];
+    assert_eq!(
+        store.get_refcount(&orphan).expect("refcount"),
+        1,
+        "the partial tail block is referenced once by turn 1"
+    );
+
+    let t2: Vec<i32> = (0..TURN2).collect();
+    store
+        .persist("m3", "tmpl", &t2, &fp16_set(LAYERS, TURN2))
+        .expect("turn 2 persists");
+
+    assert_eq!(
+        store.get_refcount(&orphan).expect("refcount"),
+        0,
+        "pruning turn 1 must release its tail block, or every turn leaks one"
+    );
+
+    store.gc_blocks().expect("gc");
+    assert!(
+        !store.blocks_dir().join(hex_digest(&orphan)).exists(),
+        "a released orphan block must be collectable by gc_blocks"
+    );
+}
+
+/// REGRESSION — `PruneMode::Observe` is the DEFAULT and must not delete.
+///
+/// It is documented as "log what WOULD be pruned, do not delete", and
+/// `gc_blocks` honours that. `prune_prefix_manifests` did not: it deleted in
+/// every mode except `Off`, so the default configuration silently destroyed
+/// superseded manifests while presenting itself as observe-only. An operator
+/// validating on real data before enabling deletion was already deleting.
+///
+/// The mutation that must redden this test: remove the `PruneMode::Observe`
+/// early-`continue` in `prune_prefix_manifests`.
+#[test]
+fn observe_mode_reports_a_prune_without_performing_it() {
+    const LAYERS: usize = 2;
+    const TURN1: i32 = DEFAULT_BLOCK_SIZE as i32 + 512;
+    const TURN2: i32 = 2 * DEFAULT_BLOCK_SIZE as i32;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    // Default mode — deliberately NOT set, so this test also pins the default.
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xD3u8; 32]);
+    assert_eq!(
+        store.prune_mode(),
+        PruneMode::Observe,
+        "Observe must remain the default; this test is about the default"
+    );
+
+    let t1: Vec<i32> = (0..TURN1).collect();
+    let m1 = store
+        .persist("m3", "tmpl", &t1, &fp16_set(LAYERS, TURN1))
+        .expect("turn 1 persists");
+    let t2: Vec<i32> = (0..TURN2).collect();
+    store
+        .persist("m3", "tmpl", &t2, &fp16_set(LAYERS, TURN2))
+        .expect("turn 2 persists");
+
+    assert_eq!(
+        count_manifests(&store),
+        2,
+        "observe mode DELETED a manifest. Its whole purpose is to let an \
+         operator see what deletion would do before enabling it."
+    );
+    assert_eq!(
+        store.get_refcount(&m1.block_hashes[1]).expect("refcount"),
+        1,
+        "observe mode must not decrement refcounts either — a released block \
+         is one gc pass away from deletion, so a silent decrement is a \
+         deferred silent delete"
+    );
+}

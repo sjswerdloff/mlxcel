@@ -249,6 +249,13 @@ impl BlockColdStore {
         self.block_size
     }
 
+    /// The configured prune mode. Exposed so a test can pin the DEFAULT rather
+    /// than only the modes it sets explicitly — the default is the one an
+    /// operator gets without choosing.
+    pub fn prune_mode(&self) -> PruneMode {
+        self.prune_mode
+    }
+
     // -----------------------------------------------------------------------
     // Block I/O
     // -----------------------------------------------------------------------
@@ -526,9 +533,44 @@ impl BlockColdStore {
     // Prune-on-persist (manifest prefix)
     // -----------------------------------------------------------------------
 
-    /// Delete manifests whose block hashes are a prefix of the new manifest's
-    /// block hashes. This handles the normal case (conversation grows).
-    pub fn prune_prefix_manifests(&self, new_manifest: &Manifest) -> Result<(), ColdStoreError> {
+    /// Delete manifests that describe a strict TOKEN prefix of the new
+    /// manifest's token sequence. This handles the normal case (conversation
+    /// grows).
+    ///
+    /// # Why this proves a token prefix rather than checking a hash-list prefix
+    ///
+    /// Alden's finding 2, confirmed against this code 2026-07-27 and pinned by
+    /// `growth_from_a_partial_tail_block_still_prunes_the_old_manifest`:
+    ///
+    /// `persist` chunks with `tokens.chunks(block_size)`, which yields a
+    /// PARTIAL final chunk whenever the token count is not an exact multiple of
+    /// the block size — and `block_hash_merkle` commits to that chunk's own
+    /// token count and tokens. So the moment the next turn fills that tail
+    /// block, its hash CHANGES. The old manifest's hash list is therefore not a
+    /// prefix of the new one, and a hash-list prefix check skips it: the
+    /// superseded manifest survives, holding a refcount on a now-orphaned tail
+    /// block. A conversation lands on an exact multiple of `block_size` only by
+    /// accident, so that was the ordinary path, not an edge case.
+    ///
+    /// The fix is to prove the thing we actually mean. We are inside `persist`
+    /// and hold the full token sequence, so for each candidate we recompute the
+    /// block hashes that `tokens[..old.total_tokens]` WOULD produce under the
+    /// current cache-computation identity, and prune only on an exact match.
+    /// That is a positive proof that the old manifest describes a prefix of
+    /// this same conversation under this same identity — strictly stronger than
+    /// the hash-list check it replaces, and it does not care where block
+    /// boundaries fall.
+    ///
+    /// Conservative by construction: any mismatch (divergent branch, different
+    /// mode/`v_bits`, different `block_size`, unreadable manifest) leaves the
+    /// candidate alone. Failing to prune costs disk; pruning wrongly costs a
+    /// live manifest, so every uncertain case must fall the same way.
+    pub fn prune_prefix_manifests(
+        &self,
+        new_manifest: &Manifest,
+        tokens: &[i32],
+        cache_id: &str,
+    ) -> Result<(), ColdStoreError> {
         let manifests_dir = self.manifests_dir();
         if !manifests_dir.exists() {
             return Ok(());
@@ -558,19 +600,65 @@ impl BlockColdStore {
                 Err(_) => continue,
             };
 
-            // Check if old manifest's block hashes are a prefix of new manifest's
-            if old_manifest.block_hashes.len() >= new_manifest.block_hashes.len() {
-                continue;
-            }
-            if old_manifest.block_hashes[..] != new_manifest.block_hashes[..old_manifest.block_hashes.len()] {
-                continue;
-            }
-
-            // Same identity check
+            // Same identity check — cheapest discriminator, so it runs first.
             if old_manifest.runtime_fingerprint != new_manifest.runtime_fingerprint
                 || old_manifest.model_id != new_manifest.model_id
                 || old_manifest.template_sig != new_manifest.template_sig
             {
+                continue;
+            }
+
+            // Never prune the manifest we just wrote, and never prune a
+            // manifest that is not STRICTLY shorter — equal length is either
+            // the same manifest or a divergence, and longer is not a prefix.
+            if old_manifest.total_tokens >= new_manifest.total_tokens {
+                continue;
+            }
+
+            // Block hashes computed under a different block_size are not
+            // comparable to ours at all.
+            if old_manifest.block_size != self.block_size {
+                continue;
+            }
+
+            // Guard the slice below. `total_tokens` is read off disk, so it is
+            // untrusted input, not an invariant.
+            if old_manifest.total_tokens > tokens.len() {
+                continue;
+            }
+
+            // TOKEN-PREFIX PROOF. Recompute what this candidate's block hashes
+            // would be for the first `old.total_tokens` tokens of the sequence
+            // we are persisting. An exact match proves the candidate describes
+            // a prefix of THIS conversation under THIS cache identity —
+            // including when its final block was partial and has since filled.
+            let expected = compute_block_hashes(
+                &tokens[..old_manifest.total_tokens],
+                self.block_size,
+                cache_id,
+            );
+            if expected != old_manifest.block_hashes {
+                continue;
+            }
+
+            // OBSERVE MEANS OBSERVE.
+            //
+            // `PruneMode::Observe` is the DEFAULT and is documented as "log
+            // what WOULD be pruned, do not delete". `gc_blocks` honours that;
+            // this function did not — it called `delete_manifest` in every mode
+            // except `Off`, so the default configuration was silently deleting
+            // manifests while reporting itself as observe-only. Found
+            // 2026-07-27 while testing Alden's finding 2: the prune tests
+            // passed under the default mode, which they could only do if
+            // deletion was really happening. Pinned by
+            // `observe_mode_reports_a_prune_without_performing_it`.
+            if self.prune_mode == PruneMode::Observe {
+                tracing::info!(
+                    would_prune = %old_manifest.hash_hex(),
+                    old_tokens = old_manifest.total_tokens,
+                    new_tokens = new_manifest.total_tokens,
+                    "COLD-STORE v4 observe: would prune token-prefix manifest"
+                );
                 continue;
             }
 
@@ -655,9 +743,11 @@ impl BlockColdStore {
 
         self.write_manifest(&manifest)?;
 
-        // Prune old manifests whose block hashes are a prefix
+        // Prune manifests proven to describe a strict token prefix of `tokens`.
+        // `cache_id` is passed through so the proof is computed under the same
+        // identity the hashes above were — see prune_prefix_manifests.
         if self.prune_mode != PruneMode::Off {
-            self.prune_prefix_manifests(&manifest)?;
+            self.prune_prefix_manifests(&manifest, tokens, &cache_id)?;
         }
 
         Ok(manifest)
