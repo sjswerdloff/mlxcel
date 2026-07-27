@@ -6008,6 +6008,101 @@ mod tests {
              to the thing every G1 bit-identity green claims to be measuring, and those \
              greens are unbacked rather than wrong."
         );
+
+        // ── THE SECOND AXIS, and the one the family's failure modes live in ──
+        //
+        // Violet, reviewing this control: the two arms above differ in EXTENT — three
+        // chunks against two, and the precondition asserts it. Different offset means a
+        // different attention window, so that divergence is a COARSE result. The failures
+        // G1 actually guards are CONTENT corruption at IDENTICAL extent: `detach.rs:164`'s
+        // v4 donation resurrecting as v8, packed u32 V codes read as u8 — same offset, same
+        // window, wrong payload.
+        //
+        // So a third arm at the SAME extent as the first, differing only in what the
+        // history contains. Same chunk count, same offset, same decode token; only the
+        // content behind it differs. Still entirely forward-driven.
+        let mut cache_other = KVCache::new();
+        for i in [0, 1] {
+            let _ = attn.forward(&chunk(i), &mut cache_other, None);
+        }
+        // Third chunk of the same LENGTH, drawn from a different region of the input.
+        let alt = mlxcel_core::slice(&input, &[0, l_chunk, 0], &[1, l_chunk * 2, hidden]);
+        let _ = attn.forward(&alt, &mut cache_other, None);
+        assert_eq!(
+            cache_other.offset, cache_long.offset - l_chunk,
+            "precondition: the content arm must reach the SAME extent as arm 1 did before \
+             its decode — equal offset is the whole point of this axis"
+        );
+
+        let out_other = attn.forward(&decode, &mut cache_other, None);
+        mlxcel_core::eval(&out_other);
+        assert_eq!(
+            cache_other.offset, cache_long.offset,
+            "precondition: equal extent must survive the decode too"
+        );
+        assert!(
+            !arrays_bit_identical(&out_long, &out_other),
+            "the output comparison did not distinguish two caches at IDENTICAL EXTENT whose \
+             histories hold different content. Extent-sensitivity alone is too coarse to \
+             back G1: the failure modes it guards — a v4 payload adopted as v8, a layer \
+             assembled from the wrong bytes — all keep the offset intact and change what is \
+             behind it."
+        );
+    }
+
+    /// The same backstop under K8V4, because fp16 sensitivity does not establish K8V4
+    /// sensitivity — my own argument, returned to me.
+    ///
+    /// Violet quoted `daa84a7` back at me: *"Under Fp16 the V payload is a plain tensor.
+    /// Under K8V4 it is packed u32 codes plus a scale sidecar."* That reasoning is exactly
+    /// as valid for the divergence control as it was for the equivalence test it justified.
+    /// A sensitivity demonstration in fp16 leaves G1.2a and G1.2b **unbacked** — the same
+    /// word, one representation along.
+    ///
+    /// Both axes, both arms forward-driven, at d128 with `v_bits = 4`.
+    #[test]
+    fn g1_0_output_comparison_is_sensitive_to_k8v4_cache_state() {
+        let attn = make_test_sparse_attention_d128();
+        let hidden = attn.num_heads * attn.head_dim;
+        let kv_len_prior = 429;
+        let x_decode = make_test_input(1, 1, hidden);
+
+        // Reference arm.
+        let mut cache_a = k8v4_prefilled(&attn, kv_len_prior, hidden);
+        let out_a = attn.forward(&x_decode, &mut cache_a, None);
+        mlxcel_core::eval(&out_a);
+        assert!(l2_norm(&out_a) > 1e-3, "degenerate output proves nothing");
+
+        // EXTENT axis: a shorter history.
+        let mut cache_short = k8v4_prefilled(&attn, kv_len_prior - 128, hidden);
+        let out_short = attn.forward(&x_decode, &mut cache_short, None);
+        mlxcel_core::eval(&out_short);
+        assert!(
+            !arrays_bit_identical(&out_a, &out_short),
+            "K8V4: the comparison did not distinguish differing history EXTENT"
+        );
+
+        // CONTENT axis at EQUAL extent — the one the K8V4 failure modes live in, where a
+        // v4 payload mislabelled v8 keeps every offset intact and changes the bytes behind
+        // them. Same prefill length, different prefill content, same decode token.
+        let mut cache_other = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        cache_other.set_kvarn_v_bits(4);
+        let x_alt = mlxcel_core::multiply_scalar(&make_test_input(1, kv_len_prior, hidden), -1.0);
+        let _ = attn.forward(&x_alt, &mut cache_other, None);
+        assert_eq!(
+            cache_other.offset, cache_a.offset - 1,
+            "precondition: equal extent before the decode"
+        );
+        let out_other = attn.forward(&x_decode, &mut cache_other, None);
+        mlxcel_core::eval(&out_other);
+        assert_eq!(cache_other.offset, cache_a.offset, "precondition: equal extent after");
+        assert!(
+            !arrays_bit_identical(&out_a, &out_other),
+            "K8V4: the comparison did not distinguish two caches at IDENTICAL EXTENT holding \
+             different content. G1.2a and G1.2b's bit-identity greens are unbacked without \
+             this — packed u32 codes plus a scale sidecar is a different representation from \
+             fp16's plain tensor, and sensitivity in one does not establish it in the other."
+        );
     }
 
     /// G1.1 at the cheap width — the routine structural regression gate.
