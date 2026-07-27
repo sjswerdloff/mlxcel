@@ -5909,6 +5909,412 @@ mod tests {
             .collect()
     }
 
+    /// Extract a float array to host as `Vec<f32>`. Forces the dtype rather
+    /// than assuming it: reading an fp16 array's raw bytes as f32 recovers
+    /// half the elements and yields a plausible-looking wrong answer
+    /// (measured 2026-07-27 — 328 values for 656 elements, on an instrument
+    /// whose conclusion happened to survive anyway).
+    fn host_f32(a: &MlxArray) -> Vec<f32> {
+        let as_f32 = mlxcel_core::astype(a, mlxcel_core::dtype::FLOAT32);
+        mlxcel_core::array_to_raw_bytes(&as_f32)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// Elementwise divergence between two outputs, computed on the HOST so
+    /// that no device reduction order enters the number being calibrated.
+    /// Calibrating a tolerance with an instrument that has its own
+    /// accumulation error would fold that error into the threshold.
+    struct DiffStats {
+        max_abs: f32,
+        max_rel: f32,
+        l2: f32,
+        ref_absmax: f32,
+        n: usize,
+    }
+
+    fn diff_stats(a: &MlxArray, b: &MlxArray) -> DiffStats {
+        let (av, bv) = (host_f32(a), host_f32(b));
+        assert_eq!(
+            av.len(),
+            bv.len(),
+            "element counts must match to compare elementwise"
+        );
+        assert!(!av.is_empty(), "VACUOUS: nothing to compare");
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        let mut sumsq = 0.0f64;
+        let mut ref_absmax = 0.0f32;
+        for (x, y) in av.iter().zip(bv.iter()) {
+            assert!(
+                x.is_finite() && y.is_finite(),
+                "non-finite value in a calibration input ({x}, {y}) — the \
+                 measurement is void, not merely large"
+            );
+            let d = (x - y).abs();
+            max_abs = max_abs.max(d);
+            sumsq += (d as f64) * (d as f64);
+            let scale = x.abs().max(y.abs());
+            ref_absmax = ref_absmax.max(scale);
+            if scale > 1e-6 {
+                max_rel = max_rel.max(d / scale);
+            }
+        }
+        DiffStats {
+            max_abs,
+            max_rel,
+            l2: sumsq.sqrt() as f32,
+            ref_absmax,
+            n: av.len(),
+        }
+    }
+
+    /// The K1 body, parameterized by prior length and run under WHATEVER
+    /// core dispatch is currently in effect. Returns the divergence between
+    /// the production gathered path (taken by `forward`) and the v1
+    /// full-window reference path driven by hand over an identically
+    /// prefilled cache.
+    ///
+    /// Note the asymmetry this is measuring, which is the whole point of
+    /// the layer-3 gate: `sparse_decode_attention` always runs the BLOCKED
+    /// core, while the gathered flow is the only one carrying the
+    /// `msa_core_sdpa_enabled()` hook. Under the production default the two
+    /// sides therefore differ by kernel AND by wrapper, and a tolerance
+    /// inherited from the two-cores-on-identical-inputs gate would not
+    /// cover the wrapper half.
+    ///
+    /// PRECONDITION, asserted rather than assumed: nkb must exceed top_k,
+    /// or `forward` never takes the gathered branch and this measures the
+    /// full-window path against itself — reporting a comfortable 0.0 that
+    /// means nothing at all.
+    fn measure_gathered_vs_full(kv_len_prior: i32) -> DiffStats {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128; // production quantum; harness default is 2
+        let hidden = 16;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+        let nkb = (kv_len + attn.block_size - 1) / attn.block_size;
+        assert!(
+            nkb > attn.top_k,
+            "VACUOUS GEOMETRY: nkb ({nkb}) <= top_k ({}) means forward() does \
+             not take the gathered branch, so this would measure the \
+             full-window path against itself",
+            attn.top_k
+        );
+
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let x_decode = make_test_input(1, l, hidden);
+
+        // Cache A: the real forward dispatch (production gathered path).
+        let mut cache_a = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        assert!(cache_a.supports_block_fetch());
+        let _ = attn.forward(&x_prefill, &mut cache_a, None);
+        assert_eq!(cache_a.offset, kv_len_prior);
+        let gathered_out = attn.forward(&x_decode, &mut cache_a, None);
+        mlxcel_core::eval(&gathered_out);
+        assert_eq!(cache_a.offset, kv_len, "decode token must be cached");
+
+        // Cache B: identical prefill, decode hand-driven down the v1
+        // full-window path, replicating forward's pre-dispatch pipeline.
+        let mut cache_b = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let _ = attn.forward(&x_prefill, &mut cache_b, None);
+        assert_eq!(cache_b.offset, kv_len_prior);
+
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = if let Some(ref n) = attn.k_norm {
+            n.forward(&k)
+        } else {
+            k
+        };
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let (cache_k, cache_v) = cache_b.update_and_fetch(k, v);
+
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(&x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = if let Some(ref n) = attn.index_k_norm {
+            n.forward(&idx_k)
+        } else {
+            idx_k
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let idx_k_full = cache_b.m3_idx_k_update_and_fetch(&idx_k);
+
+        let q_raw = attn.q_proj.forward(&x_decode);
+        let q = mlxcel_core::reshape(&q_raw, &[1, l, attn.num_heads, attn.head_dim]);
+        let q = if let Some(ref n) = attn.q_norm {
+            n.forward(&q)
+        } else {
+            q
+        };
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let q = mlxcel_core::fast_rope(&q, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+
+        let v1_out = attn.sparse_decode_attention(
+            &x_decode,
+            &q,
+            &cache_k,
+            &cache_v,
+            &idx_k_full,
+            1,
+            l,
+            kv_len,
+            offset,
+        );
+        mlxcel_core::eval(&v1_out);
+
+        assert_eq!(
+            mlxcel_core::array_shape(&gathered_out),
+            mlxcel_core::array_shape(&v1_out),
+            "output shapes must match to compare"
+        );
+        diff_stats(&gathered_out, &v1_out)
+    }
+
+    /// MEASUREMENT, not a gate. Sweeps a geometry matrix under the
+    /// PRODUCTION default dispatch and prints the divergence table that the
+    /// layer-3 tolerance is calibrated from. The tolerance is not guessed
+    /// and not inherited — it is read off this sweep, with margin, and then
+    /// mutation-proven to bite.
+    ///
+    /// Run with:
+    ///   cargo test -p mlxcel --lib -- --ignored --test-threads=1 \
+    ///     layer3_tolerance_calibration_sweep --nocapture
+    #[test]
+    #[ignore = "CALIBRATION sweep, not a gate. Run with: --ignored --test-threads=1 --nocapture"]
+    fn layer3_tolerance_calibration_sweep() {
+        // Production default must be in effect — this sweep is calibrating
+        // the tolerance for the dispatch users actually get.
+        assert!(
+            msa_core_sdpa_enabled(),
+            "dispatch witness: the sweep must run under the production sdpa \
+             core, otherwise it calibrates a tolerance for a path nobody runs"
+        );
+
+        // nkb >= 3 throughout (nkb > top_k = 2 is required for the gathered
+        // branch); varies depth and tail alignment independently.
+        let geometries: [(i32, &str); 5] = [
+            (383, "nkb=3  exact block multiple (kv_len 384)"),
+            (429, "nkb=4  partial tail 46 (kv_len 430) — the K1 geometry"),
+            (511, "nkb=4  exact block multiple (kv_len 512)"),
+            (900, "nkb=8  partial tail 5   (kv_len 901)"),
+            (1023, "nkb=8  exact block multiple (kv_len 1024)"),
+        ];
+
+        eprintln!(
+            "\n{:<46} {:>4} {:>12} {:>12} {:>12} {:>12}",
+            "GEOMETRY", "n", "max_abs", "max_rel", "l2", "ref_absmax"
+        );
+        let mut worst_abs = 0.0f32;
+        let mut worst_rel = 0.0f32;
+        for (prior, label) in geometries {
+            let s = measure_gathered_vs_full(prior);
+            assert!(
+                s.max_abs > 0.0,
+                "VACUOUS at {label}: the two paths are identical to the bit. \
+                 Under the production sdpa core the gathered path runs a \
+                 different kernel than the full-window reference, so exact \
+                 equality means the gathered branch did not run."
+            );
+            eprintln!(
+                "{label:<46} {:>4} {:>12.3e} {:>12.3e} {:>12.3e} {:>12.3e}",
+                s.n, s.max_abs, s.max_rel, s.l2, s.ref_absmax
+            );
+            worst_abs = worst_abs.max(s.max_abs);
+            worst_rel = worst_rel.max(s.max_rel);
+        }
+        eprintln!("\nWORST ACROSS MATRIX: max_abs {worst_abs:.3e}  max_rel {worst_rel:.3e}\n");
+    }
+
+    /// Layer-3 tolerance. CALIBRATED, not guessed and not inherited.
+    ///
+    /// Read off `layer3_tolerance_calibration_sweep` on 2026-07-27 over a
+    /// 5-geometry matrix (nkb 3/4/8, exact and partial tails), reproducible
+    /// bit-for-bit across repeated runs:
+    ///
+    ///     worst max_abs 1.118e-8      worst max_rel 4.572e-6
+    ///
+    /// Margins: rtol is ~22x the worst observed relative divergence, atol
+    /// ~89x the worst observed absolute. Both are TIGHTER than the
+    /// 1e-3/1e-3 that `sdpa_core_matches_blocked_core_on_identical_inputs`
+    /// uses, because the end-to-end path measured far inside that — a
+    /// tolerance inherited from that gate would have been ~200x looser than
+    /// the evidence supports.
+    ///
+    /// SCOPE CAVEAT, stated because it is easy to carry these numbers
+    /// somewhere they do not belong: L3_ATOL is magnitude-dependent and is
+    /// calibrated for THIS harness, whose outputs run ~1.3e-2. Production
+    /// magnitudes are larger and would scale the absolute divergence with
+    /// them. If the harness dimensions or input scale change, re-run the
+    /// sweep — do not reuse this constant on faith. L3_RTOL is the
+    /// magnitude-independent half and is the one that transfers.
+    ///
+    /// `layer3_tolerance_bites_on_a_mutation` proves these numbers
+    /// discriminate real bugs rather than merely passing.
+    const L3_RTOL: f32 = 1e-4;
+    const L3_ATOL: f32 = 1e-6;
+
+    /// LAYER 3 (Alden's disposition, 2026-07-27): the gate on the dispatch
+    /// users actually get.
+    ///
+    /// K1 pins the STRUCTURAL contract — gathered vs full-window on the
+    /// same blocked core, where bit identity is the right claim. It says
+    /// nothing about production, because production defaults to
+    /// `MsaCore::Sdpa`, which is hooked ONLY on the gathered flow. So the
+    /// shipped path differs from the reference by kernel AND by wrapper,
+    /// and until this test existed nothing gated it at all.
+    ///
+    /// Tolerance-gated by necessity: `sparse_decode_core_sdpa` is
+    /// documented as "NOT bit-identical to the blocked core (the fused
+    /// kernel's accumulation order differs)". Demanding atol=0 here is the
+    /// exact mistake that made K1 unpassable for nine eliminations.
+    #[test]
+    fn production_gathered_sdpa_decode_matches_full_window_within_tolerance() {
+        assert!(
+            msa_core_sdpa_enabled(),
+            "dispatch witness: this gate is meaningless unless the production \
+             sdpa core is the one in effect — without this assertion a default \
+             flip would silently turn it into a duplicate of K1"
+        );
+        assert!(
+            !msa_fetch_qmm_enabled(),
+            "dispatch witness: the fused qmm fetch core must be off"
+        );
+
+        let geometries: [(i32, &str); 5] = [
+            (383, "nkb=3 exact"),
+            (429, "nkb=4 partial tail (K1 geometry)"),
+            (511, "nkb=4 exact"),
+            (900, "nkb=8 partial tail"),
+            (1023, "nkb=8 exact"),
+        ];
+
+        for (prior, label) in geometries {
+            let s = measure_gathered_vs_full(prior);
+
+            // A zero here is not a pass. Under the production sdpa core the
+            // gathered path runs a DIFFERENT kernel than the full-window
+            // reference, so exact equality means the gathered branch never
+            // ran and this geometry certified nothing.
+            assert!(
+                s.max_abs > 0.0,
+                "VACUOUS at {label}: outputs identical to the bit under a \
+                 dispatch that cannot produce bit identity — the gathered \
+                 branch did not run"
+            );
+
+            assert!(
+                s.max_rel <= L3_RTOL,
+                "{label}: production gathered+sdpa decode diverges from the \
+                 full-window reference by max_rel {:.3e}, over the calibrated \
+                 {:.0e}. Observed worst at calibration was 4.572e-6, so this \
+                 is {:.0}x the measured baseline — a logic divergence, not \
+                 kernel accumulation noise. (max_abs {:.3e}, l2 {:.3e}, n {})",
+                s.max_rel,
+                L3_RTOL,
+                s.max_rel / 4.572e-6,
+                s.max_abs,
+                s.l2,
+                s.n
+            );
+            assert!(
+                s.max_abs <= L3_ATOL,
+                "{label}: max_abs {:.3e} over the calibrated {:.0e} \
+                 (ref_absmax {:.3e}). If harness magnitudes changed, re-run \
+                 layer3_tolerance_calibration_sweep rather than loosening this.",
+                s.max_abs,
+                L3_ATOL,
+                s.ref_absmax
+            );
+        }
+    }
+
+    /// MUTATION CONTROL for the layer-3 tolerance. A gate whose green
+    /// cannot go red certifies nothing, so this names two mutations and
+    /// proves each blows through L3_RTOL by orders of magnitude.
+    ///
+    /// Both are injected at the core, where they can be applied without
+    /// touching production code: a position table shifted by one (the
+    /// masking/position class of bug) and a selection pointed at the wrong
+    /// block (the union/remap class). These are precisely the two suspects
+    /// the K1 failure message named and could not distinguish.
+    #[test]
+    fn layer3_tolerance_bites_on_a_mutation() {
+        let attn = make_test_sparse_attention();
+        let (b, h_kv, nh, hd) = (1, attn.num_kv_heads, attn.num_heads, attn.head_dim);
+        let (bs, top_k) = (attn.block_size, attn.top_k);
+        let nkb = 5;
+        let w = nkb * bs;
+        let l = 2;
+        let offset = w - l;
+
+        let det = |n: usize, phase: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32) * 0.37 + phase).sin() * 0.5)
+                .collect()
+        };
+        let k =
+            mlxcel_core::from_slice_f32(&det((b * h_kv * w * hd) as usize, 0.1), &[b, h_kv, w, hd]);
+        let v =
+            mlxcel_core::from_slice_f32(&det((b * h_kv * w * hd) as usize, 1.3), &[b, h_kv, w, hd]);
+        let q = mlxcel_core::from_slice_f32(&det((b * nh * l * hd) as usize, 2.7), &[b, nh, l, hd]);
+        let pos_full = mlxcel_core::arange_f32(0.0, w as f32, 1.0);
+
+        let sel_f: Vec<f32> = vec![1.0, 4.0, 2.0, 4.0, 0.0, 4.0, 3.0, 4.0];
+        let selected = mlxcel_core::astype(
+            &mlxcel_core::from_slice_f32(&sel_f, &[b, h_kv, l, top_k]),
+            mlxcel_core::dtype::INT32,
+        );
+
+        let out_ok =
+            attn.sparse_decode_core_sdpa(&q, &k, &v, &selected, &pos_full, nkb, b, l, offset);
+        mlxcel_core::eval(&out_ok);
+
+        // MUTATION 1: every absolute position shifted by one. Changes which
+        // keys the position rule masks before softmax.
+        let pos_shift = mlxcel_core::arange_f32(1.0, (w + 1) as f32, 1.0);
+        let out_pos =
+            attn.sparse_decode_core_sdpa(&q, &k, &v, &selected, &pos_shift, nkb, b, l, offset);
+        mlxcel_core::eval(&out_pos);
+
+        // MUTATION 2: one row's past-block pick moved to a different block.
+        let sel_mut_f: Vec<f32> = vec![1.0, 4.0, 2.0, 4.0, 0.0, 4.0, 1.0, 4.0];
+        let selected_mut = mlxcel_core::astype(
+            &mlxcel_core::from_slice_f32(&sel_mut_f, &[b, h_kv, l, top_k]),
+            mlxcel_core::dtype::INT32,
+        );
+        let out_sel =
+            attn.sparse_decode_core_sdpa(&q, &k, &v, &selected_mut, &pos_full, nkb, b, l, offset);
+        mlxcel_core::eval(&out_sel);
+
+        for (name, mutated) in [("positions+1", &out_pos), ("selection", &out_sel)] {
+            let s = diff_stats(&out_ok, mutated);
+            eprintln!(
+                "MUTATION {name}: max_rel {:.3e}  max_abs {:.3e}  ({:.0}x L3_RTOL)",
+                s.max_rel,
+                s.max_abs,
+                s.max_rel / L3_RTOL
+            );
+            assert!(
+                s.max_rel > L3_RTOL * 10.0,
+                "MUTATION {name} produced max_rel {:.3e}, which is NOT clear of \
+                 L3_RTOL ({:.0e}) by 10x. The layer-3 tolerance does not \
+                 discriminate this class of bug, so its green means nothing \
+                 for that class — tighten the tolerance or strengthen the gate.",
+                s.max_rel,
+                L3_RTOL
+            );
+        }
+    }
+
     /// ALDEN'S LEVEL-1/2 DISCRIMINATOR for the K1 gate (his brief, 2026-07-27).
     ///
     /// The K1 gate compares two decode paths with `allclose(a, b, 0.0, 0.0)`
