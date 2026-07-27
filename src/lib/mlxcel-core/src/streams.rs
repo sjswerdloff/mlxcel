@@ -234,6 +234,33 @@ pub fn install_default_stream(stream: Option<&UniquePtr<MlxStream>>) {
 ///
 /// Idempotent. Safe no-op semantics are the caller's responsibility only
 /// in the sense that it must be on a live thread.
+///
+/// # DELIBERATELY UNWIRED — read this before adding a caller
+///
+/// Nothing in production calls this, and that is on purpose. So is the
+/// same fact about [`shutdown`]. **There is no measured evidence that any
+/// per-thread release is required**: MLX's own per-thread containers are
+/// `thread_local` and self-destruct, and `main` — which has none of this
+/// machinery at all — does not exhibit the flake this was built for.
+///
+/// This function exists to demonstrate, executably, the *correct* shape
+/// (release from a live thread body), as the contrast partner to the
+/// destructor version that was fatal. That is its whole job today.
+///
+/// **The historical warning, because it already happened once.** Commit
+/// `2cda250` added `clear_streams` plumbing and said in its own message:
+/// *"Neither production nor test paths currently invoke `clear_streams`
+/// anywhere"* and *"the test-teardown flake is not proven fixed"*. An
+/// unwired primitive with a plausible name was then auto-wired into
+/// `install_thread_local_default_stream` without that verification, and
+/// every thread installing a generation stream began dying at thread exit
+/// — the deterministic version of the intermittent crash it was meant to
+/// prevent.
+///
+/// So: **do not wire this because it looks like it belongs somewhere.**
+/// Wire it only together with a measurement showing the release is needed
+/// and a test that reddens without it. Machinery and its verification land
+/// in the same change, or neither lands.
 pub fn finalize_thread() {
     ffi::clear_streams();
 }
@@ -253,6 +280,11 @@ pub fn finalize_thread() {
 ///
 /// Sound because it runs on a live thread. The same three calls from a
 /// thread-exit destructor trap; see the "Per-thread MLX teardown" notes.
+///
+/// **Also DELIBERATELY UNWIRED — zero callers.** Same reasoning and same
+/// historical warning as [`finalize_thread`]; read that before adding one.
+/// A SIGTERM handler is the intended eventual home, but it lands with the
+/// measurement, not ahead of it.
 pub fn shutdown() {
     ffi::synchronize_default();
     ffi::clear_streams();
@@ -262,6 +294,33 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Refuse to run vacuously.
+    ///
+    /// The teardown tests below only discriminate anything when a GPU is
+    /// present: without one, `new_thread_local_generation_stream()` returns
+    /// `None`, `install_thread_local_default_stream(None)` is a no-op, and
+    /// the test degenerates into "run an MLX op on a thread" — green under
+    /// any finalizer, correct or catastrophic.
+    ///
+    /// So the precondition is an assertion, not a silent branch. On a host
+    /// without a GPU these tests FAIL rather than pass emptily, and the
+    /// failure text says what to do about it. Turning that into a
+    /// deliberate `#[ignore]` for a genuinely CPU-only target is a decision
+    /// someone makes on purpose and can be seen making — which is the whole
+    /// point.
+    fn require_gpu_or_refuse(test: &str) {
+        assert!(
+            ffi::is_gpu_available(),
+            "VACUOUS: `{test}` cannot fail on this host — no GPU, so \
+             install_thread_local_default_stream is a no-op and the teardown \
+             path under test is never exercised. This test is REFUSING to \
+             report a green it did not earn. If this target is genuinely \
+             CPU-only, gate the test with an explicit #[ignore] naming that \
+             reason (see cold_store::tests::sharpened_kv_concurrency_probe \
+             for the precedent) rather than letting it pass emptily."
+        );
+    }
 
     /// REGRESSION GUARD — a thread that installs a generation stream, uses
     /// MLX, and then EXITS must not take the process with it.
@@ -286,11 +345,13 @@ mod tests {
     /// coverage). This test catches ONE failure mode: a thread-exit
     /// destructor that faults. It is silent about:
     ///
-    /// 1. **CPU-only builds — it goes VACUOUS.** With no GPU,
-    ///    `new_thread_local_generation_stream()` returns `None`,
-    ///    `install_thread_local_default_stream(None)` is a no-op, and this
-    ///    degenerates to "run an MLX op on a thread". It would pass under
-    ///    any finalizer at all. It only bites on a GPU build.
+    /// 1. ~~CPU-only builds — it goes VACUOUS.~~ **CLOSED** — this is now
+    ///    enforced, not documented. Violet's point: a doc comment is
+    ///    fail-visible to a *reviewer*, and CI is not a reviewer — it reads
+    ///    exit codes, where a vacuous green is indistinguishable from a real
+    ///    one. `require_gpu_or_refuse` below makes the vacuous case fail
+    ///    loudly in the OUTPUT. Silent-pass is the one outcome not available
+    ///    to a test whose job is catching a silent crash.
     /// 2. **Corruption without a fault.** A finalizer that releases the
     ///    wrong thread's state, or releases too early, and does not crash,
     ///    stays green here.
@@ -308,6 +369,8 @@ mod tests {
     #[test]
     fn install_then_exit_thread_does_not_kill_the_process() {
         use crate::dtype;
+
+        require_gpu_or_refuse("install_then_exit_thread_does_not_kill_the_process");
 
         let handle = std::thread::spawn(|| {
             let tls = new_thread_local_generation_stream();
@@ -333,6 +396,8 @@ mod tests {
     /// destructor.
     #[test]
     fn finalize_thread_from_a_live_thread_body_is_sound() {
+        require_gpu_or_refuse("finalize_thread_from_a_live_thread_body_is_sound");
+
         let handle = std::thread::spawn(|| {
             let tls = new_thread_local_generation_stream();
             install_thread_local_default_stream(tls.as_ref());
