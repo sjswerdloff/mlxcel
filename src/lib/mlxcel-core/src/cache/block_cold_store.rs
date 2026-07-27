@@ -634,6 +634,24 @@ impl BlockColdStore {
         // Read layers
         let mut caches = Vec::with_capacity(header.layer_count);
         for (expected_index, metadata) in header.layers.iter().enumerate() {
+            // `metadata.index` was WRITTEN and never READ: the path below is built
+            // from the enumerate position, so a corrupted stored index changed
+            // nothing and went unchallenged. Found 2026-07-28 by flipping every
+            // header byte in turn — after the token region was covered by address
+            // re-derivation, these 8 bytes (two `index` fields) were the only ones
+            // left that could be corrupted with the load still succeeding.
+            //
+            // Harmless today precisely BECAUSE nothing trusts it, which is the
+            // argument for checking rather than deleting: a stored field that is
+            // allowed to lie is inherited by whoever reads it next.
+            if metadata.index as usize != expected_index {
+                return Err(invalid_data(format!(
+                    "block header layer slot {expected_index} declares index {} — the \
+                     layer table is out of order or corrupted, and the payload read below \
+                     would be attributed to the wrong layer",
+                    metadata.index
+                )));
+            }
             let layer_path = block_dir.join(format!("layer_{expected_index:04}.bin"));
             let bytes = fs::read(&layer_path)?;
             if bytes.len() as u64 != metadata.byte_len {
@@ -1539,7 +1557,15 @@ impl BlockColdStore {
 
         // Try to load each candidate
         for (manifest, matched_tokens) in candidates {
-            match self.assemble_blocks(&manifest) {
+            match self.assemble_blocks(&manifest).and_then(|(cache_set, stored)| {
+                // ACCEPTANCE, not assembly: the merge succeeding says the blocks
+                // fit together, not that they are the blocks this address names.
+                // A failure here falls through to the next-shorter candidate by
+                // the same path a damaged payload takes — a manifest whose tokens
+                // do not re-derive its addresses is not a candidate.
+                self.verify_manifest_addresses(&manifest, &stored, &load_cache_id)?;
+                Ok(cache_set)
+            }) {
                 Ok(cache_set) => {
                     let matched = matched_tokens.min(tokens.len());
                     return Ok((cache_set, matched));
@@ -1580,7 +1606,19 @@ impl BlockColdStore {
     /// never was one. The within-module fact (`load_prefix` calls this) does not
     /// establish reachability from the server, and the earlier wording conflated
     /// the two.
-    fn assemble_blocks(&self, manifest: &Manifest) -> Result<DetachedCacheSet, ColdStoreError> {
+    /// Merge a manifest's blocks into one cache set, and return the token list
+    /// the blocks themselves carry alongside it.
+    ///
+    /// **The tokens are returned, not discarded.** They are the input to
+    /// [`Self::verify_manifest_addresses`], and discarding them is what left them
+    /// unverified. This function stays a mechanical merge — it does not decide
+    /// whether the manifest is the one the caller asked for. That is a candidate
+    /// ACCEPTANCE question and belongs to `load_prefix`, which is also the only
+    /// caller that knows the `kv_mode_config` the addresses were computed under.
+    fn assemble_blocks(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<(DetachedCacheSet, Vec<i32>), ColdStoreError> {
         if manifest.block_hashes.is_empty() {
             return Err(invalid_data("manifest has no blocks".into()));
         }
@@ -1588,8 +1626,10 @@ impl BlockColdStore {
         // Read every block up front: merging is per LAYER across ALL blocks,
         // so no layer can be finished until every block has been read.
         let mut blocks: Vec<DetachedCacheSet> = Vec::with_capacity(manifest.block_hashes.len());
+        let mut stored_tokens: Vec<i32> = Vec::with_capacity(manifest.total_tokens);
         for block_hash in &manifest.block_hashes {
-            let (_tokens, cache_set) = self.read_block(block_hash)?;
+            let (tokens, cache_set) = self.read_block(block_hash)?;
+            stored_tokens.extend_from_slice(&tokens);
             blocks.push(cache_set);
         }
 
@@ -1625,7 +1665,65 @@ impl BlockColdStore {
             origin_seq_id: SequenceId(0),
         };
 
-        Ok(cache_set)
+        Ok((cache_set, stored_tokens))
+    }
+
+    /// Re-derive this manifest's block addresses from the tokens the blocks
+    /// themselves carry, and require the chain to match.
+    ///
+    /// **This is the check the store's correctness argument assumed and did not
+    /// perform.** `read_block` compares `header.block_hash` against the hash it
+    /// was ASKED for — a stored field against an argument — and checksums each
+    /// layer PAYLOAD. Nothing digested the header, and the block's token list
+    /// lives in the header. Measured 2026-07-28 by flipping every byte in turn:
+    /// **8200 of 8328 header bytes** could be corrupted with `read_block` still
+    /// returning `Ok`, and 8192 of those are the 2048 stored tokens
+    /// (`encode_block_header`: version 4 ‖ hash 32 ‖ count 8 ‖ tokens 4·N ‖ … ).
+    ///
+    /// Why it mattered: the whole argument for this store is that the address is
+    /// a hash over the tokens, so a matching address means matching tokens.
+    /// `block_hash_merkle` *does* commit to `own_tokens` — but nothing recomputed
+    /// it on read, so corrupted tokens yielded KV state attributed to a prefix it
+    /// did not come from. Intact payload, wrong interpretation: the `116924f`
+    /// failure class, which did not crash — it computed the wrong thing. v3
+    /// (`cold_store_reference.rs`) digests its header and cross-checks the
+    /// identity on load, so v4 was **less** protected than the store it
+    /// supersedes.
+    ///
+    /// The data to verify against was already on disk. This is a verification
+    /// that was skipped, not new state.
+    ///
+    /// Chunking the concatenation reproduces the original partition because
+    /// `persist` chunks with `tokens.chunks(block_size)`, so every block but the
+    /// last is exactly `block_size` long.
+    fn verify_manifest_addresses(
+        &self,
+        manifest: &Manifest,
+        stored_tokens: &[i32],
+        kv_mode_config: &str,
+    ) -> Result<(), ColdStoreError> {
+        let rederived = compute_block_hashes(stored_tokens, manifest.block_size, kv_mode_config);
+        if rederived == manifest.block_hashes {
+            return Ok(());
+        }
+        let first_bad = rederived
+            .iter()
+            .zip(&manifest.block_hashes)
+            .position(|(a, b)| a != b);
+        Err(invalid_data(format!(
+            "the stored token list does not re-derive this manifest's block addresses \
+             (manifest {} blocks / {} tokens, re-derived {} blocks from {} stored tokens; \
+             first divergence at block {}). The payload bytes may be perfectly intact — what \
+             failed is the claim that they belong to THESE tokens. Adopting this state would \
+             attach a KV prefix to a conversation it did not come from.",
+            manifest.block_hashes.len(),
+            manifest.total_tokens,
+            rederived.len(),
+            stored_tokens.len(),
+            first_bad
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "length".into()),
+        )))
     }
 }
 

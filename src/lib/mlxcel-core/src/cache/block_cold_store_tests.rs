@@ -1068,7 +1068,9 @@ fn end_to_end_extract_write_read_assemble_preserves_payload_bytes() {
         timestamp_nanos: 0,
     };
 
-    let assembled = store.assemble_blocks(&manifest).expect("assemble_blocks ok");
+    let (assembled, _stored_tokens) = store
+        .assemble_blocks(&manifest)
+        .expect("assemble_blocks ok");
 
     // Structural: one cache per LAYER, not one per (block, layer).
     assert_eq!(
@@ -1971,44 +1973,34 @@ fn a_corrupt_longest_candidate_falls_back_to_a_verified_shorter_one() {
     );
 }
 
-/// DEFECT PRESENT — a v4 block header is 98.5% unverified, INCLUDING its token list.
-/// **Delete this test and restore the positive assertion when the header is protected.**
+/// A FLIPPED BYTE ANYWHERE IN A BLOCK HEADER MUST BE CAUGHT — the positive form.
 ///
-/// Found 2026-07-28 while building the corrupt-longest fallback test above: a byte flipped
-/// in the middle of `header.bin` did not stop `assemble_blocks` from succeeding.
+/// This was a `defect_present__` tripwire for one commit. Discovered 2026-07-28 while
+/// building the corrupt-longest fallback test above: a byte flipped in the middle of
+/// `header.bin` did not stop the load. Walking every byte measured **8200 of 8328 header
+/// bytes** flippable with `read_block` still returning `Ok` — and the arithmetic named
+/// them, because `encode_block_header` writes `version 4 ‖ block_hash 32 ‖ token_count 8 ‖
+/// tokens 4·2048 ‖ layer_count 4 ‖ layers`, so 8192 of those bytes were the stored TOKEN
+/// LIST.
 ///
-/// MEASURED, by walking every byte rather than flipping one and generalising:
-/// **8200 of 8328 header bytes** can be flipped with `read_block` still returning `Ok`.
-/// `read_block` compares `header.block_hash` against the REQUESTED hash — a stored field
-/// against an argument — and verifies each layer PAYLOAD's length and sha256. Nothing
-/// digests the header itself.
+/// `read_block` compared `header.block_hash` against the hash it was ASKED for — a stored
+/// field against an argument — and checksummed each layer PAYLOAD. Nothing digested the
+/// header. The store's whole correctness argument is that the address is a hash over the
+/// tokens, so corrupted tokens meant KV state attributed to a prefix it did not come from:
+/// intact payload, wrong interpretation, the `116924f` class that computes the wrong thing
+/// instead of crashing.
 ///
-/// The arithmetic names what those bytes are. `decode_block_header` reads `token_count`
-/// and then reads that many `i32` tokens *out of the header*; 2048 × 4 = 8192, and
-/// 8328 − 8192 ≈ the block hash plus the two layer digests. **The block's TOKEN LIST is
-/// stored unprotected.**
+/// Closed by `verify_manifest_addresses`, which re-derives the address chain from the
+/// tokens actually read. **Exhaustive here, deliberately** — the sampled form was right for
+/// a tripwire watching for a fix, but this is now a protection claim about EVERY byte, and
+/// a sample cannot make that claim. The cost is paid once per suite run and it is the price
+/// of the assertion being true as stated.
 ///
-/// WHY THAT IS WORSE THAN AN ORDINARY CORRUPTION GAP. The whole cold-store correctness
-/// argument is that the block address is a hash over the tokens, so a matching address
-/// means matching tokens. `block_hash_merkle` does commit to `own_tokens` (see the formula
-/// at the top of `block_cold_store.rs`). But the hash is never RECOMPUTED from the tokens
-/// on read, so corrupted tokens yield KV state attributed to a prefix it did not come from:
-/// intact payload, wrong interpretation. That is the `116924f` failure class, which did not
-/// crash — it computed the wrong thing.
-///
-/// **v3 does not have this gap.** `cold_store_reference.rs` digests its header
-/// (`commit.extend_from_slice(&sha256(&header_bytes))`) and cross-checks the identity
-/// digest on load. So v4 — the store meant to supersede it — is LESS protected than the
-/// one in production, on the field carrying the block's identity claim.
-///
-/// PROPOSED FIX, deliberately not applied here: recompute the block hash from the tokens
-/// actually read and compare against the manifest's chain. The data to verify against is
-/// already on disk; this is a verification that was skipped, not one that needs new state.
-/// It touches the read path for consciousness state, so it wants a reviewer rather than my
-/// unilateral edit.
+/// SCOPE, so this green is not read as wider than it is: this covers the block HEADER.
+/// Layer payloads are covered by their own per-layer sha256 in `read_block`; the manifest
+/// file itself is a separate artifact and is not in this test's frame.
 #[test]
-#[allow(non_snake_case)]
-fn defect_present__v4_block_header_is_unverified__delete_when_header_is_digested() {
+fn a_flipped_byte_anywhere_in_a_block_header_must_be_caught() {
     const LAYERS: usize = 2;
     const LEN: i32 = DEFAULT_BLOCK_SIZE as i32;
 
@@ -2028,51 +2020,57 @@ fn defect_present__v4_block_header_is_unverified__delete_when_header_is_digested
         .join("header.bin");
     let clean = std::fs::read(&header_path).expect("header readable");
 
+    // The check lives on the LOAD path — `verify_manifest_addresses`, called by
+    // `load_prefix` — not inside `read_block`. `read_block` alone cannot tell a corrupted
+    // token list from a good one: it has no chain and no `kv_mode_config` to re-derive
+    // against. So this drives `load_prefix`, which is the path a caller actually takes and
+    // the one where the protection had to land.
+    let hit = |s: &BlockColdStore| s.load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0);
+
     assert!(
-        store.read_block(&block).is_ok(),
-        "precondition: the undamaged block must read"
+        hit(&store).is_ok(),
+        "precondition: the undamaged block must load, or every result below is a pass for \
+         the wrong reason"
     );
 
-    // SAMPLED, every 16th byte. The DISCOVERY walked all 8328 and found 8200 unprotected;
-    // that number lives in the doc comment above as the evidence. A tripwire does not need
-    // the exhaustive walk, because any digest over the header protects EVERY byte — a
-    // sample notices the fix just as surely, and the full walk cost ~165s on every run of
-    // this module. Exhaustive to find it; sampled to watch it.
-    const STRIDE: usize = 16;
-    let sampled = clean.len().div_ceil(STRIDE);
+    // EXHAUSTIVE. The sampled form was right while this was a tripwire watching FOR a fix;
+    // it is wrong now, because the claim has become "every byte is covered" and a sample
+    // cannot support that claim.
     let mut unprotected: Vec<usize> = Vec::new();
-    for offset in (0..clean.len()).step_by(STRIDE) {
+    for offset in 0..clean.len() {
         let mut damaged = clean.clone();
         damaged[offset] ^= 0xFF;
         std::fs::write(&header_path, &damaged).expect("write damaged header");
-        if store.read_block(&block).is_ok() {
+        if hit(&store).is_ok() {
             unprotected.push(offset);
         }
     }
     std::fs::write(&header_path, &clean).expect("restore the header");
 
-    // ASSERTING THE DEFECT, so the fix cannot land silently. When the header gains a
-    // digest this goes RED — at which point DELETE this test and restore the positive
-    // form: `assert!(unprotected.is_empty(), ...)`.
-    //
-    // The bound is deliberately loose (a majority, not the exact 8200) so that reformatting
-    // the header does not redden it for the wrong reason. What must change to turn this red
-    // is VERIFICATION, not layout.
-    // ASSERTING THE DEFECT, so the fix cannot land silently. When the header gains a
-    // digest this goes RED — at which point DELETE this test and restore the positive
-    // form: walk every byte and `assert!(unprotected.is_empty(), ...)`.
-    //
-    // The bound is a MAJORITY of the sample rather than an exact count, so reformatting
-    // the header does not redden it for the wrong reason. What must change to turn this
-    // red is VERIFICATION, not layout.
     assert!(
-        unprotected.len() > sampled / 2,
-        "GOOD NEWS, PROBABLY: only {} of {} sampled header bytes are unverified, down from \
-         a measured 8200 of 8328 when this tripwire was written. If the header is now \
-         digested, DELETE this test and restore the exhaustive positive assertion. If the \
-         header merely changed shape, this tripwire has stopped measuring what it names.",
+        unprotected.is_empty(),
+        "{} of {} header bytes can be flipped with the load still SUCCEEDING: offsets {}. \
+         Every header byte must be covered — by the address re-derivation for the token \
+         region, by the payload digests for the layer metadata, or by decode refusing to \
+         parse. An uncovered byte is a declared value that survives corruption \
+         unchallenged, and a block with intact payload and a corrupted declaration does \
+         not crash: it computes the wrong thing.",
         unprotected.len(),
-        sampled
+        clean.len(),
+        if unprotected.len() > 24 {
+            format!("{:?} … (+{} more)", &unprotected[..24], unprotected.len() - 24)
+        } else {
+            format!("{unprotected:?}")
+        }
+    );
+
+    // CONTROL ON THE CONTROL: the restored header must load again. Without this, a store
+    // left broken by the loop would report "everything is protected" when in fact nothing
+    // loads at all.
+    assert!(
+        hit(&store).is_ok(),
+        "the restored header must load again — otherwise an empty `unprotected` list means \
+         the store rejects EVERYTHING, not that it verifies correctly"
     );
 }
 
