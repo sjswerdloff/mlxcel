@@ -6153,6 +6153,687 @@ mod tests {
         );
     }
 
+    /// THE SETTLING TEST — is the gathered PAYLOAD identical to the
+    /// corresponding slice of the full-window payload?
+    ///
+    /// L1/L2/L3 cleared selection, union, remap and positions. That leaves
+    /// the payload or the arithmetic at the `sparse_decode_core` boundary.
+    /// This separates those two.
+    ///
+    /// # Why this has no premise problem
+    ///
+    /// Every earlier attempt compared TWO caches and therefore inherited the
+    /// unproven "identical KVarN8 state" assumption. **This uses ONE cache and
+    /// two FETCH paths.** There is nothing to assume: the state is literally
+    /// the same object.
+    ///
+    ///   full    = cache.update_and_fetch(k, v)   -> dequantized full window
+    ///   compact = cache.fetch_msa_blocks(&union) -> dequantized gathered window
+    ///
+    /// The contract the gathered path relies on is that compact slot `s` holds
+    /// exactly block `union[s]`. So for every slot, the compact rows
+    /// `[s*bs, s*bs+valid)` must be BYTE-IDENTICAL to the full rows
+    /// `[union[s]*bs, union[s]*bs+valid)`, where `valid` clips the final block
+    /// to `kv_len` (positions beyond `kv_len` are padding the core masks).
+    ///
+    /// Compared as RAW BYTES, so no tolerance and no `output_l2_diff`.
+    ///
+    /// FAILS  => the block-fetch dequant path returns different values than
+    ///           the full-window dequant path for the same stored tiles. The
+    ///           K1 divergence is a PAYLOAD bug, and "union/remap/positions"
+    ///           in its message is the wrong suspect list.
+    /// PASSES => payload is identical; the fault is arithmetic or operation
+    ///           order inside `sparse_decode_core`, on inputs that agree.
+    #[test]
+    fn gathered_payload_matches_full_window_payload_byte_for_byte() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+        let b = 1;
+        let bs = attn.block_size;
+
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let x_decode = make_test_input(1, l, hidden);
+
+        // ONE cache. No second prefill, so no premise to prove.
+        let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let _ = attn.forward(&x_prefill, &mut cache, None);
+
+        // Drive the decode token in exactly as the full-window path does.
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = if let Some(ref n) = attn.k_norm {
+            n.forward(&k)
+        } else {
+            k
+        };
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let (full_k, full_v) = cache.update_and_fetch(k, v);
+        mlxcel_core::eval(&full_k);
+        mlxcel_core::eval(&full_v);
+
+        // The union the gathered path would fetch, from the production planner.
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(&x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = if let Some(ref n) = attn.index_k_norm {
+            n.forward(&idx_k)
+        } else {
+            idx_k
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let idx_k_full = cache.m3_idx_k_update_and_fetch(&idx_k);
+        let idx_q = attn.project_index_queries(&x_decode, b, l, offset);
+        let sel =
+            host_i32(&attn.per_token_block_selection(&idx_q, &idx_k_full, b, l, kv_len, offset));
+        let union = union_from_selection(&sel);
+
+        let (comp_k, comp_v) = cache.fetch_msa_blocks(&union);
+        mlxcel_core::eval(&comp_k);
+        mlxcel_core::eval(&comp_v);
+
+        let fk_shape = mlxcel_core::array_shape(&full_k);
+        let ck_shape = mlxcel_core::array_shape(&comp_k);
+        eprintln!(
+            "DIAG PAYLOAD union={union:?} full_k={fk_shape:?} comp_k={ck_shape:?} \
+             full_v={:?} comp_v={:?}",
+            mlxcel_core::array_shape(&full_v),
+            mlxcel_core::array_shape(&comp_v)
+        );
+
+        let heads = fk_shape[1];
+        let hd = fk_shape[3];
+        assert_eq!(
+            ck_shape[0], fk_shape[0],
+            "batch must match between fetch paths"
+        );
+        assert_eq!(ck_shape[1], heads, "kv-head count must match");
+        assert_eq!(ck_shape[3], hd, "head_dim must match");
+        assert_eq!(
+            ck_shape[2],
+            union.len() as i32 * bs,
+            "compact window must be exactly n_blocks * block_size rows"
+        );
+
+        let mut compared_rows = 0;
+        for (s, &blk) in union.iter().enumerate() {
+            let abs_start = blk * bs;
+            let valid = (kv_len - abs_start).min(bs);
+            if valid <= 0 {
+                continue;
+            }
+            let comp_start = s as i32 * bs;
+
+            for (name, cbuf, fbuf) in [("K", &comp_k, &full_k), ("V", &comp_v, &full_v)] {
+                let c = mlxcel_core::slice(
+                    cbuf,
+                    &[0, 0, comp_start, 0],
+                    &[fk_shape[0], heads, comp_start + valid, hd],
+                );
+                let f = mlxcel_core::slice(
+                    fbuf,
+                    &[0, 0, abs_start, 0],
+                    &[fk_shape[0], heads, abs_start + valid, hd],
+                );
+                let cb = mlxcel_core::array_to_raw_bytes(&c);
+                let fb = mlxcel_core::array_to_raw_bytes(&f);
+                assert_eq!(
+                    cb.len(),
+                    fb.len(),
+                    "{name}: byte length differs for compact slot {s} (absolute block {blk})"
+                );
+                let first_diff = cb.iter().zip(fb.iter()).position(|(x, y)| x != y);
+                assert!(
+                    first_diff.is_none(),
+                    "PAYLOAD DIVERGENCE in {name}: compact slot {s} holds absolute \
+                     block {blk}, but the block-fetch dequant differs from the \
+                     full-window dequant at byte {} of {} ({} rows compared). \
+                     Selection, union, remap and positions are all already proven \
+                     exact (L1/L2/L3), so this is the payload, and the K1 failure \
+                     message's 'union/remap/positions' is the wrong suspect list.",
+                    first_diff.unwrap(),
+                    cb.len(),
+                    valid
+                );
+            }
+            compared_rows += valid;
+        }
+
+        assert!(
+            compared_rows > 0,
+            "no rows compared — the test proved nothing"
+        );
+        eprintln!(
+            "DIAG PAYLOAD compared {compared_rows} rows across {} blocks",
+            union.len()
+        );
+    }
+
+    /// THE ANSWER — the two paths differ in their PADDING, not their data.
+    ///
+    /// Everything else is now proven identical: selection (L1), union (L2),
+    /// remap and positions (L3), and the VALID payload rows byte-for-byte.
+    /// Reduction extent was refuted as the cause by saturating `top_k`.
+    /// One region was never compared, because the earlier payload test
+    /// explicitly clipped to `kv_len`: the rows BEYOND the sequence end.
+    ///
+    /// The two paths fill that region differently by construction:
+    ///
+    ///   full-window: `k` is concatenated with an EXPLICIT ZERO block of
+    ///                `pad_k_amt = padded_k_len - kv_len` rows.
+    ///   gathered:    `fetch_msa_blocks` returns whole tiles, so the tail
+    ///                tile's rows past `kv_len` carry whatever the stored
+    ///                tile holds — NOT necessarily zero.
+    ///
+    /// Both are masked by the core's `pos <= q_pos` rule, so neither is
+    /// *wrong*. But masking is applied to SCORES; the padded value rows still
+    /// enter the reduction weighted by (near-)zero probabilities, and
+    /// `0 * garbage` is only exactly `0` if the garbage is finite and the
+    /// weight is exactly zero. Any difference here is a few-ULP output
+    /// difference — precisely what the K1 gate measures.
+    ///
+    /// This test does not assert which behaviour is correct. It MEASURES
+    /// whether the tail regions differ, so the K1 failure stops being
+    /// attributed to "union/remap/positions".
+    #[test]
+    fn tail_padding_differs_between_the_two_fetch_paths() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+        let bs = attn.block_size;
+        let num_key_blocks = (kv_len + bs - 1) / bs;
+        let padded_k_len = num_key_blocks * bs;
+        let pad_amt = padded_k_len - kv_len;
+
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let x_decode = make_test_input(1, l, hidden);
+
+        // ONE cache — no premise to prove.
+        let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let _ = attn.forward(&x_prefill, &mut cache, None);
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = if let Some(ref n) = attn.k_norm {
+            n.forward(&k)
+        } else {
+            k
+        };
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let (full_k, _full_v) = cache.update_and_fetch(k, v);
+        mlxcel_core::eval(&full_k);
+
+        // Whole-window block fetch: every block, so the tail tile is included.
+        let all_blocks: Vec<i32> = (0..num_key_blocks).collect();
+        let (comp_k, comp_v) = cache.fetch_msa_blocks(&all_blocks);
+        mlxcel_core::eval(&comp_k);
+        mlxcel_core::eval(&comp_v);
+
+        let shape = mlxcel_core::array_shape(&comp_k);
+        assert_eq!(
+            shape[2], padded_k_len,
+            "whole-window block fetch must return the full padded extent"
+        );
+        assert_eq!(
+            mlxcel_core::array_shape(&full_k)[2],
+            kv_len,
+            "the full-window fetch returns only kv_len rows; the path pads it \
+             with an explicit ZERO block afterwards"
+        );
+
+        // The tail region the full-window path fills with explicit zeros.
+        let tail = mlxcel_core::slice(
+            &comp_k,
+            &[0, 0, kv_len, 0],
+            &[shape[0], shape[1], padded_k_len, shape[3]],
+        );
+        let tail_v = mlxcel_core::slice(
+            &comp_v,
+            &[0, 0, kv_len, 0],
+            &[shape[0], shape[1], padded_k_len, shape[3]],
+        );
+        mlxcel_core::eval(&tail);
+        mlxcel_core::eval(&tail_v);
+
+        let nonzero = |a: &MlxArray, name: &str| -> (usize, f32) {
+            let bytes = mlxcel_core::array_to_raw_bytes(a);
+            let vals: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let n = vals.iter().filter(|x| **x != 0.0).count();
+            let m = vals.iter().fold(0.0f32, |acc, x| acc.max(x.abs()));
+            eprintln!(
+                "DIAG TAIL {name}: {} values, {n} nonzero, max_abs={m:e}",
+                vals.len()
+            );
+            (n, m)
+        };
+        let (nz_k, _) = nonzero(&tail, "K");
+        let (nz_v, _) = nonzero(&tail_v, "V");
+
+        eprintln!(
+            "DIAG TAIL kv_len={kv_len} padded_k_len={padded_k_len} pad_amt={pad_amt} \
+             (full-window path fills these {pad_amt} rows with EXPLICIT ZEROS)"
+        );
+
+        assert_eq!(
+            (nz_k, nz_v),
+            (0, 0),
+            "TAIL PADDING DIVERGENCE: the block-fetch path returns {nz_k} nonzero K \
+             and {nz_v} nonzero V values in the {pad_amt} rows past kv_len, where \
+             the full-window path substitutes an EXPLICIT ZERO block. Selection, \
+             union, remap, positions and the valid payload rows are all already \
+             proven identical, and reduction extent was refuted by saturating \
+             top_k — so this is the remaining structural difference between the \
+             two paths and the candidate source of the K1 gate's few-ULP diff."
+        );
+    }
+
+    /// THE DECISIVE PAYLOAD COMPARISON — every block, whole window, raw bytes.
+    ///
+    /// The earlier payload test compared only the blocks in the DEFAULT union
+    /// ([1, 3]). Blocks 0 and 2 were never compared, and block 0 is the SINK,
+    /// which the KVarN8 layout stores differently from history tiles
+    /// ([sink | history | tail]). So "payload matches" was scoped to two
+    /// blocks and read as if it covered the window.
+    ///
+    /// This compares the ENTIRE padded window, byte for byte, on ONE cache:
+    ///
+    ///   full-window path: `update_and_fetch` (kv_len rows) ++ an explicit
+    ///                     ZERO block of `pad_amt` rows  == padded_k_len
+    ///   gathered path:    `fetch_msa_blocks(all blocks)` == padded_k_len
+    ///
+    /// Under a saturated union these are the exact tensors the two paths hand
+    /// to the SAME `sparse_decode_core`. If they are byte-identical, the core
+    /// receives identical inputs and the K1 divergence must come from the core
+    /// itself. If they differ, the K1 divergence is a fetch/dequant difference
+    /// and every "union/remap/positions" attribution is wrong.
+    #[test]
+    fn whole_window_payload_is_identical_across_both_fetch_paths() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+        let bs = attn.block_size;
+        let num_key_blocks = (kv_len + bs - 1) / bs;
+        let padded_k_len = num_key_blocks * bs;
+        let pad_amt = padded_k_len - kv_len;
+
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let x_decode = make_test_input(1, l, hidden);
+
+        let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let _ = attn.forward(&x_prefill, &mut cache, None);
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = if let Some(ref n) = attn.k_norm {
+            n.forward(&k)
+        } else {
+            k
+        };
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let (full_k, full_v) = cache.update_and_fetch(k, v);
+
+        // Reproduce the full-window path's padding exactly: concatenate a zero
+        // block of pad_amt rows (see sparse_decode_attention).
+        let kv_dtype = mlxcel_core::array_dtype(&full_k);
+        let pad = mlxcel_core::full_f32(
+            &[1, attn.num_kv_heads, pad_amt, attn.head_dim],
+            0.0,
+            kv_dtype,
+        );
+        let full_k_pad = mlxcel_core::concatenate(&full_k, &pad, 2);
+        let full_v_pad = mlxcel_core::concatenate(&full_v, &pad, 2);
+        mlxcel_core::eval(&full_k_pad);
+        mlxcel_core::eval(&full_v_pad);
+
+        let all_blocks: Vec<i32> = (0..num_key_blocks).collect();
+        let (comp_k, comp_v) = cache.fetch_msa_blocks(&all_blocks);
+        mlxcel_core::eval(&comp_k);
+        mlxcel_core::eval(&comp_v);
+
+        assert_eq!(
+            mlxcel_core::array_shape(&full_k_pad),
+            mlxcel_core::array_shape(&comp_k),
+            "padded full-window and whole-window block fetch must have the same shape"
+        );
+
+        for (name, a, b_) in [("K", &full_k_pad, &comp_k), ("V", &full_v_pad, &comp_v)] {
+            let ab = mlxcel_core::array_to_raw_bytes(a);
+            let bb = mlxcel_core::array_to_raw_bytes(b_);
+            assert_eq!(ab.len(), bb.len(), "{name}: byte lengths differ");
+            let diffs: Vec<usize> = ab
+                .iter()
+                .zip(bb.iter())
+                .enumerate()
+                .filter(|(_, (x, y))| x != y)
+                .map(|(i, _)| i)
+                .collect();
+            let per_row = ab.len() / padded_k_len as usize;
+            let rows: std::collections::BTreeSet<usize> = diffs
+                .iter()
+                .map(|i| (i / per_row) % padded_k_len as usize)
+                .collect();
+            let blocks: std::collections::BTreeSet<usize> =
+                rows.iter().map(|r| r / bs as usize).collect();
+            eprintln!(
+                "DIAG WHOLE {name}: {} of {} bytes differ; {} rows; blocks touched={:?}",
+                diffs.len(),
+                ab.len(),
+                rows.len(),
+                blocks
+            );
+            assert!(
+                diffs.is_empty(),
+                "WHOLE-WINDOW PAYLOAD DIVERGENCE in {name}: {} of {} bytes differ, \
+                 spanning {} rows in blocks {:?}. The two fetch paths do NOT return \
+                 the same window for the same cache, so the K1 gate's inputs differ \
+                 before the core is ever entered — and 'union/remap/positions' is \
+                 the wrong suspect list.",
+                diffs.len(),
+                ab.len(),
+                rows.len(),
+                blocks
+            );
+        }
+    }
+
+    /// THE SETTLEMENT — drive BOTH decode paths from the SAME `q`.
+    ///
+    /// Everything upstream is now proven identical on one cache: selection,
+    /// union, remap, positions, and the WHOLE padded window byte-for-byte
+    /// (0 of 8192 bytes differ, K and V, all blocks including the sink).
+    /// Reduction extent was refuted by saturating `top_k`. Tail padding is
+    /// zero in both. And with `MsaFetch::Dequant` (the default) both paths
+    /// call the SAME `sparse_decode_core`.
+    ///
+    /// One difference was never eliminated, and it is in the K1 GATE ITSELF
+    /// rather than in the code under test: the gate takes its gathered output
+    /// from `attn.forward(...)`, which computes `q` internally, and its
+    /// full-window output from a HAND-REBUILT copy of that pipeline. If the
+    /// hand-rebuild is not bit-exact, the gate measures its own harness.
+    ///
+    /// This removes that variable: one cache, one `q`, both decode functions
+    /// called directly.
+    ///
+    /// PASSES => the two decode paths ARE bit-identical on identical inputs.
+    ///           The K1 gate's 6 ULP is an artifact of its harness — the
+    ///           hand-rebuilt `q`/pipeline — not a union/remap/positions bug,
+    ///           and not a defect in the gathered path at all.
+    /// FAILS  => a genuine divergence survives with every input identical,
+    ///           and it lives inside the core dispatch.
+    #[test]
+    #[ignore = "OPEN DEFECT probe, not a gate: reproduces the K1 divergence in minimal form (one cache, one q, every upstream input proven byte-identical). Un-ignore when the core is made provenance-insensitive or the K1 premise is revised. Do NOT delete and do NOT loosen. Run with: cargo test --lib -- --ignored --test-threads=1"]
+    fn both_decode_paths_agree_when_driven_from_the_same_q() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+        let b = 1;
+
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let x_decode = make_test_input(1, l, hidden);
+
+        let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        assert!(cache.supports_block_fetch());
+        let _ = attn.forward(&x_prefill, &mut cache, None);
+
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = if let Some(ref n) = attn.k_norm {
+            n.forward(&k)
+        } else {
+            k
+        };
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let (cache_k, cache_v) = cache.update_and_fetch(k, v);
+
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(&x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = if let Some(ref n) = attn.index_k_norm {
+            n.forward(&idx_k)
+        } else {
+            idx_k
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let idx_k_full = cache.m3_idx_k_update_and_fetch(&idx_k);
+
+        // ONE q, shared by both calls.
+        let q_raw = attn.q_proj.forward(&x_decode);
+        let q = mlxcel_core::reshape(&q_raw, &[1, l, attn.num_heads, attn.head_dim]);
+        let q = if let Some(ref n) = attn.q_norm {
+            n.forward(&q)
+        } else {
+            q
+        };
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let q = mlxcel_core::fast_rope(&q, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        mlxcel_core::eval(&q);
+
+        let gathered = attn.sparse_decode_attention_gathered(
+            &x_decode,
+            &q,
+            &cache,
+            &idx_k_full,
+            b,
+            l,
+            kv_len,
+            offset,
+        );
+        let full = attn.sparse_decode_attention(
+            &x_decode,
+            &q,
+            &cache_k,
+            &cache_v,
+            &idx_k_full,
+            b,
+            l,
+            kv_len,
+            offset,
+        );
+        mlxcel_core::eval(&gathered);
+        mlxcel_core::eval(&full);
+
+        assert_eq!(
+            mlxcel_core::array_shape(&gathered),
+            mlxcel_core::array_shape(&full),
+            "the two decode functions must return the same shape"
+        );
+
+        let gb = mlxcel_core::array_to_raw_bytes(&gathered);
+        let fb = mlxcel_core::array_to_raw_bytes(&full);
+        let ndiff = gb.iter().zip(fb.iter()).filter(|(x, y)| x != y).count();
+        eprintln!(
+            "DIAG SAMEQ shape={:?} bytes={} differing={} l2={:e}",
+            mlxcel_core::array_shape(&gathered),
+            gb.len(),
+            ndiff,
+            output_l2_diff(&gathered, &full)
+        );
+
+        assert_eq!(
+            ndiff,
+            0,
+            "Both decode paths were driven from ONE cache and ONE q, with every \
+             upstream input already proven byte-identical, and they STILL differ \
+             ({ndiff} of {} bytes, l2 {:e}). The divergence is inside the core \
+             dispatch itself.",
+            gb.len(),
+            output_l2_diff(&gathered, &full)
+        );
+    }
+
+    /// THE 2x2 CELL — same q AND saturated extent — drive BOTH decode paths from the SAME `q`.
+    ///
+    /// Everything upstream is now proven identical on one cache: selection,
+    /// union, remap, positions, and the WHOLE padded window byte-for-byte
+    /// (0 of 8192 bytes differ, K and V, all blocks including the sink).
+    /// Reduction extent was refuted by saturating `top_k`. Tail padding is
+    /// zero in both. And with `MsaFetch::Dequant` (the default) both paths
+    /// call the SAME `sparse_decode_core`.
+    ///
+    /// One difference was never eliminated, and it is in the K1 GATE ITSELF
+    /// rather than in the code under test: the gate takes its gathered output
+    /// from `attn.forward(...)`, which computes `q` internally, and its
+    /// full-window output from a HAND-REBUILT copy of that pipeline. If the
+    /// hand-rebuild is not bit-exact, the gate measures its own harness.
+    ///
+    /// This removes that variable: one cache, one `q`, both decode functions
+    /// called directly.
+    ///
+    /// PASSES => the two decode paths ARE bit-identical on identical inputs.
+    ///           The K1 gate's 6 ULP is an artifact of its harness — the
+    ///           hand-rebuilt `q`/pipeline — not a union/remap/positions bug,
+    ///           and not a defect in the gathered path at all.
+    /// FAILS  => a genuine divergence survives with every input identical,
+    ///           and it lives inside the core dispatch.
+    #[test]
+    #[ignore = "OPEN DEFECT probe, not a gate: reproduces the K1 divergence in minimal form (one cache, one q, every upstream input proven byte-identical). Un-ignore when the core is made provenance-insensitive or the K1 premise is revised. Do NOT delete and do NOT loosen. Run with: cargo test --lib -- --ignored --test-threads=1"]
+    fn both_decode_paths_agree_when_driven_from_the_same_q_saturated() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+        let b = 1;
+        // SATURATE: union covers every block, so both windows have the SAME
+        // extent. Combined with the shared q, this is the clean 2x2 cell:
+        // harness eliminated AND extent equalised.
+        attn.top_k = (kv_len + attn.block_size - 1) / attn.block_size;
+
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let x_decode = make_test_input(1, l, hidden);
+
+        let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        assert!(cache.supports_block_fetch());
+        let _ = attn.forward(&x_prefill, &mut cache, None);
+
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = if let Some(ref n) = attn.k_norm {
+            n.forward(&k)
+        } else {
+            k
+        };
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let (cache_k, cache_v) = cache.update_and_fetch(k, v);
+
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(&x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = if let Some(ref n) = attn.index_k_norm {
+            n.forward(&idx_k)
+        } else {
+            idx_k
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let idx_k_full = cache.m3_idx_k_update_and_fetch(&idx_k);
+
+        // ONE q, shared by both calls.
+        let q_raw = attn.q_proj.forward(&x_decode);
+        let q = mlxcel_core::reshape(&q_raw, &[1, l, attn.num_heads, attn.head_dim]);
+        let q = if let Some(ref n) = attn.q_norm {
+            n.forward(&q)
+        } else {
+            q
+        };
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let q = mlxcel_core::fast_rope(&q, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        mlxcel_core::eval(&q);
+
+        let gathered = attn.sparse_decode_attention_gathered(
+            &x_decode,
+            &q,
+            &cache,
+            &idx_k_full,
+            b,
+            l,
+            kv_len,
+            offset,
+        );
+        let full = attn.sparse_decode_attention(
+            &x_decode,
+            &q,
+            &cache_k,
+            &cache_v,
+            &idx_k_full,
+            b,
+            l,
+            kv_len,
+            offset,
+        );
+        mlxcel_core::eval(&gathered);
+        mlxcel_core::eval(&full);
+
+        assert_eq!(
+            mlxcel_core::array_shape(&gathered),
+            mlxcel_core::array_shape(&full),
+            "the two decode functions must return the same shape"
+        );
+
+        let gb = mlxcel_core::array_to_raw_bytes(&gathered);
+        let fb = mlxcel_core::array_to_raw_bytes(&full);
+        let ndiff = gb.iter().zip(fb.iter()).filter(|(x, y)| x != y).count();
+        eprintln!(
+            "DIAG SAMEQ shape={:?} bytes={} differing={} l2={:e}",
+            mlxcel_core::array_shape(&gathered),
+            gb.len(),
+            ndiff,
+            output_l2_diff(&gathered, &full)
+        );
+
+        assert_eq!(
+            ndiff,
+            0,
+            "Both decode paths were driven from ONE cache and ONE q, with every \
+             upstream input already proven byte-identical, and they STILL differ \
+             ({ndiff} of {} bytes, l2 {:e}). The divergence is inside the core \
+             dispatch itself.",
+            gb.len(),
+            output_l2_diff(&gathered, &full)
+        );
+    }
+
     /// K1 gate (plan §K1): the gathered decode path on a KVarN8 cache must
     /// be BIT-IDENTICAL to the v1 full-window sparse decode path on the
     /// same cache state (atol 0). The two share `sparse_decode_core`, so
