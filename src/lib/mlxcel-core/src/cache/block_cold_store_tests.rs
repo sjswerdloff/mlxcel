@@ -1552,3 +1552,163 @@ fn concurrent_same_block_persist_leaves_a_readable_store() {
          Writer errors: {errs:?}"
     );
 }
+
+// ===========================================================================
+// G3.1 — KILL -9 MID-PERSIST (Violet's pre-deploy gate, minimum-viable item 4)
+//
+// Distinct from G2.1 and from the fsync question, and the gate doc bundled all
+// three under "durability". They are different failure modes:
+//   G2.1  concurrent writers      -> logical interleaving
+//   G3.1  process dies mid-write  -> torn LOGICAL state (manifest vs blocks)
+//   fsync process+kernel survive  -> torn PHYSICAL state; kill -9 does NOT
+//         exercise it, because the page cache outlives the process. Only power
+//         loss or a kernel panic tears those writes. Do not read a green G3.1
+//         as discharging fsync.
+//
+// The child re-execs THIS test binary with MLXCEL_G31_CHILD set, persists into
+// a directory the parent owns, and is SIGKILLed after a delay. The parent then
+// asserts a property that must hold for EVERY kill point, so the gate cannot
+// be flaky: whatever survives on disk must be READABLE, or absent. Never
+// present-and-corrupt, because present-and-corrupt is what load_prefix would
+// adopt as a prefix.
+// ===========================================================================
+
+// # MUTATION RECORD — this gate is proven two-sided
+//
+//   PRISTINE                      -> GREEN. 26/40 runs killed mid-persist,
+//                                    195 committed blocks inspected, all
+//                                    readable. temp+rename holds under SIGKILL.
+//   ATOMIC COMMIT REMOVED         -> RED. "KILL -9 LEFT A READABLE-BUT-CORRUPT
+//   (tmp_dir = block_dir, no          COMMITTED BLOCK (delay 225ms)". Restored
+//    rename)                          md5-identical afterwards.
+//
+// # Why the kill points are dense, which is load-bearing
+//
+// The FIRST version used 5 coarse delays and PASSED WITH ATOMIC COMMIT
+// REMOVED — it could not demonstrate its own bite. The window where a block
+// directory exists but is incomplete is short (serialization dominates; file
+// writes are memcpy into page cache), so coarse sampling misses it. Density is
+// what turns this from decoration into a control. Do not thin the delay list
+// to make the suite faster without re-running the mutation.
+//
+// Cost: ~25s. That is the price of a durability gate that can actually fail.
+const G31_CHILD_ENV: &str = "MLXCEL_G31_CHILD";
+const G31_DIR_ENV: &str = "MLXCEL_G31_DIR";
+
+/// Child workload: persist a multi-block cache, then exit. Never returns if
+/// the parent kills it first, which is the point.
+fn g31_child_workload() {
+    let base = std::path::PathBuf::from(
+        std::env::var(G31_DIR_ENV).expect("child needs MLXCEL_G31_DIR"),
+    );
+    let store = BlockColdStore::new(base, [31u8; 32]);
+    // 8 blocks — enough work that a kill lands mid-persist rather than
+    // always before or always after.
+    const BLOCKS: i32 = 8;
+    let depth = BLOCKS * DEFAULT_BLOCK_SIZE as i32;
+    let set = fp16_set(2, depth);
+    let tokens: Vec<i32> = (0..depth).collect();
+    let _ = store.persist("m3", "tmpl", &tokens, &set);
+}
+
+#[test]
+fn kill_9_mid_persist_never_leaves_a_readable_corrupt_block() {
+    // Child mode: this same binary, re-entered. Do the work and leave.
+    if std::env::var(G31_CHILD_ENV).is_ok() {
+        g31_child_workload();
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("current_exe");
+    // The harness matches on the FULL module path, without the crate name.
+    // Passing the bare fn name with --exact silently matches nothing and the
+    // child exits "ok. 0 passed" — a green child that ran no workload.
+    let test_path = format!(
+        "{}::kill_9_mid_persist_never_leaves_a_readable_corrupt_block",
+        module_path!()
+            .strip_prefix("mlxcel_core::")
+            .unwrap_or(module_path!())
+    );
+    // Kill points must be DENSE, not merely spread. The window in which a
+    // block directory exists but is incomplete is short — serialization
+    // dominates, file writes are memcpy-to-page-cache — so a handful of
+    // coarse delays samples it with low probability. Measured: with 5 coarse
+    // delays this test passed even with atomic commit REMOVED, i.e. it could
+    // not demonstrate its own bite. Density is what makes it a control.
+    let delays_ms: Vec<u64> = (1..=40).map(|i| i * 25).collect();
+    let mut killed_runs = 0usize;
+    let mut survivors = 0usize;
+
+    for delay in delays_ms.iter().copied() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut child = std::process::Command::new(&exe)
+            .arg(&test_path)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(G31_CHILD_ENV, "1")
+            .env(G31_DIR_ENV, dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child");
+
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+        let already_exited = child.try_wait().expect("try_wait").is_some();
+        if !already_exited {
+            child.kill().expect("SIGKILL child");
+            killed_runs += 1;
+        }
+        let _ = child.wait();
+
+        // ---- the invariant, checked on whatever the corpse left behind ----
+        let store = BlockColdStore::new(dir.path().to_path_buf(), [31u8; 32]);
+        let blocks_dir = store.blocks_dir();
+        if !blocks_dir.exists() {
+            continue; // killed before any block landed — valid outcome
+        }
+
+        for entry in std::fs::read_dir(&blocks_dir).expect("read blocks dir") {
+            let entry = entry.expect("dir entry");
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue; // .refcount sidecars are not blocks
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".tmp.") {
+                // Staging residue is EXPECTED after a kill: temp+rename means
+                // an interrupted write leaves .tmp.<hash> behind. It is a disk
+                // leak, not a correctness hazard — every scan site skips the
+                // .tmp. prefix (:323, :486, :621), so it is never mistaken for
+                // a committed block. Recorded, not asserted against.
+                continue;
+            }
+            survivors += 1;
+            // A COMMITTED directory must be fully readable. read_block verifies
+            // per-layer sha256 and byte_len, so this catches a block that was
+            // renamed into place while incomplete.
+            let mut hash = [0u8; 32];
+            let raw: Vec<u8> = (0..32)
+                .map(|i| u8::from_str_radix(&name[i * 2..i * 2 + 2], 16).unwrap_or(0))
+                .collect();
+            hash.copy_from_slice(&raw);
+            store.read_block(&hash).unwrap_or_else(|e| {
+                panic!(
+                    "KILL -9 LEFT A READABLE-BUT-CORRUPT COMMITTED BLOCK (delay {delay}ms): \
+                     {name}: {e}\n\
+                     The directory exists, so load_prefix can discover and adopt it, but it \
+                     fails its own per-layer sha256/byte_len. temp+rename is supposed to make \
+                     commit atomic; this is the case where it did not."
+                )
+            });
+        }
+    }
+
+    // Control: if we never actually killed anything mid-flight, this test
+    // proved nothing and must say so rather than pass quietly.
+    assert!(
+        killed_runs > 0,
+        "no child was killed mid-persist at any delay — the workload finished too fast, \
+         so this gate exercised NOTHING. Increase BLOCKS or shorten the delays."
+    );
+    eprintln!("G3.1: killed {killed_runs}/{} runs, inspected {survivors} committed blocks",
+              delays_ms.len());
+}
