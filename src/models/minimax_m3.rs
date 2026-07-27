@@ -5932,6 +5932,17 @@ mod tests {
         l2: f32,
         ref_absmax: f32,
         n: usize,
+        /// Worst elementwise UTILIZATION of the layer-3 tolerance:
+        /// `max |a-b| / (L3_ATOL + L3_RTOL*|b|)`. This is the quantity
+        /// `allclose` actually tests, and it is the only honest one.
+        ///
+        /// Bare `max_rel` is misleading on near-zero outputs: the flat-softmax
+        /// production cell shows max_rel 1.125e-3 on a max_abs of 4.889e-9,
+        /// because the denominator is ~3e-3. Judging a tolerance by max_rel
+        /// there would demand a threshold ~10x looser than the arithmetic
+        /// needs, and that looser threshold would then fail to catch real
+        /// bugs elsewhere. `util <= 1.0` passes; the value is the headroom.
+        util: f32,
     }
 
     fn diff_stats(a: &MlxArray, b: &MlxArray) -> DiffStats {
@@ -5946,7 +5957,9 @@ mod tests {
         let mut max_rel = 0.0f32;
         let mut sumsq = 0.0f64;
         let mut ref_absmax = 0.0f32;
+        let mut util = 0.0f32;
         for (x, y) in av.iter().zip(bv.iter()) {
+            util = util.max((x - y).abs() / (L3_ATOL + L3_RTOL * y.abs()));
             assert!(
                 x.is_finite() && y.is_finite(),
                 "non-finite value in a calibration input ({x}, {y}) — the \
@@ -5967,6 +5980,7 @@ mod tests {
             l2: sumsq.sqrt() as f32,
             ref_absmax,
             n: av.len(),
+            util,
         }
     }
 
@@ -6134,6 +6148,250 @@ mod tests {
         eprintln!("\nWORST ACROSS MATRIX: max_abs {worst_abs:.3e}  max_rel {worst_rel:.3e}\n");
     }
 
+    /// Human-readable dtype name for witness output.
+    fn dtype_name(d: i32) -> &'static str {
+        match d {
+            mlxcel_core::dtype::INT32 => "int32",
+            mlxcel_core::dtype::FLOAT16 => "float16",
+            mlxcel_core::dtype::FLOAT32 => "float32",
+            other => Box::leak(format!("dtype#{other}").into_boxed_str()),
+        }
+    }
+
+    /// DTYPE WITNESS (Alden's open acceptance item, 2026-07-27): "verify and
+    /// assert the actual dtype before accepting its tolerance... If outputs
+    /// are FP32, use a materially tighter starting envelope."
+    ///
+    /// The existing 1e-3/1e-3 on the kernel-equivalence gate is only
+    /// defensible for FP16. At an output magnitude around 1e-2, an ABSOLUTE
+    /// 1e-3 is ~10% of signal — permissive to the point of being decorative.
+    /// This test records what the dtypes actually are so no tolerance is
+    /// accepted on an assumption about them.
+    #[test]
+    fn dtype_witness_for_tolerance_calibration() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let l = 1;
+        let kv_len_prior = 429;
+        let offset = kv_len_prior;
+
+        let mut cache = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let _ = attn.forward(&x_prefill, &mut cache, None);
+        let x_decode = make_test_input(1, l, hidden);
+
+        let k_raw = attn.k_proj.forward(&x_decode);
+        let v_raw = attn.v_proj.forward(&x_decode);
+        let k = mlxcel_core::reshape(&k_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let v = mlxcel_core::reshape(&v_raw, &[1, l, attn.num_kv_heads, attn.head_dim]);
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+        let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let (win_k, win_v) = cache.update_and_fetch(k, v);
+        mlxcel_core::eval(&win_k);
+
+        let out = attn.forward(&x_decode, &mut cache, None);
+        mlxcel_core::eval(&out);
+
+        let (dk, dv, dout) = (
+            mlxcel_core::array_dtype(&win_k),
+            mlxcel_core::array_dtype(&win_v),
+            mlxcel_core::array_dtype(&out),
+        );
+        eprintln!(
+            "DTYPE WITNESS  K={} V={} decode_out={}",
+            dtype_name(dk),
+            dtype_name(dv),
+            dtype_name(dout)
+        );
+
+        // The load-bearing half: the tolerance envelope is chosen for the
+        // OUTPUT dtype. Pin it so a dtype change forces recalibration rather
+        // than silently inheriting a tolerance sized for something else.
+        assert_eq!(
+            dout,
+            mlxcel_core::dtype::FLOAT32,
+            "decode output dtype changed (now {}). The layer-3 and \
+             kernel-equivalence tolerances were calibrated for float32 \
+             outputs; re-run layer3_tolerance_calibration_sweep and \
+             kernel_equivalence_envelope_sweep before trusting either.",
+            dtype_name(dout)
+        );
+    }
+
+    /// One cell of the kernel-equivalence envelope: fused SDPA core versus
+    /// blocked-gather core on the SAME explicitly-evaluated inputs.
+    ///
+    /// Alden's spec (2026-07-27) requires the envelope span "partial final
+    /// block, saturated and unsaturated top-k, multiple selected-block
+    /// layouts, values near zero, and softmax-sensitive score
+    /// distributions". `scale` moves the input magnitude, `q_gain` moves the
+    /// score spread (and so how peaked the softmax is), and `tail_mask`
+    /// pulls `offset` back so trailing slots are causally masked — the
+    /// core-level shape of a partial final block.
+    ///
+    /// Every input is eval'd BEFORE the two calls, so this isolates kernel
+    /// arithmetic from any lazy-graph or host-sync scheduling difference.
+    ///
+    /// DIMENSIONS ARE LOAD-BEARING. `make_test_sparse_attention` is a toy:
+    /// head_dim 4, block_size 2, so a cell runs windows of 4–16 slots and
+    /// reduces over 4 elements. Two kernels agree bitwise at that depth far
+    /// more often than they do in production (head_dim 128, block_size 128,
+    /// windows in the hundreds). An envelope measured on the toy harness is
+    /// an UNDERESTIMATE and must not be used to bound anything real —
+    /// measured 2026-07-27: toy worst max_rel 3.899e-7 versus the
+    /// production-quantum end-to-end sweep's 4.572e-6, a 12x gap that would
+    /// have read as "the composition is worse than its components" when it
+    /// was only measured deeper. `d128` selects the production-dim harness.
+    fn measure_core_equivalence(
+        d128: bool,
+        nkb: i32,
+        l: i32,
+        scale: f32,
+        q_gain: f32,
+        tail_mask: i32,
+    ) -> DiffStats {
+        let attn = if d128 {
+            make_test_sparse_attention_d128()
+        } else {
+            make_test_sparse_attention()
+        };
+        let (b, h_kv, nh, hd) = (1, attn.num_kv_heads, attn.num_heads, attn.head_dim);
+        let (bs, top_k) = (attn.block_size, attn.top_k);
+        let w = nkb * bs;
+        let offset = w - l - tail_mask;
+        assert!(offset >= 0, "geometry underflow: offset {offset}");
+        assert!(nkb >= top_k, "need at least top_k blocks to select from");
+
+        let det = |n: usize, phase: f32, amp: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32) * 0.37 + phase).sin() * amp)
+                .collect()
+        };
+        let k = mlxcel_core::from_slice_f32(
+            &det((b * h_kv * w * hd) as usize, 0.1, scale),
+            &[b, h_kv, w, hd],
+        );
+        let v = mlxcel_core::from_slice_f32(
+            &det((b * h_kv * w * hd) as usize, 1.3, scale),
+            &[b, h_kv, w, hd],
+        );
+        let q = mlxcel_core::from_slice_f32(
+            &det((b * nh * l * hd) as usize, 2.7, scale * q_gain),
+            &[b, nh, l, hd],
+        );
+        let pos_full = mlxcel_core::arange_f32(0.0, w as f32, 1.0);
+
+        // Unique-per-row selection (both cores assume uniqueness): always the
+        // local block, plus a distinct past block that rotates per row so the
+        // matrix covers multiple selected-block layouts.
+        let local = nkb - 1;
+        let mut sel_f: Vec<f32> = Vec::new();
+        let mut row = 0usize;
+        for _h in 0..h_kv {
+            for _t in 0..l {
+                let past = if local > 0 {
+                    (row as i32) % local
+                } else {
+                    0
+                };
+                sel_f.push(past as f32);
+                sel_f.push(local as f32);
+                row += 1;
+            }
+        }
+        assert_eq!(sel_f.len(), (b * h_kv * l * top_k) as usize);
+        let selected = mlxcel_core::astype(
+            &mlxcel_core::from_slice_f32(&sel_f, &[b, h_kv, l, top_k]),
+            mlxcel_core::dtype::INT32,
+        );
+
+        // Force every input before dispatch: this cell measures KERNEL
+        // arithmetic, not graph scheduling.
+        for a in [&k, &v, &q, &pos_full, &selected] {
+            mlxcel_core::eval(a);
+        }
+
+        let out_blocked =
+            attn.sparse_decode_core(&q, &k, &v, &selected, &pos_full, nkb, b, l, offset);
+        let out_sdpa =
+            attn.sparse_decode_core_sdpa(&q, &k, &v, &selected, &pos_full, nkb, b, l, offset);
+        mlxcel_core::eval(&out_blocked);
+        mlxcel_core::eval(&out_sdpa);
+        assert_eq!(
+            mlxcel_core::array_shape(&out_blocked),
+            mlxcel_core::array_shape(&out_sdpa),
+            "output shapes"
+        );
+        diff_stats(&out_blocked, &out_sdpa)
+    }
+
+    /// MEASUREMENT, not a gate. Establishes the kernel-equivalence error
+    /// envelope Alden's disposition requires before ANY tolerance in this
+    /// file is accepted — including layer 3's, which must derive from this
+    /// envelope rather than from an independent convenient number.
+    ///
+    /// Run with:
+    ///   cargo test --lib -- --ignored --test-threads=1 \
+    ///     kernel_equivalence_envelope_sweep --nocapture
+    #[test]
+    #[ignore = "CALIBRATION sweep, not a gate. Run with: --ignored --test-threads=1 --nocapture"]
+    fn kernel_equivalence_envelope_sweep() {
+        // (nkb, l, scale, q_gain, tail_mask, label)
+        let cells: [(i32, i32, f32, f32, i32, &str); 8] = [
+            (5, 2, 0.5, 1.0, 0, "base            unsaturated, aligned"),
+            (2, 2, 0.5, 1.0, 0, "saturated       nkb == top_k"),
+            (8, 2, 0.5, 1.0, 0, "deep            nkb=8 unsaturated"),
+            (5, 2, 0.5, 1.0, 3, "partial tail    3 slots causally masked"),
+            (5, 1, 0.5, 1.0, 0, "single token    l=1 (decode shape)"),
+            (5, 2, 1e-3, 1.0, 0, "near zero       inputs at 1e-3"),
+            (5, 2, 0.5, 20.0, 0, "peaked softmax  q_gain 20"),
+            (5, 2, 0.5, 0.01, 0, "flat softmax    q_gain 0.01"),
+        ];
+
+        // The production-dim harness is the one whose number may bound
+        // anything. The toy harness is run alongside ONLY to measure how far
+        // it understates — a number that exists to be distrusted.
+        for (d128, harness) in [(false, "TOY  head_dim=4  bs=2"), (true, "PROD head_dim=128 bs=128")] {
+            eprintln!(
+                "\n=== {harness} ===\n{:<34} {:>6} {:>12} {:>12} {:>12} {:>10}",
+                "CELL", "n", "max_abs", "max_rel", "ref_absmax", "L3_util"
+            );
+            let mut worst_abs = 0.0f32;
+            let mut worst_rel = 0.0f32;
+            let mut worst_rel_cell = "";
+            let mut exact_cells = 0;
+            let mut worst_util = 0.0f32;
+            for (nkb, l, scale, q_gain, tail, label) in cells {
+                let s = measure_core_equivalence(d128, nkb, l, scale, q_gain, tail);
+                eprintln!(
+                    "{label:<34} {:>6} {:>12.3e} {:>12.3e} {:>12.3e} {:>10.3}",
+                    s.n, s.max_abs, s.max_rel, s.ref_absmax, s.util
+                );
+                worst_util = worst_util.max(s.util);
+                if s.max_abs == 0.0 {
+                    exact_cells += 1;
+                }
+                if s.max_rel > worst_rel {
+                    worst_rel = s.max_rel;
+                    worst_rel_cell = label;
+                }
+                worst_abs = worst_abs.max(s.max_abs);
+            }
+            eprintln!(
+                "{harness}: worst max_abs {worst_abs:.3e}  worst max_rel \
+                 {worst_rel:.3e}  (driven by: {worst_rel_cell})  \
+                 bit-exact cells: {exact_cells}/8  WORST L3_util {worst_util:.4}"
+            );
+        }
+        eprintln!(
+            "\nOnly the PROD row may bound a tolerance. A high bit-exact \
+             count on TOY is the reduction being too shallow to disagree, \
+             not the kernels being equivalent.\n"
+        );
+    }
+
     /// Layer-3 tolerance. CALIBRATED, not guessed and not inherited.
     ///
     /// Read off `layer3_tolerance_calibration_sweep` on 2026-07-27 over a
@@ -6142,23 +6400,46 @@ mod tests {
     ///
     ///     worst max_abs 1.118e-8      worst max_rel 4.572e-6
     ///
-    /// Margins: rtol is ~22x the worst observed relative divergence, atol
-    /// ~89x the worst observed absolute. Both are TIGHTER than the
-    /// 1e-3/1e-3 that `sdpa_core_matches_blocked_core_on_identical_inputs`
-    /// uses, because the end-to-end path measured far inside that — a
-    /// tolerance inherited from that gate would have been ~200x looser than
-    /// the evidence supports.
+    /// CORRECTION (2026-07-27, after `kernel_equivalence_envelope_sweep`):
+    /// the margins originally recorded here — "~22x the worst relative,
+    /// ~89x the worst absolute", and a claimed five-order-of-magnitude gap
+    /// to the nearest real bug — were measured on head_dim=4 and OVERSTATED
+    /// the gate's robustness. The layer-3 sweep overrides `block_size` to
+    /// 128 but leaves the harness `head_dim` at 4, so it is deep in window
+    /// length and shallow in reduction width. At production width the
+    /// kernels disagree ~2900x more (toy worst max_rel 3.899e-7, bit-exact
+    /// in 5 of 8 cells; production worst 1.125e-3, bit-exact in 0 of 8).
     ///
-    /// SCOPE CAVEAT, stated because it is easy to carry these numbers
-    /// somewhere they do not belong: L3_ATOL is magnitude-dependent and is
-    /// calibrated for THIS harness, whose outputs run ~1.3e-2. Production
-    /// magnitudes are larger and would scale the absolute divergence with
-    /// them. If the harness dimensions or input scale change, re-run the
-    /// sweep — do not reuse this constant on faith. L3_RTOL is the
-    /// magnitude-independent half and is the one that transfers.
+    /// THE REAL PICTURE, in the currency the gate asserts (utilization of
+    /// `L3_ATOL + L3_RTOL*|b|`, measured at head_dim=128 / block_size=128):
     ///
-    /// `layer3_tolerance_bites_on_a_mutation` proves these numbers
-    /// discriminate real bugs rather than merely passing.
+    ///     kernel accumulation noise  0.105   -> 9.5x headroom below 1.0
+    ///     GATE THRESHOLD             1.0
+    ///     weakest real mutation     10.34    -> 10.3x margin above 1.0
+    ///
+    /// So these constants sit almost exactly at the geometric midpoint
+    /// between the arithmetic and the nearest bug. That is not luck worth
+    /// trusting twice: the PRODUCT of the two margins (~98) is a property
+    /// of the kernels, fixed no matter where the threshold goes, and
+    /// moving the threshold only trades one margin for the other. ~10x each
+    /// way is the best available split, not a comfortable cushion.
+    ///
+    /// The binding constraint is the POSITION mutation at 10.34, not the
+    /// noise floor. Shifting every position by one only changes the causal
+    /// mask at the boundary slots of a 640-wide window, so it is the
+    /// quietest of the three real bugs — if a future change pushes it under
+    /// 10x, `layer3_tolerance_bites_on_a_mutation` fails, and that failure
+    /// means the tolerance has stopped discriminating position defects.
+    /// Do not answer it by lowering the control's threshold.
+    ///
+    /// SCOPE CAVEAT: L3_ATOL is magnitude-dependent. If harness dimensions
+    /// or input scale change, re-run BOTH sweeps — do not reuse either
+    /// constant on faith. L3_RTOL is the magnitude-independent half.
+    ///
+    /// Judge with `DiffStats::util`, never with bare `max_rel`: at
+    /// production width the flat-softmax cell shows max_rel 1.125e-3 on a
+    /// max_abs of 4.889e-9, and a bare relative bound would false-fail
+    /// there while the arithmetic is fine.
     const L3_RTOL: f32 = 1e-4;
     const L3_ATOL: f32 = 1e-6;
 
@@ -6211,28 +6492,37 @@ mod tests {
                  branch did not run"
             );
 
+            // The COMBINED allclose criterion, elementwise:
+            //     |a-b| <= L3_ATOL + L3_RTOL*|b|
+            // expressed as utilization (<= 1.0 passes).
+            //
+            // NOT separate max_rel and max_abs bounds. That was this test's
+            // form in e0a445e and it was wrong: at production dimensions the
+            // flat-softmax distribution yields max_rel 1.125e-3 on a max_abs
+            // of 4.889e-9, because the denominator is ~3e-3. A bare
+            // `max_rel <= 1e-4` fails there while the arithmetic is fine, and
+            // the "fix" would be to loosen rtol ~10x — which would then stop
+            // catching real bugs. The separate form only passed because this
+            // harness is head_dim=4; it would have false-failed the moment
+            // anyone ran it at production width. Measured worst utilization
+            // across the production kernel envelope: 0.105.
             assert!(
-                s.max_rel <= L3_RTOL,
-                "{label}: production gathered+sdpa decode diverges from the \
-                 full-window reference by max_rel {:.3e}, over the calibrated \
-                 {:.0e}. Observed worst at calibration was 4.572e-6, so this \
-                 is {:.0}x the measured baseline — a logic divergence, not \
-                 kernel accumulation noise. (max_abs {:.3e}, l2 {:.3e}, n {})",
+                s.util <= 1.0,
+                "{label}: production gathered+sdpa decode exceeds the \
+                 calibrated envelope — utilization {:.3} (>1.0 fails), i.e. \
+                 some element's |a-b| exceeds L3_ATOL + L3_RTOL*|b|. \
+                 Worst utilization across the production kernel-equivalence \
+                 envelope is 0.105, so this is {:.0}x the demonstrated \
+                 arithmetic. That is a logic divergence, not accumulation \
+                 noise. (max_abs {:.3e}, max_rel {:.3e}, l2 {:.3e}, \
+                 ref_absmax {:.3e}, n {})",
+                s.util,
+                s.util / 0.105,
+                s.max_abs,
                 s.max_rel,
-                L3_RTOL,
-                s.max_rel / 4.572e-6,
-                s.max_abs,
                 s.l2,
+                s.ref_absmax,
                 s.n
-            );
-            assert!(
-                s.max_abs <= L3_ATOL,
-                "{label}: max_abs {:.3e} over the calibrated {:.0e} \
-                 (ref_absmax {:.3e}). If harness magnitudes changed, re-run \
-                 layer3_tolerance_calibration_sweep rather than loosening this.",
-                s.max_abs,
-                L3_ATOL,
-                s.ref_absmax
             );
         }
     }
@@ -6248,7 +6538,11 @@ mod tests {
     /// the K1 failure message named and could not distinguish.
     #[test]
     fn layer3_tolerance_bites_on_a_mutation() {
-        let attn = make_test_sparse_attention();
+        // Production dimensions. The tolerance has to discriminate where it
+        // is actually applied, and the toy harness is bit-exact in 5 of 8
+        // envelope cells — a mutation control run there would be measuring
+        // whether a mutation beats zero, which is not the question.
+        let attn = make_test_sparse_attention_d128();
         let (b, h_kv, nh, hd) = (1, attn.num_kv_heads, attn.num_heads, attn.head_dim);
         let (bs, top_k) = (attn.block_size, attn.top_k);
         let nkb = 5;
@@ -6295,22 +6589,48 @@ mod tests {
             attn.sparse_decode_core_sdpa(&q, &k, &v, &selected_mut, &pos_full, nkb, b, l, offset);
         mlxcel_core::eval(&out_sel);
 
-        for (name, mutated) in [("positions+1", &out_pos), ("selection", &out_sel)] {
+        // MUTATION 3 (Alden's third named class): a MEANINGFUL V
+        // perturbation. Deliberately small — 1e-3 relative on one head's
+        // values — because a large one proves nothing. The question is
+        // whether the tolerance separates real corruption from accumulation
+        // noise, and the interesting case is corruption of the same order as
+        // a plausible bug, not a catastrophic one.
+        let v_pert = {
+            let mut vals = det((b * h_kv * w * hd) as usize, 1.3);
+            for (i, x) in vals.iter_mut().enumerate() {
+                if i % 7 == 0 {
+                    *x += 1e-3;
+                }
+            }
+            mlxcel_core::from_slice_f32(&vals, &[b, h_kv, w, hd])
+        };
+        let out_v =
+            attn.sparse_decode_core_sdpa(&q, &k, &v_pert, &selected, &pos_full, nkb, b, l, offset);
+        mlxcel_core::eval(&out_v);
+
+        for (name, mutated) in [
+            ("positions+1", &out_pos),
+            ("selection", &out_sel),
+            ("V perturb 1e-3", &out_v),
+        ] {
             let s = diff_stats(&out_ok, mutated);
             eprintln!(
-                "MUTATION {name}: max_rel {:.3e}  max_abs {:.3e}  ({:.0}x L3_RTOL)",
-                s.max_rel,
-                s.max_abs,
-                s.max_rel / L3_RTOL
+                "MUTATION {name}: util {:.4}  max_abs {:.3e}  max_rel {:.3e}",
+                s.util, s.max_abs, s.max_rel
             );
+            // Judged in the SAME currency the gate uses. A control measured
+            // against a different quantity than the gate asserts proves
+            // nothing about the gate.
             assert!(
-                s.max_rel > L3_RTOL * 10.0,
-                "MUTATION {name} produced max_rel {:.3e}, which is NOT clear of \
-                 L3_RTOL ({:.0e}) by 10x. The layer-3 tolerance does not \
-                 discriminate this class of bug, so its green means nothing \
-                 for that class — tighten the tolerance or strengthen the gate.",
-                s.max_rel,
-                L3_RTOL
+                s.util > 10.0,
+                "MUTATION {name} produced utilization {:.4}, not clear of the \
+                 gate's 1.0 threshold by 10x. The layer-3 tolerance does not \
+                 discriminate this class of bug, so its green certifies \
+                 nothing for that class — tighten the envelope or strengthen \
+                 the gate. (max_abs {:.3e}, max_rel {:.3e})",
+                s.util,
+                s.max_abs,
+                s.max_rel
             );
         }
     }
