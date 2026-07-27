@@ -5637,11 +5637,26 @@ mod tests {
     // generation or logit equivalence. One synthetic attention layer, no
     // sampler, no scheduler. Production scheduler/logit equivalence is G1.3
     // and requires wiring `BlockColdStore` into the scheduler — a separate,
-    // explicitly reviewed decision. `BlockColdStore` has ZERO references
-    // outside its own module today (verified by type-name grep; the
-    // scheduler's `load_prefix` call site resolves to v3), so no path from v4
-    // to a logit exists, and none is to be created merely to make a test
-    // possible.
+    // explicitly reviewed decision. `BlockColdStore` has ZERO **PRODUCTION**
+    // references outside its own module today, so no path from v4 to a logit
+    // exists, and none is to be created merely to make a test possible.
+    //
+    // The check that reproduces that, stated so a later reader gets the
+    // result the sentence claims:
+    //
+    //     grep -rn 'BlockColdStore' src --include='*.rs' | grep -v block_cold_store
+    //
+    // → 13 hits, ALL inside this file's `#[cfg(test)]` module — i.e. the tests
+    //   below. Zero production hits. The scheduler's `load_prefix` call site
+    //   resolves to v3 (`cold_store::ColdStoreError` on its error arm).
+    //
+    // CORRECTED 2026-07-28 by Violet. The original said "ZERO references
+    // ... (verified by type-name grep)". That grep returned empty when I ran
+    // it — and then THESE TESTS made it return 13, so the commit that
+    // documented the check is the commit that falsified it. A named check
+    // whose stated result a reader cannot reproduce reads as a stale comment
+    // or as "someone wired v4 into the scheduler", and either conclusion is
+    // worse than no comment.
     //
     // WHY THREE ARMS. A two-arm test (continuous vs disk) cannot tell an
     // adoption defect from a serialization defect:
