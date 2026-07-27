@@ -2563,7 +2563,7 @@ fn a_killed_lock_holder_releases_the_store_lock_without_sentinel_recovery() {
 //
 // "Compose logically" is a reasoning claim about two tested halves; it is not
 // itself tested. This exercises them together: a real sweep in this process, a
-// real `persist` in another, contending the same on-disk lock.
+// real `persist` in another, racing for the same on-disk lock.
 //
 // AND IT USES THE PRODUCTION PATH. The in-process test hand-calls `write_block`
 // then `write_manifest`. The child here calls `persist`, which is what the
@@ -2899,10 +2899,14 @@ fn writer_child_process() {
 /// a control for the refusal — the deterministic test above is.
 ///
 /// What it does certify, and nothing else does: two processes genuinely
-/// contending the same on-disk publication lock leave the store consistent.
+/// racing for the same on-disk publication lock leave the store consistent.
+/// ALDEN, 8dc3da1: `rendezvous_ok` proves both processes reached the pre-lock RACE
+/// POINT — not that their lock operations overlapped. A scheduler may still
+/// serialize them after `child.publishing`. "Racing for the lock" is exact;
+/// "contending the lock" would claim an ordering we deliberately did not pin.
 /// Named for that, not for the refusal.
 #[test]
-fn two_processes_contending_the_publication_lock_preserve_the_invariant() {
+fn two_processes_racing_publication_and_gc_preserve_the_invariant() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let base = dir.path().to_path_buf();
     let store = BlockColdStore::new(base.clone(), XPROC_FINGERPRINT)
@@ -2947,7 +2951,7 @@ fn two_processes_contending_the_publication_lock_preserve_the_invariant() {
     // `b52268d`: this originally called `wait_for_file` and ignored its bool. On
     // timeout the parent simply proceeded, and a late child could then wake
     // AFTER the sweep, reinstall the blocks, publish successfully, and the test
-    // would report the green child-wins branch having had no lock contention at
+    // would report the green child-wins branch having never reached the race point at
     // all — passing without its sole stated claim.
     //
     // Same shape Violet named the same morning: an instrument that FAILED and an
@@ -3000,7 +3004,7 @@ fn two_processes_contending_the_publication_lock_preserve_the_invariant() {
         "the nomination rendezvous never completed: the parent signalled \
          `gc.nominated` and the child did not answer with `child.publishing` \
          within the bound. The sweep therefore ran WITHOUT a publisher racing it, \
-         so whatever branch is reported below was not reached through contention \
+         so whatever branch is reported below was not reached through a race \
          and this test certifies nothing. Failing rather than reporting a green \
          branch it did not earn."
     );
