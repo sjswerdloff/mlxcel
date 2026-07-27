@@ -2593,6 +2593,50 @@ fn wait_for_file(p: &std::path::Path, limit: std::time::Duration) -> bool {
     p.exists()
 }
 
+/// Bounded process wait, and it exists because `wait_for_file` above guarded the
+/// RENDEZVOUS while nothing guarded the PROCESS.
+///
+/// `child.wait()` is unbounded. A child that DIES returns promptly and yields a
+/// red — fine. A child that HANGS blocks the parent forever, which is exactly the
+/// hung suite `wait_for_file`'s own comment calls worse than a red, reached
+/// through the adjacent door. **Found by Violet reviewing `b52268d`:** the guard
+/// covered the failure mode I was thinking about and not the one beside it.
+///
+/// The concrete mechanism is a lock deadlock. The sweeping child takes the store
+/// `flock`; a parent holding that lock across the spawn would block the child
+/// forever and then block itself here, with neither side timing out. Not
+/// reachable on today's code — the writer takes `write_block`'s dedup
+/// early-return rather than the lock — but **nothing enforces that**, and a
+/// change making the writer acquire earlier would convert a red test into a
+/// stalled CI job with no diagnostic. So the bound is for the future edit, not
+/// for today's code path.
+fn wait_for_child_bounded(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+    what: &str,
+) -> std::process::ExitStatus {
+    let step = std::time::Duration::from_millis(10);
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait must not error") {
+            return status;
+        }
+        if waited >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "{what} did not exit within {limit:?} and was killed. A hang here is \
+                 most likely a lock deadlock: if this process holds the store lock \
+                 across the spawn, the child blocks on `flock` forever and an \
+                 unbounded wait would never return. Failing loud rather than \
+                 stalling the suite."
+            );
+        }
+        std::thread::sleep(step);
+        waited += step;
+    }
+}
+
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
@@ -2730,7 +2774,11 @@ fn a_writer_cannot_publish_across_a_sweep_that_ran_in_another_process() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn gc child");
-    let status = child.wait().expect("wait for gc child");
+    let status = wait_for_child_bounded(
+        &mut child,
+        std::time::Duration::from_secs(60),
+        "the sweeping child process",
+    );
     assert!(
         status.success(),
         "the sweeping child process failed ({status}); nothing below is attributable"
@@ -2921,7 +2969,11 @@ fn two_processes_contending_the_publication_lock_preserve_the_invariant() {
 
     gc_result.expect("gc must not error");
 
-    let _ = child.wait();
+    let _ = wait_for_child_bounded(
+        &mut child,
+        std::time::Duration::from_secs(60),
+        "the writer child process",
+    );
 
     let result_path = base.join("child.result");
     assert!(
