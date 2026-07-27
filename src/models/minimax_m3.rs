@@ -6513,6 +6513,124 @@ mod tests {
         );
     }
 
+    /// Drive one decode step's SELECTION on `cache`, exactly as
+    /// `sparse_decode_attention_gathered` does, and return the selected block
+    /// indices. Advances the cache's indexer, so each call wants its own arm.
+    ///
+    /// Selection reads only `idx_q`, `idx_k` and the geometry — the main K/V
+    /// is not an input to `per_token_block_selection` — so the main cursor is
+    /// deliberately left alone here. What this measures is the INDEXER state,
+    /// which is the point.
+    fn selected_blocks_for_decode(
+        attn: &SparseAttention,
+        cache: &mut KVCache,
+        x_decode: &MlxArray,
+        offset: i32,
+        kv_len: i32,
+    ) -> UniquePtr<MlxArray> {
+        let l = 1;
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = match attn.index_k_norm {
+            Some(ref n) => n.forward(&idx_k),
+            None => idx_k,
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+        let idx_k_full = cache.m3_idx_k_update_and_fetch(&idx_k);
+
+        let idx_q = attn.project_index_queries(x_decode, 1, l, offset);
+        let selected = attn.per_token_block_selection(&idx_q, &idx_k_full, 1, l, kv_len, offset);
+        mlxcel_core::eval(&selected);
+        selected
+    }
+
+    /// G1.2b — SELECTED-BLOCK PARITY, the direct MSA-state witness.
+    ///
+    /// Alden: "For real K8V4, generation equivalence must include
+    /// selected-block parity or another direct MSA-state witness, not only
+    /// final text. A wrong state can occasionally generate the same short
+    /// output."
+    ///
+    /// G1.2a compares outputs. This compares the SELECTION those outputs were
+    /// computed from — which blocks the indexer chose. Two caches can agree on
+    /// one short decode's output while disagreeing about what they attended to;
+    /// they cannot agree here without agreeing about the indexer state itself.
+    ///
+    /// His precision, honoured: this proves parity from the two `idx_k` states
+    /// and does NOT prove `forward` took the sparse branch. That is
+    /// `g1_2a`'s branch-local counter, and the two witnesses are kept in
+    /// separate tests so neither can be mistaken for the other.
+    #[test]
+    fn g1_2b_k8v4_selected_block_parity_across_the_disk_round_trip() {
+        use mlxcel_core::cache::KVCacheMode;
+        use mlxcel_core::cache::block_cold_store::BlockColdStore;
+
+        let attn = make_test_sparse_attention_d128();
+        let hidden = attn.num_heads * attn.head_dim;
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+
+        let x_decode = make_test_input(1, l, hidden);
+
+        // ---- ARM A: continuous -------------------------------------------
+        let mut cache_a = k8v4_prefilled(&attn, kv_len_prior, hidden);
+        let sel_a =
+            selected_blocks_for_decode(&attn, &mut cache_a, &x_decode, kv_len_prior, kv_len);
+
+        // ---- ARM C: disk round trip ---------------------------------------
+        let mut cache_c_src = k8v4_prefilled(&attn, kv_len_prior, hidden);
+        let set = one_layer_set(&mut cache_c_src, kv_len_prior);
+        let tokens: Vec<i32> = (0..kv_len_prior).collect();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        {
+            let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+            store
+                .persist("m3-g12b", "tmpl", &tokens, &set)
+                .expect("persist must succeed");
+        }
+        let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+        let (mut loaded, matched) = store
+            .load_prefix("m3-g12b", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+            .expect("the K8V4 candidate must be found");
+        assert_eq!(matched, tokens.len());
+
+        let mut cache_c = KVCache::new_with_mode(KVCacheMode::KVarN8);
+        cache_c.set_kvarn_v_bits(4);
+        cache_c
+            .install_detached(loaded.caches.remove(0))
+            .expect("adoption must succeed");
+        let sel_c =
+            selected_blocks_for_decode(&attn, &mut cache_c, &x_decode, kv_len_prior, kv_len);
+
+        // ---- NON-VACUITY: the comparison must be able to fail --------------
+        // A different query selects differently against the SAME indexer state.
+        // Without this, an all-constant selection would make parity trivially
+        // true and the test would certify nothing.
+        let mut cache_probe = k8v4_prefilled(&attn, kv_len_prior, hidden);
+        let x_other = mlxcel_core::multiply_scalar(&x_decode, -3.0);
+        let sel_other =
+            selected_blocks_for_decode(&attn, &mut cache_probe, &x_other, kv_len_prior, kv_len);
+        assert!(
+            !arrays_bit_identical(&sel_a, &sel_other),
+            "selection is insensitive to the query, so selected-block parity \
+             below is trivially true and witnesses nothing. Either the geometry \
+             saturated (every block selected) or the selection collapsed."
+        );
+
+        // ---- THE PARITY ASSERTION -----------------------------------------
+        assert!(
+            arrays_bit_identical(&sel_a, &sel_c),
+            "SELECTED-BLOCK PARITY FAILED. The disk-adopted K8V4 cache chose \
+             different blocks than the continuous reference for the same decode \
+             query. The indexer state did not survive the round trip intact — \
+             and this can be true while the final output still matches, which is \
+             exactly why output equivalence alone is not sufficient for K8V4."
+        );
+    }
+
     /// Read one element from a block-scores tensor at
     /// (kv_head, q_block, k_block) for batch 0.
     fn block_score_at(scores: &MlxArray, head: i32, q_block: i32, k_block: i32) -> f32 {
