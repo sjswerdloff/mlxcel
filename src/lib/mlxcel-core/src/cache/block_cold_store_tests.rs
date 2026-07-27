@@ -1761,7 +1761,14 @@ fn a_block_referenced_by_a_manifest_published_after_nomination_must_survive() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let store = Arc::new(
         BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32])
-            .with_prune_mode(PruneMode::Delete),
+            .with_prune_mode(PruneMode::Delete)
+            // REQUIRED, not incidental. Under the production age floor these
+            // freshly-orphaned blocks are too young to nominate, so `candidates`
+            // is empty, GC returns before the seam, and the racing publication
+            // never happens — the test would then fail on its own precondition
+            // rather than on the invariant. It did exactly that when the floor
+            // landed, which is the test being vacuity-sensitive as intended.
+            .with_min_gc_age(std::time::Duration::ZERO),
     );
 
     let manifest = store
@@ -2512,7 +2519,11 @@ fn pruning_a_partial_tail_manifest_releases_the_orphaned_block() {
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let store = BlockColdStore::new(dir.path().to_path_buf(), [0xD2u8; 32])
-        .with_prune_mode(PruneMode::Delete);
+        .with_prune_mode(PruneMode::Delete)
+        // Opt out of the nomination age floor. A test cannot wait out the
+        // production default, and this test is about whether a released orphan
+        // is COLLECTABLE, not about the cushion in front of collection.
+        .with_min_gc_age(std::time::Duration::ZERO);
 
     let t1: Vec<i32> = (0..TURN1).collect();
     let m1 = store

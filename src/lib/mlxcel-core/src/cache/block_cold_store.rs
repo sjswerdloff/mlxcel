@@ -284,6 +284,19 @@ pub struct BlockColdStore {
     block_size: usize,
     prune_mode: PruneMode,
     persist_lock: Mutex<()>,
+    /// Minimum age before an unreferenced block may even be NOMINATED.
+    ///
+    /// Defence in depth, explicitly NOT a correctness gate (Alden, finding 4:
+    /// "age cannot authorize deletion and never replaces lock+final reverify").
+    /// What it buys: less churn, a recovery/forensics window in which a
+    /// mistakenly-orphaned block is still on disk, and protection against
+    /// implementation mistakes around freshly-staged artifacts that are not yet
+    /// referenced because their manifest has not been published.
+    ///
+    /// What it does NOT buy: safety against the publication race. A block older
+    /// than any threshold can be referenced by a manifest published one
+    /// microsecond from now.
+    min_gc_age: std::time::Duration,
 }
 
 impl BlockColdStore {
@@ -294,7 +307,20 @@ impl BlockColdStore {
             block_size: DEFAULT_BLOCK_SIZE,
             prune_mode: PruneMode::default(),
             persist_lock: Mutex::new(()),
+            // Conservative by default. Zero-age deletion is NOT advertised as
+            // safe for production; tests that need immediate collection opt in
+            // explicitly via `with_min_gc_age`.
+            min_gc_age: std::time::Duration::from_secs(300),
         }
+    }
+
+    /// Override the nomination age floor. Intended for tests, which cannot wait
+    /// out the production default. Setting this to zero does not make deletion
+    /// safe — the lock and the under-lock re-verification are what make it
+    /// safe; this only removes a cushion.
+    pub fn with_min_gc_age(mut self, age: std::time::Duration) -> Self {
+        self.min_gc_age = age;
+        self
     }
 
     pub fn with_block_size(mut self, block_size: usize) -> Self {
@@ -1143,6 +1169,33 @@ impl BlockColdStore {
                     "COLD-STORE v4 observe: would GC unreferenced block"
                 );
             } else {
+                // AGE FLOOR — defence in depth, never authorization. A block
+                // younger than the floor is skipped even though it is provably
+                // unreferenced right now, because the most likely reason for a
+                // brand-new unreferenced block is a publication in flight.
+                //
+                // Missing, unreadable, or FUTURE timestamps count as fresh and
+                // are skipped: an unknown age is not an old age, and a clock
+                // that jumped backwards must not be able to authorize a sweep.
+                let age = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
+                match age {
+                    Some(a) if a >= self.min_gc_age => {}
+                    _ => {
+                        tracing::debug!(
+                            block = %name,
+                            age_secs = age.map(|a| a.as_secs_f64()),
+                            floor_secs = self.min_gc_age.as_secs_f64(),
+                            "COLD-STORE v4 GC: unreferenced but below the age floor (or \
+                             its timestamp is unknown/future) — not nominated"
+                        );
+                        continue;
+                    }
+                }
+
                 // NOMINATION ONLY. Nothing is deleted from an unlocked scan —
                 // every decision so far came from a snapshot taken while
                 // publishers were free to run.
