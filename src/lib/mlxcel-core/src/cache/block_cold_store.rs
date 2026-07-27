@@ -669,11 +669,28 @@ impl BlockColdStore {
     // -----------------------------------------------------------------------
 
     /// Load the best matching manifest and assemble its blocks into a cache.
+    ///
+    /// `kv_mode` MUST be the mode the CALLING RUNTIME is currently using.
+    /// Block addresses commit to the KV mode (see `block_hash_merkle`), and
+    /// `persist` addresses with `cache_set.caches[0].mode`, so load must
+    /// address with the live mode or it cannot match its own manifests.
+    ///
+    /// This parameter replaces a hardcoded `KVCacheMode::Fp16` at the hashing
+    /// site. Under KVarN8 that hardcode made the store WRITE-ONLY: computed
+    /// addresses could never equal the ones in its own manifest, `matched_blocks`
+    /// was always 0, every candidate was dropped, and the caller saw `NoMatch` —
+    /// indistinguishable from a legitimately cold cache, so it never surfaced
+    /// as a failure. Handoff §7.5.
+    ///
+    /// Passing a mode that does not match the persisted one is SAFE by
+    /// construction: the addresses simply will not match and the candidate is
+    /// skipped, so a KVarN8 cache can never be adopted into an Fp16 runtime.
     pub fn load_prefix(
         &self,
         model_id: &str,
         template_sig: &str,
         tokens: &[i32],
+        kv_mode: super::KVCacheMode,
     ) -> Result<(DetachedCacheSet, usize), ColdStoreError> {
         let manifests_dir = self.manifests_dir();
         if !manifests_dir.exists() {
@@ -712,7 +729,7 @@ impl BlockColdStore {
             let matched_blocks = manifest
                 .block_hashes
                 .iter()
-                .zip(compute_block_hashes(tokens, self.block_size, &kv_mode_config_string(super::KVCacheMode::Fp16)))
+                .zip(compute_block_hashes(tokens, self.block_size, &kv_mode_config_string(kv_mode)))
                 .take_while(|(a, b)| a == &b)
                 .count();
 

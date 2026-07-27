@@ -130,11 +130,11 @@ run_mutation \
 
 # --- M2: load_prefix must address blocks with the runtime's real KV mode ----
 run_mutation \
-  "M2 load_prefix: Fp16 -> KVarN8 hardcode" \
+  "M2 load_prefix: re-hardcode the KV mode (regression of §7.5)" \
   "block_cold_store.rs" \
-  's/kv_mode_config_string\(super::KVCacheMode::Fp16\)/kv_mode_config_string(super::KVCacheMode::KVarN8)/' \
-  "persist_then_load_prefix_reports_a_hit_fp16" \
-  "If load addresses blocks under a different mode than persist, the store is write-only and every miss looks like a cold cache."
+  's/compute_block_hashes\(tokens, self\.block_size, &kv_mode_config_string\(kv_mode\)\)/compute_block_hashes(tokens, self.block_size, \&kv_mode_config_string(super::KVCacheMode::Fp16))/' \
+  "persist_then_load_prefix_reports_a_hit_kvarn8" \
+  "This is the ORIGINAL §7.5 defect. Re-hardcoding Fp16 at the hashing site makes the store WRITE-ONLY under KVarN8: computed addresses can never equal the ones in its own manifest, matched_blocks is 0, and the caller sees NoMatch — indistinguishable from a legitimately cold cache, so it never surfaces as a failure."
 
 # --- M3: commit must be atomic (temp+rename) -------------------------------
 run_mutation \

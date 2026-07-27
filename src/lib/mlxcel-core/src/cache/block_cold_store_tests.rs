@@ -1303,7 +1303,7 @@ fn persist_then_load_prefix_reports_a_hit_fp16() {
         .expect("persist must succeed");
 
     let (loaded, matched) = store
-        .load_prefix("m3", "tmpl", &tokens)
+        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16)
         .expect("load_prefix MUST HIT the entry just persisted — a miss here is a write-only store");
 
     assert!(
@@ -1323,43 +1323,30 @@ fn persist_then_load_prefix_reports_a_hit_fp16() {
     );
 }
 
-/// PINNING TEST for handoff §7.5 — this asserts a BUG, deliberately.
+/// THE SAME HIT ASSERTION, UNDER k8v4 — this is the one that matters.
 ///
-/// `persist` addresses blocks with the REAL mode (`:562`); `load_prefix`
-/// hardcodes `KVCacheMode::Fp16` (`:715`). `kv_mode_config_string` is
-/// `format!("{:?}", mode)`, and `block_hash_includes_kv_mode` already pins that
-/// the two hashes differ. So under KVarN8 the store is **write-only**: the
-/// addresses computed at load can never equal the ones in its own manifest,
-/// `matched_blocks` is 0, the candidate is dropped, and the caller sees
-/// `NoMatch` — indistinguishable from a legitimately cold cache.
+/// Replaces the `defect_present__kvarn8_load_prefix_uses_fp16_address` tripwire,
+/// which asserted the §7.5 write-only bug and reddened the moment the bug was
+/// fixed. It did its job: the fix could not land silently, and its failure
+/// message said to delete it and extend the hit test to KVarN8. This is that
+/// extension, per its own instruction.
 ///
-/// **This test is GREEN today because the bug is present, and it will go RED
-/// the moment §7.5 is fixed.** That is intended: it makes the defect
-/// executable rather than a paragraph in a document, and it makes the fix
-/// impossible to land silently. When it reddens, DELETE it and extend
-/// `persist_then_load_prefix_reports_a_hit_fp16` to cover KVarN8 — the hit
-/// assertion is the one worth keeping.
+/// Under KVarN8 the store was WRITE-ONLY before §7.5: `persist` addressed
+/// blocks with the real mode while `load_prefix` hardcoded `Fp16`, so computed
+/// addresses could never equal the ones in its own manifest and every load
+/// returned `NoMatch` — indistinguishable from a legitimately cold cache.
 ///
-/// It is NOT an endorsement of the miss. See §7.5 for the two fix options.
-///
-/// **RED here means §7.5 CHANGED, not necessarily that it was fixed
-/// CORRECTLY.** This pins the bug's SYMPTOM (`NoMatch`), not its CAUSE (the
-/// address computed under the wrong mode). A "fix" that produces a *different*
-/// wrong behaviour — hits, but assembles wrong bytes — also reddens this test.
-/// **Verify the fix before deleting this**, or you will have removed the
-/// tripwire for a reason it was not reporting. (Violet.)
-///
-/// The `defect_present__` prefix is load-bearing: a reader scanning names and
-/// statuses at speed must be able to read this green correctly without opening
-/// the comment.
+/// Spans TWO blocks (128 sink + 31 tiles x 128 = 4096 = 2 x DEFAULT_BLOCK_SIZE)
+/// so it also drives multi-block KVarN8 assembly through the public API, with
+/// both block boundaries landing tile-aligned.
 #[test]
-fn defect_present__kvarn8_load_prefix_uses_fp16_address__delete_when_s7_5_fixed() {
-    // 128 sink + 15 tiles * 128 + 0 tail = 2048 = exactly one block.
-    const N_TILES: i32 = 15;
-    let depth = TILE + N_TILES * TILE;
-    assert_eq!(depth as usize, DEFAULT_BLOCK_SIZE, "one whole block");
+fn persist_then_load_prefix_reports_a_hit_kvarn8() {
+    const LAYERS: usize = 2;
+    const N_TILES: i32 = 31;
+    let depth = TILE + N_TILES * TILE; // 4096
+    assert_eq!(depth as usize, 2 * DEFAULT_BLOCK_SIZE, "must span two blocks");
 
-    let set = kvarn_v4_set_distinct(2, N_TILES, 0);
+    let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
     let tokens: Vec<i32> = (0..depth).collect();
 
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1367,15 +1354,60 @@ fn defect_present__kvarn8_load_prefix_uses_fp16_address__delete_when_s7_5_fixed(
 
     store
         .persist("m3", "tmpl", &tokens, &set)
-        .expect("persist must succeed — the WRITE half works, which is why this is invisible");
+        .expect("persist must succeed");
 
-    let outcome = store.load_prefix("m3", "tmpl", &tokens);
+    let (loaded, matched) = store
+        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8)
+        .expect(
+            "load_prefix MUST HIT under KVarN8. A miss here is the §7.5 write-only bug \
+             returning: persist addresses with the real mode, so load must too.",
+        );
 
+    assert!(matched > 0, "zero match means the store was written and never used");
+    assert_eq!(matched, tokens.len(), "the full prefix was persisted");
+    assert_eq!(
+        loaded.caches.len(),
+        LAYERS,
+        "one cache per LAYER, not one per (block, layer) — a B*L length is the \
+         flat-append bug reached through the public API under k8v4"
+    );
+    assert_eq!(
+        loaded.caches[0].mode,
+        KVCacheMode::KVarN8,
+        "the adopted cache must still be KVarN8"
+    );
+}
+
+/// A mode MISMATCH must be a clean miss, never a wrong adoption.
+///
+/// Persist under KVarN8, load under Fp16. Because block addresses commit to the
+/// KV mode, the addresses cannot match and the candidate is skipped. This is
+/// what makes threading the mode SAFE rather than merely correct: passing the
+/// wrong mode degrades to re-prefill, it does not adopt a KVarN8 cache into an
+/// Fp16 runtime.
+#[test]
+fn mode_mismatch_at_load_is_a_clean_miss_not_a_wrong_adoption() {
+    const N_TILES: i32 = 15;
+    let depth = TILE + N_TILES * TILE; // 2048, one block
+    let set = kvarn_v4_set_distinct(2, N_TILES, 0);
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
+    store.persist("m3", "tmpl", &tokens, &set).expect("persist");
+
+    // Correct mode hits.
+    store
+        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8)
+        .expect("KVarN8 load of a KVarN8 persist must hit");
+
+    // Wrong mode must MISS, not adopt.
+    let wrong = store.load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16);
     assert!(
-        matches!(outcome, Err(ColdStoreError::NoMatch)),
-        "EXPECTED the §7.5 write-only bug (NoMatch under KVarN8). If this line \
-         failed, the Fp16 hardcode at load_prefix:715 has been FIXED — delete \
-         this test and extend the fp16 hit test to KVarN8 instead."
+        matches!(wrong, Err(ColdStoreError::NoMatch)),
+        "loading a KVarN8 cache under Fp16 must be NoMatch (re-prefill), never an \
+         adoption. Got: {:?}",
+        wrong.map(|(_, m)| m)
     );
 }
 
