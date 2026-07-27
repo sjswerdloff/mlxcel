@@ -2943,19 +2943,35 @@ fn two_processes_contending_the_publication_lock_preserve_the_invariant() {
         .spawn()
         .expect("spawn writer child");
 
-    // Arm the seam. Only plain data crosses into the closure.
+    // THE RENDEZVOUS RESULT IS RECORDED, NOT DISCARDED. Found by Alden on
+    // `b52268d`: this originally called `wait_for_file` and ignored its bool. On
+    // timeout the parent simply proceeded, and a late child could then wake
+    // AFTER the sweep, reinstall the blocks, publish successfully, and the test
+    // would report the green child-wins branch having had no lock contention at
+    // all — passing without its sole stated claim.
+    //
+    // Same shape Violet named the same morning: an instrument that FAILED and an
+    // instrument that found nothing return the same thing to a caller who does
+    // not look. The bool existed; not reading it is what made the timeout silent.
+    let rendezvous_ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let b = base.clone();
+        let flag = std::sync::Arc::clone(&rendezvous_ok);
         *crate::cache::block_cold_store::GC_NOMINATION_SEAM
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(Box::new(move || {
-            std::fs::write(b.join("gc.nominated"), b"1").expect("signal nominated");
-            // Bounded: a child that died must not hang the suite. The parent's
-            // assertions below report its absence loudly.
-            wait_for_file(
+            // NEVER panic in here. A panic unwinds through `gc_blocks` with the
+            // seam still armed and the child still live — one red becomes a
+            // confusing several plus an orphaned process. Failures are recorded
+            // and asserted by the parent after cleanup.
+            if std::fs::write(b.join("gc.nominated"), b"1").is_err() {
+                return; // flag stays false
+            }
+            let observed = wait_for_file(
                 &b.join("child.publishing"),
                 std::time::Duration::from_secs(30),
             );
+            flag.store(observed, std::sync::atomic::Ordering::SeqCst);
         }));
     }
 
@@ -2967,12 +2983,26 @@ fn two_processes_contending_the_publication_lock_preserve_the_invariant() {
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = None;
 
-    gc_result.expect("gc must not error");
-
+    // REAP BEFORE ANY ASSERTION THAT CAN PANIC — Alden's ordering point. With
+    // `gc_result.expect()` first, a GC error panicked out of the test while the
+    // child was potentially still running, leaking a process into the rest of
+    // the suite.
     let _ = wait_for_child_bounded(
         &mut child,
         std::time::Duration::from_secs(60),
         "the writer child process",
+    );
+
+    gc_result.expect("gc must not error");
+
+    assert!(
+        rendezvous_ok.load(std::sync::atomic::Ordering::SeqCst),
+        "the nomination rendezvous never completed: the parent signalled \
+         `gc.nominated` and the child did not answer with `child.publishing` \
+         within the bound. The sweep therefore ran WITHOUT a publisher racing it, \
+         so whatever branch is reported below was not reached through contention \
+         and this test certifies nothing. Failing rather than reporting a green \
+         branch it did not earn."
     );
 
     let result_path = base.join("child.result");
