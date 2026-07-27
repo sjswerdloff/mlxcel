@@ -5932,6 +5932,84 @@ mod tests {
         );
     }
 
+    /// THE BIT-IDENTITY BACKSTOP — proof that the output comparison CAN fail, built so the
+    /// N2 confound cannot reach it.
+    ///
+    /// Violet, 2026-07-28, escalating a worry I had scoped too narrowly. I flagged that
+    /// N2's hand-built K/V might confound its divergence half. She checked what the other
+    /// controls actually assert: `g1_0_no_persist...` asserts `is_err()`,
+    /// `g1_0_a_mode_mismatch...` asserts `is_err()`, and **neither compares outputs at
+    /// all**. So N2's output half is the ONLY assertion anywhere in the G1 apparatus
+    /// establishing that bit-identity is a DISCRIMINATING result rather than an automatic
+    /// one — and G1.1 d4, G1.1 d128, G1.2a and G1.2b all rest on it. If that divergence is
+    /// confounded, every bit-identity green loses its non-vacuity backstop. Not wrong;
+    /// unbacked.
+    ///
+    /// **BOTH ARMS ARE DRIVEN BY `forward`.** No hand-replication of the pre-dispatch
+    /// pipeline anywhere, so the confound this exists to escape cannot reach it.
+    ///
+    /// SHARPENING on her proposal, and the reason for it: perturb the **cache state**, not
+    /// the decode input. G1's greens claim that outputs match when the STATE PATH differs
+    /// and the input is identical. A control that varies the input would only show the
+    /// comparison responds to inputs, which was never in doubt. Here the decode token is
+    /// byte-identical on both arms and only the history differs, so what is demonstrated is
+    /// exactly the sensitivity G1 relies on.
+    ///
+    /// This also closes Q2. The non-degeneracy guard (`l2_norm > 1e-3`) catches all-zero
+    /// arms and nothing else — notably not two arms agreeing because the comparison is
+    /// insensitive to the state behind them.
+    #[test]
+    fn g1_0_output_comparison_is_sensitive_to_cache_state_not_merely_to_input() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let l_chunk: i32 = 128;
+
+        // A longer input than either arm consumes, so both arms slice the SAME decode
+        // token out of the same tensor and differ only in what preceded it.
+        let input = make_test_input(1, l_chunk * 4, hidden);
+        let chunk = |i: i32| {
+            mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            )
+        };
+
+        // Arm 1: history = chunks 0,1,2. Arm 2: history = chunks 0,1 only.
+        let mut cache_long = KVCache::new();
+        for i in 0..3 {
+            let _ = attn.forward(&chunk(i), &mut cache_long, None);
+        }
+        let mut cache_short = KVCache::new();
+        for i in 0..2 {
+            let _ = attn.forward(&chunk(i), &mut cache_short, None);
+        }
+        assert_ne!(
+            cache_long.offset, cache_short.offset,
+            "precondition: the two arms must actually hold different state"
+        );
+
+        // THE SAME decode token on both arms — byte-identical input, differing state.
+        let decode = chunk(3);
+        let out_long = attn.forward(&decode, &mut cache_long, None);
+        let out_short = attn.forward(&decode, &mut cache_short, None);
+        mlxcel_core::eval(&out_long);
+        mlxcel_core::eval(&out_short);
+
+        assert!(
+            l2_norm(&out_long) > 1e-3,
+            "degenerate output makes the comparison below meaningless"
+        );
+        assert!(
+            !arrays_bit_identical(&out_long, &out_short),
+            "the output comparison did not distinguish two caches holding DIFFERENT state \
+             under an identical decode token. Then `arrays_bit_identical` is not sensitive \
+             to the thing every G1 bit-identity green claims to be measuring, and those \
+             greens are unbacked rather than wrong."
+        );
+    }
+
     /// G1.1 at the cheap width — the routine structural regression gate.
     #[test]
     fn g1_1_fp16_disk_adoption_attention_layer_equivalence_d4() {
