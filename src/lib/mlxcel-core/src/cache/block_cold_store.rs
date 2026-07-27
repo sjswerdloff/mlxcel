@@ -940,26 +940,50 @@ impl BlockColdStore {
             return Ok(());
         }
 
-        let entries: Vec<_> = fs::read_dir(&manifests_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-            .filter(|e| {
-                let name = e.file_name();
-                let name = name.to_string_lossy();
-                !name.starts_with(".tmp.")
-            })
-            .collect();
+        let entries: Vec<_> = fs::read_dir(&manifests_dir)?.filter_map(|e| e.ok()).collect();
 
         for entry in entries {
-            let manifest_path = entry.path().join("manifest.bin");
-            if !manifest_path.exists() {
-                continue;
-            }
-            let bytes = match fs::read(&manifest_path) {
-                Ok(b) => b,
+            // MIGRATED TO THE SHARED PREDICATE — Alden, 2026-07-28, blocker 2.
+            //
+            // This surface kept its own inline `.tmp.` filter and direct-decoded
+            // `manifest.bin`, so the "single audit surface" was still two.
+            //
+            // ⚠️ NOT A DEMONSTRATED LIVE BUG — and this is recorded because the
+            // person who raised the concern WITHDREW it, which is more useful to
+            // a future reader than an anonymous worry.
+            //
+            // The concern: a direct decode lets misfiled bytes at directory Y
+            // drive `delete_manifest` against a different directory X. I could
+            // not construct that as an observable harm; Alden then confirmed the
+            // claim was hypothetical and that he had stated it as demonstrated.
+            // His own enumeration, kept here so nobody re-derives it or "fixes"
+            // the non-bug: misfiled Y contains X, so it carries X's pruning
+            // eligibility — if correctly-filed X exists and is prunable, X's own
+            // entry reaches the same deletion; if X is divergent, both entries
+            // reject; if X is absent, `delete_manifest(X)` has no target. Every
+            // check below is CONTENT-based, so the two entries are judged
+            // identically, and the old deletion was content-addressed too.
+            //
+            // What the migration buys is therefore STRUCTURAL, not a bug fix:
+            // one audit surface instead of two, and a deletion target bound to
+            // the directory actually examined, so a future direct-decode
+            // regression cannot reintroduce the concern. Pinned by
+            // `a_misfiled_manifest_is_not_a_prune_input_and_causes_no_deletion`
+            // (property that holds either way) and its positive control.
+            //
+            // FAILS SOFT on both the predicate and the read, which is safe in the
+            // pruning direction specifically: skipping a prune leaves EXTRA state
+            // behind, never deletes live state. The sweeper cannot make that
+            // trade; this function can.
+            let manifest_hash = match committed_manifest_hash(&entry) {
+                Ok(Some(h)) => h,
+                Ok(None) => continue,
                 Err(_) => continue,
             };
-            let old_manifest = match decode_manifest(&bytes) {
+            // CANONICAL READ — binds the content to the address it is filed
+            // under, so `manifest_hash` below is the directory we actually read
+            // and not a hash recovered from bytes that may not belong here.
+            let old_manifest = match self.read_manifest(&manifest_hash) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -1026,8 +1050,12 @@ impl BlockColdStore {
                 continue;
             }
 
-            // Prune
-            match self.delete_manifest(&old_manifest.hash()) {
+            // Prune BY THE DIRECTORY ADDRESS we read, not by a hash recovered
+            // from the bytes. `read_manifest` has already proved the two agree;
+            // using the address makes the deletion target structurally the thing
+            // that was examined, so a future direct-decode regression cannot
+            // reintroduce "delete X because Y contained X's bytes".
+            match self.delete_manifest(&manifest_hash) {
                 Ok(()) => {
                     tracing::info!(
                         pruned = %old_manifest.hash_hex(),
@@ -1189,7 +1217,10 @@ impl BlockColdStore {
         }
         for entry in fs::read_dir(&manifests_dir)? {
             let entry = entry?;
-            let Some(manifest_hash) = committed_manifest_hash(&entry) else {
+            // PROPAGATES on error. An I/O failure here must not silently shrink
+            // the root set — a manifest missing from it is a manifest whose
+            // blocks this pass would authorize deleting.
+            let Some(manifest_hash) = committed_manifest_hash(&entry)? else {
                 continue;
             };
             // Deliberately propagates — NOT the fail-soft `continue` that
@@ -1513,8 +1544,13 @@ impl BlockColdStore {
             // ONE PREDICATE, shared with `mark_reachable_blocks`. See
             // `committed_manifest_hash` for what went wrong when this site had
             // its own inline rules.
-            let Some(manifest_hash) = committed_manifest_hash(&entry) else {
-                continue;
+            // FAILS SOFT, deliberately: a reader that skips a candidate loses a
+            // cache hit. Contrast `mark_reachable_blocks`, which propagates,
+            // because a sweeper that skips one deletes live data.
+            let manifest_hash = match committed_manifest_hash(&entry) {
+                Ok(Some(h)) => h,
+                Ok(None) => continue,
+                Err(_) => continue,
             };
             // CANONICAL READ, not a direct decode of `manifest.bin`.
             //
@@ -2502,18 +2538,37 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 /// keep their own rules — their artifact policy differs (`.tombstone.` is a live
 /// stage of a delete, not a discard), and collapsing them would be the opposite
 /// error to the one this fixes.
-fn committed_manifest_hash(entry: &fs::DirEntry) -> Option<[u8; 32]> {
-    if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-        return None;
+/// RETURNS `Result`, NOT BARE `Option` — Alden, 2026-07-28, and the distinction
+/// has a deletion consequence.
+///
+/// The first draft mapped a `file_type()` I/O error to `None`. That is fine for
+/// a reader: skip the candidate, lose a cache hit. It is **unsafe for
+/// `mark_reachable_blocks`**, where a transient I/O error would make a COMMITTED
+/// manifest silently vanish from the root set — and a manifest missing from the
+/// root set is a manifest whose blocks the sweep is authorized to delete.
+///
+/// So the error channel is separated from the verdict, and each caller states
+/// its own policy: readers and pruners may `continue` on `Err`, the sweeper must
+/// propagate. Same asymmetry as `read_manifest`, one layer earlier.
+fn committed_manifest_hash(entry: &fs::DirEntry) -> Result<Option<[u8; 32]>, ColdStoreError> {
+    if !entry.file_type()?.is_dir() {
+        return Ok(None);
     }
     let name = entry.file_name();
     let name = name.to_string_lossy();
     // Staged, not published: `write_manifest` fills `.tmp.<hash>` BEFORE taking
     // the lock, and only the final rename commits. The name IS the commit marker.
+    //
+    // BELT-AND-BRACES, NOT INDEPENDENTLY NECESSARY — measured, not assumed.
+    // Disabling this clause alone leaves all three tests GREEN, because
+    // `parse_hex_digest` rejects `.tmp.<64 hex>` on length (69 != 64) anyway.
+    // Retained to state intent where a reader looks, and because the redundancy
+    // is a coincidence of the current naming scheme rather than a guarantee.
+    // Do NOT cite it as a proven guard; see the handoff for what actually holds.
     if name.starts_with(".tmp.") {
-        return None;
+        return Ok(None);
     }
-    parse_hex_digest(&name)
+    Ok(parse_hex_digest(&name))
 }
 
 fn parse_hex_digest(hex: &str) -> Option<[u8; 32]> {

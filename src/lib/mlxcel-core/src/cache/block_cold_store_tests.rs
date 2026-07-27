@@ -2908,6 +2908,115 @@ fn a_manifest_whose_content_does_not_match_its_directory_is_not_a_candidate() {
     );
 }
 
+/// ALDEN BLOCKER 2 (2026-07-28) — `prune_prefix_manifests` migrated to the shared
+/// candidacy predicate and the canonical read.
+///
+/// NEGATIVE: a misfiled manifest — valid bytes under a well-formed but WRONG
+/// address — must not be a prune decision input, and must not cause any
+/// deletion.
+///
+/// ⚠️ **SCOPE, STATED HONESTLY.** Alden described a sequence where the direct
+/// decode deletes the correctly-filed X because of the misfiled copy. **I could
+/// not construct that harm as an observable difference** and I am not claiming
+/// it here: prune's checks are content-based, so a misfiled copy decodes to X
+/// and is accepted or rejected on X's own merits exactly as X's own entry is,
+/// and the old deletion was content-addressed too, making it self-consistent.
+/// What this test pins is the property that holds either way — a misfiled
+/// directory is skipped and nothing is deleted on its account — plus the
+/// structural change that deletion now targets the ENUMERATED address rather
+/// than a hash recovered from bytes. That is defence against a future
+/// direct-decode regression, not a demonstrated live bug. See the message to
+/// Alden; if he supplies the sequence, this test gets the stronger assertion.
+#[test]
+fn a_misfiled_manifest_is_not_a_prune_input_and_causes_no_deletion() {
+    const LAYERS: usize = 2;
+    let short_tokens: Vec<i32> = (0..DEFAULT_BLOCK_SIZE as i32).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xCAu8; 32])
+        .with_prune_mode(PruneMode::Delete);
+
+    // A DIVERGENT manifest that must survive: not a prefix of what we persist
+    // next, so nothing legitimate may prune it.
+    let keeper_tokens: Vec<i32> = (5000..5000 + DEFAULT_BLOCK_SIZE as i32).collect();
+    let keeper = store
+        .persist(
+            "m3",
+            "tmpl",
+            &keeper_tokens,
+            &fp16_set(LAYERS, keeper_tokens.len() as i32),
+        )
+        .expect("persist keeper");
+
+    // MISFILE a copy of the keeper's bytes under a well-formed WRONG address.
+    let keeper_dir = store.manifests_dir().join(hex_digest(&keeper.hash()));
+    let bytes = std::fs::read(keeper_dir.join("manifest.bin")).expect("read keeper manifest");
+    let wrong = [0x77u8; 32];
+    assert_ne!(wrong, keeper.hash(), "precondition: addresses must differ");
+    let wrong_dir = store.manifests_dir().join(hex_digest(&wrong));
+    std::fs::create_dir_all(&wrong_dir).expect("create misfiled dir");
+    std::fs::write(wrong_dir.join("manifest.bin"), &bytes).expect("write misfiled copy");
+    decode_manifest(&bytes).expect("precondition: the misfiled bytes must decode");
+
+    // Persist an unrelated sequence, which runs the prune pass.
+    store
+        .persist(
+            "m3",
+            "tmpl",
+            &short_tokens,
+            &fp16_set(LAYERS, short_tokens.len() as i32),
+        )
+        .expect("persist unrelated");
+
+    // The keeper survives — nothing about the misfiled copy authorized touching it.
+    store
+        .read_manifest(&keeper.hash())
+        .expect("the correctly-filed manifest must survive a prune pass that saw a misfiled copy");
+    // And the misfiled directory is inert, not adopted into the store's accounting.
+    assert!(
+        wrong_dir.exists(),
+        "the misfiled directory should be left alone, not silently deleted"
+    );
+}
+
+/// ALDEN BLOCKER 2, POSITIVE CONTROL — requested by name.
+///
+/// Every assertion above is satisfied by a prune that never prunes ANYTHING. This
+/// is the off-diagonal: a genuine committed prefix ancestor is still pruned after
+/// the migration. Without it, a change that broke pruning entirely would turn the
+/// negative green.
+#[test]
+fn a_real_committed_prefix_ancestor_is_still_pruned_after_the_migration() {
+    const LAYERS: usize = 2;
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xCBu8; 32])
+        .with_prune_mode(PruneMode::Delete);
+
+    let short: Vec<i32> = (0..DEFAULT_BLOCK_SIZE as i32).collect();
+    store
+        .persist("m3", "tmpl", &short, &fp16_set(LAYERS, short.len() as i32))
+        .expect("persist ancestor");
+    assert_eq!(
+        count_manifests(&store),
+        1,
+        "precondition: the ancestor must be committed"
+    );
+
+    let long: Vec<i32> = (0..2 * DEFAULT_BLOCK_SIZE as i32).collect();
+    store
+        .persist("m3", "tmpl", &long, &fp16_set(LAYERS, long.len() as i32))
+        .expect("persist descendant");
+
+    assert_eq!(
+        count_manifests(&store),
+        1,
+        "the committed prefix ancestor must still be pruned after routing prune \
+         through the shared predicate and the canonical read. If this is 2, the \
+         migration broke pruning outright and the negative beside it is green on \
+         a dead feature rather than a working guard."
+    );
+}
+
 /// CHILD-PROCESS HELPER — the SWEEPER. Inert unless `MLXCEL_TEST_GC_DIR` is set.
 ///
 /// Runs a real `gc_blocks()` in its own process, taking the `flock` from its own
