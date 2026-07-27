@@ -520,6 +520,38 @@ impl Store {
 
 static STORE: OnceLock<Store> = OnceLock::new();
 
+/// TEST-ONLY scoped override of the MSA core selection.
+///
+/// Added 2026-07-27 (Clement, on Alden's design verdict) so a structural
+/// bit-identity gate cannot silently inherit the MUTABLE, TOML-reloadable
+/// runtime core choice. K1 compares the gathered flow against the
+/// full-window flow and demands bit identity; that is only a meaningful
+/// contract when both flows run the SAME core. The production default is
+/// `MsaCore::Sdpa`, which is hooked ONLY on the gathered flow and is
+/// documented as NOT bit-identical to the blocked core — so without this
+/// guard the gate was comparing two different kernels and could never pass.
+///
+/// Restores the previous value on drop. A test that uses this MUST also
+/// assert the effective dispatch before comparing, so a lost race shows up
+/// as a loud failure rather than a silently wrong comparison.
+#[cfg(test)]
+pub struct MsaCoreGuard(bool);
+
+#[cfg(test)]
+impl MsaCoreGuard {
+    /// Force the blocked-gather core for the lifetime of the guard.
+    pub fn force_blocked() -> Self {
+        Self(global().sdpa_core.swap(false, Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+impl Drop for MsaCoreGuard {
+    fn drop(&mut self) {
+        global().sdpa_core.store(self.0, Ordering::Relaxed);
+    }
+}
+
 fn global() -> &'static Store {
     STORE.get_or_init(|| {
         let config_file = std::env::var_os("MLXCEL_DECODE_CONFIG").map(PathBuf::from);

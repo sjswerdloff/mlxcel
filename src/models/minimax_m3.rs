@@ -7198,7 +7198,34 @@ mod tests {
     /// the whole K1 design rests on, and the reason the tiny bs=2 harness
     /// cannot drive this path (fetch_kvarn8_blocks asserts the quantum).
     #[test]
-    fn kvarn8_gathered_decode_is_bit_identical_to_full_window_path() {
+    fn kvarn8_gathered_decode_is_bit_identical_to_full_window_path_on_the_blocked_core() {
+        // K1 demands BIT identity, which is only a meaningful contract when
+        // both flows run the SAME core. The production default is
+        // MsaCore::Sdpa, hooked ONLY on the gathered flow and documented on
+        // sparse_decode_core_sdpa as "NOT bit-identical to the blocked core
+        // (the fused kernel's accumulation order differs) — equivalence is
+        // tolerance-gated". Without this the gate compared two different
+        // kernels and could never pass; it measured 6 ULP (relative 2.36x
+        // fp32 epsilon), well inside the fp16 tolerance that
+        // sdpa_core_matches_blocked_core_on_identical_inputs already pins.
+        //
+        // So this gate is now explicitly the STRUCTURAL one: gathered
+        // blocked-core versus full-window blocked-core, where bit identity
+        // IS the right contract. Numerical equivalence of the two CORES is a
+        // separate gate at its documented tolerance, and an end-to-end test
+        // of the production sdpa dispatch would be a third, tolerance-gated.
+        // (Alden design verdict, 2026-07-27; diagnosis in commits
+        // 0d666d5..2bd3d9c.)
+        let _core_guard = crate::decode_config::MsaCoreGuard::force_blocked();
+        assert!(
+            !msa_core_sdpa_enabled(),
+            "dispatch witness: the blocked core must be in effect before any              bit-identity comparison — otherwise this gate silently compares              two different kernels"
+        );
+        assert!(
+            !msa_fetch_qmm_enabled(),
+            "dispatch witness: the fused qmm fetch core must be off"
+        );
+
         let mut attn = make_test_sparse_attention();
         attn.block_size = 128; // production quantum; harness default is 2
         let hidden = 16;
