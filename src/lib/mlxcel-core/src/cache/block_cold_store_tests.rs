@@ -1468,6 +1468,30 @@ fn round_trip_must_preserve_per_layer_m3_idx_state_including_dense_layers() {
         );
     }
 
+    // `offset` is the OTHER field §7.3 names as chosen-but-unverified, and it
+    // carries the same risk in the same shape: a number I picked
+    // (`total_tokens`) standing in for the real extent of the state. Under
+    // KVarN8 that state is split across sink / history / tail, so the honest
+    // check is that the declared cursor equals what is actually stored. A
+    // wrong `offset` here is the "tensors right, interpretation wrong" case
+    // that generates garbage while every byte assertion passes.
+    for (i, c) in loaded.caches.iter().enumerate() {
+        let sink = c.kvarn_sink_k.as_ref().map_or(0, |a| axis2_len(a));
+        let hist = c.kvarn_hist_k.as_ref().map_or(0, |a| axis2_len(a));
+        let tail = c.kvarn_tail_k.as_ref().map_or(0, |a| axis2_len(a));
+        assert_eq!(
+            c.offset,
+            sink + hist + tail,
+            "layer {i}: offset ({}) disagrees with the tokens actually stored \
+             (sink {sink} + hist {hist} + tail {tail} = {}). The cursor and the \
+             payload must describe the same cache — a cursor past the data \
+             reads uninitialised state, one short of it silently truncates the \
+             adopted prefix.",
+            c.offset,
+            sink + hist + tail
+        );
+    }
+
     // The invariant that makes the above load-bearing rather than bookkeeping:
     // a declared length with no tensor behind it.
     for (i, c) in loaded.caches.iter().enumerate() {
