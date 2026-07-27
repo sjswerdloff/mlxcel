@@ -28,7 +28,7 @@
 //! - Block max-pool scoring with causal masking
 //! - Local block always included (score set to inf)
 
-use crate::models::switch_layers::{SwitchLinear, gather_sort};
+use crate::models::switch_layers::{gather_sort, SwitchLinear};
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{GemmaRMSNorm, KVCache, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
@@ -1363,8 +1363,20 @@ impl SparseAttention {
             static HARVEST_STEP: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             if HARVEST_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 == 0 {
-                mlxcel_core::cache::harvest::dump("idx_q", self.layer_idx as usize, offset, 0, &idx_q);
-                mlxcel_core::cache::harvest::dump("sel", self.layer_idx as usize, offset, 0, &selected);
+                mlxcel_core::cache::harvest::dump(
+                    "idx_q",
+                    self.layer_idx as usize,
+                    offset,
+                    0,
+                    &idx_q,
+                );
+                mlxcel_core::cache::harvest::dump(
+                    "sel",
+                    self.layer_idx as usize,
+                    offset,
+                    0,
+                    &selected,
+                );
             }
         }
 
@@ -1421,9 +1433,7 @@ impl SparseAttention {
                     "KV-outer block-sparse attention active (first dispatch this process)"
                 );
             });
-            let out = self.sparse_decode_attention_kv_outer(
-                q, &selected, cache, kv_len, offset,
-            );
+            let out = self.sparse_decode_attention_kv_outer(q, &selected, cache, kv_len, offset);
             // Apply output projection: [B, Hq, 1, Dim] → [B, 1, Hq*Dim] → o_proj.
             let out = mlxcel_core::transpose_axes(&out, &[0, 2, 1, 3]);
             let out = mlxcel_core::reshape(&out, &[b, l, self.num_heads * self.head_dim]);
@@ -2016,10 +2026,8 @@ impl SparseAttention {
             None => mlxcel_core::reshape(st.sink_v, &[1, h_kv, bs, d]),
         };
         let q_rot4 = mlxcel_core::reshape(&q_rot, &[1, h_kv, n_rep, d]);
-        let logits_st = mlxcel_core::matmul(
-            &q_rot4,
-            &mlxcel_core::transpose_axes(&k_st, &[0, 1, 3, 2]),
-        ); // [1, H, n_rep, s_len]
+        let logits_st =
+            mlxcel_core::matmul(&q_rot4, &mlxcel_core::transpose_axes(&k_st, &[0, 1, 3, 2])); // [1, H, n_rep, s_len]
 
         // ── One softmax over the concatenated logits, blocked-core op
         // order: raw logits → ·scale → +mask → softmax.
@@ -2240,7 +2248,8 @@ impl SparseAttention {
         // Diagnostic: check partials for validity (guarded — forces GPU→CPU sync).
         if *KV_OUTER_DIAG {
             let m_bytes = mlxcel_core::array_to_raw_bytes(&partial_m);
-            let m_vals: Vec<f32> = m_bytes.chunks_exact(4)
+            let m_vals: Vec<f32> = m_bytes
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             let m_finite_count = m_vals.iter().filter(|v| v.is_finite()).count();
@@ -2260,17 +2269,14 @@ impl SparseAttention {
 
         // Phase 2: global softmax reduction.
         let out = mlxcel_core::turbo_minimax_sparse_kv_outer_reduction(
-            q,
-            &partial_m,
-            &partial_l,
-            &partial_v,
-            n_selected,
+            q, &partial_m, &partial_l, &partial_v, n_selected,
         );
 
         // Diagnostic: check output for validity (guarded — forces GPU→CPU sync).
         if *KV_OUTER_DIAG {
             let out_bytes = mlxcel_core::array_to_raw_bytes(&out);
-            let out_vals: Vec<f32> = out_bytes.chunks_exact(4)
+            let out_vals: Vec<f32> = out_bytes
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             let out_finite = out_vals.iter().filter(|v| v.is_finite()).count();
@@ -5658,17 +5664,17 @@ mod tests {
         let l_chunk = 6;
         let n_chunks = 4;
         let l_total = l_chunk * n_chunks; // 24
-        // Block-aligned (but NOT chunk-aligned) trim: cold-equivalence holds
-        // and this test pins it. Empirical finding (2026-07-04): at an
-        // UNALIGNED trim (7 here, or the live dense-adoption 160 with
-        // block_size 128), the resumed output legitimately diverges from a
-        // cold run (relative L2 ≈ 1.13 at this scale) because MSA's
-        // query-block pooling grid anchors at the chunk start — a shifted
-        // grid pools different positions together, selects different top-k
-        // blocks, and computes different (valid) attention. Cold-equivalence
-        // after partial adoption therefore requires flooring dense adoption
-        // to the MSA block size, mirroring the paged path's #225 flooring.
-        // Tracked as follow-up work.
+                                          // Block-aligned (but NOT chunk-aligned) trim: cold-equivalence holds
+                                          // and this test pins it. Empirical finding (2026-07-04): at an
+                                          // UNALIGNED trim (7 here, or the live dense-adoption 160 with
+                                          // block_size 128), the resumed output legitimately diverges from a
+                                          // cold run (relative L2 ≈ 1.13 at this scale) because MSA's
+                                          // query-block pooling grid anchors at the chunk start — a shifted
+                                          // grid pools different positions together, selects different top-k
+                                          // blocks, and computes different (valid) attention. Cold-equivalence
+                                          // after partial adoption therefore requires flooring dense adoption
+                                          // to the MSA block size, mirroring the paged path's #225 flooring.
+                                          // Tracked as follow-up work.
         let trim_target: i32 = 8;
 
         let input = make_test_input(1, l_total, hidden);
@@ -5864,6 +5870,135 @@ mod tests {
         assert_eq!(checked, 64, "expected 64 mask positions checked");
     }
 
+    /// Extract an integer array to host as `Vec<i32>`. Forces evaluation.
+    /// No floating comparison anywhere in the caller — deliberate.
+    fn host_i32(a: &MlxArray) -> Vec<i32> {
+        let as_i32 = mlxcel_core::astype(a, mlxcel_core::dtype::INT32);
+        mlxcel_core::array_to_raw_bytes(&as_i32)
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// ALDEN'S LEVEL-1/2 DISCRIMINATOR for the K1 gate (his brief, 2026-07-27).
+    ///
+    /// The K1 gate compares two decode paths with `allclose(a, b, 0.0, 0.0)`
+    /// and, on failure, blames "union/remap/positions". That message names
+    /// three suspects and distinguishes none of them, because the comparison
+    /// is on the FLOAT OUTPUT at the end of the pipeline.
+    ///
+    /// This checks the same premise with INTEGER EQUALITY, upstream of any
+    /// arithmetic:
+    ///
+    ///   L1: the per-query/per-head ABSOLUTE selected tile indices, in
+    ///       canonical (head-major) order, must be identical between the two
+    ///       caches the K1 gate builds.
+    ///   L2: their sorted-unique unions must be identical.
+    ///
+    /// Both paths call the SAME `per_token_block_selection` with an `idx_q`
+    /// derived from the same `x_decode`, so the ONLY way the selections can
+    /// diverge is if the two caches' `idx_k` state differs after identical
+    /// prefill. That makes this a direct, tolerance-free test of the K1
+    /// gate's unstated "identical KVarN8 state" premise.
+    ///
+    /// Reading the result:
+    ///   FAILS  => selector/cache-state issue. The K1 float diff is a
+    ///             consequence, and "union/remap/positions" is the wrong
+    ///             suspect list.
+    ///   PASSES => selection is bit-exact and the fault is DOWNSTREAM of index
+    ///             construction — payload or arithmetic, not which blocks were
+    ///             chosen. Combined with `fresh_k == 0` from the earlier
+    ///             harness, that points at the V quantize/dequantize path.
+    ///
+    /// NOT COVERED (Alden's level 3, stated so absence is not read as
+    /// coverage): the compact-index remap and compact position table are built
+    /// INLINE inside `sparse_decode_attention_gathered` and are not reachable
+    /// from here. Asserting `gathered_abs[compact_idx] == full_abs` and the
+    /// position mapping requires that function to expose them. Level 2 as
+    /// written here recomputes the union by the same rule the gathered path
+    /// uses, so it verifies the RULE is deterministic, not that the gathered
+    /// path applied it — that check needs the same exposure.
+    #[test]
+    fn gathered_and_full_window_select_identical_absolute_blocks() {
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let kv_len_prior = 429;
+        let l = 1;
+        let kv_len = kv_len_prior + l;
+        let offset = kv_len_prior;
+        let b = 1;
+
+        let x_prefill = make_test_input(1, kv_len_prior, hidden);
+        let x_decode = make_test_input(1, l, hidden);
+
+        // Two caches, identical prefill through the SAME attn — exactly what
+        // the K1 gate does, including that shared-attn detail.
+        let mut cache_a = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let _ = attn.forward(&x_prefill, &mut cache_a, None);
+        let mut cache_b = KVCache::new_with_mode(mlxcel_core::cache::KVCacheMode::KVarN8);
+        let _ = attn.forward(&x_prefill, &mut cache_b, None);
+        assert_eq!(cache_a.offset, kv_len_prior);
+        assert_eq!(cache_b.offset, kv_len_prior);
+
+        // One idx_k for the decode token, fed to both caches.
+        let idx_k_raw = attn.index_k_proj.as_ref().unwrap().forward(&x_decode);
+        let idx_k = mlxcel_core::reshape(&idx_k_raw, &[1, l, 1, attn.index_dim]);
+        let idx_k = if let Some(ref n) = attn.index_k_norm {
+            n.forward(&idx_k)
+        } else {
+            idx_k
+        };
+        let idx_k = mlxcel_core::transpose_axes(&idx_k, &[0, 2, 1, 3]);
+        let idx_k =
+            mlxcel_core::fast_rope(&idx_k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+
+        let ika = cache_a.m3_idx_k_update_and_fetch(&idx_k);
+        let ikb = cache_b.m3_idx_k_update_and_fetch(&idx_k);
+
+        let idx_q = attn.project_index_queries(&x_decode, b, l, offset);
+        let sel_a = attn.per_token_block_selection(&idx_q, &ika, b, l, kv_len, offset);
+        let sel_b = attn.per_token_block_selection(&idx_q, &ikb, b, l, kv_len, offset);
+
+        assert_eq!(
+            mlxcel_core::array_shape(&sel_a),
+            mlxcel_core::array_shape(&sel_b),
+            "selection shapes must match before comparing indices"
+        );
+
+        let va = host_i32(&sel_a);
+        let vb = host_i32(&sel_b);
+        eprintln!(
+            "DIAG L1 shape={:?} n={} first16_a={:?} first16_b={:?}",
+            mlxcel_core::array_shape(&sel_a),
+            va.len(),
+            &va[..va.len().min(16)],
+            &vb[..vb.len().min(16)]
+        );
+
+        // L1 — absolute selected indices, canonical order, integer-exact.
+        assert_eq!(
+            va, vb,
+            "ALDEN L1: the two caches select DIFFERENT absolute tile indices \
+             after identical prefill. The K1 gate's 'identical KVarN8 state' \
+             premise is false at the selector, and its float diff is a \
+             consequence of choosing different blocks — not a union, remap or \
+             position bug."
+        );
+
+        // L2 — sorted-unique unions.
+        let mut ua = va.clone();
+        ua.sort_unstable();
+        ua.dedup();
+        let mut ub = vb.clone();
+        ub.sort_unstable();
+        ub.dedup();
+        assert_eq!(
+            ua, ub,
+            "ALDEN L2: unions differ though raw selections matched"
+        );
+    }
+
     /// K1 gate (plan §K1): the gathered decode path on a KVarN8 cache must
     /// be BIT-IDENTICAL to the v1 full-window sparse decode path on the
     /// same cache state (atol 0). The two share `sparse_decode_core`, so
@@ -5990,10 +6125,14 @@ mod tests {
         let offset = w - l; // q tokens at positions 8, 9 (local block = 4)
 
         let det = |n: usize, phase: f32| -> Vec<f32> {
-            (0..n).map(|i| ((i as f32) * 0.37 + phase).sin() * 0.5).collect()
+            (0..n)
+                .map(|i| ((i as f32) * 0.37 + phase).sin() * 0.5)
+                .collect()
         };
-        let k = mlxcel_core::from_slice_f32(&det((b * h_kv * w * hd) as usize, 0.1), &[b, h_kv, w, hd]);
-        let v = mlxcel_core::from_slice_f32(&det((b * h_kv * w * hd) as usize, 1.3), &[b, h_kv, w, hd]);
+        let k =
+            mlxcel_core::from_slice_f32(&det((b * h_kv * w * hd) as usize, 0.1), &[b, h_kv, w, hd]);
+        let v =
+            mlxcel_core::from_slice_f32(&det((b * h_kv * w * hd) as usize, 1.3), &[b, h_kv, w, hd]);
         let q = mlxcel_core::from_slice_f32(&det((b * nh * l * hd) as usize, 2.7), &[b, nh, l, hd]);
         let pos_full = mlxcel_core::arange_f32(0.0, w as f32, 1.0);
 
@@ -6152,7 +6291,14 @@ mod tests {
 
         // Reference: the production gathered path (env off → blocked core).
         let ref_out = attn.sparse_decode_attention_gathered(
-            &x_decode, &q, &cache, &idx_k_full, 1, l, kv_len, offset,
+            &x_decode,
+            &q,
+            &cache,
+            &idx_k_full,
+            1,
+            l,
+            kv_len,
+            offset,
         );
         mlxcel_core::eval(&ref_out);
 
@@ -6235,7 +6381,9 @@ mod tests {
         let offset = total - 1;
         let nkb = 4;
         let cache = KVCache::synth_kvarn8_state(1, h_kv, d, total, attn.index_dim, 7);
-        let st = cache.kvarn_qmm_state().expect("synth state is qmm-servable");
+        let st = cache
+            .kvarn_qmm_state()
+            .expect("synth state is qmm-servable");
         assert_eq!(st.n_tiles, 2);
         assert_eq!(st.tail_len, 45);
 
