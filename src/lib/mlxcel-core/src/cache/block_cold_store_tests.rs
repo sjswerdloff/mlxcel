@@ -1378,3 +1378,177 @@ fn defect_present__kvarn8_load_prefix_uses_fp16_address__delete_when_s7_5_fixed(
          this test and extend the fp16 hit test to KVarN8 instead."
     );
 }
+
+// ===========================================================================
+// G2.1 — CONCURRENT SAME-BLOCK PERSIST (Violet's pre-deploy gate, minimum four)
+//
+// The dedup claim: two writers persisting the SAME block converge on one
+// block on disk, with no corruption. Until now the only atomicity test was
+// single-threaded, so the claim was unexercised.
+//
+// What the code actually does, read before writing this test:
+//   * `persist` declares a `persist_lock: Mutex<()>` (:159, :169) and NEVER
+//     ACQUIRES IT — `grep -F ".lock()"` over the file returns nothing. The
+//     field is dead. persist is entirely unserialized.
+//   * `write_block` guards with `if block_dir.exists() { return Ok(()) }`,
+//     which is a TOCTOU check, and stages into `.tmp.<hash>` — THE SAME PATH
+//     for the same block hash. Two concurrent writers of one block therefore
+//     share a staging directory and both attempt `rename(tmp, block_dir)`.
+//
+// The invariant asserted here is deliberately interleaving-INDEPENDENT, so
+// this cannot become a flaky gate: whatever ordering occurs, the store must
+// end in a state where every committed block is READABLE AND CHECKSUM-CLEAN.
+// `read_block` verifies per-layer sha256, so a torn or interleaved block is
+// caught rather than silently adopted.
+// ===========================================================================
+
+/// Both threads persist byte-identical content, so both compute the SAME block
+/// hash — the real dedup scenario, not an artificial one.
+///
+/// # MUTATION RECORD — what this test does and does NOT catch
+///
+/// Proven by mutating `write_block` and observing, not by reasoning:
+///
+/// * **Torn write** (write only some layer files, header still lists them all)
+///   → **RED, 8/8 runs.** The checksum invariant bites: a committed block that
+///   is structurally incomplete is caught by `read_block`'s per-layer sha256
+///   and byte_len checks. This is the failure mode that matters — a block
+///   directory `load_prefix` can discover but which yields a corrupt prefix.
+///
+/// * **Staging removed** (`tmp_dir = block_dir`, no rename — writers interleave
+///   directly into the committed directory) → **GREEN. This test does NOT catch
+///   that.** And it cannot, by construction: content-addressing means both
+///   writers of one block write BYTE-IDENTICAL data, so interleaving them is
+///   harmless. Stated here so this green is not read as certifying atomicity.
+///   It certifies that whatever the interleaving produced is READABLE.
+///
+/// So the honest scope: this gate catches structural incompleteness under
+/// concurrency. It does not, and cannot, catch byte-level interleaving, because
+/// the dedup scenario guarantees the interleaved bytes are equal.
+///
+/// # What was found writing it
+///
+/// `persist` declares `persist_lock: Mutex<()>` and NEVER acquires it —
+/// `grep -F ".lock()"` over the file returns nothing. `persist` is entirely
+/// unserialized, and concurrent same-block persist nonetheless leaves a
+/// readable store, 5/5 runs on pristine code. Safe by content-addressing
+/// rather than by locking.
+#[test]
+fn concurrent_same_block_persist_leaves_a_readable_store() {
+    use std::sync::Arc;
+
+    const LAYERS: usize = 2;
+    const DEPTH: i32 = 2 * DEFAULT_BLOCK_SIZE as i32;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = Arc::new(BlockColdStore::new(dir.path().to_path_buf(), [21u8; 32]));
+    let tokens: Vec<i32> = (0..DEPTH).collect();
+
+    // `DetachedCacheSet` is NEITHER Send NOR Sync — it holds cxx `UniquePtr`s
+    // over `*const cxx::void`. Verified by compiler, both directions: passing
+    // `&set` fails "cannot be shared between threads", moving `set` fails
+    // "cannot be sent between threads". So each worker must BUILD its own set
+    // in its own thread; a cache set cannot cross a thread boundary at all.
+    // fp16_set is a pure function of its inputs, so both workers produce
+    // byte-identical content and therefore the SAME block address.
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let mut outcomes = Vec::new();
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let tokens = tokens.clone();
+            handles.push(s.spawn(move || {
+                let set = fp16_set(LAYERS, DEPTH);
+                barrier.wait(); // maximise overlap on the persist itself
+                store.persist("m3", "tmpl", &tokens, &set)
+            }));
+        }
+        for h in handles {
+            outcomes.push(h.join().expect("worker must not panic"));
+        }
+    });
+
+    let errs: Vec<String> = outcomes
+        .iter()
+        .filter_map(|r| r.as_ref().err().map(|e| e.to_string()))
+        .collect();
+
+    // INVARIANT 1 — whatever happened, every committed block must be readable
+    // and checksum-clean. This is the assertion that holds for ALL
+    // interleavings, and it is the one that matters: a block that survives
+    // the race but fails its own sha256 is a corrupt adopted prefix.
+    // Ask the store where its blocks live rather than reconstructing the path.
+    // The layout is base/<V4_ROOT>/blocks, and a hand-built `base/blocks`
+    // silently found nothing — a green-looking zero for a directory that never
+    // existed.
+    let blocks_dir = store.blocks_dir();
+    // Address the blocks the way persist did, rather than decoding directory
+    // names — same source of truth, and it also catches a block committed
+    // under an address we did NOT expect.
+    let expected = compute_block_hashes(
+        &tokens,
+        DEFAULT_BLOCK_SIZE,
+        &kv_mode_config_string(KVCacheMode::Fp16),
+    );
+    let mut committed = 0usize;
+    for hash in &expected {
+        if !blocks_dir.join(hex_digest(hash)).exists() {
+            continue;
+        }
+        committed += 1;
+        store.read_block(hash).unwrap_or_else(|e| {
+            panic!(
+                "COMMITTED BLOCK IS UNREADABLE AFTER CONCURRENT PERSIST: {}: {e}\n\
+                 A block directory exists (so load_prefix can discover it) but the block fails \
+                 its own per-layer sha256 or byte_len check. That is a corrupt adopted prefix, \
+                 which is the failure this gate exists to catch. persist_lock is declared and \
+                 NEVER acquired, and both writers stage into the same .tmp.<hash> path.",
+                hex_digest(hash)
+            )
+        });
+    }
+    assert!(committed > 0, "at least one block must be committed");
+
+    // Any committed directory that is NOT one of the expected addresses is
+    // also a defect — it would mean the race produced a block nobody asked for.
+    // Only DIRECTORIES are blocks. `<hash>.refcount` sidecar FILES live in the
+    // same directory (see the eviction path) and are not block commits.
+    let unexpected: Vec<String> = std::fs::read_dir(&blocks_dir)
+        .expect("read blocks dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| !n.starts_with(".tmp."))
+        .filter(|n| !expected.iter().any(|h| &hex_digest(h) == n))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "block directories committed under unexpected addresses: {unexpected:?}"
+    );
+
+    // INVARIANT 2 — at least one writer must have succeeded. If BOTH failed,
+    // concurrent persist of identical content is unusable, not merely racy.
+    assert!(
+        outcomes.iter().any(|r| r.is_ok()),
+        "both concurrent persists failed; errors: {errs:?}"
+    );
+
+    // INVARIANT 3 — no staging residue. An orphaned .tmp.<hash> is a disk leak
+    // (no scan reads it, so it is not a correctness hazard) but it is evidence
+    // the race was hit, so report it explicitly rather than let it pass silent.
+    let residue: Vec<String> = std::fs::read_dir(&blocks_dir)
+        .expect("read blocks dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(".tmp."))
+        .collect();
+    assert!(
+        residue.is_empty(),
+        "orphaned staging directories left by concurrent persist: {residue:?} \
+         (disk leak, and direct evidence the shared .tmp.<hash> path was contended). \
+         Writer errors: {errs:?}"
+    );
+}
