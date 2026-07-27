@@ -2032,6 +2032,72 @@ fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::
     Ok(())
 }
 
+/// ALDEN TEST 5 — an active-load lease prevents block deletion until release.
+///
+/// Structured so nothing can hang: rather than starting a sweep and asserting it
+/// blocks (a blocked sweep is indistinguishable from a slow one, and proving it
+/// by waiting means proving it by hanging), this asserts the exclusion directly
+/// with a NON-BLOCKING exclusive probe. If the probe cannot take the lock while
+/// a lease is held, a real sweep cannot either — same lock, same mode.
+///
+/// Both directions are required. Only checking that the block survives while
+/// leased would pass against a GC that never collects anything; only checking
+/// that it is collected after release would pass against a lease that excludes
+/// nothing. The pair is the test.
+#[test]
+fn an_active_load_lease_holds_off_the_sweep_until_it_is_released() {
+    const N_TILES: i32 = 31;
+    let depth = TILE + N_TILES * TILE;
+    let set = kvarn_v4_set_distinct(2, N_TILES, 0);
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32])
+        .with_prune_mode(PruneMode::Delete)
+        .with_min_gc_age(std::time::Duration::ZERO);
+
+    let manifest = store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+    let victim = manifest.block_hashes[0];
+
+    // Orphan the blocks so a sweep would genuinely collect them. Without this
+    // the "survives while leased" half is vacuous — nothing was at risk.
+    store
+        .delete_manifest(&manifest.hash())
+        .expect("orphan the blocks");
+
+    {
+        let _lease = store.acquire_read_lease().expect("take a read lease");
+
+        // A sweep needs LOCK_EX. While this lease is held it must not get it.
+        let probe = store
+            .try_acquire_store_lock()
+            .expect("probe must not error");
+        assert!(
+            probe.is_none(),
+            "acquired the EXCLUSIVE store lock while a read lease was held — the \
+             lease excludes nothing, so a sweep could unlink a block mid-load and \
+             the loader would fail on a block its own manifest promised"
+        );
+
+        store
+            .read_block(&victim)
+            .expect("the leased block must still be present while the lease is held");
+    } // lease released here
+
+    // ...and the other direction: once released, the sweep proceeds and the
+    // orphan is genuinely collectable. Without this half the test would pass
+    // against a GC that never collects anything at all.
+    store.gc_blocks().expect("gc after release");
+    assert!(
+        store.read_block(&victim).is_err(),
+        "after the lease was released the orphaned block should have been \
+         collected — if it survives, this test's first half proved nothing about \
+         leases and only proved GC is inert"
+    );
+}
+
 /// A mode MISMATCH must be a clean miss, never a wrong adoption.
 ///
 /// Persist under KVarN8, load under Fp16. Because block addresses commit to the

@@ -454,7 +454,19 @@ impl BlockColdStore {
     /// because a publisher happened to hold it for a millisecond.
     #[cfg(test)]
     fn try_acquire_store_lock(&self) -> Result<Option<StoreLock<'static>>, ColdStoreError> {
-        let process_guard = STORE_MUTEX.write().unwrap_or_else(|p| p.into_inner());
+        // `try_write`, not `write`. A blocking acquire inside a function named
+        // "try" is a latent deadlock for every caller, and it deadlocked the
+        // very first one: a test holding a read lease on this thread probed for
+        // the exclusive lock, and `write()` blocked on the guard that same
+        // thread was holding. The suite HUNG rather than failed, which is the
+        // worse failure — a hang carries no message. Non-blocking at BOTH
+        // layers, or the probe is not a probe.
+        //
+        // A held read lease therefore reports `None`, which is the honest
+        // answer: a real sweep would block on exactly that guard.
+        let Ok(process_guard) = STORE_MUTEX.try_write() else {
+            return Ok(None);
+        };
         fs::create_dir_all(&self.base_dir)?;
         let file = fs::OpenOptions::new()
             .create(true)
