@@ -3418,7 +3418,27 @@ fn observe_mode_reports_a_prune_without_performing_it() {
 /// module). `verify_manifest_addresses` is RUNTIME: it runs on every `load_prefix`. That
 /// distinction is worth a number rather than a shrug, so here is the number.
 ///
-/// Measured 2026-07-28, M3 Ultra, `cargo test` debug profile:
+/// Measured 2026-07-28, M3 Ultra. **RELEASE profile — the one that ships:**
+///
+/// ```text
+/// REDERIVE    4096 tokens (  2 blocks):   0.020 ms
+/// REDERIVE   32768 tokens ( 16 blocks):   0.150 ms
+/// REDERIVE  131072 tokens ( 64 blocks):   0.528 ms
+/// REDERIVE  300000 tokens (147 blocks):   0.997 ms
+/// FULL LOAD   8192 tokens (  4 blocks, 2 layers, fp16): 4.903 ms  (1638 MiB/s effective)
+/// ```
+///
+/// **300K tokens of cache re-derives in under a millisecond.** At M3's 57 layers that
+/// cache is ~8.4 GB of payload, which an NVMe reads in 1.2–1.7 s at 5–7 GB/s — so the
+/// verification is **~0.06–0.08% of the read it is attached to**. (The drive bandwidth is a
+/// spec figure, not measured on this machine; the 0.997 ms is measured.)
+///
+/// Debug is ~19× slower and is kept below only because it is what a normal `cargo test`
+/// run sees — do NOT quote the debug figures as production cost, which is a mistake I made
+/// before this run existed:
+///
+/// ```text
+/// debug profile, same machine, for contrast only:
 ///
 /// ```text
 /// REDERIVE    4096 tokens (  2 blocks):   0.396 ms
