@@ -1068,9 +1068,20 @@ fn end_to_end_extract_write_read_assemble_preserves_payload_bytes() {
         timestamp_nanos: 0,
     };
 
-    let (assembled, _stored_tokens) = store
-        .assemble_blocks(&manifest)
-        .expect("assemble_blocks ok");
+    // Reads its own blocks and merges them, rather than going through
+    // `assemble_blocks`. This fixture's partition — sink and tail placed across
+    // tile boundaries — is deliberately one the fixed-chunk address contract
+    // cannot express, so `assemble_blocks` (fail-closed since Alden's 2026-07-28
+    // ruling) correctly refuses it. What this test is FOR is the merge, so it
+    // drives the merge primitive and says so.
+    let read: Vec<DetachedCacheSet> = manifest
+        .block_hashes
+        .iter()
+        .map(|h| store.read_block(h).expect("read_block ok").1)
+        .collect();
+    let assembled = store
+        .merge_read_blocks(&read, &manifest)
+        .expect("merge_read_blocks ok");
 
     // Structural: one cache per LAYER, not one per (block, layer).
     assert_eq!(
@@ -1154,8 +1165,17 @@ fn assemble_rejects_block_with_a_dropped_per_token_field() {
         timestamp_nanos: 0,
     };
 
+    // Same scoping as the fixture above: a hand-built partition the address
+    // contract cannot express, so the merge primitive is the right boundary to
+    // exercise. The refusal under test is a STRUCTURAL one (a per-token field
+    // dropped), which lives in the merge, not in the identity check.
+    let read: Vec<DetachedCacheSet> = manifest
+        .block_hashes
+        .iter()
+        .map(|h| store.read_block(h).expect("read_block ok").1)
+        .collect();
     let err = store
-        .assemble_blocks(&manifest)
+        .merge_read_blocks(&read, &manifest)
         .expect_err("a block missing k_zp must be REFUSED, not silently concatenated short");
     let msg = format!("{err}");
     assert!(
@@ -2071,6 +2091,164 @@ fn a_flipped_byte_anywhere_in_a_block_header_must_be_caught() {
         hit(&store).is_ok(),
         "the restored header must load again — otherwise an empty `unprotected` list means \
          the store rejects EVERYTHING, not that it verifies correctly"
+    );
+}
+
+/// LOWER-BOUNDARY NEGATIVE — `assemble_blocks` itself must refuse an unverifiable
+/// manifest, independently of `load_prefix`.
+///
+/// Alden, 2026-07-28: *"Add a direct negative at the lower boundary so removing
+/// verification from assemble_blocks reddens independently of load_prefix."*
+///
+/// The point is coverage INDEPENDENCE. The exhaustive header walk drives `load_prefix`,
+/// so if verification were ever moved back up into the caller, that test would still pass
+/// and the fail-open seam would return unnoticed. This test fails in that case, because it
+/// calls the lower boundary directly.
+///
+/// The invariant it defends, in his words: *"no non-test function returns
+/// `DetachedCacheSet` from disk bytes before token-chain verification."*
+#[test]
+fn assemble_blocks_itself_refuses_a_manifest_its_tokens_do_not_re_derive() {
+    const LAYERS: usize = 2;
+    const DEPTH: i32 = 2 * DEFAULT_BLOCK_SIZE as i32;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let fingerprint = [0xB7u8; 32];
+    let store = BlockColdStore::new(dir.path().to_path_buf(), fingerprint);
+    let tokens: Vec<i32> = (0..DEPTH).collect();
+    let manifest = store
+        .persist("m3", "tmpl", &tokens, &fp16_set(LAYERS, DEPTH))
+        .expect("persist");
+
+    let kv_mode = cache_computation_id(&fingerprint, KVCacheMode::Fp16, 0);
+
+    // Control first: undamaged, the lower boundary accepts.
+    assert!(
+        store.assemble_blocks(&manifest, &kv_mode).is_ok(),
+        "precondition: a sound manifest must assemble, or the refusal below proves nothing"
+    );
+
+    // Corrupt ONE token inside the first block's header. The payload bytes stay perfectly
+    // intact and every layer checksum still passes — what breaks is only the claim that
+    // this state belongs to these tokens.
+    let header_path = dir
+        .path()
+        .join(V4_ROOT)
+        .join("blocks")
+        .join(hex_digest(&manifest.block_hashes[0]))
+        .join("header.bin");
+    let mut bytes = std::fs::read(&header_path).expect("header readable");
+    bytes[44] ^= 0x01; // first token: 4 version + 32 hash + 8 count = offset 44
+    std::fs::write(&header_path, &bytes).expect("write damaged header");
+
+    let err = store
+        .assemble_blocks(&manifest, &kv_mode)
+        .expect_err(
+            "assemble_blocks returned an adoptable cache set for a manifest whose stored \
+             tokens do not re-derive its addresses. Every layer payload checksum passed — \
+             that is the point. This is the fail-open seam returning.",
+        );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("re-derive"),
+        "the refusal must be the IDENTITY one, not an incidental failure that happens to \
+         error here for another reason; got: {msg}"
+    );
+}
+
+/// ALDEN TEST 2 — a writer that DEDUP-OBSERVED a block must not publish across its
+/// deletion.
+///
+/// His words: *"Writer dedup-observes X while GC is sweeping: either publication
+/// retries/revalidates or X survives; never a committed broken manifest."* And the
+/// mechanism he named: *"A writer must never early-return merely because a block path
+/// exists if GC can concurrently tombstone/remove it."*
+///
+/// That early-return is real and it is the whole hazard: `write_block` opens with
+/// `if block_dir.exists() { return Ok(()) }`. A writer that takes that branch has decided
+/// the block is fine WITHOUT holding any lock, and everything it does afterwards rests on
+/// an observation that a sweep can invalidate.
+///
+/// CONSTRUCTED, NOT RACED — the interleaving is exact and single-threaded, so there is no
+/// timing assumption to be flaky about:
+///
+/// 1. persist → blocks written, manifest committed
+/// 2. delete the manifest → the blocks are orphans GC will nominate
+/// 3. **the writer dedup-observes**: `write_block` early-returns `Ok` on the existing dir
+/// 4. GC sweeps and physically removes them
+/// 5. the writer publishes the manifest it built on that observation
+///
+/// Step 5 must FAIL. The protection is `write_manifest`'s under-lock revalidation —
+/// "existing means fully committed and integrity-valid, not path-exists" — and this test is
+/// its only exercise.
+#[test]
+fn a_writer_that_dedup_observed_a_block_cannot_publish_across_its_deletion() {
+    const LAYERS: usize = 2;
+    const N_TILES: i32 = 31;
+    let depth = TILE + N_TILES * TILE;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xA2u8; 32])
+        .with_prune_mode(PruneMode::Delete)
+        // Required, not incidental: under the production age floor these freshly-orphaned
+        // blocks are too young to nominate, GC collects nothing, and the test would pass
+        // on its own precondition rather than on the invariant.
+        .with_min_gc_age(std::time::Duration::ZERO);
+
+    let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
+    let tokens: Vec<i32> = (0..depth).collect();
+    let manifest = store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+    let blocks = manifest.block_hashes.clone();
+    assert!(!blocks.is_empty(), "precondition: the manifest must have blocks");
+
+    store
+        .delete_manifest(&manifest.hash())
+        .expect("orphan the blocks");
+
+    // STEP 3 — THE DEDUP OBSERVATION. This is the writer deciding "already present,
+    // nothing to do" on nothing more than a directory existing.
+    let observed = store.write_block(&blocks[0], &tokens[..TILE as usize], &set);
+    assert!(
+        observed.is_ok(),
+        "precondition: the writer must take the dedup early-return, or the hazard this \
+         test describes never arises"
+    );
+
+    // STEP 4 — the sweep invalidates it.
+    store.gc_blocks().expect("gc must not error");
+    assert!(
+        store.read_block(&blocks[0]).is_err(),
+        "precondition: GC must actually have removed the observed block, or step 5 \
+         succeeds for the boring reason"
+    );
+
+    // STEP 5 — publication across the deletion.
+    let published = store.write_manifest(&manifest);
+    assert!(
+        published.is_err(),
+        "a manifest was COMMITTED referencing a block the sweep had already removed. The \
+         writer's observation was stale and nothing revalidated it under the lock — this \
+         is Alden's interleaving lost rather than caught."
+    );
+
+    // THE INVARIANT, stated independently of HOW step 5 failed: nothing is on disk. A
+    // refusal that still left a partially-committed manifest behind would satisfy the
+    // assertion above and violate the contract, so the store's state is checked too.
+    assert_eq!(
+        count_manifests(&store),
+        0,
+        "no manifest may be committed: the only publication attempted referenced a block \
+         the sweep had removed, and it had to be refused. A manifest here means the \
+         refusal was partial."
+    );
+
+    // And the block really is gone rather than merely unreadable — so the next writer
+    // reinstalls it instead of inheriting a half-state.
+    assert!(
+        store.read_block(&blocks[0]).is_err(),
+        "the swept block must remain absent after the refused publication"
     );
 }
 

@@ -1557,15 +1557,12 @@ impl BlockColdStore {
 
         // Try to load each candidate
         for (manifest, matched_tokens) in candidates {
-            match self.assemble_blocks(&manifest).and_then(|(cache_set, stored)| {
-                // ACCEPTANCE, not assembly: the merge succeeding says the blocks
-                // fit together, not that they are the blocks this address names.
-                // A failure here falls through to the next-shorter candidate by
-                // the same path a damaged payload takes — a manifest whose tokens
-                // do not re-derive its addresses is not a candidate.
-                self.verify_manifest_addresses(&manifest, &stored, &load_cache_id)?;
-                Ok(cache_set)
-            }) {
+            // `assemble_blocks` is fail-closed: what it returns is already
+            // identity-verified. `load_prefix` keeps CANDIDATE POLICY — a
+            // manifest whose tokens do not re-derive its addresses simply is not
+            // a candidate, and falls through to the next-shorter one by the same
+            // path a damaged payload takes.
+            match self.assemble_blocks(&manifest, &load_cache_id) {
                 Ok(cache_set) => {
                     let matched = matched_tokens.min(tokens.len());
                     return Ok((cache_set, matched));
@@ -1618,7 +1615,8 @@ impl BlockColdStore {
     fn assemble_blocks(
         &self,
         manifest: &Manifest,
-    ) -> Result<(DetachedCacheSet, Vec<i32>), ColdStoreError> {
+        kv_mode_config: &str,
+    ) -> Result<DetachedCacheSet, ColdStoreError> {
         if manifest.block_hashes.is_empty() {
             return Err(invalid_data("manifest has no blocks".into()));
         }
@@ -1633,6 +1631,52 @@ impl BlockColdStore {
             blocks.push(cache_set);
         }
 
+        // FAIL-CLOSED, BEFORE THE MERGE (Alden, 2026-07-28).
+        //
+        // This check first lived in `load_prefix`, after the merge. I moved it
+        // there because putting it here reddened two structural fixtures, and I
+        // read that as "wrong layer". Alden read the same red correctly: those
+        // fixtures use hand-written hashes and partitions that do not satisfy the
+        // fixed-chunk address contract, so they were calling a production
+        // ACCEPTANCE boundary with deliberately invalid input. The tests were
+        // right to fail; my conclusion from their failing was wrong.
+        //
+        // The invariant, in his words: "no non-test function returns
+        // DetachedCacheSet from disk bytes before token-chain verification."
+        // Verifying in the caller left `assemble_blocks` returning directly
+        // adoptable state on an unchecked identity claim — a fail-OPEN seam that
+        // any second caller would inherit by omission. Here it is fail-closed by
+        // construction.
+        //
+        // BEFORE the merge, not after: a candidate that fails cannot be adopted,
+        // so merging its payload first is work spent to reach a refusal.
+        self.verify_manifest_addresses(manifest, &stored_tokens, kv_mode_config)?;
+
+        self.merge_read_blocks(&blocks, manifest)
+    }
+
+    /// Merge ALREADY-READ blocks into one cache set. Pure in-memory mechanics:
+    /// per-layer concatenation and the structural checks around it.
+    ///
+    /// **Deliberately NOT an unverified `assemble_blocks`.** It does not touch
+    /// disk and so cannot return state derived from unchecked disk bytes —
+    /// Alden's invariant ("no non-test function returns `DetachedCacheSet` from
+    /// disk bytes before token-chain verification") is satisfied by its shape
+    /// rather than by its callers remembering.
+    ///
+    /// It exists because two structural fixtures need block partitions the
+    /// address contract cannot express — sink and tail placed across tile
+    /// boundaries — to exercise the merge itself. Those fixtures read their own
+    /// blocks and call this. Exposing a disk-reading unverified variant for them
+    /// was the alternative, and it is exactly the seam this refactor removes.
+    fn merge_read_blocks(
+        &self,
+        blocks: &[DetachedCacheSet],
+        manifest: &Manifest,
+    ) -> Result<DetachedCacheSet, ColdStoreError> {
+        if blocks.is_empty() {
+            return Err(invalid_data("merge_read_blocks: no blocks".into()));
+        }
         let layer_count = blocks[0].caches.len();
         for (i, b) in blocks.iter().enumerate() {
             if b.caches.len() != layer_count {
@@ -1665,7 +1709,7 @@ impl BlockColdStore {
             origin_seq_id: SequenceId(0),
         };
 
-        Ok((cache_set, stored_tokens))
+        Ok(cache_set)
     }
 
     /// Re-derive this manifest's block addresses from the tokens the blocks
