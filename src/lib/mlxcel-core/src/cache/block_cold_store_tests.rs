@@ -3428,14 +3428,30 @@ fn observe_mode_reports_a_prune_without_performing_it() {
 /// FULL LOAD   8192 tokens (  4 blocks, 2 layers, fp16): 82.764 ms
 /// ```
 ///
-/// Linear in tokens, ~0.13 ms per block, and — the structural point — **independent of
-/// layer count**. It hashes the token list; it does not touch the KV payload. The block
-/// READ it is added to scales with layers, so the ratio only improves on a real model.
+/// ```text
+/// ON DISK  4 blocks / 2 layers: 8.03 MiB  ->  98 MiB/s effective
+/// HASHED   per 8192 tokens: 32.000 KiB  (0.3890% of the payload bytes)
+/// ```
 ///
-/// Against the 2-layer baseline: 0.198 ms re-derive vs 20.7 ms read per block, **~1%**.
-/// M3 has 57 layers, so a production block read is far heavier while the re-derivation is
-/// unchanged — but that extrapolation is arithmetic, NOT a measurement, and is labelled as
-/// such deliberately.
+/// **THE RATIO THAT ACTUALLY ANSWERS IT, and it is not a wall-clock one.** `read_block`
+/// already sha256s every layer payload it reads. This change adds a hash over the TOKEN
+/// LIST — 4 bytes per token. Measured: **32 KiB hashed on top of 8.03 MiB already being
+/// hashed, 0.389%.** The store was already doing ~256× this work on the same code path.
+/// That is a structural answer rather than a timing one, and it does not move with
+/// hardware, build profile, or cache warmth.
+///
+/// **The 82 ms baseline is NOT I/O time**, and it would be wrong to present it as such.
+/// 98 MiB/s is an order of magnitude below this machine's NVMe; the fixture is
+/// page-cache-warm, so that figure is CPU — payload hashing, deserialization, MLX array
+/// construction — in a DEBUG build. Both directions of that error favour the conclusion:
+/// release makes both sides faster in proportion, and genuine cold I/O only enlarges the
+/// denominator.
+///
+/// Linear in tokens, ~0.13 ms per block, and — the structural point — **independent of
+/// layer count**. It hashes the token list; it never touches the KV payload. The read it
+/// is added to DOES scale with layers, so at M3's 57 layers the payload grows ~28× while
+/// the token hash does not: 0.389% → roughly 0.014%. That last step is arithmetic, NOT a
+/// measurement, and is labelled as such deliberately.
 ///
 /// It is also paid **once per adoption, not per decode step** — the decode path is
 /// untouched. And the alternative to a cold load is a full re-prefill, which for 300K
@@ -3499,6 +3515,32 @@ fn timing_probe_verification_cost() {
             .expect("hit");
     }
     let per_load = t.elapsed() / LOADS;
+
+    // How many BYTES that load actually moved — so the ratio can be stated against I/O
+    // volume rather than asserted.
+    fn dir_bytes(p: &std::path::Path) -> u64 {
+        let mut total = 0;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                let md = e.metadata().expect("metadata");
+                total += if md.is_dir() { dir_bytes(&e.path()) } else { md.len() };
+            }
+        }
+        total
+    }
+    let payload = dir_bytes(&dir.path().join(V4_ROOT).join("blocks"));
+    println!(
+        "ON DISK  {} blocks / {} layers: {:.2} MiB  ->  {:.0} MiB/s effective",
+        DEPTH as usize / DEFAULT_BLOCK_SIZE,
+        LAYERS,
+        payload as f64 / (1024.0 * 1024.0),
+        (payload as f64 / (1024.0 * 1024.0)) / per_load.as_secs_f64()
+    );
+    println!(
+        "HASHED   per 8192 tokens: {:.3} KiB  ({:.4}% of the payload bytes)",
+        (DEPTH as f64 * 4.0) / 1024.0,
+        100.0 * (DEPTH as f64 * 4.0) / payload as f64
+    );
     println!(
         "FULL LOAD {} tokens ({} blocks, {} layers, fp16): {:.3} ms",
         DEPTH,
