@@ -8,7 +8,7 @@
 // See docs/DESIGN_cold_store_block_storage_v4_2026-07-26.md for the
 // full design.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -759,11 +759,75 @@ impl BlockColdStore {
 
     /// Garbage-collect blocks with refcount 0.
     /// In observe mode, logs what WOULD be deleted without deleting.
+    /// MARK PHASE — the authoritative live set.
+    ///
+    /// Alden's finding 4 (2026-07-27): "Mark phase validates every committed
+    /// manifest plus roots, rollback pins, and active-load leases. Refcounts
+    /// are nomination/observability hints only, never authority."
+    ///
+    /// Reachability is a property of the committed manifests, so it is read
+    /// from them. A refcount file is a derived cache of that fact and can be
+    /// stale, racy, or simply wrong; deleting a block because a *hint* says
+    /// zero is how a live manifest ends up pointing at missing data.
+    ///
+    /// An unreadable manifest ABORTS the caller rather than being skipped:
+    /// "an unreadable committed manifest or authoritative root means zero
+    /// references are NOT proved. Do not interpret corruption as an empty
+    /// reference set." Skipping one is precisely how corruption becomes
+    /// deletion — the block it referenced would look unreachable.
+    ///
+    /// NOT YET IMPLEMENTED, and this function is not safe for delete mode
+    /// without them (finding 4, remaining bullets): publication/sweep
+    /// exclusion via a shared lock or generation epoch, re-verification of
+    /// every candidate after the grace interval, and active-load leases. The
+    /// mark below is a point-in-time snapshot; a writer may commit a manifest
+    /// referencing a candidate the instant after it is taken.
+    fn mark_reachable_blocks(&self) -> Result<HashSet<[u8; 32]>, ColdStoreError> {
+        let mut live: HashSet<[u8; 32]> = HashSet::new();
+        let manifests_dir = self.manifests_dir();
+        if !manifests_dir.exists() {
+            return Ok(live);
+        }
+        for entry in fs::read_dir(&manifests_dir)? {
+            let entry = entry?;
+            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".tmp.") {
+                continue;
+            }
+            let Some(manifest_hash) = parse_hex_digest(&name) else {
+                continue;
+            };
+            // Deliberately propagates. See the doc above: a manifest we cannot
+            // read is not a manifest with no references.
+            let manifest = self.read_manifest(&manifest_hash).map_err(|e| {
+                tracing::error!(
+                    manifest = %name,
+                    error = %e,
+                    "COLD-STORE v4 GC: a committed manifest is unreadable, so reachability \
+                     cannot be proved — ABORTING this pass rather than treating its blocks \
+                     as unreferenced"
+                );
+                e
+            })?;
+            for b in &manifest.block_hashes {
+                live.insert(*b);
+            }
+        }
+        Ok(live)
+    }
+
     pub fn gc_blocks(&self) -> Result<(), ColdStoreError> {
         let blocks_dir = self.blocks_dir();
         if !blocks_dir.exists() {
             return Ok(());
         }
+
+        // Authority comes from here, not from refcount files.
+        let live = self.mark_reachable_blocks()?;
 
         let entries: Vec<_> = fs::read_dir(&blocks_dir)?
             .filter_map(|e| e.ok())
@@ -785,9 +849,32 @@ impl BlockColdStore {
                 None => continue,
             };
 
-            let refcount = self.get_refcount(&block_hash)?;
-            if refcount > 0 {
+            // REACHABILITY decides. A block named by any committed manifest
+            // survives regardless of what its refcount file claims.
+            if live.contains(&block_hash) {
                 continue;
+            }
+
+            // The refcount is now a HINT. Where it disagrees with reachability
+            // it is the refcount that is wrong, and that disagreement is worth
+            // seeing: it means the increment/decrement ordering leaked
+            // somewhere. Reported, never obeyed.
+            match self.get_refcount(&block_hash) {
+                Ok(rc) if rc > 0 => tracing::warn!(
+                    block = %name,
+                    refcount = rc,
+                    "COLD-STORE v4 GC: refcount hint disagrees with reachability — no \
+                     committed manifest references this block but its refcount is {rc}. \
+                     Proceeding on reachability; the hint is stale.",
+                    rc = rc
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    block = %name,
+                    error = %e,
+                    "COLD-STORE v4 GC: refcount hint unreadable; reachability already \
+                     decided this block is unreferenced"
+                ),
             }
 
             if self.prune_mode == PruneMode::Observe {

@@ -1518,6 +1518,113 @@ fn round_trip_must_preserve_per_layer_m3_idx_state_including_dense_layers() {
     }
 }
 
+/// Build a small persisted store and hand back (dir, store, manifest).
+fn persisted_store_for_gc() -> (tempfile::TempDir, BlockColdStore, Manifest) {
+    const LAYERS: usize = 2;
+    const N_TILES: i32 = 31;
+    let depth = TILE + N_TILES * TILE; // 4096 == 2 * DEFAULT_BLOCK_SIZE
+    let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
+    let tokens: Vec<i32> = (0..depth).collect();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32])
+        .with_prune_mode(PruneMode::Delete);
+    let manifest = store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+    (dir, store, manifest)
+}
+
+/// REFCOUNTS ARE HINTS, NOT AUTHORITY (Alden finding 4, 2026-07-27).
+///
+/// `gc_blocks` used to read the refcount sidecar and delete on zero. That makes
+/// a derived, racy, on-disk cache the arbiter of whether consciousness state
+/// survives. Alden: "Refcounts are nomination/observability hints only, never
+/// authority... never GC on an untrusted count."
+///
+/// The discriminating case is a block that IS referenced by a committed
+/// manifest while its refcount file says 0 — exactly what a lost increment, a
+/// crash between write and bump, or the publication race leaves behind. Under
+/// the old code that block was deleted and its live manifest was left pointing
+/// at missing data. Reachability must overrule the hint.
+///
+/// RED against the old implementation by construction: it consulted only
+/// `get_refcount`, which this test pins at 0.
+#[test]
+fn a_referenced_block_survives_gc_even_when_its_refcount_hint_says_zero() {
+    let (_dir, store, manifest) = persisted_store_for_gc();
+    let victim = manifest.block_hashes[0];
+
+    // Simulate the lost increment. The manifest still references this block.
+    store.set_refcount(&victim, 0).expect("force refcount to 0");
+    assert_eq!(
+        store.get_refcount(&victim).expect("refcount"),
+        0,
+        "precondition: the hint must read zero or this test proves nothing"
+    );
+
+    store.gc_blocks().expect("gc must succeed");
+
+    store.read_block(&victim).unwrap_or_else(|e| {
+        panic!(
+            "GC deleted a block that a COMMITTED MANIFEST still references, because a \
+             refcount sidecar said zero ({e}). The manifest is now unloadable and the \
+             cached state is gone. Reachability is the authority; the count is a hint."
+        )
+    });
+}
+
+/// CORRUPTION IS NOT AN EMPTY REFERENCE SET (Alden finding 4, test 4).
+///
+/// "An unreadable committed manifest or authoritative root means zero references
+/// are NOT proved: abort delete mode for that pass and report loudly. Do not
+/// interpret corruption as an empty reference set."
+///
+/// The failure this prevents is the worst-shaped one available: a single
+/// unreadable manifest makes every block it alone referenced look unreachable,
+/// so the response to corruption would be to delete the data the corrupt
+/// manifest was pointing at — turning a recoverable metadata fault into
+/// unrecoverable state loss.
+#[test]
+fn an_unreadable_manifest_aborts_gc_rather_than_freeing_its_blocks() {
+    let (_dir, store, manifest) = persisted_store_for_gc();
+
+    // Corrupt every file inside the manifest directory.
+    let mdir = store.manifests_dir();
+    let mut corrupted = 0usize;
+    for entry in std::fs::read_dir(&mdir).expect("read manifests dir") {
+        let entry = entry.expect("entry");
+        if !entry.file_type().expect("ft").is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(entry.path()).expect("read manifest dir") {
+            let f = f.expect("file");
+            if f.file_type().expect("ft").is_file() {
+                std::fs::write(f.path(), b"not a manifest").expect("corrupt");
+                corrupted += 1;
+            }
+        }
+    }
+    assert!(
+        corrupted > 0,
+        "precondition: nothing was corrupted, so this test cannot discriminate"
+    );
+
+    let err = store.gc_blocks().expect_err(
+        "GC must ABORT when a committed manifest is unreadable. Succeeding here means \
+         it treated an unparseable manifest as referencing nothing, which would free \
+         the very blocks that manifest was protecting.",
+    );
+    let _ = err;
+
+    for b in &manifest.block_hashes {
+        store.read_block(b).unwrap_or_else(|e| {
+            panic!(
+                "a block was deleted during a pass that could not prove reachability ({e})"
+            )
+        });
+    }
+}
+
 /// A mode MISMATCH must be a clean miss, never a wrong adoption.
 ///
 /// Persist under KVarN8, load under Fp16. Because block addresses commit to the
