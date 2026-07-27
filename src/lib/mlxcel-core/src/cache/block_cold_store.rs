@@ -790,6 +790,11 @@ impl BlockColdStore {
     }
 
     /// Read a manifest from disk.
+    ///
+    /// Enforces that the decoded content hashes to the directory it was filed
+    /// under. Every MANIFEST-directory consumer should reach content through
+    /// here rather than decoding `manifest.bin` directly — see
+    /// [`committed_manifest_hash`].
     pub fn read_manifest(
         &self,
         manifest_hash: &[u8; 32],
@@ -1184,22 +1189,18 @@ impl BlockColdStore {
         }
         for entry in fs::read_dir(&manifests_dir)? {
             let entry = entry?;
-            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(".tmp.") {
-                continue;
-            }
-            let Some(manifest_hash) = parse_hex_digest(&name) else {
+            let Some(manifest_hash) = committed_manifest_hash(&entry) else {
                 continue;
             };
-            // Deliberately propagates. See the doc above: a manifest we cannot
-            // read is not a manifest with no references.
+            // Deliberately propagates — NOT the fail-soft `continue` that
+            // `load_prefix` uses on the same helper. The asymmetry is the point:
+            // a manifest this function cannot read is not a manifest with no
+            // references, so the sweep aborts rather than treating its blocks as
+            // unreferenced. A reader that skips a bad candidate loses a cache
+            // hit; a sweeper that skips one deletes live data.
             let manifest = self.read_manifest(&manifest_hash).map_err(|e| {
                 tracing::error!(
-                    manifest = %name,
+                    manifest = %hex_digest(&manifest_hash),
                     error = %e,
                     "COLD-STORE v4 GC: a committed manifest is unreadable, so reachability \
                      cannot be proved — ABORTING this pass rather than treating its blocks \
@@ -1509,20 +1510,28 @@ impl BlockColdStore {
         let mut candidates = Vec::new();
         for entry in fs::read_dir(&manifests_dir)? {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            // ONE PREDICATE, shared with `mark_reachable_blocks`. See
+            // `committed_manifest_hash` for what went wrong when this site had
+            // its own inline rules.
+            let Some(manifest_hash) = committed_manifest_hash(&entry) else {
                 continue;
-            }
-            let manifest_path = entry.path().join("manifest.bin");
-            if !manifest_path.exists() {
-                continue;
-            }
-            let bytes = match fs::read(&manifest_path) {
-                Ok(b) => b,
-                Err(_) => continue,
             };
-            let manifest = match decode_manifest(&bytes) {
+            // CANONICAL READ, not a direct decode of `manifest.bin`.
+            //
+            // Alden, 2026-07-28: the `.tmp.` filter alone is necessary but NOT
+            // sufficient. This site used to `fs::read` + `decode_manifest`
+            // straight from the path, which also bypassed `read_manifest`'s
+            // check that `manifest.hash()` equals the directory name. So a
+            // manifest whose CONTENT does not match the address it is filed
+            // under was adoptable here and nowhere else.
+            //
+            // Going through `read_manifest` makes the rename/name the commit
+            // marker BY CONSTRUCTION: `.tmp.` prefixes, malformed names, and
+            // content/name mismatches all fail soft as non-candidates through
+            // one path rather than three hand-written ones.
+            let manifest = match self.read_manifest(&manifest_hash) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(_) => continue, // not a candidate; never fatal to the scan
             };
 
             // Filter: same identity
@@ -2466,6 +2475,45 @@ fn now_nanos() -> u128 {
 
 fn hex_digest(digest: &[u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// THE predicate for "this directory entry is a COMMITTED manifest", and the
+/// only one. Returns the address it is filed under, or `None` if it is not a
+/// committed manifest directory at all.
+///
+/// WHY THIS IS ONE FUNCTION AND NOT AN INLINE RULE PER CALLER. Five places
+/// enumerate store directories and each had its own hand-written idea of what
+/// to skip. On 2026-07-28 `load_prefix` turned out to be missing the `.tmp.`
+/// rule the other four had, so it would ADOPT AS A PREFIX a manifest staged by
+/// a publication that crashed before its rename — while `mark_reachable_blocks`
+/// correctly refused to root that same manifest, leaving GC free to collect the
+/// very blocks `load_prefix` was offering. Two functions, one on-disk state,
+/// opposite answers about what is live.
+///
+/// Convergence is a property, not a step: when two places assert the same thing
+/// they drift, and the drift is silent because each site reads correctly on its
+/// own. One surface, so there is nothing left to disagree.
+///
+/// Callers must still reach content through [`BlockColdStore::read_manifest`],
+/// which enforces content-hash == directory-name. This function decides
+/// CANDIDACY; that one decides INTEGRITY.
+///
+/// Deliberately scoped to MANIFEST directories. Block and tombstone enumeration
+/// keep their own rules — their artifact policy differs (`.tombstone.` is a live
+/// stage of a delete, not a discard), and collapsing them would be the opposite
+/// error to the one this fixes.
+fn committed_manifest_hash(entry: &fs::DirEntry) -> Option<[u8; 32]> {
+    if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+        return None;
+    }
+    let name = entry.file_name();
+    let name = name.to_string_lossy();
+    // Staged, not published: `write_manifest` fills `.tmp.<hash>` BEFORE taking
+    // the lock, and only the final rename commits. The name IS the commit marker.
+    if name.starts_with(".tmp.") {
+        return None;
+    }
+    parse_hex_digest(&name)
 }
 
 fn parse_hex_digest(hex: &str) -> Option<[u8; 32]> {

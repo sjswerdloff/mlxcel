@@ -2684,6 +2684,230 @@ fn assert_no_committed_manifest_dangles(store: &BlockColdStore, context: &str) {
     }
 }
 
+/// ALDEN FINDING 4, ITEM 3 — the RESIDUE of a publication that crashed after the
+/// epoch bump and before the manifest rename.
+///
+/// ⚠️ **Item 3's headline claim was already covered and the handoff said "unbuilt".**
+/// `a_bumped_epoch_alone_aborts_the_pass_even_when_nothing_was_published` pins the
+/// behavioural half — its own docstring says *"the epoch cannot tell a
+/// bump-then-crash from a bump-then-publish. Declining costs a wasted pass."*
+/// That IS "only an extra rescan expected". What that test does NOT touch is the
+/// **artifact the crash leaves on disk**, which is what this one is for.
+///
+/// `write_manifest`'s order is: increment refcounts → stage
+/// `.tmp.<hash>/manifest.bin` → take the lock → revalidate → **bump the epoch** →
+/// rename. A crash in the chosen window therefore leaves a staged manifest
+/// directory holding a fully valid, decodable manifest that was never published.
+///
+/// TWO WAYS THAT COULD GO WRONG, and the second is the dangerous one:
+///
+/// - `load_prefix` adopts it → a prefix is served from a manifest whose
+///   publication was never committed.
+/// - **GC treats it as a reachability ROOT → the blocks it names are pinned
+///   forever.** Nothing can reach them (no committed manifest references them)
+///   and nothing can collect them. A permanent leak, growing once per crash.
+///
+/// **THE STAGED BYTES ARE DELIBERATELY VALID.** If they were garbage, every
+/// assertion below could pass because decoding failed rather than because
+/// `.tmp.` is skipped by policy — the test would be green on the wrong
+/// mechanism. `mark_reachable_blocks` skips the prefix by NAME at
+/// `block_cold_store.rs:1192`, before it ever reads; writing a decodable
+/// manifest is what makes this test able to tell those two apart.
+#[test]
+fn a_publication_that_crashed_before_its_rename_pins_nothing_and_adopts_nothing() {
+    const LAYERS: usize = 2;
+    const N_TILES: i32 = 31;
+    let depth = TILE + N_TILES * TILE;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xC7u8; 32])
+        .with_prune_mode(PruneMode::Delete)
+        .with_min_gc_age(std::time::Duration::ZERO);
+
+    let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
+    let tokens: Vec<i32> = (0..depth).collect();
+    let manifest = store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+    let blocks = manifest.block_hashes.clone();
+    assert!(
+        !blocks.is_empty(),
+        "precondition: the manifest must have blocks"
+    );
+
+    // Orphan them: with no committed manifest, only the staged one could pin them.
+    store
+        .delete_manifest(&manifest.hash())
+        .expect("delete manifest to orphan the blocks");
+
+    // RECONSTRUCT THE POST-CRASH STATE EXACTLY. Constructed rather than raced:
+    // the window between the epoch bump and the rename is one file write wide,
+    // so a delay-based SIGKILL would essentially never land in it — the lesson
+    // the G3.1 gate records about coarse kill points, one order of magnitude
+    // further down.
+    let staged = store
+        .manifests_dir()
+        .join(format!(".tmp.{}", hex_digest(&manifest.hash())));
+    std::fs::create_dir_all(&staged).expect("create staged manifest dir");
+    let bytes = encode_manifest(&manifest).expect("encode manifest");
+    std::fs::write(staged.join("manifest.bin"), &bytes).expect("write staged manifest");
+    store.bump_publication_epoch().expect("bump the epoch");
+
+    // The staged bytes really are a valid manifest — proven here rather than
+    // assumed, because the whole discriminating power of this test rests on it.
+    let decoded = decode_manifest(&bytes).expect(
+        "the staged manifest must DECODE, or every assertion below could pass \
+         because parsing failed rather than because `.tmp.` is skipped by policy",
+    );
+    assert_eq!(
+        decoded.block_hashes, manifest.block_hashes,
+        "the staged manifest must name exactly the orphaned blocks, or it could \
+         not have pinned them even in the failure this test guards"
+    );
+
+    // 1. Nothing is committed. A staged directory is not a manifest.
+    assert_eq!(
+        count_manifests(&store),
+        0,
+        "a `.tmp.` staging directory was counted as a committed manifest"
+    );
+
+    // 2. Nothing is adoptable.
+    assert!(
+        store
+            .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+            .is_err(),
+        "load_prefix adopted a manifest whose publication CRASHED before its \
+         rename. Those bytes were staged but never committed, and serving a \
+         prefix from them means adopting state the protocol deliberately never \
+         made visible."
+    );
+
+    // 3. THE LEAK DIRECTION — the staged manifest must not root its blocks.
+    store.gc_blocks().expect("gc must not error");
+    for b in &blocks {
+        assert!(
+            store.read_block(b).is_err(),
+            "block {} survived GC because a CRASHED publication's staged manifest \
+             kept it reachable. Nothing can reach it — no committed manifest \
+             references it — and now nothing can collect it either. That is a \
+             permanent leak that grows by one manifest's blocks on every crash in \
+             this window.",
+            hex_digest(b)
+        );
+    }
+
+    assert_no_committed_manifest_dangles(&store, "After a crashed publication.");
+}
+
+/// ALDEN'S SIBLING CONTROL, requested by name — the staged-manifest rejection
+/// must not be "reject everything".
+///
+/// Every assertion in the residue test above is satisfied by a `load_prefix`
+/// that returns `NoMatch` unconditionally. This is the off-diagonal: a COMMITTED
+/// manifest sitting beside a staged one is still found and still adopted. Without
+/// it the fix could have broken all prefix loading and the residue test would
+/// have gone green on the breakage.
+#[test]
+fn a_committed_manifest_is_still_adopted_with_staged_residue_beside_it() {
+    const LAYERS: usize = 2;
+    const N_TILES: i32 = 31;
+    let depth = TILE + N_TILES * TILE;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xC8u8; 32]);
+
+    let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
+    let tokens: Vec<i32> = (0..depth).collect();
+    let manifest = store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+
+    // Drop a crashed publication's residue beside the committed manifest. It
+    // carries the SAME valid bytes, so only the directory name distinguishes
+    // them — which is exactly the discrimination under test.
+    let staged = store.manifests_dir().join(".tmp.deadbeef");
+    std::fs::create_dir_all(&staged).expect("stage");
+    std::fs::write(
+        staged.join("manifest.bin"),
+        encode_manifest(&manifest).expect("encode"),
+    )
+    .expect("write staged");
+
+    let (_set, matched) = store
+        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+        .expect(
+            "the COMMITTED manifest must still load with staged residue present. \
+             If this is NoMatch, the staged-manifest fix rejects everything and \
+             the residue test beside it is green on a broken store rather than a \
+             working guard.",
+        );
+    assert_eq!(
+        matched, depth as usize,
+        "the committed manifest must match its full token span"
+    );
+}
+
+/// ALDEN, 2026-07-28 — the `.tmp.` filter is NECESSARY BUT NOT SUFFICIENT.
+///
+/// `load_prefix` used to `fs::read` + `decode_manifest` straight from the path,
+/// which bypassed `read_manifest`'s check that the decoded content hashes to the
+/// directory it is filed under. A filter-only fix closes the staged-manifest hole
+/// and leaves this one: a manifest whose CONTENT does not match its ADDRESS was
+/// adoptable here and nowhere else in the store.
+///
+/// This is the test my own fix would not have needed — which is why he ruled the
+/// canonical-read fix rather than the one I proposed.
+#[test]
+fn a_manifest_whose_content_does_not_match_its_directory_is_not_a_candidate() {
+    const LAYERS: usize = 2;
+    const N_TILES: i32 = 31;
+    let depth = TILE + N_TILES * TILE;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [0xC9u8; 32]);
+
+    let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
+    let tokens: Vec<i32> = (0..depth).collect();
+    let manifest = store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+
+    // MISFILE IT. Move the committed manifest's bytes under a well-formed but
+    // WRONG 32-byte hex address, and remove the correct one. The name parses,
+    // the prefix is not `.tmp.`, the bytes decode — every check except the
+    // content/name agreement passes.
+    let real_dir = store
+        .manifests_dir()
+        .join(hex_digest(&manifest.hash()));
+    let bytes = std::fs::read(real_dir.join("manifest.bin")).expect("read committed manifest");
+    std::fs::remove_dir_all(&real_dir).expect("remove the correctly-filed manifest");
+
+    let wrong = [0x5Au8; 32];
+    assert_ne!(
+        wrong,
+        manifest.hash(),
+        "precondition: the misfiled address must actually differ"
+    );
+    let wrong_dir = store.manifests_dir().join(hex_digest(&wrong));
+    std::fs::create_dir_all(&wrong_dir).expect("create misfiled dir");
+    std::fs::write(wrong_dir.join("manifest.bin"), &bytes).expect("write misfiled manifest");
+
+    // Precondition: the bytes really are a valid manifest, so a rejection below
+    // is the content/name check firing rather than a decode failure.
+    decode_manifest(&bytes).expect("the misfiled bytes must still decode");
+
+    assert!(
+        store
+            .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+            .is_err(),
+        "load_prefix adopted a manifest filed under an address its own content \
+         does not hash to. The directory name is the store's addressing claim; \
+         accepting content that contradicts it means the address proves nothing, \
+         and every argument resting on address-equals-identity is void here."
+    );
+}
+
 /// CHILD-PROCESS HELPER — the SWEEPER. Inert unless `MLXCEL_TEST_GC_DIR` is set.
 ///
 /// Runs a real `gc_blocks()` in its own process, taking the `flock` from its own
