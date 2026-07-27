@@ -173,6 +173,54 @@ fn k1_prof_maybe_report() {
 static MSA_PREFILL_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 static MSA_DECODE_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
+// Branch-local dispatch witness, test-only.
+//
+// Alden, 2026-07-28: `m3_idx_offset == offset` proves an INPUT to sparse
+// eligibility, not that the sparse branch executed — every other predicate
+// (`is_msa_eligible_layer`, `num_key_blocks > top_k`) could still route to
+// dense while that assertion stayed green. "W3 plus all eligibility inputs
+// establishes that sparse SHOULD dispatch; a branch-local witness establishes
+// that it DID."
+//
+// The per-dispatch `attn.dispatch` lines are `debug!` — invisible at default
+// level and unassertable — so a log is not a witness here.
+//
+// THREAD-LOCAL, not a global counter: the suite runs multi-threaded, and a
+// process-wide counter would be read across tests non-deterministically. Each
+// test observes only the dispatches its own thread made.
+#[cfg(test)]
+thread_local! {
+    static DISPATCH_WITNESS: std::cell::Cell<(u32, u32)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn record_sparse_dispatch() {
+    DISPATCH_WITNESS.with(|w| {
+        let (s, d) = w.get();
+        w.set((s + 1, d));
+    });
+}
+
+#[cfg(test)]
+fn record_dense_dispatch() {
+    DISPATCH_WITNESS.with(|w| {
+        let (s, d) = w.get();
+        w.set((s, d + 1));
+    });
+}
+
+/// `(sparse, dense)` dispatch counts on this thread since the last reset.
+#[cfg(test)]
+fn dispatch_witness() -> (u32, u32) {
+    DISPATCH_WITNESS.with(|w| w.get())
+}
+
+#[cfg(test)]
+fn reset_dispatch_witness() {
+    DISPATCH_WITNESS.with(|w| w.set((0, 0)));
+}
+
 /// Load a UnifiedLinear. Auto-detects quantization mode from weight shapes.
 fn load_linear(weights: &WeightMap, prefix: &str, g: i32, b: i32) -> Result<UnifiedLinear, String> {
     UnifiedLinear::from_weights(weights, prefix, g, b)
@@ -681,6 +729,8 @@ impl SparseAttention {
                 reason = reason,
                 "attn.dispatch"
             );
+            #[cfg(test)]
+            record_dense_dispatch();
             return self.dense_attention(
                 &q,
                 cache_k
@@ -692,6 +742,13 @@ impl SparseAttention {
                 mask,
             );
         }
+
+        // Past the dense early-return, every remaining path is sparse. One
+        // increment at the single point where sparse is DECIDED, so "exactly
+        // one sparse dispatch" means exactly what it says regardless of which
+        // sparse sub-path (decode vs block-pooled prefill) runs below.
+        #[cfg(test)]
+        record_sparse_dispatch();
 
         if l <= self.block_size {
             if !MSA_DECODE_ANNOUNCED.swap(true, Ordering::Relaxed) {
@@ -5568,6 +5625,549 @@ mod tests {
             relative,
             diff,
             ref_norm
+        );
+    }
+
+    // ================================================================
+    // G1.0 / G1.1 — FP16 DISK-ADOPTION ATTENTION-LAYER EQUIVALENCE
+    // ================================================================
+    //
+    // NAMED PRECISELY, because the name is the claim (Alden, 2026-07-28):
+    // this is *disk-adoption attention-layer* equivalence. It is NOT
+    // generation or logit equivalence. One synthetic attention layer, no
+    // sampler, no scheduler. Production scheduler/logit equivalence is G1.3
+    // and requires wiring `BlockColdStore` into the scheduler — a separate,
+    // explicitly reviewed decision. `BlockColdStore` has ZERO references
+    // outside its own module today (verified by type-name grep; the
+    // scheduler's `load_prefix` call site resolves to v3), so no path from v4
+    // to a logit exists, and none is to be created merely to make a test
+    // possible.
+    //
+    // WHY THREE ARMS. A two-arm test (continuous vs disk) cannot tell an
+    // adoption defect from a serialization defect:
+    //
+    //   A  continuous cache, never detached          — the ground truth
+    //   B  in-memory detach/adopt (`clone_handle`)   — adoption semantics only
+    //   C  real disk: persist -> DROP the store ->
+    //      recreate -> `load_prefix` -> adopt        — adoption + disk
+    //
+    //   A vs B pins the existing adoption contract.
+    //   B vs C isolates disk serialization/reassembly from adoption.
+    //   A vs C corroborates end to end.
+    //
+    // The store is dropped and recreated between persist and load so that no
+    // in-process object can be the source of the loaded state.
+    //
+    // WHY THE DISPATCH WITNESS IS BRANCH-LOCAL. `m3_idx_offset == offset` is
+    // an INPUT to sparse eligibility, not proof the sparse branch ran — the
+    // other predicates could still route to dense with that assertion green.
+    // The `attn.dispatch` lines are `debug!`, invisible at default level and
+    // unassertable. So the witness is a `cfg(test)` counter incremented at the
+    // single point where sparse is DECIDED, and output divergence is kept as a
+    // decorrelated second witness rather than a substitute.
+
+    /// Bit-identity over evaluated MLX arrays. Exactness is the right contract
+    /// for B-vs-C: the two differ only in whether the state made a disk round
+    /// trip, and a round trip that changes a bit has changed the state.
+    fn arrays_bit_identical(a: &MlxArray, b: &MlxArray) -> bool {
+        mlxcel_core::eval(a);
+        mlxcel_core::eval(b);
+        mlxcel_core::array_shape(a) == mlxcel_core::array_shape(b)
+            && mlxcel_core::array_to_raw_bytes(a) == mlxcel_core::array_to_raw_bytes(b)
+    }
+
+    fn concat_outs(outs: &[UniquePtr<MlxArray>]) -> UniquePtr<MlxArray> {
+        let mut acc = mlxcel_core::copy(&outs[0]);
+        for out in &outs[1..] {
+            acc = mlxcel_core::concatenate(&acc, out, 1);
+        }
+        mlxcel_core::eval(&acc);
+        acc
+    }
+
+    fn l2_norm(a: &MlxArray) -> f32 {
+        let sq = mlxcel_core::multiply(a, a);
+        let s = mlxcel_core::array_shape(&sq);
+        let mut acc = mlxcel_core::copy(&sq);
+        for axis in (0..s.len()).rev() {
+            acc = mlxcel_core::sum_axis(&acc, axis as i32, false);
+        }
+        mlxcel_core::eval(&acc);
+        mlxcel_core::item_f32(&acc).sqrt()
+    }
+
+    /// The shared three-arm body. `attn` is taken by value so each width can
+    /// set its own block size without disturbing the other.
+    fn g1_1_disk_adoption_equivalence(mut attn: SparseAttention, hidden: i32, width_label: &str) {
+        use mlxcel_core::cache::block_cold_store::BlockColdStore;
+        use mlxcel_core::cache::{
+            DetachedCacheSet, KVCacheMode, SequenceId, SequenceStateBackend,
+        };
+
+        // Production quantum. The harness default of 2 would make every chunk
+        // saturate (`num_key_blocks <= top_k`) and dispatch dense, so the
+        // "compared step" would not be the sparse path at all.
+        attn.block_size = 128;
+
+        let l_chunk: i32 = 128;
+        let n_chunks: i32 = 4;
+        let split: i32 = 2; // the round trip happens here
+        let l_total = l_chunk * n_chunks;
+        let prefix_len = l_chunk * split;
+
+        // Dispatch geometry, asserted rather than assumed: chunks 0-1 saturate
+        // (nkb <= top_k -> dense), chunks 2-3 do not (nkb > top_k -> sparse).
+        // If a width ever changes `top_k` this fails loud instead of silently
+        // comparing two dense paths and calling it MSA equivalence.
+        let nkb_at = |kv_len: i32| (kv_len + attn.block_size - 1) / attn.block_size;
+        assert!(
+            nkb_at(prefix_len) <= attn.top_k,
+            "{width_label}: pre-split chunks are expected to saturate to dense \
+             (nkb {} vs top_k {})",
+            nkb_at(prefix_len),
+            attn.top_k
+        );
+        assert!(
+            nkb_at(prefix_len + l_chunk) > attn.top_k,
+            "{width_label}: post-split chunks must dispatch SPARSE, else this \
+             test compares two dense paths (nkb {} vs top_k {})",
+            nkb_at(prefix_len + l_chunk),
+            attn.top_k
+        );
+
+        let input = make_test_input(1, l_total, hidden);
+        let chunk = |i: i32| {
+            mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            )
+        };
+
+        // ---- ARM A: continuous cache, never detached ----------------------
+        let mut cache_a = KVCache::new();
+        let mut outs_a: Vec<UniquePtr<MlxArray>> = Vec::new();
+        for i in 0..split {
+            outs_a.push(attn.forward(&chunk(i), &mut cache_a, None));
+        }
+        reset_dispatch_witness();
+        for i in split..n_chunks {
+            outs_a.push(attn.forward(&chunk(i), &mut cache_a, None));
+        }
+        let witness_a = dispatch_witness();
+
+        // ---- ARM B: in-memory detach / adopt ------------------------------
+        let mut cache_b_src = KVCache::new();
+        let mut outs_b: Vec<UniquePtr<MlxArray>> = Vec::new();
+        for i in 0..split {
+            outs_b.push(attn.forward(&chunk(i), &mut cache_b_src, None));
+        }
+        let handle_b = cache_b_src.clone_handle();
+        let mut cache_b = KVCache::new();
+        cache_b
+            .install_detached(handle_b)
+            .expect("in-memory adoption must succeed");
+        reset_dispatch_witness();
+        for i in split..n_chunks {
+            outs_b.push(attn.forward(&chunk(i), &mut cache_b, None));
+        }
+        let witness_b = dispatch_witness();
+
+        // ---- ARM C: real disk round trip ----------------------------------
+        let mut cache_c_src = KVCache::new();
+        let mut outs_c: Vec<UniquePtr<MlxArray>> = Vec::new();
+        for i in 0..split {
+            outs_c.push(attn.forward(&chunk(i), &mut cache_c_src, None));
+        }
+
+        let handle_c = cache_c_src.clone_handle();
+        let now = std::time::Instant::now();
+        let set = DetachedCacheSet {
+            caches: vec![handle_c],
+            backend: SequenceStateBackend::DenseKvCache,
+            prompt_len: prefix_len as usize,
+            current_offset: prefix_len,
+            created_at: now,
+            detached_at: now,
+            origin_seq_id: SequenceId::from_raw(1),
+        };
+
+        let tokens: Vec<i32> = (0..prefix_len).collect();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let manifest = {
+            // Scoped so the writing store is DROPPED before the load. Alden:
+            // "Drop/recreate the BlockColdStore before load so no in-process
+            // object is the source."
+            let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+            store
+                .persist("m3-g1", "tmpl", &tokens, &set)
+                .expect("persist must succeed")
+        };
+        assert!(
+            !manifest.block_hashes.is_empty(),
+            "{width_label}: persist must commit at least one block"
+        );
+
+        let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+        let (mut loaded, matched) = store
+            .load_prefix("m3-g1", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+            .expect(
+                "W1 (candidate selected): load_prefix must return the candidate \
+                 just committed. A miss here is a write-only store, and a miss \
+                 is silently soft in production — it simply re-prefills.",
+            );
+        // W1 and W2a are kept DISTINCT from W2b (Alden): load_prefix returning
+        // a verified candidate witnesses integrity/layout validation, while
+        // install_detached returning Ok witnesses only that adoption accepted
+        // the reconstructed state. Collapsing them would let a later validator
+        // be bypassed while the adoption seam stayed green.
+        assert_eq!(
+            matched,
+            tokens.len(),
+            "W1: the whole persisted prefix must match"
+        );
+        assert_eq!(
+            loaded.caches.len(),
+            1,
+            "W2a (integrity/layout validated): one cache per LAYER"
+        );
+
+        let mut cache_c = KVCache::new();
+        cache_c
+            .install_detached(loaded.caches.remove(0))
+            .expect("W2b (adoption accepted): install_detached must succeed");
+
+        // W3: reusable cursor and indexer cursor equal expected. Expected is
+        // what was persisted, not a constant chosen here.
+        assert_eq!(
+            cache_c.offset, prefix_len,
+            "W3: main K/V cursor must survive the disk round trip"
+        );
+        assert_eq!(
+            cache_c.m3_idx_offset(),
+            prefix_len,
+            "W3: indexer cursor must survive the disk round trip. A zero here \
+             means m3_idx_k was dropped; a token count on a layer with no \
+             indexer is the 116924f defect."
+        );
+        assert!(
+            cache_c.has_m3_idx_k_state(),
+            "W3: the indexer TENSOR must arrive, not just its declared length"
+        );
+
+        reset_dispatch_witness();
+        for i in split..n_chunks {
+            outs_c.push(attn.forward(&chunk(i), &mut cache_c, None));
+        }
+        let witness_c = dispatch_witness();
+
+        // ---- W4: the branch-local dispatch witness ------------------------
+        let expect = ((n_chunks - split) as u32, 0u32);
+        assert_eq!(
+            witness_a, expect,
+            "{width_label} arm A: expected exactly {} sparse dispatches and zero \
+             dense for the compared segment, got {:?}",
+            expect.0, witness_a
+        );
+        assert_eq!(
+            witness_b, expect,
+            "{width_label} arm B: in-memory adoption fell back to dense, got {:?}",
+            witness_b
+        );
+        assert_eq!(
+            witness_c, expect,
+            "W4 ({width_label} arm C): the DISK-adopted cache must take the \
+             sparse branch for every compared step. {:?} with a non-zero dense \
+             count means the adopted state failed an eligibility predicate — \
+             the state was accepted but is not usable as MSA state.",
+            witness_c
+        );
+
+        // ---- W5: output equivalence, exact first --------------------------
+        let cat_a = concat_outs(&outs_a);
+        let cat_b = concat_outs(&outs_b);
+        let cat_c = concat_outs(&outs_c);
+
+        // B vs C isolates disk from adoption: identical adoption seam, the only
+        // difference is the round trip. Exactness is the right contract here.
+        assert!(
+            arrays_bit_identical(&cat_b, &cat_c),
+            "{width_label} B vs C: the disk round trip changed the computation. \
+             Adoption semantics are identical on both arms, so this isolates \
+             serialization/reassembly. relative L2 = {}",
+            output_l2_diff(&cat_b, &cat_c) / l2_norm(&cat_b).max(1e-6)
+        );
+
+        // A vs B pins the existing adoption contract; A vs C corroborates end
+        // to end. Asserted exact deliberately — if MLX provenance makes these
+        // differ, the difference is to be CLASSIFIED before any tolerance is
+        // introduced, not absorbed by a loosened bound.
+        assert!(
+            arrays_bit_identical(&cat_a, &cat_b),
+            "{width_label} A vs B: in-memory adoption perturbed the computation \
+             relative to a continuous cache. relative L2 = {}. Classify this \
+             before reaching for a tolerance.",
+            output_l2_diff(&cat_a, &cat_b) / l2_norm(&cat_a).max(1e-6)
+        );
+        assert!(
+            arrays_bit_identical(&cat_a, &cat_c),
+            "{width_label} A vs C: end-to-end disk adoption diverged from the \
+             continuous reference. relative L2 = {}",
+            output_l2_diff(&cat_a, &cat_c) / l2_norm(&cat_a).max(1e-6)
+        );
+    }
+
+    /// G1.1 at the cheap width — the routine structural regression gate.
+    #[test]
+    fn g1_1_fp16_disk_adoption_attention_layer_equivalence_d4() {
+        g1_1_disk_adoption_equivalence(make_test_sparse_attention(), 16, "d4");
+    }
+
+    /// G1.1 at production geometry — release evidence. `head_dim` 128 with
+    /// `index_dim` 4 means K/V and the indexer have DIFFERENT widths here,
+    /// which the d4 harness (where both are 4) cannot distinguish. Width has
+    /// already invalidated one margin claim on this branch.
+    #[test]
+    fn g1_1_fp16_disk_adoption_attention_layer_equivalence_d128() {
+        g1_1_disk_adoption_equivalence(make_test_sparse_attention_d128(), 512, "d128");
+    }
+
+    // ----------------------------------------------------------------
+    // G1.0 NEGATIVE CONTROLS — each measured red, none assumed
+    // ----------------------------------------------------------------
+    //
+    // A green witness certifies nothing until something is shown to turn it
+    // red. Twice on this branch a test stayed green with its supposed guard
+    // removed (the concurrency stress test with the publication lock gone; the
+    // `.tombstone.` filter clause), so "it passes" and "it checks" are tracked
+    // separately here.
+
+    /// N1 — the positive hit witness is NON-VACUOUS.
+    ///
+    /// Same store, same tokens, nothing persisted. If `load_prefix` returned a
+    /// candidate here, W1 in G1.1 would be proving nothing. A cold-store miss
+    /// is silently soft in production (`scheduler.rs`) — it just re-prefills —
+    /// so a store that answered every query would be indistinguishable from a
+    /// working one until the state it handed back was wrong.
+    #[test]
+    fn g1_0_no_persist_makes_the_hit_witness_red() {
+        use mlxcel_core::cache::KVCacheMode;
+        use mlxcel_core::cache::block_cold_store::BlockColdStore;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+        let tokens: Vec<i32> = (0..256).collect();
+
+        let got = store.load_prefix("m3-g1", "tmpl", &tokens, KVCacheMode::Fp16, 0);
+        assert!(
+            got.is_err(),
+            "N1: an empty store returned a candidate — the G1.1 hit witness \
+             would then be vacuous"
+        );
+    }
+
+    /// N3 — a mode/`v_bits` mismatch fails BEFORE adoption, not during it.
+    ///
+    /// Alden: "mode/v_bits mismatch must fail before adoption." The seam that
+    /// must catch it is the block ADDRESS (`cache_computation_id` commits to
+    /// mode and v_bits), so the wrong identity cannot even find the manifest.
+    /// If this ever failed later — at validation, or worse at adoption — a
+    /// mislabelled cache would have travelled further into the system than its
+    /// identity permits.
+    #[test]
+    fn g1_0_a_mode_mismatch_misses_before_adoption() {
+        use mlxcel_core::cache::block_cold_store::BlockColdStore;
+        use mlxcel_core::cache::{
+            DetachedCacheSet, KVCacheMode, SequenceId, SequenceStateBackend,
+        };
+
+        let attn = make_test_sparse_attention();
+        let hidden = 16;
+        let len = 256;
+
+        let mut cache = KVCache::new();
+        let x = make_test_input(1, len, hidden);
+        let _ = attn.forward(&x, &mut cache, None);
+
+        let now = std::time::Instant::now();
+        let set = DetachedCacheSet {
+            caches: vec![cache.clone_handle()],
+            backend: SequenceStateBackend::DenseKvCache,
+            prompt_len: len as usize,
+            current_offset: len,
+            created_at: now,
+            detached_at: now,
+            origin_seq_id: SequenceId::from_raw(1),
+        };
+
+        let tokens: Vec<i32> = (0..len).collect();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+        store
+            .persist("m3-g1", "tmpl", &tokens, &set)
+            .expect("persist must succeed");
+
+        // Written as Fp16; asked for as KVarN8/v4. The address differs, so the
+        // manifest cannot be found at all.
+        let wrong = store.load_prefix("m3-g1", "tmpl", &tokens, KVCacheMode::KVarN8, 4);
+        assert!(
+            wrong.is_err(),
+            "N3: a KVarN8/v4 lookup found an Fp16 entry. Adoption would then \
+             read packed-u32 V codes as u8 — the exact silent mislabelling the \
+             identity exists to prevent."
+        );
+
+        // And the control on the control: the RIGHT identity still hits, so the
+        // miss above is the identity biting and not a store that never works.
+        assert!(
+            store
+                .load_prefix("m3-g1", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+                .is_ok(),
+            "N3: the correct identity must still hit, or the mismatch result \
+             above proves nothing"
+        );
+    }
+
+    /// N2 — a structurally broken adopted state turns BOTH G1.1 witnesses red.
+    ///
+    /// Alden: "wrong m3_idx_offset must fail both the structural witness and
+    /// output equivalence." This is the desync direction: main K/V advanced to
+    /// 256, the indexer never advanced at all. `116924f` was the complementary
+    /// shape (a declared length with no tensor) and is pinned at the byte level
+    /// by `round_trip_must_preserve_per_layer_m3_idx_state_including_dense_layers`.
+    ///
+    /// The K/V here is hand-built along forward's own pre-dispatch pipeline
+    /// (projection -> reshape -> norm -> transpose -> RoPE -> `update_and_fetch`),
+    /// the same replication the qmm-gather gate at `minimax_m3.rs` relies on, so
+    /// the ONLY difference from a healthy cache is the missing indexer update.
+    #[test]
+    fn g1_0_a_desynced_adopted_state_reddens_dispatch_and_equivalence() {
+        use mlxcel_core::cache::block_cold_store::BlockColdStore;
+        use mlxcel_core::cache::{
+            DetachedCacheSet, KVCacheMode, SequenceId, SequenceStateBackend,
+        };
+
+        let mut attn = make_test_sparse_attention();
+        attn.block_size = 128;
+        let hidden = 16;
+        let l_chunk: i32 = 128;
+        let split: i32 = 2;
+        let n_chunks: i32 = 4;
+        let l_total = l_chunk * n_chunks;
+        let prefix_len = l_chunk * split;
+
+        let input = make_test_input(1, l_total, hidden);
+        let chunk = |i: i32| {
+            mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            )
+        };
+
+        // Healthy reference: the continuous arm from G1.1.
+        let mut cache_ref = KVCache::new();
+        let mut outs_ref: Vec<UniquePtr<MlxArray>> = Vec::new();
+        for i in 0..n_chunks {
+            outs_ref.push(attn.forward(&chunk(i), &mut cache_ref, None));
+        }
+
+        // Broken source: main K/V only, indexer never touched.
+        let mut cache_bad = KVCache::new();
+        for i in 0..split {
+            let x = chunk(i);
+            let offset = i * l_chunk;
+            let k_raw = attn.k_proj.forward(&x);
+            let v_raw = attn.v_proj.forward(&x);
+            let k = mlxcel_core::reshape(&k_raw, &[1, l_chunk, attn.num_kv_heads, attn.head_dim]);
+            let v = mlxcel_core::reshape(&v_raw, &[1, l_chunk, attn.num_kv_heads, attn.head_dim]);
+            let k = match attn.k_norm {
+                Some(ref n) => n.forward(&k),
+                None => k,
+            };
+            let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+            let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+            let k =
+                mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+            let _ = cache_bad.update_and_fetch(k, v);
+        }
+        assert_eq!(cache_bad.offset, prefix_len);
+        assert_eq!(
+            cache_bad.m3_idx_offset(),
+            0,
+            "the broken source must actually be desynced, or this control is \
+             testing a healthy cache"
+        );
+
+        let now = std::time::Instant::now();
+        let set = DetachedCacheSet {
+            caches: vec![cache_bad.clone_handle()],
+            backend: SequenceStateBackend::DenseKvCache,
+            prompt_len: prefix_len as usize,
+            current_offset: prefix_len,
+            created_at: now,
+            detached_at: now,
+            origin_seq_id: SequenceId::from_raw(1),
+        };
+
+        let tokens: Vec<i32> = (0..prefix_len).collect();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let manifest = {
+            let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+            store
+                .persist("m3-g1", "tmpl", &tokens, &set)
+                .expect("persist must succeed")
+        };
+        assert!(!manifest.block_hashes.is_empty());
+
+        let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+        let (mut loaded, matched) = store
+            .load_prefix("m3-g1", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+            .expect("the desynced set is still a valid cold-store entry");
+        assert_eq!(matched, tokens.len());
+
+        let mut cache_adopted = KVCache::new();
+        cache_adopted
+            .install_detached(loaded.caches.remove(0))
+            .expect("adoption accepts the reconstructed state");
+
+        // THE POINT: adoption succeeded. W2b is green on a state that is not
+        // usable as MSA state. That is precisely why W2b cannot be the
+        // no-fallback witness.
+        assert_eq!(cache_adopted.offset, prefix_len);
+        assert_eq!(
+            cache_adopted.m3_idx_offset(),
+            0,
+            "W3 must go RED on the desync — it reports what arrived, not what \
+             was hoped for"
+        );
+
+        let mut outs_bad: Vec<UniquePtr<MlxArray>> = Vec::new();
+        reset_dispatch_witness();
+        for i in split..n_chunks {
+            outs_bad.push(attn.forward(&chunk(i), &mut cache_adopted, None));
+        }
+        let (sparse, dense) = dispatch_witness();
+
+        // W4 red.
+        assert_eq!(
+            (sparse, dense),
+            (0, (n_chunks - split) as u32),
+            "N2: a desynced adopted state must dispatch DENSE for every \
+             compared step. Got ({sparse} sparse, {dense} dense). If this is \
+             ever (2, 0) the branch-local witness has stopped biting and G1.1's \
+             W4 certifies nothing."
+        );
+
+        // W5 red — decorrelated from W4, and only the post-split segment is
+        // compared so the identical prefix cannot mask the divergence.
+        let cat_ref = concat_outs(&outs_ref[split as usize..]);
+        let cat_bad = concat_outs(&outs_bad);
+        assert!(
+            !arrays_bit_identical(&cat_ref, &cat_bad),
+            "N2: the dense fallback produced bit-identical output to the sparse \
+             reference. Then output equivalence cannot distinguish the two \
+             dispatch paths and G1.1's W5 is not a witness."
         );
     }
 
