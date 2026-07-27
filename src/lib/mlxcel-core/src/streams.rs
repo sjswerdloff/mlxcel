@@ -280,6 +280,31 @@ mod tests {
     ///
     /// A green run here is NOT decoration: the assertion is that we reach
     /// the line after `join()` at all.
+    ///
+    /// DECLARED BLIND SPOTS — what a green run here does NOT establish
+    /// (asked for by Violet at QE; stated so absence is never inferred as
+    /// coverage). This test catches ONE failure mode: a thread-exit
+    /// destructor that faults. It is silent about:
+    ///
+    /// 1. **CPU-only builds — it goes VACUOUS.** With no GPU,
+    ///    `new_thread_local_generation_stream()` returns `None`,
+    ///    `install_thread_local_default_stream(None)` is a no-op, and this
+    ///    degenerates to "run an MLX op on a thread". It would pass under
+    ///    any finalizer at all. It only bites on a GPU build.
+    /// 2. **Corruption without a fault.** A finalizer that releases the
+    ///    wrong thread's state, or releases too early, and does not crash,
+    ///    stays green here.
+    /// 3. **Under-release.** This is green today *because* nothing releases
+    ///    per-thread state. If a release is ever genuinely required, its
+    ///    absence is invisible to this test.
+    /// 4. **Anything needing two or more concurrent MLX threads** — one
+    ///    worker only. The separate, still-undiagnosed parallel-suite
+    ///    SIGSEGV is out of scope here.
+    /// 5. **Process-exit races** rather than thread-exit races — the
+    ///    original `2cda250` concern (static destructors interleaving with
+    ///    `MlxArray` destructors on other unwinding threads) is NOT
+    ///    exercised.
+    /// 6. **Non-Metal backends** — only the path this host takes.
     #[test]
     fn install_then_exit_thread_does_not_kill_the_process() {
         use crate::dtype;
