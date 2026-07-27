@@ -248,7 +248,12 @@ fn fire_gc_nomination_seam() {}
 /// through different paths, and a map keyed on the un-canonicalized `PathBuf`
 /// would hand them different mutexes while they share a store — an exclusion
 /// bug that looks like it works).
-static STORE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// A RwLock rather than a Mutex because the file lock it pairs with has two
+/// modes. Loaders take `read()` + `LOCK_SH`; publication and the sweep take
+/// `write()` + `LOCK_EX`. A Mutex here would serialize concurrent loaders
+/// against each other for no reason, and — worse — would make the process-level
+/// half disagree with the kernel half about what "shared" means.
+static STORE_MUTEX: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// RAII exclusion guard. Releases in the reverse of acquisition: file lock
 /// first, then the process mutex when the guard field drops.
@@ -259,8 +264,17 @@ static STORE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// lock forever after one unrelated panic would disable GC for the life of the
 /// process.
 struct StoreLock<'a> {
-    _process: std::sync::MutexGuard<'a, ()>,
+    _process: StoreGuardKind<'a>,
     file: File,
+}
+
+/// Which half of the RwLock a `StoreLock` is holding. Kept as an enum rather
+/// than two types so callers cannot accidentally hold a shared process guard
+/// while taking an exclusive file lock, or the reverse — the two halves are
+/// acquired together and released together.
+enum StoreGuardKind<'a> {
+    Exclusive(#[allow(dead_code)] std::sync::RwLockWriteGuard<'a, ()>),
+    Shared(#[allow(dead_code)] std::sync::RwLockReadGuard<'a, ()>),
 }
 
 impl Drop for StoreLock<'_> {
@@ -360,7 +374,7 @@ impl BlockColdStore {
     /// FAILS CLOSED. If the lock cannot be taken, the caller must not sweep.
     fn acquire_store_lock(&self) -> Result<StoreLock<'static>, ColdStoreError> {
         // Order is load-bearing and identical at every call site.
-        let process_guard = STORE_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let process_guard = STORE_MUTEX.write().unwrap_or_else(|p| p.into_inner());
 
         fs::create_dir_all(&self.base_dir)?;
         let file = fs::OpenOptions::new()
@@ -384,7 +398,50 @@ impl BlockColdStore {
             return Err(ColdStoreError::Io(err));
         }
         Ok(StoreLock {
-            _process: process_guard,
+            _process: StoreGuardKind::Exclusive(process_guard),
+            file,
+        })
+    }
+
+    /// ACTIVE-LOAD LEASE (Alden finding 4: "Active loads need a short
+    /// lease/read lock that also counts as a root during GC"; his test 5).
+    ///
+    /// Shared, so concurrent loaders do not block each other, but mutually
+    /// exclusive with the sweep's `LOCK_EX` — which is the point. Without it a
+    /// load is a read of manifest-then-blocks with no atomicity: GC can prove a
+    /// block unreferenced, tombstone it, and unlink it in the gap between a
+    /// loader reading the manifest that names it and the loader opening it. The
+    /// loader then fails on a block its own manifest promised.
+    ///
+    /// Held for the whole read — manifest AND blocks — because the hazard lives
+    /// in the gap between them, not in either half.
+    ///
+    /// Deliberately NOT the same thing as fail-soft re-prefill. Re-prefilling is
+    /// a fallback for a store that is legitimately cold; it is not a substitute
+    /// for a store that tears under concurrent GC, and treating it as one would
+    /// make an incoherence look like a cache miss.
+    fn acquire_read_lease(&self) -> Result<StoreLock<'static>, ColdStoreError> {
+        let process_guard = STORE_MUTEX.read().unwrap_or_else(|p| p.into_inner());
+        fs::create_dir_all(&self.base_dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.lock_path())?;
+        // SAFETY: fd valid for the duration; the guard keeps it alive.
+        let rc =
+            unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_SH) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            tracing::warn!(
+                error = %err,
+                "COLD-STORE v4: could not take a read lease; a concurrent sweep could \
+                 collect a block this load needs"
+            );
+            return Err(ColdStoreError::Io(err));
+        }
+        Ok(StoreLock {
+            _process: StoreGuardKind::Shared(process_guard),
             file,
         })
     }
@@ -397,7 +454,7 @@ impl BlockColdStore {
     /// because a publisher happened to hold it for a millisecond.
     #[cfg(test)]
     fn try_acquire_store_lock(&self) -> Result<Option<StoreLock<'static>>, ColdStoreError> {
-        let process_guard = STORE_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let process_guard = STORE_MUTEX.write().unwrap_or_else(|p| p.into_inner());
         fs::create_dir_all(&self.base_dir)?;
         let file = fs::OpenOptions::new()
             .create(true)
@@ -419,7 +476,7 @@ impl BlockColdStore {
             return Err(ColdStoreError::Io(err));
         }
         Ok(Some(StoreLock {
-            _process: process_guard,
+            _process: StoreGuardKind::Exclusive(process_guard),
             file,
         }))
     }
@@ -1369,6 +1426,15 @@ impl BlockColdStore {
         // one place rather than inline at the hashing site.
         let load_cache_id =
             cache_computation_id(&self.runtime_fingerprint, kv_mode, v_bits);
+
+        // ACTIVE-LOAD LEASE, held for the whole of this call. The hazard is the
+        // gap between reading a manifest and opening the blocks it names: a
+        // sweep can prove one unreferenced, tombstone it, and unlink it in
+        // between, leaving this load to fail on a block its own manifest just
+        // promised. Shared, so loads do not block each other; exclusive against
+        // the sweep, which is what makes it a lease rather than a formality.
+        let _lease = self.acquire_read_lease()?;
+
         let manifests_dir = self.manifests_dir();
         if !manifests_dir.exists() {
             return Err(ColdStoreError::NoMatch);
