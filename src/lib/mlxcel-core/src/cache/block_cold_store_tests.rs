@@ -1824,6 +1824,186 @@ fn a_block_referenced_by_a_manifest_published_after_nomination_must_survive() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EPOCH AND REVERIFY, PINNED SEPARATELY (Alden finding-4 residual, 2026-07-28)
+// ---------------------------------------------------------------------------
+//
+// Alden: "Redundancy explains why removing one of epoch/reverify may stay
+// green, but pin each mechanism's own contract separately so one cannot rot
+// silently."
+//
+// He was right, and worse than he put it — MEASURED 2026-07-28, both
+// mechanisms were uncertified:
+//
+//   * Forcing `live_final` empty (i.e. deleting the under-lock re-verification
+//     entirely) left all 1152 mlxcel-core tests GREEN.
+//   * `a_block_referenced_by_a_manifest_published_after_nomination_must_survive`
+//     — Alden test 1, the only test that occupies the nomination window — has
+//     its seam publish via `write_manifest`, which BUMPS the epoch. So the
+//     under-lock epoch check fires and GC returns before the reverify is
+//     reached. That test pins the epoch check; it never runs the reverify.
+//     And removing the epoch check does not redden it either, because the
+//     reverify then catches the same case — each mechanism was hidden behind
+//     the other.
+//
+// The two tests below split them. Each constructs a state where exactly ONE
+// mechanism can save the block, so each reddens when its own is removed.
+
+/// CONTRACT 1 — an epoch change aborts the pass, on its own.
+///
+/// The seam bumps the epoch and publishes NOTHING. Reachability is therefore
+/// unchanged: the reverify would find the candidate genuinely unreferenced and
+/// collect it. Only the epoch check can decline here, so this test isolates it.
+///
+/// The behaviour is deliberately conservative — collecting would have been
+/// safe, since nothing was published. That IS the contract: "any
+/// manifest/root publication since mark invalidates the mark and requires a
+/// rescan", and the epoch cannot tell a bump-then-crash from a bump-then-
+/// publish. Declining costs a wasted pass; the other direction costs a live
+/// block.
+#[test]
+fn a_bumped_epoch_alone_aborts_the_pass_even_when_nothing_was_published() {
+    use std::sync::Arc;
+
+    let (dir, store, manifest) = persisted_store_for_gc();
+    let store = Arc::new(store.with_min_gc_age(std::time::Duration::ZERO));
+    let blocks = manifest.block_hashes.clone();
+    assert!(!blocks.is_empty(), "precondition: the manifest must have blocks");
+
+    // Orphan the blocks so GC nominates them.
+    store
+        .delete_manifest(&manifest.hash())
+        .expect("delete manifest to orphan the blocks");
+
+    let epoch_path = dir.path().join("publication.epoch");
+    let before = std::fs::read(&epoch_path).expect("persist must have written an epoch");
+
+    // Fire in the nomination window: bump the counter, publish nothing.
+    let bump_path = epoch_path.clone();
+    *crate::cache::block_cold_store::GC_NOMINATION_SEAM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(Box::new(move || {
+        let cur = u64::from_le_bytes(
+            std::fs::read(&bump_path)
+                .expect("epoch readable")
+                .try_into()
+                .expect("epoch is 8 bytes"),
+        );
+        std::fs::write(&bump_path, (cur + 1).to_le_bytes()).expect("bump the epoch");
+    }));
+
+    let gc_result = store.gc_blocks();
+
+    *crate::cache::block_cold_store::GC_NOMINATION_SEAM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+
+    gc_result.expect("gc must not error");
+
+    let after = std::fs::read(&epoch_path).expect("epoch still readable");
+    assert_ne!(
+        before, after,
+        "precondition: the seam must actually have changed the epoch, or this \
+         test proves nothing"
+    );
+
+    for b in &blocks {
+        store.read_block(b).unwrap_or_else(|e| {
+            panic!(
+                "block {} was collected despite the epoch changing between the \
+                 mark and the sweep ({e}). The epoch check is the ONLY mechanism \
+                 that can decline here — nothing was published, so the locked \
+                 re-verification would agree the block is unreferenced. Removing \
+                 or reordering that check is what this test exists to catch.",
+                hex_digest(b)
+            )
+        });
+    }
+}
+
+/// CONTRACT 2 — the locked re-verification runs even when the epoch is QUIET.
+///
+/// The seam publishes a manifest referencing the candidates and then RESTORES
+/// the epoch to its previous value. That reproduces "manifest visible, epoch
+/// not bumped" — precisely the crash direction `write_manifest`'s ordering
+/// argument names as the dangerous one, and the state a process leaves if it
+/// dies between the two files.
+///
+/// Alden: "epoch and manifest are two files, so a prior process can crash after
+/// one operation; unchanged epoch is not proof by itself unless publication is
+/// transactionally atomic, which it is not."
+///
+/// The under-lock epoch check passes here, so the ONLY thing standing between a
+/// committed manifest and a missing block is the authoritative re-mark. This
+/// test is red the moment that re-mark stops being consulted — which, until it
+/// existed, nothing was.
+#[test]
+fn a_manifest_published_behind_a_quiet_epoch_still_survives_the_locked_reverify() {
+    use std::sync::Arc;
+
+    let (dir, store, manifest) = persisted_store_for_gc();
+    let store = Arc::new(store.with_min_gc_age(std::time::Duration::ZERO));
+    let blocks = manifest.block_hashes.clone();
+    assert!(!blocks.is_empty(), "precondition: the manifest must have blocks");
+
+    store
+        .delete_manifest(&manifest.hash())
+        .expect("delete manifest to orphan the blocks");
+
+    let epoch_path = dir.path().join("publication.epoch");
+    let quiet = std::fs::read(&epoch_path).expect("persist must have written an epoch");
+
+    let seam_store = Arc::clone(&store);
+    let seam_manifest = manifest.clone();
+    let seam_epoch_path = epoch_path.clone();
+    let seam_quiet = quiet.clone();
+    *crate::cache::block_cold_store::GC_NOMINATION_SEAM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(Box::new(move || {
+        seam_store
+            .write_manifest(&seam_manifest)
+            .expect("the racing publication must succeed");
+        // Roll the counter back, simulating a publisher that died after the
+        // rename but before its bump was durable. `write_manifest` bumps first
+        // precisely so this window is the RARE direction — but rare is not
+        // never, and the reverify is what covers it.
+        std::fs::write(&seam_epoch_path, &seam_quiet).expect("restore the quiet epoch");
+    }));
+
+    let gc_result = store.gc_blocks();
+
+    *crate::cache::block_cold_store::GC_NOMINATION_SEAM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+
+    gc_result.expect("gc must not error");
+
+    // The epoch really was quiet across the window — otherwise the epoch check
+    // saved the blocks and this test is Alden test 1 wearing a new name.
+    assert_eq!(
+        quiet,
+        std::fs::read(&epoch_path).expect("epoch still readable"),
+        "precondition: the epoch must be UNCHANGED across the sweep, or the \
+         cheap check fired and the re-verification was never exercised"
+    );
+
+    let republished = store
+        .read_manifest(&manifest.hash())
+        .expect("the manifest published in the nomination window must be committed");
+
+    for b in &republished.block_hashes {
+        store.read_block(b).unwrap_or_else(|e| {
+            panic!(
+                "block {} was collected while a COMMITTED manifest references it \
+                 ({e}). The epoch was quiet, so the cheap staleness check could \
+                 not decline — only the authoritative re-mark under the lock \
+                 stands here, and it did not.",
+                hex_digest(b)
+            )
+        });
+    }
+}
+
 /// CHILD-PROCESS HELPER for the cross-process lock tests. Inert unless
 /// `MLXCEL_TEST_LOCK_DIR` is set, so it is a no-op in a normal suite run and the
 /// parent test drives it by re-executing this same binary.
