@@ -208,6 +208,37 @@ impl Manifest {
 // ///
 
 /// A v4 block-based cold store.
+/// TEST SEAM — fires inside `gc_blocks` after nomination and BEFORE the store
+/// lock is acquired.
+///
+/// This is the window Alden's tests 1 and 2 require: "writer begins after mark
+/// but before sweep and commits a manifest referencing candidate X: X MUST
+/// survive." A stress test cannot schedule that interleaving — measured, the
+/// concurrency test stayed green with the publication lock removed entirely —
+/// so the interleaving has to be constructed rather than hoped for.
+///
+/// Because the seam runs before GC takes the lock, a publisher invoked from it
+/// can acquire the lock normally, which means the whole scenario runs on ONE
+/// thread. That matters here: `DetachedCacheSet` holds cxx pointers that are
+/// not `Send`, and moving MLX work off-thread is its own hazard.
+///
+/// `cfg(test)` only — it does not exist in a shipped binary.
+#[cfg(test)]
+pub(crate) static GC_NOMINATION_SEAM: std::sync::Mutex<Option<Box<dyn Fn() + Send>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn fire_gc_nomination_seam() {
+    let seam = GC_NOMINATION_SEAM.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(f) = seam.as_ref() {
+        f();
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn fire_gc_nomination_seam() {}
+
 /// Process-wide publication/sweep exclusion, paired with the kernel file lock.
 ///
 /// Deliberately COARSE — one mutex for every store in the process rather than
@@ -1122,6 +1153,11 @@ impl BlockColdStore {
         if candidates.is_empty() {
             return Ok(());
         }
+
+        // Candidates are chosen; the lock is not yet held. This is exactly the
+        // window a concurrent publisher occupies, so it is where the test seam
+        // fires.
+        fire_gc_nomination_seam();
 
         // ---------------------------------------------------------------
         // Under exclusion (Alden finding 4, GC protocol steps 3-6).

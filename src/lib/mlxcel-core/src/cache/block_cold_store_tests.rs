@@ -1734,6 +1734,89 @@ fn a_committed_manifest_never_references_a_missing_block_under_concurrent_gc() {
     }
 }
 
+/// ALDEN TEST 1, DETERMINISTIC — "writer begins after mark but before sweep and
+/// commits a manifest referencing candidate X: X MUST survive."
+///
+/// Constructed rather than raced. The seam fires in `gc_blocks` after the
+/// candidates are chosen and before the lock is taken — the exact window a
+/// concurrent publisher occupies — and the publisher runs inside it, so the
+/// whole interleaving happens on one thread with no timing assumptions.
+///
+/// Scenario: persist a sequence, then delete its manifest so its blocks become
+/// orphans GC will nominate. The seam republishes that same manifest, which
+/// re-references every one of those blocks. GC must not collect them.
+///
+/// Under the old refcount-authority GC this is a data-loss bug: the blocks are
+/// nominated, the manifest commits, the blocks are deleted, and the committed
+/// manifest points at nothing.
+#[test]
+fn a_block_referenced_by_a_manifest_published_after_nomination_must_survive() {
+    use std::sync::Arc;
+
+    const N_TILES: i32 = 31;
+    let depth = TILE + N_TILES * TILE;
+    let set = kvarn_v4_set_distinct(2, N_TILES, 0);
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = Arc::new(
+        BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32])
+            .with_prune_mode(PruneMode::Delete),
+    );
+
+    let manifest = store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+    let blocks = manifest.block_hashes.clone();
+    assert!(!blocks.is_empty(), "precondition: the manifest must have blocks");
+
+    // Orphan them: with the manifest gone, every block is unreferenced and GC
+    // will nominate it.
+    store
+        .delete_manifest(&manifest.hash())
+        .expect("delete manifest to orphan the blocks");
+
+    // The publisher, armed to fire in the nomination window. Only plain data
+    // crosses into the closure — `Manifest` is hashes and strings, while a
+    // `DetachedCacheSet` could not (cxx pointers are not `Send`).
+    let seam_store = Arc::clone(&store);
+    let seam_manifest = manifest.clone();
+    *crate::cache::block_cold_store::GC_NOMINATION_SEAM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(Box::new(move || {
+        seam_store
+            .write_manifest(&seam_manifest)
+            .expect("the racing publication must succeed");
+    }));
+
+    let gc_result = store.gc_blocks();
+
+    // Disarm before asserting, so a failure cannot leak the seam into another
+    // test and turn one red test into a confusing several.
+    *crate::cache::block_cold_store::GC_NOMINATION_SEAM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+
+    gc_result.expect("gc must not error");
+
+    // The manifest committed during the window.
+    let republished = store
+        .read_manifest(&manifest.hash())
+        .expect("the manifest published in the nomination window must be committed");
+
+    // THE INVARIANT: every block it references must still be there.
+    for b in &republished.block_hashes {
+        store.read_block(b).unwrap_or_else(|e| {
+            panic!(
+                "GC collected block {} after a manifest referencing it was published \
+                 in the nomination window ({e}). The committed manifest now points at \
+                 missing data — Alden's exact interleaving, lost rather than caught.",
+                hex_digest(b)
+            )
+        });
+    }
+}
+
 /// A mode MISMATCH must be a clean miss, never a wrong adoption.
 ///
 /// Persist under KVarN8, load under Fp16. Because block addresses commit to the
