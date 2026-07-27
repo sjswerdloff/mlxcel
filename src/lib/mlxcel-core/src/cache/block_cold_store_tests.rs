@@ -3411,3 +3411,99 @@ fn observe_mode_reports_a_prune_without_performing_it() {
          deferred silent delete"
     );
 }
+
+/// WHAT THE HEADER VERIFICATION COSTS AT RUNTIME — measured, not estimated.
+///
+/// The exhaustive byte-walk test above is DEVELOPMENT-time (8328 loads, ~200s in this
+/// module). `verify_manifest_addresses` is RUNTIME: it runs on every `load_prefix`. That
+/// distinction is worth a number rather than a shrug, so here is the number.
+///
+/// Measured 2026-07-28, M3 Ultra, `cargo test` debug profile:
+///
+/// ```text
+/// REDERIVE    4096 tokens (  2 blocks):   0.396 ms
+/// REDERIVE   32768 tokens ( 16 blocks):   2.458 ms
+/// REDERIVE  131072 tokens ( 64 blocks):   8.214 ms
+/// REDERIVE  300000 tokens (147 blocks):  18.881 ms
+/// FULL LOAD   8192 tokens (  4 blocks, 2 layers, fp16): 82.764 ms
+/// ```
+///
+/// Linear in tokens, ~0.13 ms per block, and — the structural point — **independent of
+/// layer count**. It hashes the token list; it does not touch the KV payload. The block
+/// READ it is added to scales with layers, so the ratio only improves on a real model.
+///
+/// Against the 2-layer baseline: 0.198 ms re-derive vs 20.7 ms read per block, **~1%**.
+/// M3 has 57 layers, so a production block read is far heavier while the re-derivation is
+/// unchanged — but that extrapolation is arithmetic, NOT a measurement, and is labelled as
+/// such deliberately.
+///
+/// It is also paid **once per adoption, not per decode step** — the decode path is
+/// untouched. And the alternative to a cold load is a full re-prefill, which for 300K
+/// tokens is minutes, against which 19 ms does not register.
+///
+/// KNOWN, NOT FIXED: verification runs AFTER `assemble_blocks`, so a corrupt candidate
+/// pays for a full merge before being rejected. `read_block` yields the tokens without the
+/// merge, so an early-reject restructuring is available if the corrupt path ever matters.
+/// It does not today — corruption is the rare case, and the ordering keeps
+/// `assemble_blocks` a mechanical merge with acceptance layered above it.
+///
+/// `#[ignore]` because it is a measurement, not a contract — it has no failure condition
+/// and must never gate CI on timing. Run with:
+/// `cargo test -p mlxcel-core --lib timing_probe_verification_cost -- --ignored --nocapture`
+#[test]
+#[ignore = "timing probe, not a contract — run explicitly"]
+fn timing_probe_verification_cost() {
+    use std::time::Instant;
+
+    let kv_mode = cache_computation_id(&[9u8; 32], KVCacheMode::Fp16, 0);
+
+    // Cost of the ADDED work: re-deriving the address chain over the token list.
+    for &n in &[4096usize, 32_768, 131_072, 300_000] {
+        let tokens: Vec<i32> = (0..n as i32).collect();
+        // warm
+        let _ = compute_block_hashes(&tokens, DEFAULT_BLOCK_SIZE, &kv_mode);
+        let t = Instant::now();
+        const REPS: u32 = 20;
+        for _ in 0..REPS {
+            std::hint::black_box(compute_block_hashes(
+                std::hint::black_box(&tokens),
+                DEFAULT_BLOCK_SIZE,
+                &kv_mode,
+            ));
+        }
+        let per = t.elapsed() / REPS;
+        println!(
+            "REDERIVE {:>7} tokens ({:>3} blocks): {:>9.3} ms",
+            n,
+            n.div_ceil(DEFAULT_BLOCK_SIZE),
+            per.as_secs_f64() * 1000.0
+        );
+    }
+
+    // Baseline to compare against: what one real block READ costs, which is the
+    // work the verification is added on top of.
+    const LAYERS: usize = 2;
+    const DEPTH: i32 = 4 * DEFAULT_BLOCK_SIZE as i32;
+    let set = fp16_set(LAYERS, DEPTH);
+    let toks: Vec<i32> = (0..DEPTH).collect();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
+    store.persist("m3", "tmpl", &toks, &set).expect("persist");
+
+    let _ = store.load_prefix("m3", "tmpl", &toks, KVCacheMode::Fp16, 0);
+    let t = Instant::now();
+    const LOADS: u32 = 5;
+    for _ in 0..LOADS {
+        let _ = store
+            .load_prefix("m3", "tmpl", &toks, KVCacheMode::Fp16, 0)
+            .expect("hit");
+    }
+    let per_load = t.elapsed() / LOADS;
+    println!(
+        "FULL LOAD {} tokens ({} blocks, {} layers, fp16): {:.3} ms",
+        DEPTH,
+        DEPTH as usize / DEFAULT_BLOCK_SIZE,
+        LAYERS,
+        per_load.as_secs_f64() * 1000.0
+    );
+}
