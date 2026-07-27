@@ -1304,6 +1304,24 @@ fn merge_layer_across_blocks(
         }
     }
 
+    // `m3_idx_offset` is the LOGICAL LENGTH of `m3_idx_k` (detach.rs:142-145),
+    // not a copy of the token count. Those coincide on MSA layers and DO NOT on
+    // M3's dense layers 0-2, which have no indexer at all (detach.rs:136) — the
+    // live cache only advances the counter inside `m3_idx_k_update_and_fetch`
+    // (cache.rs:5333), which those layers never call, so they sit at 0 while
+    // `offset` grows.
+    //
+    // Setting it to `total_tokens` unconditionally handed every dense layer back
+    // declaring a multi-thousand-token indexer behind a `None` tensor. Bytes
+    // perfect, interpretation wrong — handoff §7.3's exact failure class, and the
+    // mirror of the cycle-79 desync that detach.rs:139 documents as crashing the
+    // asymmetric reshape. Derive it from the tensor that actually arrived: right
+    // when the two agree, honest when they do not.
+    let m3_idx_k = concat_across(layers, |c| &c.m3_idx_k);
+    let m3_idx_offset = m3_idx_k
+        .as_ref()
+        .map_or(0, |a| crate::ffi::array_shape(a.as_ref().unwrap())[2]);
+
     let merged = DetachedKVCache {
         keys: concat_across(layers, |c| &c.keys),
         values: concat_across(layers, |c| &c.values),
@@ -1322,8 +1340,8 @@ fn merge_layer_across_blocks(
         hot_threshold: first.hot_threshold,
         delegated_fp16_fast_path: first.delegated_fp16_fast_path,
         delegated_fp16_sidecar_policy: first.delegated_fp16_sidecar_policy,
-        m3_idx_k: concat_across(layers, |c| &c.m3_idx_k),
-        m3_idx_offset: total_tokens,
+        m3_idx_k,
+        m3_idx_offset,
         kvarn_sink_k: concat_across(layers, |c| &c.kvarn_sink_k),
         kvarn_sink_v: concat_across(layers, |c| &c.kvarn_sink_v),
         kvarn_tail_k: concat_across(layers, |c| &c.kvarn_tail_k),

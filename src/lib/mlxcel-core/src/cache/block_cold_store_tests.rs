@@ -1378,6 +1378,122 @@ fn persist_then_load_prefix_reports_a_hit_kvarn8() {
     );
 }
 
+/// G1.0 STRUCTURAL WITNESS — the adopted state must EQUAL the persisted state,
+/// per layer, for the fields that carry INTERPRETATION rather than payload.
+///
+/// Handoff §7.3 names the gap this closes: every other test in this file asserts
+/// BYTES. `merge_layer_across_blocks` *chooses* `offset` and `m3_idx_offset`
+/// (both `total_tokens`) and nothing verifies those are what the engine expects
+/// on adopt. A cache with perfect bytes and a wrong offset passes all 87 tests
+/// and generates garbage — tensors right, interpretation wrong. Alden's G1.0
+/// (2026-07-27) requires the hit witness be CAUSAL: "reusable cursor/offset and
+/// m3_idx_offset equal expected", not a log line.
+///
+/// "Expected" here is not a constant I pick — that would just re-assert my own
+/// choice. It is the state that was PERSISTED. A round trip that changes the
+/// declared interpretation has corrupted the cache even with byte-perfect
+/// payload.
+///
+/// THE MIXED SET IS THE POINT. Real M3 has no indexer on dense layers 0-2
+/// (`detach.rs:136`: `m3_idx_k` is "None for non-M3 models (and for M3's dense
+/// layers 0-2)"), and the live cache only advances `m3_idx_offset` inside
+/// `m3_idx_k_update_and_fetch` (`cache.rs:5333`), which those layers never call.
+/// So a live dense layer holds `m3_idx_k = None, m3_idx_offset = 0` while
+/// `offset > 0`. A uniform fixture cannot see what a round trip does to that
+/// layer; every existing k8v4 fixture is dense-shaped on this axis, so the
+/// mixed case has never been exercised.
+#[test]
+fn round_trip_must_preserve_per_layer_m3_idx_state_including_dense_layers() {
+    const LAYERS: usize = 2;
+    const N_TILES: i32 = 31;
+    const INDEX_DIM: i32 = 8;
+    const B_M3_IDX: i32 = 91;
+    let depth = TILE + N_TILES * TILE; // 4096 == 2 * DEFAULT_BLOCK_SIZE
+    assert_eq!(depth as usize, 2 * DEFAULT_BLOCK_SIZE, "must span two blocks");
+
+    let mut set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
+
+    // Layer 0 stays DENSE-shaped: no indexer, offset > 0. Layer 1 is MSA-shaped:
+    // indexer present and in lockstep with offset.
+    assert!(
+        set.caches[0].m3_idx_k.is_none() && set.caches[0].m3_idx_offset == 0,
+        "layer 0 must start dense-shaped for this test to mean anything"
+    );
+    // FLOAT32: the f16 pattern helper packs (h, t) into 256 slots and caps
+    // len at TILE, which cannot express a 4096-token indexer.
+    set.caches[1].m3_idx_k = some_arr(B_M3_IDX, depth, INDEX_DIM, dtype::FLOAT32);
+    set.caches[1].m3_idx_offset = depth;
+
+    // What we expect back, captured BEFORE the round trip.
+    let expected: Vec<(bool, i32, i32)> = set
+        .caches
+        .iter()
+        .map(|c| (c.m3_idx_k.is_some(), c.m3_idx_offset, c.offset))
+        .collect();
+
+    let tokens: Vec<i32> = (0..depth).collect();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
+    store
+        .persist("m3", "tmpl", &tokens, &set)
+        .expect("persist must succeed");
+    let (loaded, matched) = store
+        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+        .expect("load_prefix must HIT — a miss makes this test vacuous");
+    assert_eq!(matched, tokens.len(), "full prefix must match");
+
+    for (i, (want_present, want_idx_off, want_off)) in expected.iter().enumerate() {
+        let got = &loaded.caches[i];
+        assert_eq!(
+            got.m3_idx_k.is_some(),
+            *want_present,
+            "layer {i}: indexer PRESENCE changed across the round trip \
+             (persisted {want_present}, loaded {})",
+            got.m3_idx_k.is_some()
+        );
+        assert_eq!(
+            got.m3_idx_offset, *want_idx_off,
+            "layer {i}: m3_idx_offset changed across the round trip — persisted \
+             {want_idx_off}, loaded {}. This is interpretation drift, not a byte \
+             error: the payload can be perfect and the adopted cache still wrong. \
+             `detach.rs:145` calls m3_idx_offset the LOGICAL LENGTH of m3_idx_k, \
+             and the MSA dispatch relies on its lockstep with offset.",
+            got.m3_idx_offset
+        );
+        assert_eq!(
+            got.offset, *want_off,
+            "layer {i}: offset changed across the round trip (persisted {want_off}, \
+             loaded {})",
+            got.offset
+        );
+    }
+
+    // The invariant that makes the above load-bearing rather than bookkeeping:
+    // a declared length with no tensor behind it.
+    for (i, c) in loaded.caches.iter().enumerate() {
+        if c.m3_idx_k.is_none() {
+            assert_eq!(
+                c.m3_idx_offset, 0,
+                "layer {i}: m3_idx_offset is {} but m3_idx_k is None — a declared \
+                 logical length for a tensor that does not exist. `detach.rs:136-140` \
+                 documents the mirror of this (offset > 0 with m3_idx_offset == 0) as \
+                 crashing the asymmetric reshape; this is the same desync from the \
+                 other side.",
+                c.m3_idx_offset
+            );
+        } else {
+            let actual = axis2_len(c.m3_idx_k.as_ref().unwrap());
+            assert_eq!(
+                c.m3_idx_offset, actual,
+                "layer {i}: m3_idx_offset ({}) disagrees with the actual axis-2 \
+                 extent of m3_idx_k ({actual}). Shape is documented as \
+                 [b, 1, m3_idx_offset, index_dim].",
+                c.m3_idx_offset
+            );
+        }
+    }
+}
+
 /// A mode MISMATCH must be a clean miss, never a wrong adoption.
 ///
 /// Persist under KVarN8, load under Fp16. Because block addresses commit to the
