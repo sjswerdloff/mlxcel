@@ -5935,6 +5935,23 @@ mod tests {
     /// THE BIT-IDENTITY BACKSTOP — proof that the output comparison CAN fail, built so the
     /// N2 confound cannot reach it.
     ///
+    /// **MUTUAL DEPENDENCY — READ THIS BEFORE WEAKENING EITHER SIDE.** (Violet,
+    /// 2026-07-28; neither of us had named it.) `!arrays_bit_identical(a, b)` cannot on its
+    /// own distinguish *"the comparison is sensitive to state"* from *"`forward` is
+    /// nondeterministic"* — two runs of a nondeterministic `forward` would differ whatever
+    /// the state. The determinism backstop is **G1 itself**: three-arm bit-identity under
+    /// identical state IS the demonstration that `forward` is deterministic.
+    ///
+    /// So the halves are load-bearing in **both** directions. G1 establishes determinism;
+    /// these controls establish sensitivity; neither alone establishes either. Before these
+    /// controls existed the family had determinism with no sensitivity — four bit-identity
+    /// greens and nothing showing bit-identity was a discriminating result.
+    ///
+    /// The consequence a future reader needs: **a change that weakens the G1 greens also
+    /// silently weakens these controls**, and the dependency is invisible from inside either
+    /// test. If G1's arms ever stop being bit-identical, do not "fix" it with a tolerance
+    /// without noticing that these controls stop meaning anything at the same moment.
+    ///
     /// Violet, 2026-07-28, escalating a worry I had scoped too narrowly. I flagged that
     /// N2's hand-built K/V might confound its divergence half. She checked what the other
     /// controls actually assert: `g1_0_no_persist...` asserts `is_err()`,
