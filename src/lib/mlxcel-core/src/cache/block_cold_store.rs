@@ -1156,6 +1156,17 @@ impl BlockColdStore {
                 // blocks. A crash between the rename and the unlink leaves one
                 // behind; it must never be mistaken for live state, nor
                 // re-nominated as though it were a block in its own right.
+                //
+                // BELT AND BRACES, measured 2026-07-28: removing this clause
+                // does NOT redden
+                // `a_tombstone_left_by_a_crash_is_inert_and_the_final_path_can_be_reoccupied`,
+                // because `parse_hex_digest` already rejects a dotted prefix and
+                // the entry is skipped a few lines below. The real guard is
+                // there. This clause is kept because it states the intent at the
+                // point where someone would otherwise wonder, and because a
+                // future change to the naming scheme could make hex parsing
+                // accept something it currently rejects — but do not mistake it
+                // for the control.
                 !name.starts_with(".tmp.") && !name.starts_with(".tombstone.")
             })
             .collect();

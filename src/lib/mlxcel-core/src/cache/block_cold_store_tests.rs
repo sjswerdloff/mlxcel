@@ -1939,6 +1939,99 @@ fn a_killed_lock_holder_releases_the_store_lock_without_sentinel_recovery() {
     );
 }
 
+/// ALDEN CROSS-PROCESS CASE — crash AFTER the tombstone rename, BEFORE the
+/// unlink: "final may be rewritten safely; stale tombstone is never treated as
+/// the live block."
+///
+/// This window is deliberate rather than incidental. GC renames a
+/// proven-unreferenced block to `.tombstone.<hash>` while holding the lock —
+/// that rename is the linearization point — and then unlinks it AFTER releasing,
+/// because the physical delete is slow and holding exclusion across it would
+/// stall every publisher. The cost of that choice is exactly this crash window,
+/// and the design's claim is that what it leaves behind is inert.
+///
+/// Two properties, both of which must hold or the window is not safe:
+///   1. the tombstone is never mistaken for live state, and is never
+///      re-nominated as though it were a block in its own right;
+///   2. the final path can be reoccupied by a fresh copy, and GC's later unlink
+///      of its own tombstone must not touch that replacement.
+///
+/// Simulated by constructing the artifact directly, because a real crash cannot
+/// be scheduled — and the artifact is precisely what a real crash leaves.
+#[test]
+fn a_tombstone_left_by_a_crash_is_inert_and_the_final_path_can_be_reoccupied() {
+    let (_dir, store, manifest) = persisted_store_for_gc();
+    let victim = manifest.block_hashes[0];
+    let name = hex_digest(&victim);
+
+    // Byte-for-byte what the block holds now, so we can prove the replacement
+    // is readable and correct rather than merely present.
+    let (orig_tokens, _orig_set) = store.read_block(&victim).expect("read block");
+
+    // Simulate the crash: rename to a tombstone, then stop — no unlink.
+    let final_path = store.blocks_dir().join(&name);
+    let tomb_path = store.blocks_dir().join(format!(".tombstone.{name}"));
+    std::fs::rename(&final_path, &tomb_path).expect("tombstone rename");
+    assert!(tomb_path.exists() && !final_path.exists(), "crash state staged");
+
+    // PROPERTY 1: inert. The block is genuinely gone as far as the store is
+    // concerned — the tombstone must not stand in for it.
+    assert!(
+        store.read_block(&victim).is_err(),
+        "a tombstoned block must not still be readable at its final address — if \
+         it is, the tombstone is being treated as live state"
+    );
+
+    // ...and GC must not trip over it. It is not a block, so it must not be
+    // parsed as one, nominated, or counted.
+    store
+        .gc_blocks()
+        .expect("GC must tolerate a tombstone left by a crash");
+    assert!(
+        tomb_path.exists(),
+        "GC removed a tombstone it did not create in this pass; aged-tombstone \
+         cleanup is a separate, deliberately conservative job"
+    );
+
+    // PROPERTY 2: the final path can be reoccupied. A writer that finds the
+    // block absent installs a fresh immutable copy at the same address —
+    // addresses are content hashes, so the replacement is byte-identical.
+    let (_d2, donor_store, donor_manifest) = persisted_store_for_gc();
+    let donor = donor_manifest.block_hashes[0];
+    assert_eq!(donor, victim, "same content must yield the same address");
+    let donor_path = donor_store.blocks_dir().join(&name);
+    copy_dir_recursive(&donor_path, &final_path).expect("reinstall block");
+
+    let (again_tokens, _again_set) = store
+        .read_block(&victim)
+        .expect("the reinstalled block must be readable at the final address");
+    assert_eq!(
+        again_tokens, orig_tokens,
+        "the reoccupied final path must carry the same content as before"
+    );
+
+    // The replacement must survive GC's later unlink of its OWN tombstone.
+    std::fs::remove_dir_all(&tomb_path).expect("deferred unlink of the tombstone");
+    store
+        .read_block(&victim)
+        .expect("unlinking the tombstone must not disturb the reinstalled block");
+}
+
+/// Minimal recursive copy for the reinstall step above.
+fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let dst = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst)?;
+        } else {
+            std::fs::copy(entry.path(), dst)?;
+        }
+    }
+    Ok(())
+}
+
 /// A mode MISMATCH must be a clean miss, never a wrong adoption.
 ///
 /// Persist under KVarN8, load under Fp16. Because block addresses commit to the
