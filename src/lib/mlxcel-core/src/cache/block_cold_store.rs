@@ -268,10 +268,10 @@ impl BlockColdStore {
         }
     }
 
-    /// Bumped AFTER a manifest becomes visible. Ordering matters: a bump before
-    /// the rename would let GC believe it had observed a publication that had
-    /// not happened yet, which is the safe direction, but a bump that never
-    /// happens because the rename failed would be a false quiet.
+    /// Bumped BEFORE a manifest becomes visible — see the ordering argument at
+    /// the call site in `write_manifest`. A bump for a publication that then
+    /// fails costs a wasted rescan; a visible manifest behind an un-bumped
+    /// epoch costs a live block.
     fn bump_publication_epoch(&self) -> Result<(), ColdStoreError> {
         let cur = self.read_publication_epoch();
         let next = if cur == u64::MAX { 1 } else { cur.wrapping_add(1) };
@@ -457,16 +457,30 @@ impl BlockColdStore {
         let manifest_bytes = encode_manifest(manifest)?;
         write_file(&tmp_dir.join("manifest.bin"), &manifest_bytes)?;
 
-        // Atomic rename — the manifest becomes VISIBLE here, so this is the
-        // publication point.
-        fs::rename(&tmp_dir, &manifest_dir)?;
-
-        // Announce the publication so a concurrent GC can tell its mark is
-        // stale. After the rename, never before: a bump that preceded a rename
-        // which then failed would be a false alarm (harmless), but the reverse
-        // ordering — visible manifest, un-bumped epoch — is a false QUIET, and
-        // that is the one that gets a live block deleted.
+        // Advance the epoch BEFORE the manifest becomes visible (Alden, finding
+        // 4 publication protocol step 4). The two are separate files and there
+        // is no transaction across them, so one of the two crash windows is
+        // going to exist. This ordering picks the harmless one:
+        //
+        //   epoch bumped, rename never happens  -> a GC rescan that finds
+        //                                          nothing changed. Wasted work.
+        //   manifest visible, epoch not bumped  -> a concurrent GC sees a QUIET
+        //                                          epoch, trusts its stale mark,
+        //                                          and deletes a block the new
+        //                                          manifest references.
+        //
+        // "An epoch with no manifest causes an unnecessary rescan; a visible
+        // manifest can never be hidden behind an old epoch."
+        //
+        // CORRECTED 2026-07-27: `031163d` bumped AFTER the rename — the unsafe
+        // order — while the comment above it argued for this one. The prose was
+        // right and the code did the opposite; only Alden's review caught that
+        // they disagreed. A comment that states the correct rule is not a
+        // control, and I had read past mine twice.
         self.bump_publication_epoch()?;
+
+        // Atomic rename — the manifest becomes VISIBLE here.
+        fs::rename(&tmp_dir, &manifest_dir)?;
 
         tracing::info!(
             manifest_hash = %hex_digest(&manifest_hash),
