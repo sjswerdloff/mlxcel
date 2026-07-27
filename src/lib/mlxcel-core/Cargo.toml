@@ -28,6 +28,12 @@ postcard = { version = "1", features = ["alloc"] }
 dirs = "6"
 libm = "0.2"
 tracing = "0.1"
+# Kernel advisory locking (flock) for the cold-store publication/sweep
+# exclusion. Deliberately libc rather than an O_EXCL lockfile: the kernel
+# releases the lock when the holder exits or crashes, so there is no
+# stale-lock heuristic to get wrong. Already present transitively in the
+# workspace lock, so this adds no new supply chain.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

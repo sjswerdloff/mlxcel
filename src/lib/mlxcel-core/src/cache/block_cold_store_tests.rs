@@ -1625,6 +1625,115 @@ fn an_unreadable_manifest_aborts_gc_rather_than_freeing_its_blocks() {
     }
 }
 
+/// THE PUBLICATION RACE (Alden finding 4, tests 1 and 2).
+///
+/// His unsafe interleaving: GC marks block X unreferenced; a writer sees X
+/// committed, skips rewriting it, and publishes a manifest referencing X; GC
+/// deletes X on its stale mark; a live manifest now points at missing data.
+///
+/// The invariant is stated on the OUTCOME rather than on the schedule, because
+/// the schedule is what we do not control: **no committed manifest may ever
+/// reference a block that is absent.** Either the block survives or the
+/// publication did not commit — never both.
+///
+/// **THIS TEST IS NOT A CONTROL — MEASURED, NOT ASSUMED.** Mutation run
+/// 2026-07-28: removing the publication lock from `write_manifest` entirely,
+/// so publisher and sweep no longer share exclusion, left it GREEN (12 rounds,
+/// 1 passed). It therefore certifies nothing about the protocol; it only proves
+/// the concurrent path runs without panicking or deadlocking.
+///
+/// Do not read its green as evidence the race is closed, and do not delete the
+/// real test because this one exists. Alden asked for a DETERMINISTIC seam —
+/// "writer pauses after initial existence observation; GC attempts sweep;
+/// writer then publishes" — precisely because a stress test cannot schedule the
+/// interleaving that matters. That seam is the required work; this is a
+/// smoke test standing in the right place until it lands.
+///
+/// Kept rather than deleted for two reasons: a protocol nobody ever runs
+/// concurrently is a protocol nobody has tested, and it will catch a deadlock
+/// introduced by the lock ordering — which is a real hazard of the design it
+/// exercises, even though it is not the hazard it is named for.
+#[test]
+fn a_committed_manifest_never_references_a_missing_block_under_concurrent_gc() {
+    use std::sync::Arc;
+
+    const ROUNDS: usize = 12;
+    const N_TILES: i32 = 31;
+    let depth = TILE + N_TILES * TILE;
+
+    for round in 0..ROUNDS {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = Arc::new(
+            BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32])
+                .with_prune_mode(PruneMode::Delete),
+        );
+
+        // A first sequence, so the store has blocks and a manifest.
+        let set_a = kvarn_v4_set_distinct(2, N_TILES, 0);
+        let tokens_a: Vec<i32> = (0..depth).collect();
+        store
+            .persist("m3", "tmpl", &tokens_a, &set_a)
+            .expect("seed persist");
+
+        // A DIVERGENT second sequence: shares the leading block, differs later,
+        // so publishing it introduces blocks GC has never marked.
+        let mut tokens_b = tokens_a.clone();
+        let last = tokens_b.len() - 1;
+        tokens_b[last] = 999_000 + round as i32;
+        let set_b = kvarn_v4_set_distinct(2, N_TILES, 0);
+
+        // Only GC is spawned. It touches manifests and directory entries, never
+        // MLX arrays, so it is safe off-thread — whereas `DetachedCacheSet`
+        // holds cxx pointers that are not `Send`, and moving MLX work to a
+        // second thread is its own documented hazard. The publisher therefore
+        // stays on the main thread and the two still overlap.
+        let gc_store = Arc::clone(&store);
+        let gc = std::thread::spawn(move || {
+            let _ = gc_store.gc_blocks();
+        });
+
+        let published = store.persist("m3", "tmpl", &tokens_b, &set_b);
+
+        gc.join().expect("gc thread");
+
+        // THE INVARIANT. Walk every committed manifest and require each block
+        // it names to be present. A publication that failed is acceptable — a
+        // publication that succeeded while its data was collected is not.
+        let mdir = store.manifests_dir();
+        if !mdir.exists() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&mdir).expect("read manifests") {
+            let entry = entry.expect("entry");
+            if !entry.file_type().expect("ft").is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_string();
+            if name.starts_with(".tmp.") {
+                continue;
+            }
+            let Some(mh) = parse_hex_digest(&name) else {
+                continue;
+            };
+            let manifest = store.read_manifest(&mh).unwrap_or_else(|e| {
+                panic!("round {round}: committed manifest {name} unreadable: {e}")
+            });
+            for b in &manifest.block_hashes {
+                store.read_block(b).unwrap_or_else(|e| {
+                    panic!(
+                        "round {round}: COMMITTED manifest {name} references block {} \
+                         which is ABSENT ({e}). GC collected a block a live manifest \
+                         needs — the publication race. published_ok={}",
+                        hex_digest(b),
+                        published.is_ok()
+                    )
+                });
+            }
+        }
+    }
+}
+
 /// A mode MISMATCH must be a clean miss, never a wrong adoption.
 ///
 /// Persist under KVarN8, load under Fp16. Because block addresses commit to the

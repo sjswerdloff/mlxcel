@@ -208,6 +208,45 @@ impl Manifest {
 // ///
 
 /// A v4 block-based cold store.
+/// Process-wide publication/sweep exclusion, paired with the kernel file lock.
+///
+/// Deliberately COARSE — one mutex for every store in the process rather than
+/// one per `base_dir`. Publication and GC are both rare and already do file
+/// I/O, so contention is irrelevant, and a per-path map would need its own
+/// canonicalization to be correct (two `BlockColdStore`s can name one directory
+/// through different paths, and a map keyed on the un-canonicalized `PathBuf`
+/// would hand them different mutexes while they share a store — an exclusion
+/// bug that looks like it works).
+static STORE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII exclusion guard. Releases in the reverse of acquisition: file lock
+/// first, then the process mutex when the guard field drops.
+///
+/// A poisoned mutex is recovered rather than propagated: the invariant this
+/// protects lives on disk, not in the `()` payload, so a thread that panicked
+/// while holding it has not corrupted anything this guard can see. Refusing to
+/// lock forever after one unrelated panic would disable GC for the life of the
+/// process.
+struct StoreLock<'a> {
+    _process: std::sync::MutexGuard<'a, ()>,
+    file: File,
+}
+
+impl Drop for StoreLock<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the fd is valid until `file` drops, which happens after this.
+        unsafe {
+            libc::flock(
+                std::os::unix::io::AsRawFd::as_raw_fd(&self.file),
+                libc::LOCK_UN,
+            );
+        }
+        // The kernel would also release on close/exit; unlocking explicitly
+        // keeps the release point visible at the end of the critical section
+        // rather than implicit in a later drop order.
+    }
+}
+
 pub struct BlockColdStore {
     base_dir: PathBuf,
     runtime_fingerprint: [u8; 32],
@@ -239,6 +278,58 @@ impl BlockColdStore {
 
     pub fn blocks_dir(&self) -> PathBuf {
         self.base_dir.join(V4_ROOT).join(BLOCKS_DIR)
+    }
+
+    /// Path of the persistent advisory-lock file. The FILE persists; the LOCK
+    /// is kernel-held and released automatically when the holder exits or
+    /// crashes — which is the whole reason this is `flock` and not an
+    /// `O_EXCL` sentinel. An `O_EXCL` lockfile left behind by a killed process
+    /// needs a staleness heuristic to clear, and every such heuristic fails
+    /// toward either permanent deadlock or unsafe stealing.
+    fn lock_path(&self) -> PathBuf {
+        self.base_dir.join("store.lock")
+    }
+
+    /// Acquire publication/sweep exclusion: process mutex FIRST, then the
+    /// kernel file lock (Alden, finding 4: "Acquire process Mutex then file
+    /// lock in one documented order everywhere. Do not assume flock semantics
+    /// provide same-process thread exclusion.").
+    ///
+    /// The two layers cover different things. `flock` on most platforms is
+    /// per-open-file-description, so two threads in one process can both hold
+    /// it and neither is excluded; the mutex covers threads, the file lock
+    /// covers processes. Neither alone is sufficient.
+    ///
+    /// FAILS CLOSED. If the lock cannot be taken, the caller must not sweep.
+    fn acquire_store_lock(&self) -> Result<StoreLock<'static>, ColdStoreError> {
+        // Order is load-bearing and identical at every call site.
+        let process_guard = STORE_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+
+        fs::create_dir_all(&self.base_dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.lock_path())?;
+
+        // SAFETY: `file` owns a valid fd for the duration of this call, and the
+        // returned guard keeps it alive until the lock is released in Drop.
+        let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            tracing::error!(
+                error = %err,
+                path = %self.lock_path().display(),
+                "COLD-STORE v4: could not acquire the advisory store lock — FAILING \
+                 CLOSED. Delete-mode GC must not sweep without exclusion; observe may \
+                 report but must not act."
+            );
+            return Err(ColdStoreError::Io(err));
+        }
+        Ok(StoreLock {
+            _process: process_guard,
+            file,
+        })
     }
 
     /// Monotonic count of manifest PUBLICATIONS (Alden finding 4, 2026-07-27).
@@ -456,6 +547,33 @@ impl BlockColdStore {
 
         let manifest_bytes = encode_manifest(manifest)?;
         write_file(&tmp_dir.join("manifest.bin"), &manifest_bytes)?;
+
+        // PUBLICATION CRITICAL SECTION (Alden finding 4, publication protocol
+        // steps 2-5). Block bytes and the temp manifest above were written
+        // outside it; from here to the rename we hold the same exclusion GC's
+        // sweep takes, which is what makes GC's tombstone rename a genuine
+        // linearization point. Without this half, GC could tombstone a block
+        // between a publisher's check and its publish, and the tombstone
+        // protocol would be decoration.
+        let _pub_lock = self.acquire_store_lock()?;
+
+        // Revalidate under the lock. "Existing means fully committed and
+        // integrity-valid, not path-exists" — a block observed before the lock
+        // may have been tombstoned since, and publishing a manifest that
+        // references it would commit a reference to something GC is about to
+        // unlink.
+        for bh in &manifest.block_hashes {
+            let dir = self.blocks_dir().join(hex_digest(bh));
+            if !dir.exists() {
+                return Err(invalid_data(format!(
+                    "write_manifest: block {} is absent at publication time — it was \
+                     collected or never installed. The manifest is NOT published; \
+                     reinstall the block and retry rather than committing a reference \
+                     to missing data.",
+                    hex_digest(bh)
+                )));
+            }
+        }
 
         // Advance the epoch BEFORE the manifest becomes visible (Alden, finding
         // 4 publication protocol step 4). The two are separate files and there
@@ -929,9 +1047,12 @@ impl BlockColdStore {
             return Ok(());
         }
 
-        // The epoch as observed under a stable mark. Re-checked before any
-        // delete below, so a publication between here and the sweep aborts.
+        // The epoch as observed under a stable mark. Re-checked under the lock
+        // before anything is tombstoned.
         let marked_epoch = self.read_publication_epoch();
+
+        // Nominations. Nothing is destroyed from this unlocked scan.
+        let mut candidates: Vec<([u8; 32], String)> = Vec::new();
 
         let entries: Vec<_> = fs::read_dir(&blocks_dir)?
             .filter_map(|e| e.ok())
@@ -939,7 +1060,11 @@ impl BlockColdStore {
             .filter(|e| {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
-                !name.starts_with(".tmp.")
+                // `.tombstone.` dirs are GC's own in-flight artifacts, not
+                // blocks. A crash between the rename and the unlink leaves one
+                // behind; it must never be mistaken for live state, nor
+                // re-nominated as though it were a block in its own right.
+                !name.starts_with(".tmp.") && !name.starts_with(".tombstone.")
             })
             .collect();
 
@@ -987,41 +1112,88 @@ impl BlockColdStore {
                     "COLD-STORE v4 observe: would GC unreferenced block"
                 );
             } else {
-                // RE-VERIFY BEFORE DELETING. Everything above was decided from a
-                // snapshot. If any manifest was published since that snapshot,
-                // this candidate may have just been referenced, and the delete
-                // would leave a live manifest pointing at missing data. Abort the
-                // whole sweep rather than this one block: the epoch tells us the
-                // mark is stale, and a stale mark taints every remaining
-                // candidate, not just the current one.
-                let now = self.read_publication_epoch();
-                if now != marked_epoch {
-                    tracing::warn!(
-                        epoch_at_mark = marked_epoch,
-                        epoch_now = now,
-                        stopped_before = %name,
-                        "COLD-STORE v4 GC: a manifest was published after the mark — \
-                         ABORTING the sweep before deleting anything further. The \
-                         remaining candidates were nominated against a snapshot that \
-                         is no longer true."
-                    );
-                    return Ok(());
-                }
-                match self.delete_block(&block_hash) {
-                    Ok(()) => {
-                        tracing::info!(
-                            gc = %name,
-                            "COLD-STORE v4 GC'd unreferenced block"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            gc = %name,
-                            error = %e,
-                            "COLD-STORE v4 failed to GC block"
-                        );
-                    }
-                }
+                // NOMINATION ONLY. Nothing is deleted from an unlocked scan —
+                // every decision so far came from a snapshot taken while
+                // publishers were free to run.
+                candidates.push((block_hash, name.clone()));
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        // ---------------------------------------------------------------
+        // Under exclusion (Alden finding 4, GC protocol steps 3-6).
+        // ---------------------------------------------------------------
+        let lock = self.acquire_store_lock()?; // fails closed
+
+        // Step 4: cheap staleness hint first.
+        let epoch_now = self.read_publication_epoch();
+        if epoch_now != marked_epoch {
+            tracing::info!(
+                epoch_at_mark = marked_epoch,
+                epoch_now = epoch_now,
+                candidates = candidates.len(),
+                "COLD-STORE v4 GC: published during nomination — collecting nothing \
+                 this pass, rescanning next"
+            );
+            return Ok(());
+        }
+
+        // Step 5: AUTHORITATIVE re-verification while holding the lock, even
+        // though the epoch was unchanged. Alden: "epoch and manifest are two
+        // files, so a prior process can crash after one operation; unchanged
+        // epoch is not proof by itself unless publication is transactionally
+        // atomic, which it is not." The epoch is an optimization; this is the
+        // proof.
+        let live_final = self.mark_reachable_blocks()?;
+
+        // Step 6: rename to a tombstone. THIS IS THE LINEARIZATION POINT. No
+        // publisher can have observed the block and then published across it,
+        // because a publisher's revalidation and its manifest rename happen
+        // under this same lock.
+        let mut tombstones: Vec<PathBuf> = Vec::new();
+        for (block_hash, name) in candidates {
+            if live_final.contains(&block_hash) {
+                tracing::warn!(
+                    block = %name,
+                    "COLD-STORE v4 GC: candidate became REACHABLE between nomination \
+                     and the locked re-verify — not collected. This is the publication \
+                     race being caught rather than lost."
+                );
+                continue;
+            }
+            let from = self.blocks_dir().join(&name);
+            let to = self.blocks_dir().join(format!(".tombstone.{name}"));
+            match fs::rename(&from, &to) {
+                Ok(()) => tombstones.push(to),
+                Err(e) => tracing::warn!(
+                    block = %name,
+                    error = %e,
+                    "COLD-STORE v4 GC: could not tombstone block; leaving it in place"
+                ),
+            }
+        }
+
+        // Step 7: the slow physical unlink happens OUTSIDE the critical
+        // section. A writer that now looks for the final path finds it absent
+        // and installs a fresh immutable copy; we only ever unlink our own
+        // tombstone, never that replacement.
+        drop(lock);
+
+        for t in tombstones {
+            match fs::remove_dir_all(&t) {
+                Ok(()) => tracing::info!(gc = %t.display(), "COLD-STORE v4 GC'd block"),
+                // Step 8: a crash here leaves a tombstone artifact, not a
+                // missing live block. Aged tombstones are collectable later
+                // under the same conservative rules.
+                Err(e) => tracing::warn!(
+                    tombstone = %t.display(),
+                    error = %e,
+                    "COLD-STORE v4 GC: tombstone left behind; it is inert and \
+                     collectable later"
+                ),
             }
         }
 
