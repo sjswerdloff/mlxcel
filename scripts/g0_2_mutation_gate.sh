@@ -99,7 +99,16 @@ run_mutation() {
 
   # RULE 3: restore and verify BEFORE reporting, so a bad restore cannot be
   # masked by a passing result.
-  cp "$backup" "$path"
+  # Exit code captured explicitly — RULE 2 applies to the restore itself, not
+  # just to the checks. The md5 comparison below would catch a failed copy
+  # anyway (the file is still the mutant, so the digests differ), but a script
+  # that demands explicit exit codes must not exempt its own state-restoring
+  # operation. Flagged by the OCR pass, 2026-07-27.
+  if ! cp "$backup" "$path"; then
+    printf '    ABORT: could not restore %s from %s (cp failed)\n' "$path" "$backup"
+    printf '    The tree is CONTAMINATED. Fix before continuing.\n'
+    exit 3
+  fi
   local restored_md5; restored_md5="$(md5of "$path")"
   if [ "$restored_md5" != "$pristine_md5" ]; then
     printf '    ABORT: restore failed for %s (md5 %s != %s)\n' "$path" "$restored_md5" "$pristine_md5"
