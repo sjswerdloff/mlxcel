@@ -1697,18 +1697,25 @@ pub(crate) mod tests {
             std::thread::spawn(move || {
                 // DECISIVE STREAM-INSTALL VERIFICATION (Xander's fix):
                 // The prior form silently no-op'd if new_thread_local_generation_stream()
-                // returned None — leaving the reader thread WITHOUT a Metal stream AND
-                // without an armed teardown finalizer (see streams.rs:191-247). In that
-                // case a SIGSEGV cannot be attributed: it may be a real cross-thread Metal
-                // thread-affinity fault, or merely the teardown-race artifact of a thread
-                // that touched MLX with no finalizer. We remove the ambiguity: explicitly
-                // arm the finalizer, install an explicit GPU stream, and print confirmation
-                // BEFORE touching S. If we see stream-installed=true here and STILL fault
-                // during serialization -> real thread-affinity -> off-thread dead. If it
-                // now passes -> the earlier crash was a missing-context/teardown artifact
-                // -> off-thread optimization is back on the table.
+                // returned None — leaving the reader thread WITHOUT a Metal stream. We
+                // remove that ambiguity: install an explicit GPU stream and print
+                // confirmation BEFORE touching S. If we see stream-installed=true here and
+                // STILL fault during serialization -> real thread-affinity -> off-thread
+                // dead. If it now passes -> the earlier crash was a missing-context
+                // artifact -> off-thread optimization is back on the table.
+                //
+                // !! VERDICT CONTAMINATION WARNING (clement, 2026-07-27) !!
+                // This probe previously called `streams::init_thread()` here to "remove
+                // the ambiguity" by arming a teardown finalizer. That finalizer was ITSELF
+                // a deterministic crash source: its `Drop` called into MLX after MLX's own
+                // C++ thread-locals were destroyed, killing the process at THREAD EXIT
+                // (SIGTRAP) regardless of anything this probe measured. Any prior verdict
+                // of "off-thread dead / real thread-affinity limit" drawn from a crash in
+                // this probe MUST be re-derived: arming did the opposite of what its
+                // comment claimed. The arming call is removed; the probe is otherwise
+                // unchanged and still `#[ignore]`d. See streams.rs "Per-thread MLX
+                // teardown" notes for the measurement.
                 let gpu = crate::ffi::is_gpu_available();
-                crate::streams::init_thread(); // arm teardown finalizer unconditionally
                 let installed = if let Some(s) = crate::streams::new_thread_local_generation_stream() {
                     crate::streams::install_thread_local_default_stream(Some(&s));
                     true
@@ -1717,7 +1724,7 @@ pub(crate) mod tests {
                 };
                 use std::io::Write as _;
                 println!(
-                    "PROBE reader-alone is-gpu-available={} stream-installed={} finalizer-armed=true (BEFORE touching S)",
+                    "PROBE reader-alone is-gpu-available={} stream-installed={} finalizer-armed=false (BEFORE touching S)",
                     gpu, installed
                 );
                 let _ = std::io::stdout().flush();

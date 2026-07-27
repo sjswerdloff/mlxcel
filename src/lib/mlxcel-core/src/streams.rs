@@ -79,11 +79,10 @@ pub fn new_thread_local_generation_stream() -> Option<UniquePtr<MlxThreadLocalSt
 /// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler, AudioWorker
 pub fn install_thread_local_default_stream(tls: Option<&UniquePtr<MlxThreadLocalStream>>) {
     if let Some(tls) = tls {
-        // Arm the per-thread MLX teardown finalizer before doing anything
-        // that touches MLX's per-thread stream registry, so this thread's
-        // registry entries will be released on thread exit rather than
-        // during the C++ static-destructor phase at process exit.
-        init_thread();
+        // NO teardown finalizer is armed here. Arming one used to happen on
+        // this line; it made every thread that installed a stream crash at
+        // thread exit. See the "Per-thread MLX teardown" notes below and
+        // `install_then_exit_thread_does_not_kill_the_process`.
         let stream = ffi::stream_from_thread_local_stream(tls);
         ffi::set_default_stream(&stream);
     }
@@ -189,61 +188,54 @@ pub fn install_default_stream(stream: Option<&UniquePtr<MlxStream>>) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-thread MLX teardown finalizer
+// Per-thread MLX teardown — EXPLICIT ONLY
 // ---------------------------------------------------------------------------
 //
-// MLX maintains a per-thread stream registry that is populated on every
-// `default_stream()`, `new_stream_on_device()`, and thread-local stream
-// resolve. Absent an explicit release call, MLX's own C++ static
-// destructors free the registry during process-exit static-destructor
-// phase — which races with `MlxArray` destructors still running in other
-// unwinding threads and manifests as intermittent SIGSEGV / SIGTRAP at
-// teardown when multiple threads have used MLX. See MLX `mlx/stream.h`
-// `clear_streams()` for the canonical hook.
+// MLX maintains per-thread state (see `mlx/backend/metal/device.cpp`:
+// `get_command_encoders()` is itself a `static thread_local`). Releasing
+// that state on thread exit is desirable — but it MUST NOT be done from a
+// destructor that runs during thread teardown.
 //
-// `MlxThreadFinalizer` is a zero-cost RAII guard registered as a
-// `thread_local!`. When the storing thread exits, the guard's `Drop`
-// calls `mlx::core::clear_streams()` — freeing that thread's registry
-// entries BEFORE static destructors run. Arming is idempotent (Rust
-// thread_local storage is allocated on first access), and cheap: one
-// TLS lookup.
+// WHY (measured 2026-07-27, not reasoned):
+//
+// A previous revision registered a `thread_local!` RAII guard whose `Drop`
+// called `ffi::clear_streams()`. Rust's `thread_local!` destructors and
+// libc++'s `__cxa_thread_atexit` destructors are DIFFERENT mechanisms with
+// no defined interleaving, and on this platform MLX's own C++ thread-locals
+// are torn down FIRST. By the time the Rust guard ran, MLX's per-thread
+// state was already destroyed, so:
+//
+//   * `clear_streams()`      -> hard trap (SIGTRAP), no C++ exception
+//   * `synchronize_default()` -> `std::out_of_range: vector`
+//
+// This was deterministic, and it killed the test process at thread exit
+// AFTER the test body had passed — e.g. every run of
+// `speculative::tests::speculative_generate_max_tokens_one_emits_first_non_eos_token`,
+// which capped a `--test-threads=1` suite run at 1069 of 1136 tests.
+// Re-ordering the arming relative to MLX touches does NOT help: the
+// ordering is not ours to control. Removing the guard restored the suite
+// to 1134 passed / 2 ignored / 0 failed.
+//
+// The rule this encodes: **never call MLX from a thread-exit destructor.**
+// Release per-thread state explicitly, from the thread body, while the
+// thread is still alive — that is what [`finalize_thread`] is for.
 
-struct MlxThreadFinalizer;
-
-impl Drop for MlxThreadFinalizer {
-    fn drop(&mut self) {
-        // Safety net for a very narrow window: if the process is already
-        // in static-destructor phase when this thread exits (e.g. main
-        // returned while this thread was mid-join), `ffi::clear_streams`
-        // would touch a destroyed MLX static. In practice `thread_local!`
-        // Drops run before static destructors on all supported platforms,
-        // so this call is safe. Catching a panic here would only be
-        // relevant if MLX ever grew a panic-on-teardown path — worth
-        // revisiting then.
-        ffi::clear_streams();
-    }
-}
-
-thread_local! {
-    static MLX_THREAD_FINALIZER: MlxThreadFinalizer = const { MlxThreadFinalizer };
-}
-
-/// Arm the calling thread's MLX teardown finalizer.
+/// Release the calling thread's MLX per-thread state.
 ///
-/// Idempotent and cheap. Call at least once from any thread that will
-/// touch MLX FFI — factory functions, dispatch, evaluation, or simply
-/// holding an `MlxArray` local. The finalizer's `Drop` runs on thread
-/// exit, releasing this thread's entries from MLX's per-thread stream
-/// registry before process-exit static destructors interleave with
-/// concurrent `MlxArray` destructors on other unwinding threads.
+/// Call this **from the thread body, before the thread returns** — never
+/// from a `Drop` that runs during thread teardown (see the module notes
+/// above: MLX's own thread-locals are already gone by then, and the call
+/// traps).
 ///
-/// Auto-armed by [`install_thread_local_default_stream`], so production
-/// generation threads (`CxxGenerator`, `SpeculativeGenerator`,
-/// `BatchScheduler`, `AudioWorker`) get the finalizer for free. Test
-/// threads and other consumers that use MLX without installing a
-/// stream should call this explicitly.
-pub fn init_thread() {
-    MLX_THREAD_FINALIZER.with(|_| ());
+/// Optional: MLX's per-thread containers are themselves `thread_local`
+/// and self-destruct, so a worker that simply exits is not leaking. This
+/// exists for long-lived processes that want the release to happen at a
+/// known point rather than at thread exit.
+///
+/// Idempotent. Safe no-op semantics are the caller's responsibility only
+/// in the sense that it must be on a live thread.
+pub fn finalize_thread() {
+    ffi::clear_streams();
 }
 
 /// Explicit main-thread shutdown for graceful process exit.
@@ -255,9 +247,12 @@ pub fn init_thread() {
 /// static-destructor phase has nothing racing against it on this
 /// thread.
 ///
-/// Idempotent, but only meaningful once per process. Does NOT
-/// finalize other threads' streams — each thread runs its own
-/// [`MlxThreadFinalizer`] via [`init_thread`].
+/// Idempotent, but only meaningful once per process. Does NOT finalize
+/// other threads' state — a worker thread that wants an explicit release
+/// calls [`finalize_thread`] from its own body before returning.
+///
+/// Sound because it runs on a live thread. The same three calls from a
+/// thread-exit destructor trap; see the "Per-thread MLX teardown" notes.
 pub fn shutdown() {
     ffi::synchronize_default();
     ffi::clear_streams();
@@ -267,6 +262,65 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSION GUARD — a thread that installs a generation stream, uses
+    /// MLX, and then EXITS must not take the process with it.
+    ///
+    /// This is the shape that a `thread_local!` teardown finalizer broke:
+    /// the thread body completed and passed, then the guard's `Drop` called
+    /// into MLX after MLX's own C++ thread-locals had been destroyed, and
+    /// the process died with SIGTRAP (`clear_streams`) or
+    /// `std::out_of_range` (`synchronize_default`).
+    ///
+    /// The mutation that must redden this test: re-introduce any MLX call
+    /// in a `thread_local!` `Drop` reachable from
+    /// `install_thread_local_default_stream`. Verified 2026-07-27 — with
+    /// that arming restored the process dies at the `join()` below and the
+    /// whole suite goes red, which is exactly the intended failure signal.
+    ///
+    /// A green run here is NOT decoration: the assertion is that we reach
+    /// the line after `join()` at all.
+    #[test]
+    fn install_then_exit_thread_does_not_kill_the_process() {
+        use crate::dtype;
+
+        let handle = std::thread::spawn(|| {
+            let tls = new_thread_local_generation_stream();
+            install_thread_local_default_stream(tls.as_ref());
+            // Touch MLX so this thread genuinely populates per-thread state;
+            // without a real op the teardown path under test is not exercised.
+            let a = ffi::ones(&[2, 2], dtype::FLOAT32);
+            ffi::eval(&a);
+            ffi::array_shape(&a)
+        });
+
+        let shape = handle.join().expect("worker thread must not panic");
+        assert_eq!(
+            shape,
+            vec![2, 2],
+            "worker thread must have run a real MLX op"
+        );
+    }
+
+    /// Explicit finalization from a LIVE thread body is sound — the
+    /// counterpart to the guard above. Same work, but the thread releases
+    /// MLX state itself before returning rather than leaving it to a
+    /// destructor.
+    #[test]
+    fn finalize_thread_from_a_live_thread_body_is_sound() {
+        let handle = std::thread::spawn(|| {
+            let tls = new_thread_local_generation_stream();
+            install_thread_local_default_stream(tls.as_ref());
+            let a = crate::ffi::ones(&[3, 1], crate::dtype::FLOAT32);
+            ffi::eval(&a);
+            finalize_thread();
+            true
+        });
+        assert!(
+            handle.join().expect("worker thread must not panic"),
+            "finalize_thread must return normally on a live thread"
+        );
+    }
 
     /// Smoke test: the TLS handle factory either succeeds (GPU build)
     /// or returns `None` cleanly (CPU-only build).
