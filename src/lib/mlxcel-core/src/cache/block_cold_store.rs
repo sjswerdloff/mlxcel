@@ -76,10 +76,67 @@ pub fn block_hash_merkle(
 ///
 /// This string is included in the block hash to prevent collisions between
 /// blocks from different KV modes (e.g., KVarN8 vs fp16).
-pub fn kv_mode_config_string(mode: super::KVCacheMode) -> String {
-    // Include mode tag and key quantization parameters.
-    // This must capture everything that affects the KV data bytes.
-    format!("{:?}", mode)
+/// Complete identity of everything that determines a block's BYTES.
+///
+/// A block address must commit to this in full, because blocks live in ONE
+/// GLOBAL POOL keyed only by hash. Two runtimes that compute different bytes
+/// for the same tokens must not be able to reach the same address.
+///
+/// # Why this replaced `kv_mode_config_string`
+///
+/// The previous version was `format!("{:?}", mode)` under a doc comment
+/// claiming it "must capture everything that affects the KV data bytes". It
+/// captured the mode NAME only, and missed two things:
+///
+/// * **`v_bits`** — k8v4 and k8v8 rendered to the same string "KVarN8", so
+///   they produced the SAME address with DIFFERENT payloads. No weight change
+///   needed; one model and one mode was enough to collide.
+/// * **`runtime_fingerprint`** — absent entirely, though the manifest carries
+///   it. Two runtimes with different weights computed IDENTICAL block hashes,
+///   so the second one's `write_block` hit its `block_dir.exists()` early
+///   return, silently skipped writing, and left its manifest pointing at the
+///   FIRST runtime's KV data. A silent cross-model wrong adoption.
+///
+/// # Domain separation
+///
+/// Fields are tagged and `|`-delimited, and every value here renders without
+/// a `|`: the fingerprint is hex, `v_bits` is a `u8`, and `KVCacheMode`'s
+/// derived `Debug` is a bare variant name. So no two distinct tuples can
+/// render to the same string. The `v1` prefix versions the scheme itself —
+/// bump it if the field set changes, so old and new addresses cannot alias.
+/// # Canonicalisation — why `v_bits` is normalised rather than passed through
+///
+/// The identity must commit to what DETERMINES the bytes and to nothing else.
+/// A field that does not affect the bytes must not affect the address, or the
+/// same tokens producing the same data land at different addresses and the
+/// cache misses for no reason.
+///
+/// `v_bits` is exactly that field under `Fp16`: an unquantized cache carries
+/// whatever `kvarn_v_bits` happens to hold — the test builder leaves it at 8 —
+/// while the bytes do not depend on it at all. Passing it through made an
+/// Fp16 persist at v_bits=8 unreachable to a loader that correctly considered
+/// v_bits irrelevant and passed 0. Found by exactly that miss.
+///
+/// So: quantized modes commit to `v_bits`; unquantized modes normalise it to 0.
+/// The `match` is exhaustive on purpose — a new mode forces this decision to be
+/// made rather than inherited.
+pub fn cache_computation_id(
+    runtime_fingerprint: &[u8; 32],
+    mode: super::KVCacheMode,
+    v_bits: u8,
+) -> String {
+    let effective_v_bits = match mode {
+        // Unquantized: the V width is not part of the data.
+        super::KVCacheMode::Fp16 => 0,
+        // Quantized: v_bits selects the payload layout, so it IS the identity.
+        _ => v_bits,
+    };
+    format!(
+        "v1|rt:{}|mode:{:?}|vbits:{}",
+        hex_digest(runtime_fingerprint),
+        mode,
+        effective_v_bits
+    )
 }
 
 /// Validate that a block size is 2048 or a power-of-2 multiple, and a
@@ -559,8 +616,14 @@ impl BlockColdStore {
         tokens: &[i32],
         cache_set: &DetachedCacheSet,
     ) -> Result<Manifest, ColdStoreError> {
-        let kv_mode = kv_mode_config_string(cache_set.caches[0].mode);
-        let block_hashes = compute_block_hashes(tokens, self.block_size, &kv_mode);
+        // WRITE side of the cache-computation identity. Must stay symmetric
+        // with the READ side in load_prefix or the store becomes write-only.
+        let cache_id = cache_computation_id(
+            &self.runtime_fingerprint,
+            cache_set.caches[0].mode,
+            cache_set.caches[0].kvarn_v_bits,
+        );
+        let block_hashes = compute_block_hashes(tokens, self.block_size, &cache_id);
 
         // Extract and write each block
         for (i, chunk) in tokens.chunks(self.block_size).enumerate() {
@@ -691,7 +754,13 @@ impl BlockColdStore {
         template_sig: &str,
         tokens: &[i32],
         kv_mode: super::KVCacheMode,
+        v_bits: u8,
     ) -> Result<(DetachedCacheSet, usize), ColdStoreError> {
+        // READ side of the cache-computation identity — must mirror persist's
+        // WRITE side exactly. Built once here so the symmetry is visible in
+        // one place rather than inline at the hashing site.
+        let load_cache_id =
+            cache_computation_id(&self.runtime_fingerprint, kv_mode, v_bits);
         let manifests_dir = self.manifests_dir();
         if !manifests_dir.exists() {
             return Err(ColdStoreError::NoMatch);
@@ -729,7 +798,7 @@ impl BlockColdStore {
             let matched_blocks = manifest
                 .block_hashes
                 .iter()
-                .zip(compute_block_hashes(tokens, self.block_size, &kv_mode_config_string(kv_mode)))
+                .zip(compute_block_hashes(tokens, self.block_size, &load_cache_id))
                 .take_while(|(a, b)| a == &b)
                 .count();
 
@@ -1624,7 +1693,7 @@ mod tests {
         // NOT a discrimination control — the caller's chain logic is tested below.
         let tokens_a = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let tokens_b = vec![9, 10, 11, 12, 5, 6, 7, 8];
-        let kv_mode = kv_mode_config_string(KVCacheMode::Fp16);
+        let kv_mode = cache_computation_id(&[0u8; 32], KVCacheMode::Fp16, 0);
         let block_size = 4;
 
         let hash_a0 = block_hash_merkle(&[0u8; 32], block_size, &kv_mode, &tokens_a[0..4]);
@@ -1648,7 +1717,7 @@ mod tests {
         // Under Merkle-chain, they differ.
         let tokens_a = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let tokens_b = vec![9, 10, 11, 12, 5, 6, 7, 8];
-        let kv_mode = kv_mode_config_string(KVCacheMode::Fp16);
+        let kv_mode = cache_computation_id(&[0u8; 32], KVCacheMode::Fp16, 0);
         let block_size = 4;
 
         let addrs_a = compute_block_hashes(&tokens_a, block_size, &kv_mode);
@@ -1664,7 +1733,7 @@ mod tests {
     #[test]
     fn block_hash_merkle_chain_same_prefix_same_hash() {
         let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let kv_mode = kv_mode_config_string(KVCacheMode::Fp16);
+        let kv_mode = cache_computation_id(&[0u8; 32], KVCacheMode::Fp16, 0);
         let block_size = 4;
 
         let hash_a0 = block_hash_merkle(&[0u8; 32], block_size, &kv_mode, &tokens[0..4]);
@@ -1681,8 +1750,8 @@ mod tests {
         let tokens = vec![1, 2, 3, 4];
         let block_size = 4;
 
-        let kv_fp16 = kv_mode_config_string(super::super::KVCacheMode::Fp16);
-        let kv_kvarn8 = kv_mode_config_string(KVCacheMode::KVarN8);
+        let kv_fp16 = cache_computation_id(&[0u8; 32], super::super::KVCacheMode::Fp16, 0);
+        let kv_kvarn8 = cache_computation_id(&[0u8; 32], KVCacheMode::KVarN8, 4);
 
         let hash_fp16 = block_hash_merkle(&[0u8; 32], block_size, &kv_fp16, &tokens);
         let hash_kvarn8 = block_hash_merkle(&[0u8; 32], block_size, &kv_kvarn8, &tokens);
@@ -1692,7 +1761,7 @@ mod tests {
     #[test]
     fn block_hash_includes_block_size() {
         let tokens = vec![1, 2, 3, 4];
-        let kv_mode = kv_mode_config_string(KVCacheMode::Fp16);
+        let kv_mode = cache_computation_id(&[0u8; 32], KVCacheMode::Fp16, 0);
 
         let hash_4 = block_hash_merkle(&[0u8; 32], 4, &kv_mode, &tokens);
         let hash_8 = block_hash_merkle(&[0u8; 32], 8, &kv_mode, &tokens);
@@ -1716,7 +1785,7 @@ mod tests {
     #[test]
     fn compute_block_hashes_basic() {
         let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let kv_mode = kv_mode_config_string(KVCacheMode::Fp16);
+        let kv_mode = cache_computation_id(&[0u8; 32], KVCacheMode::Fp16, 0);
         let hashes = compute_block_hashes(&tokens, 4, &kv_mode);
         assert_eq!(hashes.len(), 2);
         assert_ne!(hashes[0], hashes[1]);

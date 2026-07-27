@@ -132,9 +132,25 @@ run_mutation \
 run_mutation \
   "M2 load_prefix: re-hardcode the KV mode (regression of §7.5)" \
   "block_cold_store.rs" \
-  's/compute_block_hashes\(tokens, self\.block_size, &kv_mode_config_string\(kv_mode\)\)/compute_block_hashes(tokens, self.block_size, \&kv_mode_config_string(super::KVCacheMode::Fp16))/' \
+  's/cache_computation_id\(&self\.runtime_fingerprint, kv_mode, v_bits\)/cache_computation_id(\&self.runtime_fingerprint, super::KVCacheMode::Fp16, 0)/' \
   "persist_then_load_prefix_reports_a_hit_kvarn8" \
-  "This is the ORIGINAL §7.5 defect. Re-hardcoding Fp16 at the hashing site makes the store WRITE-ONLY under KVarN8: computed addresses can never equal the ones in its own manifest, matched_blocks is 0, and the caller sees NoMatch — indistinguishable from a legitimately cold cache, so it never surfaces as a failure."
+  "The ORIGINAL §7.5 defect. Hardcoding the mode at the READ side makes the store WRITE-ONLY under KVarN8: addresses can never equal those in its own manifest, matched_blocks is 0, and the caller sees NoMatch — indistinguishable from a legitimately cold cache."
+
+# --- M5: the address must commit to WHOSE weights computed the bytes -------
+run_mutation \
+  "M5 cache identity: drop runtime_fingerprint" \
+  "block_cold_store.rs" \
+  's/hex_digest\(runtime_fingerprint\)/hex_digest(&[0u8; 32])/' \
+  "different_runtimes_sharing_a_block_pool_do_not_collide" \
+  "Blocks live in ONE global pool. Without the fingerprint, two runtimes with different weights compute IDENTICAL addresses, the second write_block early-returns on exists(), and runtime B's manifest silently points at runtime A's KV data."
+
+# --- M6: the address must commit to the quantization width -----------------
+run_mutation \
+  "M6 cache identity: drop v_bits" \
+  "block_cold_store.rs" \
+  's/vbits:\{\}"/vbits:X"/' \
+  "cache_identity_commits_to_v_bits" \
+  "k8v4 and k8v8 lay out the V payload differently. Without v_bits they share an address — a collision inside one model and one mode, needing no weight change."
 
 # --- M3: commit must be atomic (temp+rename) -------------------------------
 run_mutation \

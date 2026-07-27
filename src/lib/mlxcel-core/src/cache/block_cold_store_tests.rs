@@ -1303,7 +1303,7 @@ fn persist_then_load_prefix_reports_a_hit_fp16() {
         .expect("persist must succeed");
 
     let (loaded, matched) = store
-        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16)
+        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0)
         .expect("load_prefix MUST HIT the entry just persisted — a miss here is a write-only store");
 
     assert!(
@@ -1357,7 +1357,7 @@ fn persist_then_load_prefix_reports_a_hit_kvarn8() {
         .expect("persist must succeed");
 
     let (loaded, matched) = store
-        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8)
+        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
         .expect(
             "load_prefix MUST HIT under KVarN8. A miss here is the §7.5 write-only bug \
              returning: persist addresses with the real mode, so load must too.",
@@ -1398,11 +1398,11 @@ fn mode_mismatch_at_load_is_a_clean_miss_not_a_wrong_adoption() {
 
     // Correct mode hits.
     store
-        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8)
+        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
         .expect("KVarN8 load of a KVarN8 persist must hit");
 
     // Wrong mode must MISS, not adopt.
-    let wrong = store.load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16);
+    let wrong = store.load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0);
     assert!(
         matches!(wrong, Err(ColdStoreError::NoMatch)),
         "loading a KVarN8 cache under Fp16 must be NoMatch (re-prefill), never an \
@@ -1523,7 +1523,10 @@ fn concurrent_same_block_persist_leaves_a_readable_store() {
     let expected = compute_block_hashes(
         &tokens,
         DEFAULT_BLOCK_SIZE,
-        &kv_mode_config_string(KVCacheMode::Fp16),
+        // Must mirror what persist used, INCLUDING the store's runtime
+        // fingerprint — block addresses now commit to the full
+        // cache-computation identity, not just the mode name.
+        &cache_computation_id(&[21u8; 32], KVCacheMode::Fp16, 0),
     );
     let mut committed = 0usize;
     for hash in &expected {
@@ -1743,4 +1746,133 @@ fn kill_9_mid_persist_never_leaves_a_readable_corrupt_block() {
     );
     eprintln!("G3.1: killed {killed_runs}/{} runs, inspected {survivors} committed blocks",
               delays_ms.len());
+}
+
+// ===========================================================================
+// CACHE-COMPUTATION IDENTITY — the block address must commit to everything
+// that determines the bytes, and to nothing else.
+//
+// Blocks live in ONE GLOBAL POOL keyed only by hash, so two runtimes that
+// compute different bytes for the same tokens must not reach the same address.
+// Before this, the address committed to `format!("{:?}", mode)` alone.
+// ===========================================================================
+
+#[test]
+fn cache_identity_commits_to_v_bits() {
+    let rt = [1u8; 32];
+    let k8v4 = cache_computation_id(&rt, KVCacheMode::KVarN8, 4);
+    let k8v8 = cache_computation_id(&rt, KVCacheMode::KVarN8, 8);
+    assert_ne!(
+        k8v4, k8v8,
+        "k8v4 and k8v8 lay out the V payload differently, so they MUST NOT share \
+         a block address. Before the fix both rendered to \"KVarN8\" and collided \
+         inside one model and one mode, with no weight change required."
+    );
+}
+
+#[test]
+fn cache_identity_commits_to_runtime_fingerprint() {
+    let a = cache_computation_id(&[1u8; 32], KVCacheMode::KVarN8, 4);
+    let b = cache_computation_id(&[2u8; 32], KVCacheMode::KVarN8, 4);
+    assert_ne!(
+        a, b,
+        "different weights compute different KV bytes for identical tokens, so \
+         they MUST NOT share a block address"
+    );
+}
+
+#[test]
+fn cache_identity_normalises_v_bits_under_fp16() {
+    let rt = [1u8; 32];
+    assert_eq!(
+        cache_computation_id(&rt, KVCacheMode::Fp16, 0),
+        cache_computation_id(&rt, KVCacheMode::Fp16, 8),
+        "v_bits does not affect unquantized bytes, so it must not affect the \
+         address — otherwise an Fp16 cache carrying a stale v_bits is unreachable \
+         to a loader that correctly passes 0, and the cache misses for no reason"
+    );
+}
+
+/// A and B must write DISTINGUISHABLE bytes, or "B loaded A's data" is
+/// indistinguishable from "B loaded its own".
+const A_SHIFT: i32 = 0;
+const B_SHIFT: i32 = 37;
+
+fn fp16_set_shifted(num_layers: usize, len: i32, shift: i32) -> DetachedCacheSet {
+    let caches = (0..num_layers)
+        .map(|i| fp16_layer(len, shift + i as i32 * 5))
+        .collect();
+    let now = Instant::now();
+    DetachedCacheSet {
+        caches,
+        backend: SequenceStateBackend::DenseKvCache,
+        prompt_len: len as usize,
+        current_offset: len,
+        created_at: now,
+        detached_at: now,
+        origin_seq_id: SequenceId::from_raw(11),
+    }
+}
+
+/// THE REAL COLLISION PATH, end to end.
+///
+/// Two runtimes with different weights, sharing one block pool, persisting the
+/// SAME tokens. Before the fix they computed IDENTICAL block hashes, so the
+/// second runtime's `write_block` hit its `block_dir.exists()` early return,
+/// silently skipped writing, and left its manifest pointing at the FIRST
+/// runtime's KV data — a silent cross-model wrong adoption.
+#[test]
+fn different_runtimes_sharing_a_block_pool_do_not_collide() {
+    const LAYERS: usize = 2;
+    const DEPTH: i32 = 2 * DEFAULT_BLOCK_SIZE as i32;
+    let tokens: Vec<i32> = (0..DEPTH).collect();
+
+    // ONE directory — the shared global pool. Two different runtimes.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store_a = BlockColdStore::new(dir.path().to_path_buf(), [0xAAu8; 32]);
+    let store_b = BlockColdStore::new(dir.path().to_path_buf(), [0xBBu8; 32]);
+
+    store_a
+        .persist("m3", "tmpl", &tokens, &fp16_set_shifted(LAYERS, DEPTH, A_SHIFT))
+        .expect("runtime A persists");
+
+    // B has NOT persisted. It must not be able to load A's blocks.
+    let leaked = store_b.load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0);
+    assert!(
+        matches!(leaked, Err(ColdStoreError::NoMatch)),
+        "runtime B loaded a prefix it never persisted — that is runtime A's KV \
+         data adopted under B's weights. Got: {:?}",
+        leaked.map(|(_, m)| m)
+    );
+
+    // And B persisting its own must not be silently skipped as "already written".
+    //
+    // MATCH LENGTH ALONE IS NOT ENOUGH HERE, and asserting only that was a
+    // vacuousness the G0.2 gate caught: `load_prefix` filters manifests by
+    // runtime_fingerprint (:704) BEFORE comparing block hashes, so B never sees
+    // A's manifest whether or not the ADDRESS commits to the fingerprint. The
+    // address matters on the WRITE side — without it, B's blocks hash to A's
+    // addresses, `write_block` early-returns on exists(), B never writes, and
+    // B's own manifest points at A's bytes. So the assertion must be on CONTENT.
+    let b_layer0_expected = bytes_of(&fp16_layer(DEPTH, B_SHIFT).keys, "b keys");
+    store_b
+        .persist("m3", "tmpl", &tokens, &fp16_set_shifted(LAYERS, DEPTH, B_SHIFT))
+        .expect("runtime B persists");
+    let (b_loaded, matched) = store_b
+        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+        .expect("B must now hit its OWN blocks");
+    assert_eq!(matched, tokens.len(), "B must match its own full prefix");
+    assert_eq!(
+        bytes_of(&b_loaded.caches[0].keys, "loaded keys"),
+        b_layer0_expected,
+        "B loaded bytes that are NOT B's. Its manifest is pointing at runtime A's \
+         block data, because the block address did not commit to whose weights \
+         computed it and write_block skipped B's write as 'already present'."
+    );
+
+    // A must still hit its own, unharmed by B.
+    let (_, matched_a) = store_a
+        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+        .expect("A must still hit its own blocks");
+    assert_eq!(matched_a, tokens.len(), "A's entry must survive B's persist");
 }
