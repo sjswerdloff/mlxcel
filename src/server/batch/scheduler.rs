@@ -306,6 +306,48 @@ pub(crate) fn adoption_leaves_token_for_logits(adopted_len: usize, request_len: 
     adopted_len < request_len
 }
 
+/// What the SSD tier actually did on this request.
+///
+/// Alden, 2026-07-29: match length alone cannot encode these states, and the
+/// previous code inferred "the SSD missed" from `ssd_match_len == 0`. That is
+/// false for every path where a candidate was LOADED and then discarded — the
+/// request still fell through to an aggregate line asserting that no entry
+/// shares any prefix under this key. Making the decline visible did not stop
+/// the contradictory assertion; only carrying the outcome does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColdProbeOutcome {
+    /// Store absent, or request identity out of scope (multimodal / LoRA).
+    NotProbed,
+    /// Probed, and genuinely nothing shares a prefix.
+    NoMatch,
+    /// A candidate was LOADED and then discarded (invalid layers, empty or
+    /// unrepresentable stored length, alignment/min-prefix decline, truncation
+    /// failure). NOT a miss.
+    LoadedDeclined,
+    /// Probe returned an error other than NoMatch.
+    LoadFailed,
+    /// Candidate selected as the winner over memory.
+    Selected,
+    /// Selected, but `cache_pool.adopt` failed.
+    AdoptFailed,
+}
+
+/// May the aggregate "both tiers MISS (no entry shares any prefix)" line be
+/// emitted?
+///
+/// ONLY when memory genuinely missed AND the SSD tier genuinely found nothing.
+/// `NotProbed` is excluded deliberately: a tier that was never consulted cannot
+/// support a claim about what it contains.
+///
+/// Pure so it can be pinned by unit tests without constructing a scheduler —
+/// which is the seam Alden identified when he refused the untested-emission
+/// contract, and he was right that "needs a full BatchScheduler" was a claim
+/// about the code's shape rather than a fact about testability.
+#[inline]
+pub(crate) fn dual_miss_claim_is_truthful(mem_missed: bool, ssd: ColdProbeOutcome) -> bool {
+    mem_missed && matches!(ssd, ColdProbeOutcome::NoMatch)
+}
+
 fn effective_decode_storage_backend(
     requested: DecodeStorageBackend,
     max_batch_size: usize,
@@ -1836,6 +1878,7 @@ impl BatchScheduler {
             ctx.mm_digest == MultimodalDigest::empty() && ctx.lora_id.is_none();
         let mut ssd_match_len = 0usize;
         let mut ssd_detached: Option<DetachedCacheSet> = None;
+        let mut ssd_outcome = ColdProbeOutcome::NotProbed;
         // COLD-STORE LOAD. v4 is opt-in and REPLACES v3 when present. It needs
         // the PER-LAYER plan, not a single (mode, v_bits) pair, because that is
         // what the block address commits to. A single pair could not describe
@@ -1877,6 +1920,7 @@ impl BatchScheduler {
                             expected_layers = self.model.num_layers(),
                             "cold-store: loaded layer count or state lengths are invalid; ignoring SSD candidate"
                         );
+                        ssd_outcome = ColdProbeOutcome::LoadedDeclined;
                     } else if let Some(stored_state_len) = usize::try_from(stored_state_len)
                         .ok()
                         .filter(|len| *len > 0)
@@ -1925,6 +1969,7 @@ impl BatchScheduler {
                                         stored_state_len,
                                         "cold-store: candidate truncation failed; ignoring SSD candidate"
                                     );
+                                    ssd_outcome = ColdProbeOutcome::LoadedDeclined;
                                 } else {
                                     tracing::info!(
                                         model_id = %ctx.model_id,
@@ -1934,6 +1979,7 @@ impl BatchScheduler {
                                     );
                                     ssd_match_len = match_len;
                                     ssd_detached = Some(detached);
+                                    ssd_outcome = ColdProbeOutcome::Selected;
                                 }
                             }
                             None => {
@@ -1945,27 +1991,44 @@ impl BatchScheduler {
                                     min_prefix = store.min_prefix_tokens(),
                                     "prompt-cache: SSD cold-store candidate DECLINED — alignment-floored match below minimum prefix"
                                 );
+                                ssd_outcome = ColdProbeOutcome::LoadedDeclined;
                             }
                         }
                     } else {
-                        // The other silent drop: a loaded candidate whose stored
-                        // length is zero or not representable. Same consequence
-                        // as above — falls through to "both tiers MISS".
-                        tracing::info!(
-                            stored_state_len,
-                            raw = raw_match_len,
-                            "prompt-cache: SSD cold-store candidate DECLINED — stored state length is empty or unrepresentable"
-                        );
+                        // SPLIT, per Alden 2026-07-29 judgment 2. A non-negative
+                        // i32 is always representable as usize here, so
+                        // "unrepresentable" can only mean NEGATIVE — an
+                        // invariant violation, not an expected artifact, and it
+                        // gets WARN. Zero also gets WARN: committed reusable v4
+                        // state should not load empty, and INFO would only be
+                        // defensible if empty were an established artifact
+                        // class. It is not, so it announces itself.
+                        if stored_state_len < 0 {
+                            tracing::warn!(
+                                stored_state_len,
+                                raw = raw_match_len,
+                                "prompt-cache: SSD cold-store candidate DECLINED — stored state length is NEGATIVE (invariant violation)"
+                            );
+                        } else {
+                            tracing::warn!(
+                                stored_state_len,
+                                raw = raw_match_len,
+                                "prompt-cache: SSD cold-store candidate DECLINED — stored state length is ZERO; committed v4 state should never load empty"
+                            );
+                        }
+                        ssd_outcome = ColdProbeOutcome::LoadedDeclined;
                     }
                 }
                 Err(mlxcel_core::cache::cold_store::ColdStoreError::NoMatch) => {
                     tracing::debug!("prompt-cache: SSD cold-store probe MISS");
+                    ssd_outcome = ColdProbeOutcome::NoMatch;
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         "prompt-cache: SSD cold-store probe failed (non-fatal)"
                     );
+                    ssd_outcome = ColdProbeOutcome::LoadFailed;
                 }
             }
         }
@@ -2018,6 +2081,7 @@ impl BatchScheduler {
                         error = %err,
                         "cold-store: adopt failed after load; falling back to in-memory or cold prefill"
                     );
+                    ssd_outcome = ColdProbeOutcome::AdoptFailed;
                     // Fall through to in-memory adoption below.
                 }
             }
@@ -2027,12 +2091,27 @@ impl BatchScheduler {
         let (entry, matched_len) = match mem_candidate {
             Some(found) => found,
             None => {
-                // Both tiers missed.
-                tracing::info!(
-                    total = tokens.len(),
-                    store_entries = store.len(),
-                    "prompt-cache: both tiers MISS (no entry shares any prefix under this key)"
-                );
+                // THE AGGREGATE IS A CLAIM ABOUT BOTH TIERS, so it may only be
+                // made when both tiers support it. Previously it was emitted
+                // whenever `mem_candidate` was None, which asserted "no entry
+                // shares any prefix under this key" on every path where the SSD
+                // had LOADED a candidate and discarded it — the contradictory
+                // assertion that a11a770 claimed to fix by adding visibility.
+                // Visibility did not stop the false claim; gating does.
+                if dual_miss_claim_is_truthful(true, ssd_outcome) {
+                    tracing::info!(
+                        total = tokens.len(),
+                        store_entries = store.len(),
+                        "prompt-cache: both tiers MISS (no entry shares any prefix under this key)"
+                    );
+                } else {
+                    tracing::info!(
+                        total = tokens.len(),
+                        store_entries = store.len(),
+                        ssd_outcome = ?ssd_outcome,
+                        "prompt-cache: memory MISS; SSD tier supplied no state — see ssd_outcome (NOT a claim that nothing shares a prefix)"
+                    );
+                }
                 return None;
             }
         };

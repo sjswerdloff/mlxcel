@@ -1346,3 +1346,49 @@ fn hash_tokens_differs_for_different_inputs() {
     tokens_b.hash(&mut h2);
     assert_ne!(h1.finish(), h2.finish());
 }
+
+// ---------------------------------------------------------------------------
+// THE AGGREGATE DUAL-MISS CLAIM IS GATED ON BOTH TIERS.
+//
+// Alden, 2026-07-29, refusing the untested-emission contract: "a small
+// classifier/outcome seam can be unit-tested without constructing the full
+// scheduler; at minimum pin that DECLINED cannot co-occur with aggregate
+// dual-miss for one request." He was right that "this needs a whole
+// BatchScheduler" was a claim about the code's shape, not a fact about
+// testability — extracting the predicate made it a pure function.
+//
+// The defect being pinned: `both tiers MISS (no entry shares any prefix under
+// this key)` was emitted whenever the in-memory candidate was None, which
+// asserted the SSD tier had nothing on every path where the SSD had LOADED a
+// candidate and then discarded it.
+// ---------------------------------------------------------------------------
+
+/// The claim requires memory to have missed AND the SSD to have genuinely
+/// found nothing. Every other outcome must forbid it.
+#[test]
+fn dual_miss_claim_requires_both_tiers_to_support_it() {
+    use super::scheduler::{dual_miss_claim_is_truthful as ok, ColdProbeOutcome as O};
+
+    // The ONLY combination that licenses the claim.
+    assert!(ok(true, O::NoMatch), "genuine dual miss must be sayable");
+
+    // THE REGRESSION: a loaded-then-discarded candidate is NOT a miss.
+    assert!(
+        !ok(true, O::LoadedDeclined),
+        "DECLINED must never co-occur with the dual-miss claim — the SSD tier \
+         had a candidate and threw it away, so 'nothing shares any prefix' is false"
+    );
+
+    // A tier never consulted cannot support a claim about what it contains.
+    assert!(!ok(true, O::NotProbed), "an unprobed tier cannot support a miss claim");
+
+    // Remaining outcomes all imply the SSD had something or errored.
+    for o in [O::LoadFailed, O::Selected, O::AdoptFailed] {
+        assert!(!ok(true, o), "{o:?} must not license the dual-miss claim");
+    }
+
+    // And memory hitting forbids it regardless of the SSD.
+    for o in [O::NoMatch, O::NotProbed, O::LoadedDeclined, O::LoadFailed] {
+        assert!(!ok(false, o), "memory hit must forbid the claim ({o:?})");
+    }
+}
