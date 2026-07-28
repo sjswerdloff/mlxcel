@@ -1373,13 +1373,14 @@ fn hash_tokens_differs_for_different_inputs() {
 fn dual_miss_claim_requires_both_tiers_to_support_it() {
     use super::scheduler::{dual_miss_claim_is_truthful as ok, ColdProbeOutcome as O};
 
-    const ALL: [O; 7] = [
-        O::NotProbed, O::NoMatch, O::LoadedDeclined,
-        O::LoadFailed, O::LoadedUsable, O::Selected, O::AdoptFailed,
-    ];
+    // Derived from the enum's own successor chain, NOT a second list. Adding a
+    // variant is a compile error there, so this table cannot silently
+    // un-exhaust itself (Alden, 2026-07-29).
+    let all = O::all();
+    assert!(all.len() >= 7, "variant enumeration collapsed: {}", all.len());
 
     for mem_missed in [true, false] {
-        for o in ALL {
+        for o in all.iter().copied() {
             // The claim is licensed by EXACTLY ONE of the fourteen combinations.
             let expected = mem_missed && o == O::NoMatch;
             assert_eq!(

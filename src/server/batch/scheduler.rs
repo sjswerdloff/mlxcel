@@ -339,6 +339,40 @@ pub(crate) enum ColdProbeOutcome {
     AdoptFailed,
 }
 
+impl ColdProbeOutcome {
+    /// Successor chain, so the variant list has ONE definition instead of two.
+    ///
+    /// Alden, 2026-07-29: a hand-maintained `const ALL: [_; 7]` in the test
+    /// would still COMPILE if an eighth variant were added and not listed,
+    /// silently making the decision table non-exhaustive again — the same
+    /// shape as a sampled table, one level up. A separate list is a thing to
+    /// forget.
+    ///
+    /// Adding a variant makes this match non-exhaustive: COMPILE ERROR, at the
+    /// exact place where you must decide where it belongs. The test iterates
+    /// this chain, so there is no second list to drift from the enum.
+    pub(crate) fn next_variant(self) -> Option<Self> {
+        use ColdProbeOutcome as O;
+        match self {
+            O::NotProbed => Some(O::NoMatch),
+            O::NoMatch => Some(O::LoadedDeclined),
+            O::LoadedDeclined => Some(O::LoadFailed),
+            O::LoadFailed => Some(O::LoadedUsable),
+            O::LoadedUsable => Some(O::Selected),
+            O::Selected => Some(O::AdoptFailed),
+            O::AdoptFailed => None,
+        }
+    }
+    /// Every variant, derived from the chain above.
+    pub(crate) fn all() -> Vec<Self> {
+        let mut v = vec![ColdProbeOutcome::NotProbed];
+        while let Some(n) = v[v.len() - 1].next_variant() {
+            v.push(n);
+        }
+        v
+    }
+}
+
 /// May the aggregate "both tiers MISS (no entry shares any prefix)" line be
 /// emitted?
 ///
