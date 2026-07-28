@@ -189,9 +189,18 @@ coherent() {
 # Point LOG at the server log to make steps 2 and 3 discriminating. Without it
 # they are reported as UNVERIFIED rather than passed, because "I could not
 # check" must never render as "it worked".
-adoption_count() {  # $1 = pattern; echoes a count, 0 if no log configured
+adoption_count() {  # $1 = pattern; echoes ONE integer, or -1 if no log
   [[ -z "${LOG:-}" || ! -r "${LOG:-}" ]] && { echo -1; return; }
-  grep -ac "$1" "$LOG" 2>/dev/null || echo 0
+  # `grep -c` PRINTS 0 and EXITS 1 when there are no matches, so a trailing
+  # `|| echo 0` emitted a SECOND line and this function returned "0\n0".
+  # Every (( )) comparison downstream then died with a syntax error — and
+  # bash's `((` failure made the else-branch run, so one step reported OK on
+  # a comparison that never happened. A counter that returns two lines is a
+  # counter that fabricates verdicts in BOTH directions.
+  local n
+  n="$(grep -ac "$1" "$LOG" 2>/dev/null)" || true
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s\n' "$n"
 }
 
 require_adoption_since() {  # $1 label, $2 baseline count, $3 pattern, $4 meaning
