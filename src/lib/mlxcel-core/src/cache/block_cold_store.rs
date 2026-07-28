@@ -118,16 +118,23 @@ pub fn block_hash_merkle(
 /// field too narrow. Widening it to the whole per-layer vector is what lets the
 /// guard become a conformance check instead of a blanket refusal.
 ///
-/// **CORRECTION (Alden, 2026-07-28): expressible is not storable.** An earlier
-/// version of this comment listed all three routes as producing a mixed set the
-/// store could now hold. That is false for Boundary-V, which applies ONLY to
-/// Turbo modes — and the block serializer drops every Turbo sidecar (see
-/// `block_serializer_supports`). The widened address can NAME a Turbo plan; the
-/// serializer cannot carry one, and `persist` now refuses it before writing.
-/// So of the three routes above, two are genuinely storable today
-/// (`skip_last_layer` over Int8/Fp16, and D1 over KVarN8/Fp16) and Boundary-V
-/// is gated. The address change was necessary for all three; it was sufficient
-/// for two.
+/// **CORRECTION (Alden, 2026-07-28, twice): expressible is not storable, and
+/// only ONE of these routes is storable today.** An earlier version of this
+/// comment claimed all three produced a mixed set the store could hold; a
+/// second claimed two. Both were reach-claims written without checking.
+///
+/// The serializer certifies only `Fp16` and `KVarN8`
+/// (see `block_serializer_supports`). Therefore:
+///
+/// * **Boundary-V** — Turbo only, and every Turbo mode is refused. Gated.
+/// * **`skip_last_layer`** — `resolve_layer_modes` leaves the policy inert when
+///   the nominal is already `Fp16`, so it yields a mixed plan only over `Int8`
+///   or `Turbo4Asym`. Both refused. Gated.
+/// * **D1 dense-prefix** — KVarN8 + Fp16, both certified. **Storable.**
+///
+/// So the widened address was NECESSARY for all three and is SUFFICIENT for
+/// one. The other two are correctly addressed and correctly refused, which is
+/// the right state: refusing loudly beats publishing blocks nothing can read.
 ///
 /// The version prefix is the anti-aliasing mechanism, so it moves with the
 /// field set AND with the preimage encoding: `v1`, `v2` and `v3` addresses can
@@ -226,20 +233,46 @@ pub fn canonical_layer_identity(mode: super::KVCacheMode, v_bits: u8) -> (super:
 /// Exhaustive, no wildcard: a new mode must not inherit "supported" by default,
 /// because the failure mode is publishing blocks that can never be read back.
 ///
-/// **`Int8` is accepted, NOT claimed proven.** It is structurally plausible —
-/// it rides `keys` / `values` / `key_scales` / `val_scales`, all of which the
-/// block path does carry — but this function is a gate against a known-missing
-/// serializer, not a certificate. Int8 deserves its own round-trip evidence
-/// before anyone writes that it works; scope for this checkpoint is the Turbo
-/// refusal only.
+/// **SUPPORT IS A CERTIFICATE, NOT STRUCTURAL PLAUSIBILITY.** Alden's second
+/// pass, 2026-07-28. A previous version returned `true` for `Int8` while both
+/// the code comment and the test said Int8 had no block round-trip evidence.
+/// That is honest documentation attached to unsafe behaviour: a doc comment
+/// does not gate anything. `BatchKvQuantConfig::base_mode` returns `Int8` for
+/// `(Uniform, 8)`, so a server running batch KV quant with v4 enabled would
+/// have published Int8 blocks on the strength of a comment saying they were
+/// unproven. Plausible-and-unverified now returns `false`.
+///
+/// Only two modes are certified: `Fp16` and `KVarN8`, both with round-trip
+/// evidence in `block_cold_store_tests`. Turning `Int8` on requires exact
+/// persist/load/install evidence over `keys`, `values`, `key_scales`,
+/// `val_scales`, offsets and post-adoption behaviour — not a reading of which
+/// fields the struct happens to carry.
+///
+/// # What this means for the heterogeneity routes, stated precisely
+///
+/// With `Int8` and every Turbo mode gated, **exactly one of the three routes
+/// can produce a STORABLE mixed plan today: D1 (KVarN8 + Fp16).** Boundary-V
+/// applies only to Turbo modes. `skip_last_layer` cannot produce one either —
+/// `resolve_layer_modes` leaves the policy inert when the nominal is already
+/// `Fp16` (`batch_quant.rs`), so it only ever yields a mixed plan over `Int8`
+/// or `Turbo4Asym`, and both are now refused.
+///
+/// I have now had to correct this reach-claim twice: first from "all three
+/// routes are storable" to "two", now from "two" to "one". Both times the
+/// mechanism was right and my statement about its reach was written without
+/// checking. It is spelled out above so the next reader can verify it against
+/// `base_mode` and `resolve_layer_modes` rather than trust it.
+///
+/// Exhaustive, no wildcard: a new mode must not inherit "supported" by default,
+/// because the failure mode is publishing blocks that can never be read back.
 fn block_serializer_supports(mode: super::KVCacheMode) -> bool {
     use super::KVCacheMode as M;
     match mode {
-        // Carried by the block path today.
+        // CERTIFIED: round-trip evidence exists in block_cold_store_tests.
         M::Fp16 => true,
         M::KVarN8 => true,
-        // Structurally plausible, unproven — see the note above.
-        M::Int8 => true,
+        // Structurally plausible, NO round-trip evidence. Not a certificate.
+        M::Int8 => false,
         // Sidecars dropped by extract_block / merge_layer_across_blocks.
         M::Turbo4Asym => false,
         M::Turbo3Asym => false,

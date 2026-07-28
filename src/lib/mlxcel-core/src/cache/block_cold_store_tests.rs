@@ -5228,8 +5228,8 @@ fn the_address_declares_format_v3() {
 
 // ── Serializer reach: expressible is not storable (Alden, 2026-07-28) ────
 
-/// A Turbo plan is REFUSED before any block is written, and leaves nothing
-/// behind.
+/// An UNCERTIFIED plan is REFUSED before any block is written, and leaves
+/// nothing behind.
 ///
 /// The gap: widening the address made Turbo plans expressible, but
 /// `extract_block` and `merge_layer_across_blocks` set `v_packed`, `v_norms`,
@@ -5245,16 +5245,24 @@ fn the_address_declares_format_v3() {
 /// Named mutation: delete the `block_serializer_supports` gate in `persist` and
 /// this goes red on the residue assertions, not merely on the error.
 #[test]
-fn a_turbo_plan_is_refused_before_any_block_is_written() {
+fn an_uncertified_plan_is_refused_before_any_block_is_written() {
     const N_TILES: i32 = 15;
     let depth = TILE + N_TILES * TILE;
     let tokens: Vec<i32> = (0..depth).collect();
 
+    // Int8 joined this matrix on Alden's second pass: it had been ACCEPTED
+    // while both the code and the test said it has no round-trip evidence.
+    // Honest documentation attached to unsafe behaviour — a comment gates
+    // nothing, and `BatchKvQuantConfig::base_mode` returns Int8 for
+    // (Uniform, 8), so a batch KV-quant server with v4 on would have published
+    // Int8 blocks on the strength of a doc comment. Support is a certificate,
+    // not structural plausibility.
     for mode in [
         KVCacheMode::Turbo4Asym,
         KVCacheMode::Turbo3Asym,
         KVCacheMode::Turbo4,
         KVCacheMode::Turbo4Delegated,
+        KVCacheMode::Int8,
     ] {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let store = BlockColdStore::new(dir.path().to_path_buf(), [51u8; 32]);
@@ -5270,7 +5278,7 @@ fn a_turbo_plan_is_refused_before_any_block_is_written() {
 
         let err = store
             .persist("m3", "tmpl", &tokens, &set, &homog(2, mode, 8))
-            .expect_err("a Turbo plan must be refused — the block serializer \
+            .expect_err("an uncertified mode must be refused — the block serializer \
                          cannot carry its sidecars");
         let msg = err.to_string();
         assert!(
@@ -5295,10 +5303,10 @@ fn a_turbo_plan_is_refused_before_any_block_is_written() {
 /// persist. Without this, the refusals above are satisfied by a store that
 /// refuses everything.
 ///
-/// Scope, stated: this asserts Fp16 and KVarN8 only. `Int8` is ACCEPTED by the
-/// gate but is deliberately NOT asserted here — it is structurally plausible
-/// (it rides keys/values/key_scales/val_scales) but has no round-trip evidence
-/// in this file, and a green here would read as evidence it does not have.
+/// Scope, stated: Fp16 and KVarN8 are the ONLY certified modes and the only
+/// ones asserted. `Int8` is now REFUSED by the gate rather than quietly
+/// accepted, so this control no longer silently declines to cover a mode the
+/// gate would have let through.
 #[test]
 fn the_modes_the_block_path_carries_still_persist() {
     const N_TILES: i32 = 15;
@@ -5340,8 +5348,11 @@ fn the_modes_the_block_path_carries_still_persist() {
 fn block_serializer_reach_is_declared_per_mode() {
     assert!(block_serializer_supports(KVCacheMode::Fp16));
     assert!(block_serializer_supports(KVCacheMode::KVarN8));
-    // Accepted, NOT claimed proven — see `block_serializer_supports`.
-    assert!(block_serializer_supports(KVCacheMode::Int8));
+    // REFUSED: structurally plausible, no round-trip evidence. Turning this
+    // true requires exact persist/load/install evidence over keys, values,
+    // key_scales, val_scales, offsets and post-adoption behaviour — not a
+    // reading of which struct fields the block path happens to carry.
+    assert!(!block_serializer_supports(KVCacheMode::Int8));
     assert!(!block_serializer_supports(KVCacheMode::Turbo4Asym));
     assert!(!block_serializer_supports(KVCacheMode::Turbo3Asym));
     assert!(!block_serializer_supports(KVCacheMode::Turbo4));
