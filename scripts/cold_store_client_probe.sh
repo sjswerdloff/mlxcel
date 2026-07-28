@@ -336,7 +336,16 @@ timed_chat() {  # $1 label, $2 prompt -> sets REPLY_TEXT, prints elapsed
 # The instrument must classify ITSELF before it classifies the store.
 # Placed AFTER the function definitions: bash executes sequentially, so a call
 # above them is "command not found", which would have silently set RC=1.
-verify_log_instrument || RC=1
+# A GATE, NOT A STEP (Violet, 2026-07-28). If the instrument cannot be shown
+# to work, the run is VOID and NO number may be emitted. Previously this only
+# set RC=1 and the script carried on printing counts under a banner asking the
+# reader not to believe them — which invites weighing a liveness result against
+# the findings it is supposed to qualify. A gate cannot be traded off.
+verify_log_instrument || {
+  printf '\n=== result\n  VOID — the instrument did not verify, so no store finding was produced.\n'
+  printf '  Server was never started, stopped or restarted by this script.\n'
+  exit 3
+}
 
 # --- 1. PERSIST -------------------------------------------------------------
 note "1/3 PERSIST — a finished sequence must leave cold-store files on disk"
@@ -376,9 +385,49 @@ else
     # A BLOCK PAYLOAD only. header.bin, manifest.bin and .refcount are each
     # declined by a DIFFERENT guard, so corrupting one would let this pass
     # while certifying a mechanism this probe does not name.
-    TARGET="$(find "$SEARCH_ROOT" -path '*/blocks/*' -type f \
-        ! -name 'header.bin' ! -name 'manifest.bin' ! -name '*.refcount' \
-        ! -name 'COMMITTED' 2>/dev/null | head -1)"
+    # PREFER A SHARED BLOCK (refcount >= 2). Violet, 2026-07-28: corruption is
+    # BLOCK-scoped but the old assertion was MANIFEST-scoped, and blocks ARE
+    # shared — two of six carried refcount 4 on this store. So the case that
+    # matters is: corrupt a block referenced by manifests A and B; the engine
+    # refuses A and serves B; B STILL CONTAINS THE CORRUPT BLOCK. A
+    # manifest-scoped assertion passes while corrupt data is served.
+    #
+    # Picking `head -1` meant WHICH property this step tested depended on which
+    # block the find happened to return. Choose deliberately instead, and say
+    # so when no shared block exists rather than silently testing the weak case.
+    TARGET="$(python3 - "$SEARCH_ROOT" <<'PY'
+import os, sys, struct
+root = sys.argv[1]
+best = None   # (refcount, payload_path)
+for dirpath, dirnames, filenames in os.walk(root):
+    if os.path.basename(os.path.dirname(dirpath)) != "blocks":
+        continue
+    rc_path = dirpath + ".refcount"
+    rc = 0
+    if os.path.isfile(rc_path):
+        try:
+            rc = struct.unpack("<Q", open(rc_path, "rb").read(8))[0]
+        except Exception:
+            rc = 0
+    for fn in sorted(filenames):
+        if fn in ("header.bin", "manifest.bin", "COMMITTED") or fn.endswith(".refcount"):
+            continue
+        cand = (rc, os.path.join(dirpath, fn))
+        if best is None or cand[0] > best[0]:
+            best = cand
+        break
+if best:
+    print(best[1])
+PY
+)"
+    TARGET_RC="$(python3 -c "
+import struct,sys,os
+p=sys.argv[1]
+rc=os.path.dirname(p)+'.refcount'
+print(struct.unpack('<Q',open(rc,'rb').read(8))[0] if os.path.isfile(rc) else 0)" "$TARGET" 2>/dev/null || echo 0)"
+    if [[ -n "$TARGET" ]] && (( TARGET_RC < 2 )); then
+      printf '  note: no block with refcount>=2 available; testing the SINGLE-REFERENCE case only (refcount=%s). The shared-block case is NOT covered by this run.\n' "$TARGET_RC"
+    fi
   else
     TARGET="$(find "$SEARCH_ROOT" -type f -name 'layer_*' 2>/dev/null | head -1)"
     [[ -z "$TARGET" ]] && TARGET="$(find "$SEARCH_ROOT" -type f \
@@ -460,14 +509,33 @@ PY
           SERVED_H="$(tail -n "+$((LOG_MARK+1))" "$LOG" 2>/dev/null \
             | local_strip | grep -a 'SERVED from manifest' \
             | grep -o 'manifest_hash=[0-9a-f]\{64\}' | cut -d= -f2 | sort -u)"
+          # BLOCK-SCOPED, not manifest-scoped. Every manifest REFERENCING the
+          # corrupted block is tainted, not just the one that happened to be
+          # refused. Computed from the manifests on disk by searching for the
+          # block's raw 32 bytes, because Manifest.block_hashes is a Vec of
+          # them and the file stores them verbatim.
+          TAINTED_H="$(python3 - "$SEARCH_ROOT" "$TARGET" <<'PY'
+import os, sys, binascii
+root, target = sys.argv[1], sys.argv[2]
+blk = binascii.unhexlify(os.path.basename(os.path.dirname(target)))
+for dirpath, dirnames, filenames in os.walk(root):
+    if os.path.basename(os.path.dirname(dirpath)) != "manifests":
+        continue
+    p = os.path.join(dirpath, "manifest.bin")
+    if os.path.isfile(p) and blk in open(p, "rb").read():
+        print(os.path.basename(dirpath))
+PY
+)"
           if [[ -z "$REFUSED_H" ]]; then
             : # the decline assertion above already reported this
           elif [[ -z "$SERVED_H" ]]; then
-            ok "turn3-served: damaged manifest refused and NOTHING served — fail-closed with no fall-through candidate"
-          elif [[ -n "$(comm -12 <(printf '%s\n' $REFUSED_H) <(printf '%s\n' $SERVED_H))" ]]; then
-            bad "turn3-served: a manifest was BOTH refused and SERVED in the same request. The damaged entry reached the cache; this is the defect the checksums exist to prevent."
+            ok "turn3-served: damaged block refused and NOTHING served — fail-closed with no fall-through candidate"
+          elif [[ -z "$TAINTED_H" ]]; then
+            bad "turn3-served: UNVERIFIED — could not determine which manifests reference the corrupted block, so 'a clean one was served' is unchecked."
+          elif [[ -n "$(comm -12 <(printf '%s\n' $TAINTED_H | sort -u) <(printf '%s\n' $SERVED_H | sort -u))" ]]; then
+            bad "turn3-served: a manifest REFERENCING the corrupted block was SERVED. Corrupt data reached the cache; this is the defect the per-layer checksums exist to prevent."
           else
-            ok "turn3-served: refused $(printf '%s' "$REFUSED_H" | wc -l | tr -d ' ')+ manifest(s), served a DIFFERENT one — refusal plus fall-through, which is correct"
+            ok "turn3-served: $(printf '%s\n' $TAINTED_H | wc -l | tr -d ' ') manifest(s) reference the damaged block and NONE was served — the served manifest is clean of it (refcount=$TARGET_RC)"
           fi
         fi
       else
