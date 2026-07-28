@@ -1870,6 +1870,21 @@ impl BatchScheduler {
                         .filter(|len| *len > 0)
                     {
                         // DECLINE VISIBILITY (2026-07-28). Both arms must speak.
+                        //
+                        // CONTRACT, NOT DIAGNOSTICS. The two `DECLINED` INFO
+                        // lines below and in the sibling `else` are the only
+                        // way an operator can distinguish "the cold store had
+                        // nothing" from "the cold store had something and threw
+                        // it away". Removing or demoting them is a BEHAVIOUR
+                        // CHANGE, not a log cleanup, and no test will redden:
+                        // the declining CONDITION is unit-pinned (see the
+                        // `reusable_prefix_len` assertions in
+                        // scheduler_prompt_cache_tests.rs), but the EMISSION is
+                        // not, because reaching it needs a full BatchScheduler
+                        // with a cache pool and cold store. That gap is stated
+                        // rather than papered over with a test that cannot
+                        // fail. If you are touching these lines, you are the
+                        // check.
                         // The in-memory caller of `reusable_prefix_len` already
                         // logs its decline at INFO (see the `None` arm further
                         // down this function); this call site did not. That
