@@ -40,6 +40,9 @@
 #   HOST/PORT  server address (default 127.0.0.1:8890).
 #   ALIAS      model alias for the API (default minimax-m3-mxfp8).
 #   COLD_DIR   cold-store base dir (default $HOME/.cache/mlxcel/cold-storage).
+#   V4         set to 1 to exercise the v4 BLOCK cold store instead of v3
+#              (exports MLXCEL_V4_COLD_STORE=1 and retargets Phase 3's
+#              corruption at a v4 block payload). Default 0 = v3, unchanged.
 #   MAX_TOKENS per-turn generation cap (default 32).
 #   READY_TIMEOUT  seconds to wait for /v1/models (default 600).
 
@@ -52,6 +55,25 @@ COLD_DIR="${COLD_DIR:-$HOME/.cache/mlxcel/cold-storage}"
 MAX_TOKENS="${MAX_TOKENS:-32}"
 READY_TIMEOUT="${READY_TIMEOUT:-600}"
 LAUNCHER="${LAUNCHER:?set LAUNCHER to a script that starts mlxcel-server in the foreground}"
+
+# V4 MODE (2026-07-28). V4=1 runs this same three-phase regression against the
+# v4 block cold store instead of v3.
+#
+# The server side is one variable: MLXCEL_V4_COLD_STORE=1 makes the scheduler
+# install BlockColdStore in place of ColdStore for persist and load. Everything
+# downstream of the load is unchanged, which is why Phase 2's
+# "falling back to cold prefill" detection works for both stores without edits.
+#
+# The test side is the CORRUPTION TARGET: v4's on-disk layout is
+# <COLD_DIR>/v4-blocks/<root>/blocks/<hash>/ and has no `layer_*` files, so the
+# v3 search below would find nothing and Phase 3 would abort rather than
+# discriminate.
+V4="${V4:-0}"
+if [[ "$V4" == "1" ]]; then
+  export MLXCEL_V4_COLD_STORE=1
+else
+  unset MLXCEL_V4_COLD_STORE || true
+fi
 
 WORK="$(mktemp -d)"
 SERVER_LOG="$WORK/server.log"
@@ -137,10 +159,25 @@ stop_server
 
 # ---------------------------------------------------------------------------
 note "Phase 3 - DISCRIMINATION CONTROL: corrupt one byte, restore must DECLINE"
-CORRUPT_TARGET="$(find "$COLD_DIR" -type f -name 'layer_*' | head -1)"
-if [[ -z "$CORRUPT_TARGET" ]]; then
-  # v3 layout is generation-dir based; fall back to any persisted payload file.
-  CORRUPT_TARGET="$(find "$COLD_DIR" -type f ! -name 'COMMITTED' ! -name 'header.bin' | head -1)"
+if [[ "$V4" == "1" ]]; then
+  # v4: corrupt a BLOCK PAYLOAD. Deliberately NOT header.bin, manifest.bin or a
+  # .refcount sidecar — each of those is declined by a DIFFERENT guard, and a
+  # Phase 3 pass would then certify a mechanism this test does not name. The
+  # payload's per-layer SHA-256 is what must fail-close here.
+  CORRUPT_TARGET="$(find "$COLD_DIR" -path '*/blocks/*' -type f \
+      ! -name 'header.bin' ! -name 'manifest.bin' ! -name '*.refcount' \
+      ! -name 'COMMITTED' | head -1)"
+  if [[ -z "$CORRUPT_TARGET" ]]; then
+    fail "Phase 3 (V4): no block payload under $COLD_DIR. Either persist did not \
+run through v4 (is MLXCEL_V4_COLD_STORE=1 reaching the server?), or the layout \
+moved. Aborting rather than corrupting an unknown file."
+  fi
+else
+  CORRUPT_TARGET="$(find "$COLD_DIR" -type f -name 'layer_*' | head -1)"
+  if [[ -z "$CORRUPT_TARGET" ]]; then
+    # v3 layout is generation-dir based; fall back to any persisted payload file.
+    CORRUPT_TARGET="$(find "$COLD_DIR" -type f ! -name 'COMMITTED' ! -name 'header.bin' | head -1)"
+  fi
 fi
 if [[ -z "$CORRUPT_TARGET" ]]; then
   fail "Phase 3: could not find a cold-store payload file to corrupt"

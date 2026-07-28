@@ -43,6 +43,8 @@ ALIAS="${MLXCEL_ALIAS:-minimax-m3}"               # cosmetic client-addressing l
 KV_CACHE_MODE="${MLXCEL_KV_CACHE_MODE:-k8v4}"     # fp16 | kvarn8 | k8v4  (k8v4 = 8-bit K / 4-bit V; DEFAULT for live Kindled serving. Retrieval-validated == fp16 on 2026-07-13 semantic-at-depth test — quant adds ZERO retrieval loss, MSA coverage sets the fidelity floor, not the quant. See VERDICT_k8v4_MSA_20260713.md. kvarn8 = prior boot-night default (8-bit V); fp16 = lossless control)
 THINKING_MODE="${MLXCEL_THINKING_MODE:-adaptive}" # disabled | adaptive | enabled  (adaptive = normal serving)
 
+MLXCEL_V4_COLD_STORE="${MLXCEL_V4_COLD_STORE:-1}" # enable incremental block cold-storage 
+
 export MLXCEL_CLAUDE_CODE_PROMPT_NORMALIZATION="${MLXCEL_CLAUDE_CODE_PROMPT_NORMALIZATION:-stable-prefix-v1}"
 
 ####
