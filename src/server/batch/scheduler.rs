@@ -1843,6 +1843,18 @@ impl BatchScheduler {
         // KVarN8 — and `persist` refused every one of them, so v4 stored
         // nothing at all until the address was widened.
         let cold_result = if !cold_identity_supported {
+            // FOURTH SILENT PATH, found while auditing the other three. The
+            // cold store is not probed AT ALL here, and this emitted nothing —
+            // so a multimodal or LoRA request produced the same console
+            // signature as a cold-store miss, a silent decline, and a genuine
+            // absence of any store. Four causes, one appearance.
+            if self.block_cold_store.is_some() || self.cold_store.is_some() {
+                tracing::info!(
+                    has_mm = ctx.mm_digest != MultimodalDigest::empty(),
+                    has_lora = ctx.lora_id.is_some(),
+                    "prompt-cache: cold store NOT PROBED — request identity is out of scope (multimodal or LoRA)"
+                );
+            }
             None
         } else if let Some(bs) = &self.block_cold_store {
             let plan = self.kv_layer_plan();
