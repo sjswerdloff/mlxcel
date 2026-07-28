@@ -236,15 +236,33 @@ adoption_count() {  # $1 = pattern; echoes ONE integer, or -1 if no log
 # cannot report on the store until it can first report on itself.
 verify_log_instrument() {
   [[ -z "${LOG:-}" ]] && return 0   # already reported UNVERIFIED downstream
-  local pos neg
-  pos="$(adoption_count 'v4 block written')"
+  local pos neg pat
+  # THE CONTROL PATTERN MUST BE GUARANTEED PRESENT BY THE SETUP, NOT BY THE
+  # BEHAVIOUR UNDER TEST.
+  #
+  # This used to be 'v4 block written' — a line that only exists AFTER a
+  # persist has happened in THIS log. On a freshly started server the log has
+  # no such line, so the control failed and the probe refused to report, on a
+  # run where the counter was working perfectly (2026-07-28 23:26). A control
+  # whose expected answer depends on the thing being measured is not a
+  # control; it conflates "the instrument is blind" with "the run is young".
+  #
+  # A startup banner is emitted before any request and proves three things at
+  # once: the file is readable, it is THIS server's log, and (for v4) that the
+  # store under test is actually enabled.
+  if [[ "$V4" == "1" ]]; then
+    pat='v4 block cold store ENABLED'
+  else
+    pat='Cold-storage enabled for KV cache SSD persistence'
+  fi
+  pos="$(adoption_count "$pat")"
   neg="$(adoption_count 'zzz_pattern_that_must_never_appear_zzz')"
   if [[ "$pos" == "-1" ]]; then
     bad "instrument: LOG is set but unreadable — every count below is meaningless"
     return 1
   fi
   if (( pos <= 0 )); then
-    bad "instrument: POSITIVE CONTROL FAILED — '$LOG' contains no 'v4 block written' lines, so this counter is BLIND. Every zero below means 'observed nothing', NOT 'nothing happened'. Do not read any store finding from this run."
+    bad "instrument: POSITIVE CONTROL FAILED — '$LOG' contains no '$pat' line. Either it is not this server's log, or the store under test was never enabled. Every zero below means 'observed nothing', NOT 'nothing happened'. Do not read any store finding from this run."
     return 1
   fi
   if (( neg != 0 )); then
