@@ -6182,8 +6182,25 @@ mod tests {
     // nothing. Exclude the defining file BY PATH, not by substring.
     //
     // → 5 production hits today: scheduler.rs (×2), model_worker.rs,
-    //   model_provider.rs (×2). The scheduler's `load_prefix` call site
-    //   resolves to v3 (`cold_store::ColdStoreError` on its error arm).
+    //   model_provider.rs (×2).
+    //
+    // ⚠️ CORRECTED 2026-07-29 by Clement. This used to read "The scheduler's
+    // `load_prefix` call site resolves to v3" — singular, unqualified, and it
+    // contradicted the paragraph 25 lines above stating that v4 REPLACES v3
+    // when enabled. There is no single call site: `scheduler.rs` 1926-1933 is a
+    // FORK, and which arm runs is a runtime property, not a source fact.
+    //
+    //     block_cold_store.is_some()  -> 1928, v4's 4-arg `load_prefix`
+    //                                    (takes `&plan`; BlockColdStoreError)
+    //     otherwise                   -> 1932, v3's 3-arg `load_prefix`
+    //                                    (`cold_store::ColdStoreError`)
+    //
+    // Default config takes the v3 arm, so the old sentence was true of the
+    // default and false under `MLXCEL_V4_COLD_STORE=1` — the configuration
+    // whose coverage is actually in question. A reader who trusts it concludes
+    // the scheduler never touches v4 and stops looking for the v4 scheduler
+    // seam, which is the coverage gap named as still-unmet directly below.
+    // The arity is the tell: 4 args means v4, 3 means v3.
     //
     // CORRECTED 2026-07-28 by Violet. The original said "ZERO references
     // ... (verified by type-name grep)". That grep returned empty when I ran
