@@ -310,12 +310,32 @@ pub(crate) fn adoption_leaves_token_for_logits(adopted_len: usize, request_len: 
 ///
 /// Alden, 2026-07-29: match length alone cannot encode these states, and the
 /// previous code inferred "the SSD missed" from `ssd_match_len == 0`. That is
-/// false for every path where a candidate was LOADED and then discarded — the
-/// request still fell through to an aggregate line asserting that no entry
-/// shares any prefix under this key. Making the decline visible did not stop
-/// the contradictory assertion; only carrying the outcome does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ColdProbeOutcome {
+/// false for every path where a candidate was LOADED and then discarded.
+///
+/// ENUM AND VARIANT LIST COME FROM ONE SOURCE. An earlier version kept a
+/// hand-written `const ALL`, then a successor chain; Alden defeated both. The
+/// chain only forced each variant to be HANDLED, not to be REACHABLE — adding
+/// `TempEighth => None` beside `AdoptFailed => None` compiles, and `all()`
+/// silently keeps walking the original seven. Handled is not reached; that is
+/// the same evidence-versus-reach gap for the third time. With the macro there
+/// is no independent topology to wire, because the variant appears exactly
+/// once in the source text and both products are generated from it.
+macro_rules! cold_probe_outcomes {
+    ($($(#[$m:meta])* $v:ident),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum ColdProbeOutcome { $($(#[$m])* $v),+ }
+
+        #[cfg(test)]
+        impl ColdProbeOutcome {
+            /// Every variant, GENERATED from the same list that defines them.
+            /// Test-only: production never enumerates outcomes.
+            pub(crate) const ALL: &'static [ColdProbeOutcome] =
+                &[$(ColdProbeOutcome::$v),+];
+        }
+    };
+}
+
+cold_probe_outcomes! {
     /// Store absent, or request identity out of scope (multimodal / LoRA).
     NotProbed,
     /// Probed, and genuinely nothing shares a prefix.
@@ -326,51 +346,13 @@ pub(crate) enum ColdProbeOutcome {
     LoadedDeclined,
     /// Probe returned an error other than NoMatch.
     LoadFailed,
-    /// Loaded and structurally usable, BUT the memory-vs-SSD comparison has
-    /// not run yet. Alden, 2026-07-29: this was previously called `Selected`
-    /// and assigned here, so a candidate that LOST to an equal-or-longer
-    /// memory match still reported `Selected` — the enum contradicting its own
-    /// doc. It could not reach the aggregate fallback in that case, so nothing
-    /// was wrong today; it would have been wrong for the next reader.
+    /// Loaded and structurally usable, but the memory-vs-SSD comparison has
+    /// not run yet. Not a winner, and not an absence.
     LoadedUsable,
     /// Won the comparison against the in-memory tier and will be adopted.
     Selected,
     /// Selected, but `cache_pool.adopt` failed.
     AdoptFailed,
-}
-
-impl ColdProbeOutcome {
-    /// Successor chain, so the variant list has ONE definition instead of two.
-    ///
-    /// Alden, 2026-07-29: a hand-maintained `const ALL: [_; 7]` in the test
-    /// would still COMPILE if an eighth variant were added and not listed,
-    /// silently making the decision table non-exhaustive again — the same
-    /// shape as a sampled table, one level up. A separate list is a thing to
-    /// forget.
-    ///
-    /// Adding a variant makes this match non-exhaustive: COMPILE ERROR, at the
-    /// exact place where you must decide where it belongs. The test iterates
-    /// this chain, so there is no second list to drift from the enum.
-    pub(crate) fn next_variant(self) -> Option<Self> {
-        use ColdProbeOutcome as O;
-        match self {
-            O::NotProbed => Some(O::NoMatch),
-            O::NoMatch => Some(O::LoadedDeclined),
-            O::LoadedDeclined => Some(O::LoadFailed),
-            O::LoadFailed => Some(O::LoadedUsable),
-            O::LoadedUsable => Some(O::Selected),
-            O::Selected => Some(O::AdoptFailed),
-            O::AdoptFailed => None,
-        }
-    }
-    /// Every variant, derived from the chain above.
-    pub(crate) fn all() -> Vec<Self> {
-        let mut v = vec![ColdProbeOutcome::NotProbed];
-        while let Some(n) = v[v.len() - 1].next_variant() {
-            v.push(n);
-        }
-        v
-    }
 }
 
 /// May the aggregate "both tiers MISS (no entry shares any prefix)" line be

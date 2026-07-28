@@ -1373,11 +1373,12 @@ fn hash_tokens_differs_for_different_inputs() {
 fn dual_miss_claim_requires_both_tiers_to_support_it() {
     use super::scheduler::{dual_miss_claim_is_truthful as ok, ColdProbeOutcome as O};
 
-    // Derived from the enum's own successor chain, NOT a second list. Adding a
-    // variant is a compile error there, so this table cannot silently
-    // un-exhaust itself (Alden, 2026-07-29).
-    let all = O::all();
-    assert!(all.len() >= 7, "variant enumeration collapsed: {}", all.len());
+    // GENERATED from the same macro list that defines the variants, so there
+    // is no independent topology to wire and no second list to forget. The
+    // assertion is EXACT, not `>= 7`: a loose bound cannot detect an omission,
+    // which is what let the previous version pass while missing a variant.
+    let all = O::ALL;
+    assert_eq!(all.len(), 7, "variant count changed; update this table deliberately");
 
     for mem_missed in [true, false] {
         for o in all.iter().copied() {
