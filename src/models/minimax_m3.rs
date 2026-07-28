@@ -6157,6 +6157,171 @@ mod tests {
     }
 
     // ================================================================
+    // G1.3 — THE SUBSTITUTION THE WIRING ACTUALLY MAKES
+    // ================================================================
+    //
+    // SCOPE, AND WHY IT IS NOT "LOGIT EQUIVALENCE". A true end-to-end
+    // scheduler/logit test needs a real `LoadedModel` and the server binary;
+    // `scheduler_prompt_cache_tests.rs` states that boundary for this repo and
+    // it predates me. What IS testable in `cargo test --lib`, and what the
+    // 2026-07-28 wiring actually risks, is the SUBSTITUTION: when
+    // `MLXCEL_V4_COLD_STORE=1` installs v4, the scheduler must get back the
+    // same adopted prefix it would have got from v3.
+    //
+    // That is the whole behavioural claim of the wiring, and nothing tested it.
+
+    /// v4 hands the scheduler what v3 hands it — same call shape, same result.
+    ///
+    /// Three arms from ONE deterministic source forward:
+    ///   REF — continuous cache, never detached
+    ///   V3  — persist/drop/reload through `cache::cold_store::ColdStore`
+    ///   V4  — persist/drop/reload through `BlockColdStore`
+    ///
+    /// V3 vs V4 is the substitution claim and the reason this test exists. Each
+    /// against REF corroborates that neither path is quietly degrading.
+    ///
+    /// Both stores are DROPPED before their reload: v3's writer is a background
+    /// thread and `Drop` joins it, so dropping is also the flush.
+    #[test]
+    fn g1_3_v4_hands_the_scheduler_the_same_prefix_as_v3() {
+        use mlxcel_core::cache::block_cold_store::BlockColdStore;
+        use mlxcel_core::cache::cold_store::ColdStore;
+        use mlxcel_core::cache::{
+            DetachedCacheSet, KVCacheMode, SequenceId, SequenceStateBackend,
+        };
+
+        let mut attn = make_test_sparse_attention();
+        let hidden = 16;
+        attn.block_size = 128;
+        let l_chunk: i32 = 128;
+        let n_chunks: i32 = 4;
+        let split: i32 = 2;
+        let prefix_len = l_chunk * split;
+        let input = make_test_input(1, l_chunk * n_chunks, hidden);
+        let chunk = |i: i32| {
+            mlxcel_core::slice(&input, &[0, i * l_chunk, 0], &[1, (i + 1) * l_chunk, hidden])
+        };
+
+        // Deterministic source: same forward, so both stores receive
+        // byte-identical state and any divergence is the store's.
+        let detach_prefix = |attn: &mut SparseAttention| {
+            let mut src = KVCache::new();
+            let mut outs: Vec<UniquePtr<MlxArray>> = Vec::new();
+            for i in 0..split {
+                outs.push(attn.forward(&chunk(i), &mut src, None));
+            }
+            let now = std::time::Instant::now();
+            (
+                DetachedCacheSet {
+                    caches: vec![src.clone_handle()],
+                    backend: SequenceStateBackend::DenseKvCache,
+                    prompt_len: prefix_len as usize,
+                    current_offset: prefix_len,
+                    created_at: now,
+                    detached_at: now,
+                    origin_seq_id: SequenceId::from_raw(1),
+                },
+                outs,
+            )
+        };
+        let tokens: Vec<i32> = (0..prefix_len).collect();
+
+        // ---- REF ---------------------------------------------------------
+        let mut cache_ref = KVCache::new();
+        let mut outs_ref: Vec<UniquePtr<MlxArray>> = Vec::new();
+        for i in 0..n_chunks {
+            outs_ref.push(attn.forward(&chunk(i), &mut cache_ref, None));
+        }
+
+        // ---- V3 ----------------------------------------------------------
+        let (set_v3, mut outs_v3) = detach_prefix(&mut attn);
+        let dir_v3 = tempfile::TempDir::new().expect("tempdir v3");
+        {
+            let store = ColdStore::with_base_dir(dir_v3.path().to_path_buf(), "g13-model");
+            store
+                .persist("g13", "tmpl", &tokens, &set_v3)
+                .expect("v3 persist");
+            // Dropped here: Drop -> shutdown -> joins the writer thread, which
+            // is the flush. Loading before this would race the writer.
+        }
+        let store_v3 = ColdStore::with_base_dir(dir_v3.path().to_path_buf(), "g13-model");
+        let (loaded_v3, matched_v3) = store_v3
+            .load_prefix("g13", "tmpl", &tokens)
+            .expect("v3 must return the candidate it just persisted");
+        let mut cache_v3 = KVCache::new();
+        cache_v3
+            .install_detached(loaded_v3.caches.into_iter().next().expect("v3 cache"))
+            .expect("v3 adoption");
+        for i in split..n_chunks {
+            outs_v3.push(attn.forward(&chunk(i), &mut cache_v3, None));
+        }
+
+        // ---- V4, called with the SCHEDULER'S argument shape ---------------
+        // `kv_mode` / `v_bits` are exactly what `scheduler.rs` now passes from
+        // `self.kv_cache_mode` / `self.kvarn_v_bits`. Hardcoding different
+        // values here would test a call the scheduler never makes.
+        let (set_v4, mut outs_v4) = detach_prefix(&mut attn);
+        let dir_v4 = tempfile::TempDir::new().expect("tempdir v4");
+        {
+            let store = BlockColdStore::new(dir_v4.path().to_path_buf(), [13u8; 32]);
+            store
+                .persist("g13", "tmpl", &tokens, &set_v4)
+                .expect("v4 persist");
+        }
+        let store_v4 = BlockColdStore::new(dir_v4.path().to_path_buf(), [13u8; 32]);
+        let (loaded_v4, matched_v4) = store_v4
+            .load_prefix("g13", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+            .expect("v4 must return the candidate it just persisted");
+        let mut cache_v4 = KVCache::new();
+        cache_v4
+            .install_detached(loaded_v4.caches.into_iter().next().expect("v4 cache"))
+            .expect("v4 adoption");
+        for i in split..n_chunks {
+            outs_v4.push(attn.forward(&chunk(i), &mut cache_v4, None));
+        }
+
+        // ---- THE SUBSTITUTION CLAIM --------------------------------------
+        assert_eq!(
+            matched_v3, matched_v4,
+            "v3 and v4 reported DIFFERENT matched prefix lengths for identical \
+             tokens and identical persisted state. The scheduler uses this number \
+             to decide how much prefill to skip, so a mismatch means swapping the \
+             store silently changes how much of the prompt is recomputed."
+        );
+        assert_eq!(
+            matched_v4, prefix_len as usize,
+            "precondition: the full persisted prefix must match, or both arms are \
+             agreeing on a partial hit and the comparison is weaker than it looks"
+        );
+
+        let cat_ref = concat_outs(&outs_ref);
+        let cat_v3 = concat_outs(&outs_v3);
+        let cat_v4 = concat_outs(&outs_v4);
+
+        assert!(
+            arrays_bit_identical(&cat_v3, &cat_v4),
+            "V3 vs V4: substituting the cold store changed the computation. This \
+             is the exact swap `MLXCEL_V4_COLD_STORE=1` performs in the scheduler, \
+             so a difference here is a difference a served request would see. \
+             relative L2 = {}",
+            output_l2_diff(&cat_v3, &cat_v4) / l2_norm(&cat_v3).max(1e-6)
+        );
+        assert!(
+            arrays_bit_identical(&cat_ref, &cat_v4),
+            "REF vs V4: adoption through v4 diverged from a continuous cache. \
+             relative L2 = {}",
+            output_l2_diff(&cat_ref, &cat_v4) / l2_norm(&cat_ref).max(1e-6)
+        );
+        assert!(
+            arrays_bit_identical(&cat_ref, &cat_v3),
+            "REF vs V3: the INCUMBENT path diverged from a continuous cache. If \
+             this is the only red, the fault is not in the v4 wiring. \
+             relative L2 = {}",
+            output_l2_diff(&cat_ref, &cat_v3) / l2_norm(&cat_ref).max(1e-6)
+        );
+    }
+
+    // ================================================================
     // G1.5 — GC INTEGRATION: a sweep against a REAL persisted cache
     // ================================================================
     //
