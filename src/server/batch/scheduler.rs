@@ -326,7 +326,14 @@ pub(crate) enum ColdProbeOutcome {
     LoadedDeclined,
     /// Probe returned an error other than NoMatch.
     LoadFailed,
-    /// Candidate selected as the winner over memory.
+    /// Loaded and structurally usable, BUT the memory-vs-SSD comparison has
+    /// not run yet. Alden, 2026-07-29: this was previously called `Selected`
+    /// and assigned here, so a candidate that LOST to an equal-or-longer
+    /// memory match still reported `Selected` — the enum contradicting its own
+    /// doc. It could not reach the aggregate fallback in that case, so nothing
+    /// was wrong today; it would have been wrong for the next reader.
+    LoadedUsable,
+    /// Won the comparison against the in-memory tier and will be adopted.
     Selected,
     /// Selected, but `cache_pool.adopt` failed.
     AdoptFailed,
@@ -337,7 +344,8 @@ pub(crate) enum ColdProbeOutcome {
 ///
 /// ONLY when memory genuinely missed AND the SSD tier genuinely found nothing.
 /// `NotProbed` is excluded deliberately: a tier that was never consulted cannot
-/// support a claim about what it contains.
+/// support a claim about what it contains. `LoadedUsable` is likewise excluded:
+/// a candidate that loaded and then lost the comparison is not an absence.
 ///
 /// Pure so it can be pinned by unit tests without constructing a scheduler —
 /// which is the seam Alden identified when he refused the untested-emission
@@ -1979,7 +1987,7 @@ impl BatchScheduler {
                                     );
                                     ssd_match_len = match_len;
                                     ssd_detached = Some(detached);
-                                    ssd_outcome = ColdProbeOutcome::Selected;
+                                    ssd_outcome = ColdProbeOutcome::LoadedUsable;
                                 }
                             }
                             None => {
@@ -2045,6 +2053,7 @@ impl BatchScheduler {
                 alignment,
                 "prompt-cache: SSD cold-store has longer match — using SSD over memory"
             );
+            ssd_outcome = ColdProbeOutcome::Selected;
             let detached = ssd_detached.unwrap();
             match self
                 .cache_pool

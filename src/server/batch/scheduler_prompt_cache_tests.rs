@@ -1363,32 +1363,39 @@ fn hash_tokens_differs_for_different_inputs() {
 // candidate and then discarded it.
 // ---------------------------------------------------------------------------
 
-/// The claim requires memory to have missed AND the SSD to have genuinely
-/// found nothing. Every other outcome must forbid it.
+/// EXHAUSTIVE over the whole decision table. Alden, 2026-07-29: 2 booleans x
+/// the outcome set is small enough to enumerate, and my first version sampled
+/// it — the `mem_missed == false` arm omitted `Selected` and `AdoptFailed`, so
+/// two of fourteen combinations were unpinned. A table small enough to
+/// enumerate should never be sampled; sampling leaves holes whose absence
+/// nothing reports.
 #[test]
 fn dual_miss_claim_requires_both_tiers_to_support_it() {
     use super::scheduler::{dual_miss_claim_is_truthful as ok, ColdProbeOutcome as O};
 
-    // The ONLY combination that licenses the claim.
-    assert!(ok(true, O::NoMatch), "genuine dual miss must be sayable");
+    const ALL: [O; 7] = [
+        O::NotProbed, O::NoMatch, O::LoadedDeclined,
+        O::LoadFailed, O::LoadedUsable, O::Selected, O::AdoptFailed,
+    ];
 
-    // THE REGRESSION: a loaded-then-discarded candidate is NOT a miss.
+    for mem_missed in [true, false] {
+        for o in ALL {
+            // The claim is licensed by EXACTLY ONE of the fourteen combinations.
+            let expected = mem_missed && o == O::NoMatch;
+            assert_eq!(
+                ok(mem_missed, o), expected,
+                "mem_missed={mem_missed} outcome={o:?}: the aggregate \
+                 'no entry shares any prefix' claim must be {}",
+                if expected { "licensed" } else { "forbidden" }
+            );
+        }
+    }
+
+    // Named explicitly because it is THE regression: a loaded-then-discarded
+    // candidate is not a miss, and the aggregate asserted it was.
     assert!(
         !ok(true, O::LoadedDeclined),
         "DECLINED must never co-occur with the dual-miss claim — the SSD tier \
          had a candidate and threw it away, so 'nothing shares any prefix' is false"
     );
-
-    // A tier never consulted cannot support a claim about what it contains.
-    assert!(!ok(true, O::NotProbed), "an unprobed tier cannot support a miss claim");
-
-    // Remaining outcomes all imply the SSD had something or errored.
-    for o in [O::LoadFailed, O::Selected, O::AdoptFailed] {
-        assert!(!ok(true, o), "{o:?} must not license the dual-miss claim");
-    }
-
-    // And memory hitting forbids it regardless of the SSD.
-    for o in [O::NoMatch, O::NotProbed, O::LoadedDeclined, O::LoadFailed] {
-        assert!(!ok(false, o), "memory hit must forbid the claim ({o:?})");
-    }
 }
