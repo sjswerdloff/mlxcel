@@ -1928,6 +1928,27 @@ impl BatchScheduler {
                 .adopt(&self.model as &dyn crate::generate::LanguageModel, detached)
             {
                 Ok(seq_id) => {
+                    // ADOPTION-SUCCESS WITNESS (Alden, 2026-07-28). The INFO
+                    // line above is emitted BEFORE `adopt`, so it witnesses
+                    // candidate SELECTION only — an operator or probe that
+                    // required it would be certifying a decision, not an
+                    // outcome. This branch previously logged nothing at all,
+                    // which left adoption success observable only as the
+                    // ABSENCE of the `adopt failed` warning, and absence of a
+                    // signal is not evidence.
+                    //
+                    // With this line the cold path has four distinguishable
+                    // states on the console: lookup miss ("both tiers MISS"),
+                    // candidate selection ("has longer match"), adoption
+                    // SUCCESS (here), and refusal ("SSD cold-store probe
+                    // failed"). A live probe can tell them apart; without it,
+                    // a coherent answer proves nothing, because a plain
+                    // re-prefill produces exactly the same output.
+                    tracing::info!(
+                        seq_id = ?seq_id,
+                        adopted_tokens = ssd_match_len,
+                        "prompt-cache: SSD cold-store ADOPTED — state installed"
+                    );
                     self.batch_observability
                         .record_prompt_cache_hit(ssd_match_len);
                     return Some((seq_id, ssd_match_len));

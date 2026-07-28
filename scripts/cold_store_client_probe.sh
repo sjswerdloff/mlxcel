@@ -41,8 +41,30 @@
 #   ALIAS       model alias (default minimax-m3-mxfp8)
 #   COLD_DIR    cold-store base (default $HOME/.cache/mlxcel/cold-storage)
 #   V4          1 = expect/inspect the v4 block layout under $COLD_DIR/v4-blocks
-#   MAX_TOKENS  per-turn cap (default 32)
+#   MAX_TOKENS  per-turn cap (default 1024)
 #   NO_CORRUPT  1 = skip step 3 (leaves the store untouched; see warning above)
+#
+# ⚠️ COHERENCE IS JUDGED ON THE WHOLE DECODE (reasoning + answer), NOT ON THE
+# ANSWER FIELD ALONE — and that is a correctness property, not a convenience.
+#
+# The original version read `content` only, with MAX_TOKENS=32. Against
+# MiniMax-M3 under thinking_mode=adaptive the reasoning block consumed the
+# entire budget, every turn returned zero content characters with
+# finish_reason=length, and step 3 duly reported "the store adopted data it
+# could not verify" — A SAFETY FINDING THAT WAS ENTIRELY THIS SCRIPT'S OWN
+# MEASUREMENT ERROR. Measured 2026-07-28:
+#   max_tokens=32    -> content 0,    reasoning 146,  finish=length
+#   max_tokens=2048  -> content 0,    reasoning 9711, finish=length  (long prompt)
+#   max_tokens=2048  -> content 870,  reasoning 433,  finish=stop    (short prompt)
+#
+# Note the middle row: RAISING THE BUDGET DID NOT FIX IT. Chasing the budget
+# was chasing the wrong variable. A corrupted KV prefix produces degenerate
+# tokens everywhere — the reasoning block comes out of the same forward pass as
+# the answer — so lucid reasoning is exactly as good evidence of a sane decode.
+# The instrument was looking at the wrong field.
+#
+# An empty or truncated ANSWER is therefore not a store finding in either
+# direction, and the script says so on stderr rather than scoring it.
 
 set -uo pipefail
 
@@ -50,8 +72,8 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8890}"
 ALIAS="${ALIAS:-minimax-m3-mxfp8}"
 COLD_DIR="${COLD_DIR:-$HOME/.cache/mlxcel/cold-storage}"
-MAX_TOKENS="${MAX_TOKENS:-32}"
-V4="${V4:-0}"
+MAX_TOKENS="${MAX_TOKENS:-1024}"
+V4="${V4:-1}"
 NO_CORRUPT="${NO_CORRUPT:-0}"
 BASE="http://${HOST}:${PORT}"
 
@@ -95,7 +117,32 @@ req = urllib.request.Request(
 try:
     with urllib.request.urlopen(req, timeout=600) as r:
         d = json.load(r)
-    print(d["choices"][0]["message"]["content"])
+    choice = d["choices"][0]
+    msg = choice["message"]
+    content = msg.get("content") or ""
+    reasoning = msg.get("reasoning_content") or ""
+
+    # JUDGE THE WHOLE DECODE, not just the answer field.
+    #
+    # What this probe needs to know is whether adoption corrupted the
+    # conversation. A corrupted KV prefix produces degenerate tokens
+    # EVERYWHERE — the reasoning block is decoded by the same forward pass as
+    # the answer, so 9k characters of lucid reasoning is exactly as good
+    # evidence of a sane decode as an answer is.
+    #
+    # Reading `content` alone made a thinking model look broken whenever its
+    # reasoning consumed the budget: on 2026-07-28 that produced a FABRICATED
+    # "the store adopted data it could not verify" verdict, and raising
+    # max_tokens to 2048 did not fix it (this prompt draws ~9.7k chars of
+    # reasoning). The bug was never the budget — it was measuring the wrong
+    # field and then inflating the budget to chase it.
+    text = (reasoning + "\n" + content) if reasoning else content
+    if not content and choice.get("finish_reason") == "length":
+        sys.stderr.write(
+            f"note: answer truncated by max_tokens={maxtok} "
+            f"(reasoning={len(reasoning)} chars). Coherence is judged on the "
+            f"full decode, so this is not a store finding either way.\n")
+    print(text)
 except Exception as e:  # noqa: BLE001 - surfaced to the caller as empty output
     print("", end="")
     sys.stderr.write(f"request failed: {e}\n")
@@ -118,6 +165,48 @@ coherent() {
   fi
   ok "$label: coherent (${n} chars)"
   return 0
+}
+
+# --- adoption witness ---------------------------------------------------
+#
+# WITHOUT THIS, STEPS 2 AND 3 CERTIFY NOTHING. A coherent answer after a
+# hot-cache reset is produced just as happily by a plain re-prefill as by a
+# successful cold adoption, and a coherent answer after corrupting a block is
+# produced just as happily by never loading the block at all as by a checksum
+# declining it. Both greens are compatible with the cold store being entirely
+# uninvolved.
+#
+# That is not hypothetical. On 2026-07-28 this script printed ALL CHECKS PASSED
+# while the server log contained ZERO adoption lines across 16 blocks and 13
+# manifests written — steps 2 and 3 had exercised nothing.
+#
+# The server's own log is the only place that distinguishes them:
+#   "SSD cold-store has longer match"  -> a cold prefix was ADOPTED
+#   "SSD cold-store probe failed"      -> a candidate was DECLINED (fail-closed)
+#   "prompt-cache: SSD cold-store probe MISS" -> nothing matched (DEBUG level,
+#                                                invisible at default INFO)
+#
+# Point LOG at the server log to make steps 2 and 3 discriminating. Without it
+# they are reported as UNVERIFIED rather than passed, because "I could not
+# check" must never render as "it worked".
+adoption_count() {  # $1 = pattern; echoes a count, 0 if no log configured
+  [[ -z "${LOG:-}" || ! -r "${LOG:-}" ]] && { echo -1; return; }
+  grep -ac "$1" "$LOG" 2>/dev/null || echo 0
+}
+
+require_adoption_since() {  # $1 label, $2 baseline count, $3 pattern, $4 meaning
+  local label="$1" before="$2" pat="$3" meaning="$4" after
+  after="$(adoption_count "$pat")"
+  if [[ "$before" == "-1" || "$after" == "-1" ]]; then
+    bad "$label: UNVERIFIED — no readable server log (set LOG=/path/to/server.log). Without it a green here is compatible with the cold store never being consulted, so this is NOT reported as a pass."
+    return 1
+  fi
+  if (( after > before )); then
+    ok "$label: witnessed in the server log — $meaning ($((after - before)) new)"
+    return 0
+  fi
+  bad "$label: NO log evidence that $meaning. The answer was coherent, but coherence is also what a plain re-prefill produces — the cold store was very likely never consulted, so this step checked nothing."
+  return 1
 }
 
 reset_hot_cache() {
@@ -154,9 +243,18 @@ fi
 
 # --- 2. SURVIVE A HOT-CACHE RESET ------------------------------------------
 note "2/3 SURVIVE — reset the hot cache, then re-ask the SAME prefix"
+# The SUCCESS witness, not the selection one. "SSD cold-store has longer match"
+# is emitted BEFORE cache_pool.adopt, so requiring it would certify that a
+# candidate was CHOSEN, not that state was installed (Alden, 2026-07-28).
+ADOPT_BEFORE="$(adoption_count 'SSD cold-store ADOPTED')"
 reset_hot_cache && {
   timed_chat "turn2" "$LONG_PROMPT What are the flying buttresses for?"
   coherent "turn2-after-reset" "$REPLY_TEXT"
+  # The coherence check above is necessary and NOT sufficient — see the
+  # adoption-witness block. This is the half that makes the step mean anything.
+  require_adoption_since "turn2-adoption" "$ADOPT_BEFORE" \
+    'SSD cold-store ADOPTED' \
+    "a cold prefix was actually ADOPTED and installed, not merely selected"
 }
 
 # --- 3. FAIL-CLOSED ---------------------------------------------------------
@@ -190,10 +288,33 @@ i = min(64, len(b) - 1)
 b[i] ^= 0xFF
 open(p, 'wb').write(b)
 PY
+    DECLINE_BEFORE="$(adoption_count 'SSD cold-store probe failed')"
+    # Also baselined: the corrupted request must NOT produce an adoption
+    # success. Requiring the decline alone would still pass if the store both
+    # declined one candidate AND adopted another.
+    CORRUPT_ADOPT_BEFORE="$(adoption_count 'SSD cold-store ADOPTED')"
     reset_hot_cache && {
       timed_chat "turn3" "$LONG_PROMPT What about the colored glass windows?"
       if coherent "turn3-corrupt" "$REPLY_TEXT"; then
-        ok "corrupt entry did not produce garbage — store declined it and re-prefilled (fail-closed)"
+        # NOT a pass on its own. Coherent output here is produced equally by
+        # "the checksum declined the damaged block" and by "the block was
+        # never loaded at all" — and on 2026-07-28 it was the latter, with the
+        # script reporting fail-closed anyway. The log is what separates them.
+        require_adoption_since "turn3-declined" "$DECLINE_BEFORE" \
+          'SSD cold-store probe failed' \
+          "the store DECLINED the damaged entry (fail-closed) rather than never reading it"
+        # AND it must not have adopted anything on this request. A decline plus
+        # an adoption would mean it refused one candidate and installed
+        # another — fail-closed for the wrong reason, and not what this step
+        # claims to have shown.
+        CORRUPT_ADOPT_AFTER="$(adoption_count 'SSD cold-store ADOPTED')"
+        if [[ "$CORRUPT_ADOPT_BEFORE" == "-1" ]]; then
+          : # already reported UNVERIFIED above; do not double-count
+        elif (( CORRUPT_ADOPT_AFTER > CORRUPT_ADOPT_BEFORE )); then
+          bad "turn3-no-adopt: the store ADOPTED state on the corrupted request ($((CORRUPT_ADOPT_AFTER - CORRUPT_ADOPT_BEFORE)) new). A decline alongside an adoption is not the fail-closed behaviour this step claims."
+        else
+          ok "turn3-no-adopt: no adoption witness on the corrupted request — the refusal was the outcome, not a detour"
+        fi
       else
         bad "DEGENERATE OUTPUT after corrupting a payload. The store adopted data it could not verify. This is the defect the checksums exist to prevent."
       fi
