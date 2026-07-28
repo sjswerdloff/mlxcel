@@ -269,7 +269,33 @@ verify_log_instrument() {
     bad "instrument: NEGATIVE CONTROL FAILED — a pattern that cannot exist matched $neg times; the matcher is over-matching and every count is inflated."
     return 1
   fi
-  ok "instrument: log is readable and discriminating (positive control $pos, negative control $neg)"
+
+  # LIVENESS CONTROL (Violet, 2026-07-28). The banner proves the file is
+  # readable, is a mlxcel log, and had the store enabled. It does NOT prove it
+  # belongs to the server we are TALKING TO: a previous run's file carries its
+  # own banner and satisfies the check perfectly, so every count afterwards is
+  # confidently about a process that no longer exists. The launch harness names
+  # logs with a per-launch timestamp, so this is not an append hazard — it is a
+  # WRONG-FILE hazard, and picking the newest log by mtime (which is how this
+  # path is usually obtained) does not rule it out.
+  #
+  # Settle it by making the server write: send a minimal request and require
+  # THIS file to grow. That is the one check that distinguishes "a log" from
+  # "the log of the process answering on $BASE".
+  local before after
+  before="$(wc -l < "$LOG" 2>/dev/null || echo 0)"
+  curl -sf --max-time 30 -X POST "$BASE/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$ALIAS\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" \
+    >/dev/null 2>&1
+  sleep 1
+  after="$(wc -l < "$LOG" 2>/dev/null || echo 0)"
+  if (( after <= before )); then
+    bad "instrument: LIVENESS CONTROL FAILED — a request to $BASE did not grow '$LOG' ($before -> $after). This file is not the log of the server under test (stale path, or the server logs elsewhere). Every count below would describe a different process."
+    return 1
+  fi
+
+  ok "instrument: log is readable, discriminating, and LIVE (positive $pos, negative $neg, grew $before->$after on a probe request)"
   return 0
 }
 
@@ -372,11 +398,39 @@ i = min(64, len(b) - 1)
 b[i] ^= 0xFF
 open(p, 'wb').write(b)
 PY
-    DECLINE_BEFORE="$(adoption_count 'SSD cold-store probe failed')"
-    # Also baselined: the corrupted request must NOT produce an adoption
-    # success. Requiring the decline alone would still pass if the store both
-    # declined one candidate AND adopted another.
-    CORRUPT_ADOPT_BEFORE="$(adoption_count 'SSD cold-store ADOPTED')"
+    # WHAT FAIL-CLOSED ACTUALLY MEANS HERE — corrected 2026-07-28 after this
+    # step raised a MAXIMUM-SEVERITY FALSE ALARM ("the store ADOPTED state on
+    # the corrupted request") against an engine that was behaving correctly.
+    #
+    # Two defects, both mine:
+    #
+    # (a) WRONG WITNESS. It required 'SSD cold-store probe failed', which is
+    #     the SCHEDULER's branch for load_prefix returning an Err other than
+    #     NoMatch. When one candidate is damaged and another is intact,
+    #     load_prefix skips the damaged one and returns Ok — so that line
+    #     never appears, and its absence was read as "never consulted". The
+    #     real refusal witness is emitted inside load_prefix.
+    #
+    # (b) WRONG PROPERTY. It asserted NO adoption may follow corruption. But
+    #     the store holds MANY manifests; refusing a damaged candidate and
+    #     falling through to an intact one is exactly right, and is what
+    #     load_prefix documents. Banning adoption encodes a single-candidate
+    #     assumption the store has never had. On this run the corrupted block
+    #     was referenced by exactly ONE manifest, the engine refused exactly
+    #     that manifest, and served a different one — correct on every count,
+    #     scored as a safety failure.
+    #
+    # The property worth asserting is neither of those: THE DAMAGED MANIFEST
+    # MUST NEVER BE SERVED. Refusal plus fall-through is a pass; refusal plus
+    # serving the same hash would be the real defect.
+    if [[ "$V4" == "1" ]]; then
+      DECLINE_PAT='COLD-STORE v4 failed to load manifest'
+    else
+      DECLINE_PAT='SSD cold-store probe failed'
+    fi
+    DECLINE_BEFORE="$(adoption_count "$DECLINE_PAT")"
+    # Line offset, so the disjointness check reads only THIS request's lines.
+    LOG_MARK=$(wc -l < "$LOG" 2>/dev/null || echo 0)
     reset_hot_cache && {
       timed_chat "turn3" "$LONG_PROMPT What about the colored glass windows?"
       if coherent "turn3-corrupt" "$REPLY_TEXT"; then
@@ -385,19 +439,36 @@ PY
         # never loaded at all" — and on 2026-07-28 it was the latter, with the
         # script reporting fail-closed anyway. The log is what separates them.
         require_adoption_since "turn3-declined" "$DECLINE_BEFORE" \
-          'SSD cold-store probe failed' \
-          "the store DECLINED the damaged entry (fail-closed) rather than never reading it"
-        # AND it must not have adopted anything on this request. A decline plus
-        # an adoption would mean it refused one candidate and installed
-        # another — fail-closed for the wrong reason, and not what this step
-        # claims to have shown.
-        CORRUPT_ADOPT_AFTER="$(adoption_count 'SSD cold-store ADOPTED')"
-        if [[ "$CORRUPT_ADOPT_BEFORE" == "-1" ]]; then
-          : # already reported UNVERIFIED above; do not double-count
-        elif (( CORRUPT_ADOPT_AFTER > CORRUPT_ADOPT_BEFORE )); then
-          bad "turn3-no-adopt: the store ADOPTED state on the corrupted request ($((CORRUPT_ADOPT_AFTER - CORRUPT_ADOPT_BEFORE)) new). A decline alongside an adoption is not the fail-closed behaviour this step claims."
-        else
-          ok "turn3-no-adopt: no adoption witness on the corrupted request — the refusal was the outcome, not a detour"
+          "$DECLINE_PAT" \
+          "the store REFUSED the damaged manifest (fail-closed) rather than never reading it"
+        # THE SAFETY PROPERTY: whatever was served, it was not the manifest
+        # that was refused. Compares hashes from THIS request's log lines only.
+        if [[ "$V4" == "1" && -r "${LOG:-/nonexistent}" ]]; then
+          # ANSI MUST BE STRIPPED BEFORE MATCHING A field=value PAIR.
+          # tracing's pretty writer colours the FIELD NAME, so the bytes on
+          # disk are `manifest_hash ESC[2m = ESC[0m 60138c...` — the literal
+          # string `manifest_hash=` DOES NOT EXIST in the file. Matching it
+          # yields zero, REFUSED_H comes back empty, and this whole safety
+          # block silently does nothing while reporting nothing wrong.
+          # Verified at the bytes on 2026-07-28: without the strip 0 matches,
+          # with it the correct hash. (Message text is uncoloured, which is
+          # why the plain-sentence counters elsewhere in this script work.)
+          local_strip() { sed -e 's/\x1b\[[0-9;]*m//g'; }
+          REFUSED_H="$(tail -n "+$((LOG_MARK+1))" "$LOG" 2>/dev/null \
+            | local_strip | grep -a 'failed to load manifest' \
+            | grep -o 'manifest_hash=[0-9a-f]\{64\}' | cut -d= -f2 | sort -u)"
+          SERVED_H="$(tail -n "+$((LOG_MARK+1))" "$LOG" 2>/dev/null \
+            | local_strip | grep -a 'SERVED from manifest' \
+            | grep -o 'manifest_hash=[0-9a-f]\{64\}' | cut -d= -f2 | sort -u)"
+          if [[ -z "$REFUSED_H" ]]; then
+            : # the decline assertion above already reported this
+          elif [[ -z "$SERVED_H" ]]; then
+            ok "turn3-served: damaged manifest refused and NOTHING served — fail-closed with no fall-through candidate"
+          elif [[ -n "$(comm -12 <(printf '%s\n' $REFUSED_H) <(printf '%s\n' $SERVED_H))" ]]; then
+            bad "turn3-served: a manifest was BOTH refused and SERVED in the same request. The damaged entry reached the cache; this is the defect the checksums exist to prevent."
+          else
+            ok "turn3-served: refused $(printf '%s' "$REFUSED_H" | wc -l | tr -d ' ')+ manifest(s), served a DIFFERENT one — refusal plus fall-through, which is correct"
+          fi
         fi
       else
         bad "DEGENERATE OUTPUT after corrupting a payload. The store adopted data it could not verify. This is the defect the checksums exist to prevent."

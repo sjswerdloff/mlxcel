@@ -1926,6 +1926,24 @@ impl BlockColdStore {
             match self.assemble_blocks(&manifest, &load_cache_id) {
                 Ok(cache_set) => {
                     let matched = matched_tokens.min(tokens.len());
+                    // WHICH manifest was served. The scheduler's ADOPTED line
+                    // reports that state was installed and how much; it cannot
+                    // say WHERE FROM, because `load_prefix` returns only
+                    // (set, len). That gap cost real work on 2026-07-28: a
+                    // fail-closed probe flipped a byte in one block, the store
+                    // correctly REFUSED that manifest and fell through to an
+                    // intact one, and the console could not distinguish that
+                    // from having adopted the damaged manifest. Establishing
+                    // which had happened needed byte-level forensics against
+                    // the manifests on disk. With this line the refusal
+                    // ("failed to load manifest, trying next") and the
+                    // subsequent success name DIFFERENT hashes, and
+                    // fall-through-to-a-good-candidate is readable as such.
+                    tracing::info!(
+                        manifest_hash = %manifest.hash_hex(),
+                        matched_tokens = matched,
+                        "COLD-STORE v4 SERVED from manifest"
+                    );
                     return Ok((cache_set, matched));
                 }
                 Err(e) => {
