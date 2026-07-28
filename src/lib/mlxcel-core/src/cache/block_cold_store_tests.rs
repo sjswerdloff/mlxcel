@@ -5100,3 +5100,128 @@ fn a_mixed_plan_renders_as_collapsed_runs() {
     let plan = m3_shaped_mixed_set(3, 5, 15).layer_plan();
     assert_eq!(describe_kv_layer_plan(&plan), "Fp16x3,KVarN8v4x5");
 }
+
+// ── Alden's review of `6ae26c7`, 2026-07-28 ─────────────────────────────
+
+/// An inert `v_bits` must not move the address for ANY mode whose variant
+/// already names its width — not just `Fp16`.
+///
+/// Alden's blocker: the first version canonicalised `Fp16 => 0, _ => v_bits`,
+/// so `Int8` and every `Turbo*` mode committed to a field their payload does
+/// not depend on. Against the audited mode table only `KVarN8` has a width the
+/// variant does not encode (`Int8` is 8-bit; `Turbo4*` 4-bit; `Turbo3Asym`
+/// 3-bit).
+///
+/// Latent when found — `resolve_nominal_layer_plan` assigns 8 to every
+/// non-KVarN8 layer and nothing sets the field on a non-kvarn cache — but it is
+/// the same shape as the `Fp16`-at-`v_bits=8` miss that was found the hard way:
+/// identical bytes, two addresses, a silent miss.
+///
+/// Named mutation: restore `_ => v_bits` and every row below except `KVarN8`
+/// goes red.
+#[test]
+fn an_inert_width_does_not_move_the_address_for_any_mode_that_names_its_own() {
+    let rt = [31u8; 32];
+    for mode in [
+        KVCacheMode::Fp16,
+        KVCacheMode::Int8,
+        KVCacheMode::Turbo4Asym,
+        KVCacheMode::Turbo3Asym,
+        KVCacheMode::Turbo4,
+        KVCacheMode::Turbo4Delegated,
+    ] {
+        assert_eq!(
+            cache_computation_id(&rt, &[(mode, 8)]),
+            cache_computation_id(&rt, &[(mode, 4)]),
+            "{mode:?} carries its width in the variant, so v_bits is inert and \
+             must not change the block address"
+        );
+    }
+}
+
+/// The control whose expected answer DIFFERS: `KVarN8`'s width is real and
+/// MUST move the address, or k8v4 and k8v8 collide with different payloads —
+/// the original defect `cache_computation_id` was introduced to fix.
+#[test]
+fn kvarn8_is_the_one_mode_whose_width_must_move_the_address() {
+    let rt = [31u8; 32];
+    assert_ne!(
+        cache_computation_id(&rt, &[(KVCacheMode::KVarN8, 8)]),
+        cache_computation_id(&rt, &[(KVCacheMode::KVarN8, 4)]),
+        "k8v8 and k8v4 have different payload layouts and must not share an \
+         address"
+    );
+}
+
+/// The mode spelling in the address preimage is a CONTRACT, not a rendering.
+///
+/// Alden's second finding: the preimage used `format!("{mode:?}")`. Derived
+/// `Debug` follows the Rust identifier, so renaming a variant — an ordinary
+/// refactor with no behavioural intent — would move every block address that
+/// mode participates in. A moved address is a silent total miss, never a loud
+/// failure, which is the one failure mode this store keeps rediscovering.
+///
+/// Spelled literally so a rename cannot pass silently. If you are here because
+/// this went red: changing a tag is a FORMAT CHANGE and needs a version bump in
+/// `cache_computation_id`, not an updated expectation.
+#[test]
+fn mode_tags_are_a_stable_contract_not_a_debug_rendering() {
+    for (mode, expected) in [
+        (KVCacheMode::Fp16, "fp16"),
+        (KVCacheMode::Int8, "int8"),
+        (KVCacheMode::Turbo4Asym, "turbo4asym"),
+        (KVCacheMode::Turbo3Asym, "turbo3asym"),
+        (KVCacheMode::Turbo4, "turbo4"),
+        (KVCacheMode::Turbo4Delegated, "turbo4delegated"),
+        (KVCacheMode::KVarN8, "kvarn8"),
+    ] {
+        assert_eq!(
+            mode_wire_tag(mode),
+            expected,
+            "the wire tag for {mode:?} changed. This is a FORMAT CHANGE: bump \
+             the version in cache_computation_id rather than editing this \
+             expectation, or every existing address for this mode moves."
+        );
+    }
+}
+
+/// Distinct modes must still produce distinct addresses — the tags are stable
+/// AND separating. Guards the failure where two tags are accidentally made
+/// equal while each individually still matches its own expectation.
+#[test]
+fn every_mode_tag_is_distinct() {
+    let all = [
+        KVCacheMode::Fp16,
+        KVCacheMode::Int8,
+        KVCacheMode::Turbo4Asym,
+        KVCacheMode::Turbo3Asym,
+        KVCacheMode::Turbo4,
+        KVCacheMode::Turbo4Delegated,
+        KVCacheMode::KVarN8,
+    ];
+    let mut tags: Vec<&str> = all.iter().map(|m| mode_wire_tag(*m)).collect();
+    let before = tags.len();
+    tags.sort_unstable();
+    tags.dedup();
+    assert_eq!(
+        tags.len(),
+        before,
+        "two modes share a wire tag — their blocks would collide in the global \
+         pool with different payloads"
+    );
+}
+
+/// The version prefix moved with the preimage change.
+///
+/// Pinned literally because the prefix is the ONLY thing standing between a
+/// pre-review address and a post-review one. `v2` and `v3` differ in both the
+/// width canonicalisation and the mode spelling, so an unversioned change would
+/// have let the two alias.
+#[test]
+fn the_address_declares_format_v3() {
+    let id = cache_computation_id(&[0u8; 32], &homog(2, KVCacheMode::KVarN8, 4));
+    assert!(
+        id.starts_with("v3|"),
+        "the address must declare its format version; got {id}"
+    );
+}

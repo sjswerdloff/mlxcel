@@ -119,7 +119,20 @@ pub fn block_hash_merkle(
 /// guard become a conformance check instead of a blanket refusal.
 ///
 /// The version prefix is the anti-aliasing mechanism, so it moves with the
-/// field set: a `v1` address and a `v2` address can never collide.
+/// field set AND with the preimage encoding: `v1`, `v2` and `v3` addresses can
+/// never collide.
+///
+/// **`v2` → `v3` (Alden's review, 2026-07-28):** two changes, both to what the
+/// digest is taken over — the width canonicalisation was extended past `Fp16`
+/// to every mode whose variant already names its width, and the mode's preimage
+/// spelling moved from derived `Debug` to a stable wire tag. Same inputs, a
+/// different digest, so the version moves with it.
+///
+/// Bumped even though no `v2` address can exist on disk (no stored v4 caches;
+/// `v2` was never built into a running binary). "Nothing could have stored one"
+/// is a reachability argument, and reachability arguments are what put the
+/// single-pair address into production in the first place. The bump costs
+/// nothing and does not require the argument to be right.
 ///
 /// # Domain separation
 ///
@@ -148,17 +161,72 @@ pub fn block_hash_merkle(
 /// layer `(Fp16, 0)`. Without canonicalisation those two describe identical
 /// bytes and would address differently, which is the write-only failure again.
 ///
-/// So: quantized modes commit to `v_bits`; unquantized modes normalise it to 0.
-/// The `match` is exhaustive on purpose — a new mode forces this decision to be
-/// made rather than inherited.
+/// # The rule is NOT "quantized keeps it" — it is "only KVarN8 has a free width"
+///
+/// **Alden, 2026-07-28.** An earlier version of this function read
+/// `Fp16 => 0, _ => v_bits` under a doc comment claiming the match was
+/// "exhaustive on purpose". It was a wildcard, and the claim was false — which
+/// is worse than saying nothing, because it tells the next reader the decision
+/// was already made for every mode when it had been made for exactly one.
+///
+/// Against the audited mode table, **every mode except `KVarN8` already encodes
+/// its width in the variant itself**: `Int8` is 8-bit, `Turbo4Asym` / `Turbo4` /
+/// `Turbo4Delegated` are 4-bit, `Turbo3Asym` is 3-bit. For all of them
+/// `kvarn_v_bits` is an inert field the payload does not depend on — the same
+/// thing that was true of `Fp16`, and the same miss waiting to happen. Only
+/// `KVarN8` has a genuine free parameter (`v_bits ∈ {8, 4}`, k8v8 vs k8v4).
+///
+/// Latent rather than live when found: `resolve_nominal_layer_plan` assigns 8
+/// to every non-KVarN8 layer and nothing sets the field on a non-kvarn cache,
+/// so plan and reality agreed. It would have become live the first time
+/// anything left a stale width on a non-kvarn layer — a future re-mode, a
+/// deserialization path, a downgrade that forgot to reset — at which point
+/// identical bytes would address differently and the store would silently miss.
+///
+/// The match below is **actually** exhaustive now: no wildcard, so adding a
+/// mode will not compile until someone decides which side of this line it is on.
 pub fn canonical_layer_identity(mode: super::KVCacheMode, v_bits: u8) -> (super::KVCacheMode, u8) {
+    use super::KVCacheMode as M;
     let effective_v_bits = match mode {
-        // Unquantized: the V width is not part of the data.
-        super::KVCacheMode::Fp16 => 0,
-        // Quantized: v_bits selects the payload layout, so it IS the identity.
-        _ => v_bits,
+        // Width is inert: either unquantized, or already named by the variant.
+        M::Fp16 => 0,
+        M::Int8 => 0,
+        M::Turbo4Asym => 0,
+        M::Turbo3Asym => 0,
+        M::Turbo4 => 0,
+        M::Turbo4Delegated => 0,
+        // The ONLY mode with a width the variant does not encode: v_bits
+        // selects the payload layout, so it IS part of the identity.
+        M::KVarN8 => v_bits,
     };
     (mode, effective_v_bits)
+}
+
+/// Stable wire tag for a mode in the address preimage.
+///
+/// **Alden, 2026-07-28.** This used to be `format!("{mode:?}")`. Derived `Debug`
+/// is a rendering of a Rust identifier, not a wire format: renaming a variant —
+/// an ordinary refactor with no behavioural intent — would silently move every
+/// block address that mode participates in, and a moved address is a silent
+/// total cache miss, never a loud failure.
+///
+/// These strings are a CONTRACT. Changing one is a format change and must come
+/// with a version bump in `cache_computation_id`. Pinned by
+/// `mode_tags_are_a_stable_contract_not_a_debug_rendering`, which spells every
+/// tag literally so a rename cannot pass silently.
+///
+/// Exhaustive, no wildcard, for the same reason as above.
+fn mode_wire_tag(mode: super::KVCacheMode) -> &'static str {
+    use super::KVCacheMode as M;
+    match mode {
+        M::Fp16 => "fp16",
+        M::Int8 => "int8",
+        M::Turbo4Asym => "turbo4asym",
+        M::Turbo3Asym => "turbo3asym",
+        M::Turbo4 => "turbo4",
+        M::Turbo4Delegated => "turbo4delegated",
+        M::KVarN8 => "kvarn8",
+    }
 }
 
 /// Complete identity of everything that determines a block's BYTES, over the
@@ -180,14 +248,17 @@ pub fn cache_computation_id(
     hasher.update((plan.len() as u64).to_le_bytes());
     for &(mode, v_bits) in plan {
         let (mode, effective_v_bits) = canonical_layer_identity(mode, v_bits);
-        let name = format!("{mode:?}");
-        hasher.update((name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
+        // STABLE WIRE TAG, not `{mode:?}` — see `mode_wire_tag`. A derived
+        // Debug rendering would tie every block address to Rust identifier
+        // spelling, so a variant rename would move addresses silently.
+        let tag = mode_wire_tag(mode);
+        hasher.update((tag.len() as u64).to_le_bytes());
+        hasher.update(tag.as_bytes());
         hasher.update([effective_v_bits]);
     }
     let plan_digest: [u8; 32] = hasher.finalize().into();
     format!(
-        "v2|rt:{}|n:{}|plan:{}",
+        "v3|rt:{}|n:{}|plan:{}",
         hex_digest(runtime_fingerprint),
         plan.len(),
         hex_digest(&plan_digest)
