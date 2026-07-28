@@ -5636,18 +5636,37 @@ mod tests {
     // this is *disk-adoption attention-layer* equivalence. It is NOT
     // generation or logit equivalence. One synthetic attention layer, no
     // sampler, no scheduler. Production scheduler/logit equivalence is G1.3
-    // and requires wiring `BlockColdStore` into the scheduler — a separate,
-    // explicitly reviewed decision. `BlockColdStore` has ZERO **PRODUCTION**
-    // references outside its own module today, so no path from v4 to a logit
-    // exists, and none is to be created merely to make a test possible.
+    // and requires wiring `BlockColdStore` into the scheduler.
+    //
+    // ⚠️ UPDATED 2026-07-28 — THIS PARAGRAPH USED TO SAY v4 HAD ZERO PRODUCTION
+    // REFERENCES. IT NO LONGER DOES. Stuart took the wiring decision and v4 is
+    // now installed in the scheduler behind `MLXCEL_V4_COLD_STORE=1` (off by
+    // default; when set it REPLACES v3 for persist/load). Production references
+    // now exist in `server/batch/scheduler.rs`, `server/model_worker.rs` and
+    // `server/model_provider.rs`.
+    //
+    // The original principle still holds and is why the wiring is opt-in: no
+    // path from v4 to a logit was created *merely to make a test possible*.
+    // G1.3 (production scheduler/logit equivalence) is now REACHABLE but still
+    // UNWRITTEN — the tests below remain attention-layer scope only.
     //
     // The check that reproduces that, stated so a later reader gets the
     // result the sentence claims:
     //
-    //     grep -rn 'BlockColdStore' src --include='*.rs' | grep -v block_cold_store
+    //     grep -rn 'BlockColdStore' src --include='*.rs' \
+    //       | grep -v 'cache/block_cold_store' | grep -v 'models/minimax_m3.rs'
     //
-    // → 13 hits, ALL inside this file's `#[cfg(test)]` module — i.e. the tests
-    //   below. Zero production hits. The scheduler's `load_prefix` call site
+    // ⚠️ THE CHECK THIS COMMENT ORIGINALLY GAVE WAS BROKEN, and it hid exactly
+    // the thing it existed to detect. It filtered with `grep -v
+    // block_cold_store`, which strips any line CONTAINING that substring — and
+    // every real production caller writes the fully-qualified
+    // `mlxcel_core::cache::block_cold_store::BlockColdStore`. So the check
+    // reported "zero production hits" AFTER v4 was wired into the scheduler.
+    // An instrument that fails returns the same shape as one that found
+    // nothing. Exclude the defining file BY PATH, not by substring.
+    //
+    // → 5 production hits today: scheduler.rs (×2), model_worker.rs,
+    //   model_provider.rs (×2). The scheduler's `load_prefix` call site
     //   resolves to v3 (`cold_store::ColdStoreError` on its error arm).
     //
     // CORRECTED 2026-07-28 by Violet. The original said "ZERO references

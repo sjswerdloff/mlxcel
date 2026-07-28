@@ -83,6 +83,9 @@ pub(crate) struct WorkerSchedulerConfig {
     pub prompt_cache: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
     /// Cold-storage for persisting detached KV caches to SSD.
     pub cold_store: Option<Arc<mlxcel_core::cache::cold_store::ColdStore>>,
+    /// v4 block-extraction cold store. Opt-in; replaces `cold_store` when set.
+    pub block_cold_store:
+        Option<Arc<mlxcel_core::cache::block_cold_store::BlockColdStore>>,
     /// (B11) / server-wide KV cache quantization mode.
     ///
     /// Defaults to [`mlxcel_core::cache::KVCacheMode::Fp16`] (bit-exact
@@ -483,6 +486,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             .with_reasoning_budget(sched_config.reasoning_budget, thinking_ids)
             .with_prompt_cache(sched_config.prompt_cache)
             .with_cold_store(sched_config.cold_store)
+            .with_block_cold_store(sched_config.block_cold_store)
             .with_kv_cache_mode(sched_config.kv_cache_mode)
             .with_kvarn_v_bits(sched_config.kvarn_v_bits)
             .with_batch_kv_quant(sched_config.batch_kv_quant)

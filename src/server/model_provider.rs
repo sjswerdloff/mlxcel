@@ -118,6 +118,46 @@ pub struct ModelProvider {
     _worker_handle: thread::JoinHandle<()>,
 }
 
+
+/// Build the v4 block cold store, or `None`.
+///
+/// OPT-IN via `MLXCEL_V4_COLD_STORE=1`, off by default, so this wiring cannot
+/// change any existing deployment's behaviour. When present it REPLACES the v3
+/// store for persist and load rather than running beside it, making a run a
+/// clean A/B and the revert a single unset variable.
+///
+/// GC IS DELIBERATELY NOT WIRED. Nothing calls `gc_blocks()` in the serving
+/// path: a sweep takes the store lock, so its trigger is a latency decision for
+/// whoever runs the server, not a side effect of enabling persistence.
+/// `PruneMode` also stays at its `Observe` default, which deletes nothing.
+fn build_block_cold_store(
+    model_path: &std::path::Path,
+) -> Option<Arc<mlxcel_core::cache::block_cold_store::BlockColdStore>> {
+    if std::env::var("MLXCEL_V4_COLD_STORE").as_deref() != Ok("1") {
+        return None;
+    }
+    let path_str = model_path.to_string_lossy().to_string();
+    let base = mlxcel_core::cache::cold_store::ColdStore::new(&path_str)
+        .base_dir()
+        .join("v4-blocks");
+    // v4's runtime fingerprint is 32 raw bytes; v3 exposes its weight
+    // fingerprint as hex text. Take the first 32 bytes of that text — stable
+    // for a model and distinct across models, which is what it is for.
+    let hex = mlxcel_core::cache::cold_store::compute_weight_fingerprint(&path_str);
+    let mut fp = [0u8; 32];
+    for (slot, byte) in fp.iter_mut().zip(hex.as_bytes()) {
+        *slot = *byte;
+    }
+    tracing::warn!(
+        base_dir = %base.display(),
+        "MLXCEL_V4_COLD_STORE=1: v4 block cold store ENABLED and REPLACING v3 for \
+         persist/load. GC is NOT wired; no sweep will run."
+    );
+    Some(Arc::new(
+        mlxcel_core::cache::block_cold_store::BlockColdStore::new(base, fp),
+    ))
+}
+
 impl ModelProvider {
     /// Create and start a new model provider
     pub fn new(model_path: PathBuf) -> Result<Self> {
@@ -583,6 +623,7 @@ impl ModelProvider {
             reasoning_budget,
             prompt_cache: prompt_cache_store.clone(),
             cold_store,
+            block_cold_store: build_block_cold_store(&model_path),
             kv_cache_mode,
             kvarn_v_bits,
             batch_kv_quant,
@@ -682,6 +723,7 @@ impl ModelProvider {
             reasoning_budget: None,
             prompt_cache: None,
             cold_store: None,
+            block_cold_store: None, // minimal test path: v3 semantics only
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
             kvarn_v_bits: 8, // inert width beside the Fp16 mode above
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
@@ -1201,3 +1243,53 @@ impl Drop for ModelProvider {
 #[cfg(test)]
 #[path = "model_provider_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod block_cold_store_optin_tests {
+    use super::build_block_cold_store;
+
+    /// THE SAFETY PROPERTY OF THIS WIRING, and the only reason it is committable
+    /// without a review of v4's production behaviour: **default-off**.
+    ///
+    /// Written because my first attempt to verify it was `cargo test ...
+    /// build_block_cold_store`, which matched NO test and reported
+    /// "ok. 0 passed" — indistinguishable from a pass. A safety property
+    /// verified by a command that runs nothing is not verified.
+    ///
+    /// Only the exact string "1" enables v4. Anything else — unset, empty,
+    /// "0", "true", "yes" — leaves the scheduler on v3 with byte-identical
+    /// behaviour, so a typo cannot silently switch a deployment's cold store.
+    #[test]
+    fn v4_is_off_unless_the_env_var_is_exactly_one() {
+        let key = "MLXCEL_V4_COLD_STORE";
+        let restore = std::env::var(key).ok();
+        let path = std::path::Path::new("/nonexistent-model-path-for-this-test");
+
+        // SAFETY: the suite runs serial (--test-threads=1); see
+        // project_mlxcel_suite_serial_only. A parallel run could interleave
+        // these mutations with another test reading the same variable.
+        unsafe {
+            std::env::remove_var(key);
+            assert!(
+                build_block_cold_store(path).is_none(),
+                "UNSET must mean v3. If v4 constructs by default, enabling it \
+                 stops being a deliberate act and every existing deployment \
+                 silently changes cold store."
+            );
+
+            for deceptive in ["", "0", "true", "yes", "on", "11", " 1"] {
+                std::env::set_var(key, deceptive);
+                assert!(
+                    build_block_cold_store(path).is_none(),
+                    "{deceptive:?} enabled v4. Only the exact string \"1\" may \
+                     enable it, or a typo switches the cold store silently."
+                );
+            }
+
+            match restore {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}

@@ -473,6 +473,11 @@ pub struct BatchScheduler {
     /// `None` when cold-storage is disabled.
     cold_store: Option<Arc<mlxcel_core::cache::cold_store::ColdStore>>,
 
+    /// v4 block-extraction cold store. OPT-IN, and it REPLACES `cold_store`
+    /// for both load and persist when present — enabling it is a clean A/B,
+    /// not a double-write. `None` keeps the v3 path exactly as it was.
+    block_cold_store: Option<Arc<mlxcel_core::cache::block_cold_store::BlockColdStore>>,
+
     /// Parallel map indexed by `SequenceId`: remembers the
     /// [`PromptCacheRequestContext`] per in-flight sequence so the donate-back
     /// path on completion can rebuild the cache key without touching the HTTP
@@ -1027,6 +1032,7 @@ impl BatchScheduler {
             thinking_token_ids: None,
             prompt_cache: None,
             cold_store: None,
+            block_cold_store: None,
             prompt_cache_seq_ctx: std::collections::HashMap::new(),
             kv_cache_mode: KVCacheMode::Fp16,
             kvarn_v_bits: 8,
@@ -1408,6 +1414,16 @@ impl BatchScheduler {
         self
     }
 
+    /// Install the v4 block-extraction cold store. When set it REPLACES the v3
+    /// store for load and persist, so the two never both write.
+    pub fn with_block_cold_store(
+        mut self,
+        store: Option<Arc<mlxcel_core::cache::block_cold_store::BlockColdStore>>,
+    ) -> Self {
+        self.block_cold_store = store;
+        self
+    }
+
     /// Whether the installed prompt-cache store is currently accepting
     /// lookups and inserts (scheduler-level gate).
     #[inline]
@@ -1738,10 +1754,28 @@ impl BatchScheduler {
             ctx.mm_digest == MultimodalDigest::empty() && ctx.lora_id.is_none();
         let mut ssd_match_len = 0usize;
         let mut ssd_detached: Option<DetachedCacheSet> = None;
-        if let Some(cs) = &self.cold_store
-            && cold_identity_supported
-        {
-            match cs.load_prefix(&ctx.model_id, &ctx.template_sig, tokens) {
+        // COLD-STORE LOAD. v4 is opt-in and REPLACES v3 when present. It needs
+        // the cache identity (`kv_mode`, `v_bits`) because it addresses blocks by
+        // it and has a mode-mismatch miss path; both are already scheduler state,
+        // which is why this is a call-shape change and not a design question.
+        let cold_result = if !cold_identity_supported {
+            None
+        } else if let Some(bs) = &self.block_cold_store {
+            Some(bs.load_prefix(
+                &ctx.model_id,
+                &ctx.template_sig,
+                tokens,
+                self.kv_cache_mode,
+                self.kvarn_v_bits,
+            ))
+        } else {
+            self.cold_store
+                .as_ref()
+                .map(|cs| cs.load_prefix(&ctx.model_id, &ctx.template_sig, tokens))
+        };
+
+        if let Some(cold_load) = cold_result {
+            match cold_load {
                 Ok((mut detached, raw_match_len)) => {
                     let stored_state_len = detached.seq_len();
                     if detached.num_layers() != self.model.num_layers()
@@ -2353,12 +2387,23 @@ impl BatchScheduler {
 
         // Persist to cold-storage (SSD) before wrapping in CacheEntry.
         // Content-addressed: keyed by token prefix, not session.
-        if let Some(cs) = &self.cold_store
+        if (self.cold_store.is_some() || self.block_cold_store.is_some())
             && ctx.mm_digest == MultimodalDigest::empty()
             && ctx.lora_id.is_none()
         {
             if let DetachedKvSet::Dense(dense) = &kv_set {
-                if let Err(e) = cs.persist(&ctx.model_id, &ctx.template_sig, &tokens, dense) {
+                // v4 replaces v3 when installed. `persist` is arg-identical
+                // across the two; only the return differs (v4 hands back the
+                // Manifest), and it is discarded here exactly as v3's unit was.
+                let persisted = if let Some(bs) = &self.block_cold_store {
+                    bs.persist(&ctx.model_id, &ctx.template_sig, &tokens, dense)
+                        .map(|_| ())
+                } else if let Some(cs) = &self.cold_store {
+                    cs.persist(&ctx.model_id, &ctx.template_sig, &tokens, dense)
+                } else {
+                    Ok(())
+                };
+                if let Err(e) = persisted {
                     tracing::warn!(
                         model_id = %ctx.model_id,
                         token_len = tokens.len(),
