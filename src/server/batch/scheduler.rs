@@ -1869,33 +1869,66 @@ impl BatchScheduler {
                         .ok()
                         .filter(|len| *len > 0)
                     {
-                        if let Some(match_len) = reusable_prefix_len(
+                        // DECLINE VISIBILITY (2026-07-28). Both arms must speak.
+                        // The in-memory caller of `reusable_prefix_len` already
+                        // logs its decline at INFO (see the `None` arm further
+                        // down this function); this call site did not. That
+                        // asymmetry was not merely a missing line — when the
+                        // cold store LOADS a candidate and then drops it here,
+                        // control falls through to the "both tiers MISS (no
+                        // entry shares any prefix under this key)" INFO line,
+                        // which is FALSE: the SSD tier did not miss, it found a
+                        // candidate and discarded it. The operator was told the
+                        // opposite of what happened, and no RUST_LOG level made
+                        // it visible, because the drop emitted nothing at all.
+                        match reusable_prefix_len(
                             raw_match_len,
                             stored_state_len,
                             tokens.len(),
                             alignment,
                             store.min_prefix_tokens(),
                         ) {
-                            if match_len < stored_state_len
-                                && let Err(err) = detached.truncate_to(match_len as i32)
-                            {
-                                tracing::warn!(
-                                    error = %err,
-                                    match_len,
-                                    stored_state_len,
-                                    "cold-store: candidate truncation failed; ignoring SSD candidate"
-                                );
-                            } else {
+                            Some(match_len) => {
+                                if match_len < stored_state_len
+                                    && let Err(err) = detached.truncate_to(match_len as i32)
+                                {
+                                    tracing::warn!(
+                                        error = %err,
+                                        match_len,
+                                        stored_state_len,
+                                        "cold-store: candidate truncation failed; ignoring SSD candidate"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        model_id = %ctx.model_id,
+                                        match_len,
+                                        total = tokens.len(),
+                                        "prompt-cache: SSD cold-store probe HIT (longest prefix match)"
+                                    );
+                                    ssd_match_len = match_len;
+                                    ssd_detached = Some(detached);
+                                }
+                            }
+                            None => {
                                 tracing::info!(
-                                    model_id = %ctx.model_id,
-                                    match_len,
-                                    total = tokens.len(),
-                                    "prompt-cache: SSD cold-store probe HIT (longest prefix match)"
+                                    raw = raw_match_len,
+                                    stored_state_len,
+                                    request = tokens.len(),
+                                    alignment,
+                                    min_prefix = store.min_prefix_tokens(),
+                                    "prompt-cache: SSD cold-store candidate DECLINED — alignment-floored match below minimum prefix"
                                 );
-                                ssd_match_len = match_len;
-                                ssd_detached = Some(detached);
                             }
                         }
+                    } else {
+                        // The other silent drop: a loaded candidate whose stored
+                        // length is zero or not representable. Same consequence
+                        // as above — falls through to "both tiers MISS".
+                        tracing::info!(
+                            stored_state_len,
+                            raw = raw_match_len,
+                            "prompt-cache: SSD cold-store candidate DECLINED — stored state length is empty or unrepresentable"
+                        );
                     }
                 }
                 Err(mlxcel_core::cache::cold_store::ColdStoreError::NoMatch) => {
