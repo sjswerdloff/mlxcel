@@ -99,8 +99,26 @@ if ! curl -sf --max-time 10 "$BASE/v1/models" >/dev/null; then
 fi
 note "probing $WHICH at $BASE (client-only; server lifecycle is yours)"
 
+# THE SHARED PREFIX MUST EXCEED ONE WHOLE BLOCK (block_size = 2048 tokens).
+#
+# `load_prefix` matches by comparing block hashes: it runs
+# `compute_block_hashes(tokens, block_size, id)` over the REQUEST's tokens and
+# zips against the manifest's, taking the common prefix. A request shorter than
+# one block produces a single PARTIAL chunk whose hash can never equal the
+# manifest's full 2048-token block 0, so `matched_blocks == 0`, the candidate
+# is dropped, and the caller sees NoMatch.
+#
+# At 40 repetitions the prompt was ~1527 tokens — under one block — so this
+# probe COULD NOT MATCH ANYTHING BY CONSTRUCTION, and duly reported
+# "both tiers MISS" three times out of three on 2026-07-28. That looked exactly
+# like a broken load path. It was a probe that had never been able to test one.
+#
+# 600 repetitions puts the prompt at 3 blocks (block_count=3, MEASURED on the
+# 2026-07-28 run) so turn 2 has two identical whole blocks to match on. 160 was
+# still only ~1463 tokens — under one block. Confirm by the manifest log line
+# `block_count`, not by counting characters.
 LONG_PROMPT="$(python3 - <<'PY'
-print("Describe the architecture of a gothic cathedral. " * 40)
+print("Describe the architecture of a gothic cathedral. " * 600)
 PY
 )"
 
