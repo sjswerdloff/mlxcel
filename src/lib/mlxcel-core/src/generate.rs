@@ -440,6 +440,39 @@ pub trait LanguageModel {
         1
     }
 
+    /// Apply this model's STRUCTURAL per-layer KV-cache downgrades to a
+    /// nominal plan, yielding the `(mode, v_bits)` each layer's cache will
+    /// actually be in once the model has touched it.
+    ///
+    /// `nominal` is what the scheduler allocates — already carrying the
+    /// config-driven per-layer policies (Boundary-V, `skip_last_layer`). This
+    /// hook adds only what the MODEL decides from its own weights, and the
+    /// default applies nothing.
+    ///
+    /// # Why the cold store cannot work without this
+    ///
+    /// The v4 block store addresses blocks by the per-layer plan. `persist`
+    /// reads the plan off the live caches, but `load_prefix` runs BEFORE any
+    /// layer has been touched, so a downgrade applied at first-touch is
+    /// invisible to it. If load guesses the nominal plan and persist wrote the
+    /// downgraded one, the addresses never match and every load misses —
+    /// silently, since a miss is indistinguishable from a cold cache (the
+    /// handoff §7.5 failure). This hook is how the read side learns the same
+    /// plan the write side will observe.
+    ///
+    /// MiniMax-M3 overrides it: a layer with no index projections can never
+    /// take the gathered path, so its empty KVarN8 cache is downgraded to Fp16
+    /// at first touch (D1). M3's first three layers are dense, so every M3
+    /// cache set is mixed by construction — which is precisely what the
+    /// original single-pair address could not express.
+    ///
+    /// Used by: the server batch scheduler, which builds the plan once and
+    /// hands the same slice to both `BlockColdStore::load_prefix` and
+    /// `BlockColdStore::persist`.
+    fn kv_cache_plan(&self, nominal: &[(KVCacheMode, u8)]) -> Vec<(KVCacheMode, u8)> {
+        nominal.to_vec()
+    }
+
     /// Describe how one sequence's runtime state should be allocated.
     ///
     /// Phase 0 keeps the default behavior aligned with today's

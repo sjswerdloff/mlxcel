@@ -28,7 +28,7 @@
 //! - Block max-pool scoring with causal masking
 //! - Local block always included (score set to inf)
 
-use crate::models::switch_layers::{gather_sort, SwitchLinear};
+use crate::models::switch_layers::{SwitchLinear, gather_sort};
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{GemmaRMSNorm, KVCache, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
@@ -3796,6 +3796,54 @@ impl LanguageModel for MiniMaxM3Model {
             .map(|layer| (layer.self_attn.block_size.max(1)) as usize)
             .unwrap_or(1)
     }
+
+    /// D1 dense-prefix downgrade, declared ahead of time so the cold store's
+    /// READ side can address the same blocks the WRITE side will produce.
+    ///
+    /// `SparseAttention::forward` downgrades an EMPTY KVarN8 cache to Fp16 on
+    /// a layer with no index projections, at first touch. That is invisible to
+    /// `BlockColdStore::load_prefix`, which runs before any layer is touched.
+    /// This states the same rule declaratively.
+    ///
+    /// STRUCTURALLY KEYED ON THE SAME TWO FACTS as the forward path — the
+    /// `index_q_proj.is_none()` test and the `kvarn_all_layers_forced()` escape
+    /// hatch are the identical expressions, so the plan cannot disagree with
+    /// what actually happens. (`persist` re-checks the plan against the live
+    /// caches and fails loud, which is the backstop if it ever does.)
+    ///
+    /// Two conditions in the forward path are deliberately NOT mirrored:
+    /// `offset == 0` and `paged_backing.is_none()`. Both hold whenever this
+    /// matters — the plan describes a set at allocation (empty), and a KVarN8
+    /// sequence never lives in the shared paged pool (non-Fp16 modes get dense
+    /// per-layer caches; see the scheduler's `apply_kv_cache_mode_to`). The
+    /// downgrade is a no-op on any layer that is not KVarN8, so this mirrors
+    /// that too rather than blanket-forcing Fp16.
+    fn kv_cache_plan(
+        &self,
+        nominal: &[(mlxcel_core::cache::KVCacheMode, u8)],
+    ) -> Vec<(mlxcel_core::cache::KVCacheMode, u8)> {
+        if kvarn_all_layers_forced() {
+            return nominal.to_vec();
+        }
+        nominal
+            .iter()
+            .enumerate()
+            .map(|(i, &(mode, v_bits))| {
+                let is_dense_prefix = self
+                    .layers
+                    .get(i)
+                    .is_some_and(|layer| layer.self_attn.index_q_proj.is_none());
+                if is_dense_prefix && mode == mlxcel_core::cache::KVCacheMode::KVarN8 {
+                    // `downgrade_kvarn8_to_fp16_if_empty` resets the width to 8
+                    // alongside the mode (cache.rs). Spelled as observed rather
+                    // than as 0; the address canonicalises Fp16 widths anyway.
+                    (mlxcel_core::cache::KVCacheMode::Fp16, 8)
+                } else {
+                    (mode, v_bits)
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -5138,6 +5186,127 @@ mod tests {
         }
     }
 
+    /// Build a miniature M3 with `dense` leading dense layers followed by
+    /// `msa` MSA-eligible ones — production M3's shape (dense 0-2, then MSA).
+    fn m3_model_with_dense_prefix(dense: usize, msa: usize) -> MiniMaxM3Model {
+        let mut layers = Vec::with_capacity(dense + msa);
+        for layer_idx in 0..dense {
+            let mut attn = make_test_sparse_attention();
+            attn.index_q_proj = None;
+            attn.index_k_proj = None;
+            attn.index_q_norm = None;
+            attn.index_k_norm = None;
+            attn.layer_idx = layer_idx;
+            layers.push(DecoderLayer {
+                self_attn: attn,
+                mlp: None,
+                moe: None,
+                input_layernorm: make_gemma_rms_norm(16),
+                post_attention_layernorm: make_gemma_rms_norm(16),
+                layer_idx,
+            });
+        }
+        for i in 0..msa {
+            let layer_idx = dense + i;
+            let mut attn = make_test_sparse_attention();
+            attn.layer_idx = layer_idx;
+            layers.push(DecoderLayer {
+                self_attn: attn,
+                mlp: None,
+                moe: None,
+                input_layernorm: make_gemma_rms_norm(16),
+                post_attention_layernorm: make_gemma_rms_norm(16),
+                layer_idx,
+            });
+        }
+        make_test_m3_model(layers)
+    }
+
+    /// M3 DECLARES the D1 downgrade, so the cold store's read side can address
+    /// the blocks the write side will actually produce.
+    ///
+    /// `SparseAttention::forward` downgrades a dense-prefix layer's empty
+    /// KVarN8 cache to Fp16 at first touch. `BlockColdStore::load_prefix` runs
+    /// before any layer is touched and cannot observe that, so it asks the
+    /// model. If this returned the nominal plan unchanged, load would address
+    /// with all-KVarN8 while persist wrote the mixed reality — addresses that
+    /// never match, every load a SILENT miss.
+    ///
+    /// Red-capability: delete the override and the trait default returns
+    /// `nominal` verbatim, so the first three entries stay KVarN8 and the
+    /// dense-prefix assertion fails.
+    #[test]
+    fn kv_cache_plan_downgrades_the_dense_prefix_to_fp16() {
+        use mlxcel_core::cache::KVCacheMode;
+
+        const DENSE: usize = 3;
+        const MSA: usize = 5;
+        let model = m3_model_with_dense_prefix(DENSE, MSA);
+
+        let nominal = vec![(KVCacheMode::KVarN8, 4); DENSE + MSA];
+        let plan = model.kv_cache_plan(&nominal);
+
+        assert_eq!(plan.len(), nominal.len(), "the plan must stay per-layer");
+        for (i, entry) in plan.iter().enumerate().take(DENSE) {
+            assert_eq!(
+                entry.0,
+                KVCacheMode::Fp16,
+                "layer {i} has no index projections, so D1 downgrades it — the \
+                 plan must say so BEFORE the first forward pass"
+            );
+        }
+        for (i, entry) in plan.iter().enumerate().skip(DENSE) {
+            assert_eq!(
+                *entry,
+                (KVCacheMode::KVarN8, 4),
+                "layer {i} is MSA-eligible and must keep the configured mode"
+            );
+        }
+        // The whole point: the resulting plan is MIXED, which is what the
+        // single-pair block address could not express.
+        assert_ne!(
+            plan[0], plan[DENSE],
+            "an M3 plan must be heterogeneous, or nothing here is exercised"
+        );
+    }
+
+    /// The downgrade is keyed on the MODE, not blanket-applied: a dense-prefix
+    /// layer that was never KVarN8 is left alone, mirroring
+    /// `downgrade_kvarn8_to_fp16_if_empty`, which is a no-op on anything else.
+    ///
+    /// This matters because the plan and the forward path must agree. If the
+    /// plan forced Fp16 on a Turbo4 dense layer the forward path would leave
+    /// as Turbo4, `persist` would refuse the set — loudly, but the cold store
+    /// would again store nothing.
+    #[test]
+    fn kv_cache_plan_leaves_non_kvarn_dense_layers_untouched() {
+        use mlxcel_core::cache::KVCacheMode;
+
+        let model = m3_model_with_dense_prefix(2, 2);
+        let nominal = vec![(KVCacheMode::Turbo4, 8); 4];
+        let plan = model.kv_cache_plan(&nominal);
+        assert_eq!(
+            plan, nominal,
+            "no layer was KVarN8, so D1 has nothing to downgrade and the plan \
+             must pass through unchanged"
+        );
+    }
+
+    /// A model with NO dense-prefix layers plans homogeneously — the control
+    /// on the two above, whose expected answer differs from theirs.
+    #[test]
+    fn kv_cache_plan_of_an_all_msa_model_is_unchanged() {
+        use mlxcel_core::cache::KVCacheMode;
+
+        let model = m3_model_with_dense_prefix(0, 4);
+        let nominal = vec![(KVCacheMode::KVarN8, 4); 4];
+        assert_eq!(
+            model.kv_cache_plan(&nominal),
+            nominal,
+            "every layer is MSA-eligible, so D1 downgrades nothing"
+        );
+    }
+
     #[test]
     fn prefill_alignment_first_msa_layer_supplies_block_quantum() {
         // Production M3 has dense layers 0-2 before its first MSA layer, so
@@ -5734,9 +5903,7 @@ mod tests {
     /// set its own block size without disturbing the other.
     fn g1_1_disk_adoption_equivalence(mut attn: SparseAttention, hidden: i32, width_label: &str) {
         use mlxcel_core::cache::block_cold_store::BlockColdStore;
-        use mlxcel_core::cache::{
-            DetachedCacheSet, KVCacheMode, SequenceId, SequenceStateBackend,
-        };
+        use mlxcel_core::cache::{DetachedCacheSet, SequenceId, SequenceStateBackend};
 
         // Production quantum. The harness default of 2 would make every chunk
         // saturate (`num_key_blocks <= top_k`) and dispatch dense, so the
@@ -5834,7 +6001,7 @@ mod tests {
             // object is the source."
             let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
             store
-                .persist("m3-g1", "tmpl", &tokens, &set)
+                .persist("m3-g1", "tmpl", &tokens, &set, &set.layer_plan())
                 .expect("persist must succeed")
         };
         assert!(
@@ -5844,7 +6011,7 @@ mod tests {
 
         let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
         let (mut loaded, matched) = store
-            .load_prefix("m3-g1", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+            .load_prefix("m3-g1", "tmpl", &tokens, &set.layer_plan())
             .expect(
                 "W1 (candidate selected): load_prefix must return the candidate \
                  just committed. A miss here is a write-only store, and a miss \
@@ -6065,7 +6232,8 @@ mod tests {
         let alt = mlxcel_core::slice(&input, &[0, l_chunk, 0], &[1, l_chunk * 2, hidden]);
         let _ = attn.forward(&alt, &mut cache_other, None);
         assert_eq!(
-            cache_other.offset, cache_long.offset - l_chunk,
+            cache_other.offset,
+            cache_long.offset - l_chunk,
             "precondition: the content arm must reach the SAME extent as arm 1 did before \
              its decode — equal offset is the whole point of this axis"
         );
@@ -6126,12 +6294,16 @@ mod tests {
         let x_alt = mlxcel_core::multiply_scalar(&make_test_input(1, kv_len_prior, hidden), -1.0);
         let _ = attn.forward(&x_alt, &mut cache_other, None);
         assert_eq!(
-            cache_other.offset, cache_a.offset - 1,
+            cache_other.offset,
+            cache_a.offset - 1,
             "precondition: equal extent before the decode"
         );
         let out_other = attn.forward(&x_decode, &mut cache_other, None);
         mlxcel_core::eval(&out_other);
-        assert_eq!(cache_other.offset, cache_a.offset, "precondition: equal extent after");
+        assert_eq!(
+            cache_other.offset, cache_a.offset,
+            "precondition: equal extent after"
+        );
         assert!(
             !arrays_bit_identical(&out_a, &out_other),
             "K8V4: the comparison did not distinguish two caches at IDENTICAL EXTENT holding \
@@ -6186,9 +6358,7 @@ mod tests {
     fn g1_3_v4_hands_the_scheduler_the_same_prefix_as_v3() {
         use mlxcel_core::cache::block_cold_store::BlockColdStore;
         use mlxcel_core::cache::cold_store::ColdStore;
-        use mlxcel_core::cache::{
-            DetachedCacheSet, KVCacheMode, SequenceId, SequenceStateBackend,
-        };
+        use mlxcel_core::cache::{DetachedCacheSet, SequenceId, SequenceStateBackend};
 
         let mut attn = make_test_sparse_attention();
         let hidden = 16;
@@ -6199,7 +6369,11 @@ mod tests {
         let prefix_len = l_chunk * split;
         let input = make_test_input(1, l_chunk * n_chunks, hidden);
         let chunk = |i: i32| {
-            mlxcel_core::slice(&input, &[0, i * l_chunk, 0], &[1, (i + 1) * l_chunk, hidden])
+            mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            )
         };
 
         // Deterministic source: same forward, so both stores receive
@@ -6265,12 +6439,12 @@ mod tests {
         {
             let store = BlockColdStore::new(dir_v4.path().to_path_buf(), [13u8; 32]);
             store
-                .persist("g13", "tmpl", &tokens, &set_v4)
+                .persist("g13", "tmpl", &tokens, &set_v4, &set_v4.layer_plan())
                 .expect("v4 persist");
         }
         let store_v4 = BlockColdStore::new(dir_v4.path().to_path_buf(), [13u8; 32]);
         let (loaded_v4, matched_v4) = store_v4
-            .load_prefix("g13", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+            .load_prefix("g13", "tmpl", &tokens, &set_v4.layer_plan())
             .expect("v4 must return the candidate it just persisted");
         let mut cache_v4 = KVCache::new();
         cache_v4
@@ -6365,7 +6539,7 @@ mod tests {
     fn a_sweep_that_collects_orphans_leaves_a_reachable_cache_bit_identical() {
         use mlxcel_core::cache::block_cold_store::BlockColdStore;
         use mlxcel_core::cache::cold_store::PruneMode;
-        use mlxcel_core::cache::{DetachedCacheSet, KVCacheMode, SequenceId, SequenceStateBackend};
+        use mlxcel_core::cache::{DetachedCacheSet, SequenceId, SequenceStateBackend};
 
         let mut attn = make_test_sparse_attention();
         let hidden = 16;
@@ -6421,12 +6595,12 @@ mod tests {
         {
             let store = BlockColdStore::new(dir_b.path().to_path_buf(), [11u8; 32]);
             store
-                .persist("m3-g15", "tmpl", &tokens, &set_b)
+                .persist("m3-g15", "tmpl", &tokens, &set_b, &set_b.layer_plan())
                 .expect("arm B persist");
         }
         let store_b = BlockColdStore::new(dir_b.path().to_path_buf(), [11u8; 32]);
         let (loaded_b, matched_b) = store_b
-            .load_prefix("m3-g15", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+            .load_prefix("m3-g15", "tmpl", &tokens, &set_b.layer_plan())
             .expect("arm B: load_prefix must return the candidate");
         assert_eq!(matched_b, prefix_len as usize, "arm B partial match");
         let mut cache_b = KVCache::new();
@@ -6448,7 +6622,7 @@ mod tests {
                 .with_prune_mode(PruneMode::Delete)
                 .with_min_gc_age(std::time::Duration::ZERO);
             store
-                .persist("m3-g15", "tmpl", &tokens, &set_c)
+                .persist("m3-g15", "tmpl", &tokens, &set_c, &set_c.layer_plan())
                 .expect("arm C persist (keeper)")
         };
 
@@ -6462,7 +6636,13 @@ mod tests {
                 .with_prune_mode(PruneMode::Delete)
                 .with_min_gc_age(std::time::Duration::ZERO);
             let m = store
-                .persist("m3-g15", "tmpl", &orphan_tokens, &set_orphan)
+                .persist(
+                    "m3-g15",
+                    "tmpl",
+                    &orphan_tokens,
+                    &set_orphan,
+                    &set_orphan.layer_plan(),
+                )
                 .expect("persist the soon-to-be orphan");
             store
                 .delete_manifest(&m.hash())
@@ -6525,7 +6705,7 @@ mod tests {
         }
 
         let (loaded_c, matched_c) = store_c
-            .load_prefix("m3-g15", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+            .load_prefix("m3-g15", "tmpl", &tokens, &set_c.layer_plan())
             .expect("arm C: the reachable candidate must still load AFTER a sweep");
         assert_eq!(
             matched_c, prefix_len as usize,
@@ -6586,7 +6766,7 @@ mod tests {
         let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
         let tokens: Vec<i32> = (0..256).collect();
 
-        let got = store.load_prefix("m3-g1", "tmpl", &tokens, KVCacheMode::Fp16, 0);
+        let got = store.load_prefix("m3-g1", "tmpl", &tokens, &[(KVCacheMode::Fp16, 0)]);
         assert!(
             got.is_err(),
             "N1: an empty store returned a candidate — the G1.1 hit witness \
@@ -6605,9 +6785,7 @@ mod tests {
     #[test]
     fn g1_0_a_mode_mismatch_misses_before_adoption() {
         use mlxcel_core::cache::block_cold_store::BlockColdStore;
-        use mlxcel_core::cache::{
-            DetachedCacheSet, KVCacheMode, SequenceId, SequenceStateBackend,
-        };
+        use mlxcel_core::cache::{DetachedCacheSet, KVCacheMode, SequenceId, SequenceStateBackend};
 
         let attn = make_test_sparse_attention();
         let hidden = 16;
@@ -6632,12 +6810,17 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
         store
-            .persist("m3-g1", "tmpl", &tokens, &set)
+            .persist("m3-g1", "tmpl", &tokens, &set, &set.layer_plan())
             .expect("persist must succeed");
 
         // Written as Fp16; asked for as KVarN8/v4. The address differs, so the
         // manifest cannot be found at all.
-        let wrong = store.load_prefix("m3-g1", "tmpl", &tokens, KVCacheMode::KVarN8, 4);
+        let wrong = store.load_prefix(
+            "m3-g1",
+            "tmpl",
+            &tokens,
+            &vec![(KVCacheMode::KVarN8, 4); set.num_layers()],
+        );
         assert!(
             wrong.is_err(),
             "N3: a KVarN8/v4 lookup found an Fp16 entry. Adoption would then \
@@ -6649,7 +6832,7 @@ mod tests {
         // miss above is the identity biting and not a store that never works.
         assert!(
             store
-                .load_prefix("m3-g1", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+                .load_prefix("m3-g1", "tmpl", &tokens, &set.layer_plan())
                 .is_ok(),
             "N3: the correct identity must still hit, or the mismatch result \
              above proves nothing"
@@ -6671,9 +6854,7 @@ mod tests {
     #[test]
     fn g1_0_a_desynced_adopted_state_reddens_dispatch_and_equivalence() {
         use mlxcel_core::cache::block_cold_store::BlockColdStore;
-        use mlxcel_core::cache::{
-            DetachedCacheSet, KVCacheMode, SequenceId, SequenceStateBackend,
-        };
+        use mlxcel_core::cache::{DetachedCacheSet, SequenceId, SequenceStateBackend};
 
         let mut attn = make_test_sparse_attention();
         attn.block_size = 128;
@@ -6715,8 +6896,7 @@ mod tests {
             };
             let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
             let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
-            let k =
-                mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
+            let k = mlxcel_core::fast_rope(&k, attn.rope_dims, false, attn.rope_base, 1.0, offset);
             let _ = cache_bad.update_and_fetch(k, v);
         }
         assert_eq!(cache_bad.offset, prefix_len);
@@ -6743,14 +6923,14 @@ mod tests {
         let manifest = {
             let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
             store
-                .persist("m3-g1", "tmpl", &tokens, &set)
+                .persist("m3-g1", "tmpl", &tokens, &set, &set.layer_plan())
                 .expect("persist must succeed")
         };
         assert!(!manifest.block_hashes.is_empty());
 
         let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
         let (mut loaded, matched) = store
-            .load_prefix("m3-g1", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+            .load_prefix("m3-g1", "tmpl", &tokens, &set.layer_plan())
             .expect("the desynced set is still a valid cold-store entry");
         assert_eq!(matched, tokens.len());
 
@@ -6985,17 +7165,19 @@ mod tests {
 
         let manifest = {
             let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
-            store.persist("m3-g12", "tmpl", &tokens, &set).expect(
-                "persist must accept a LIVE K8V4 cache — sink, finalized tiles \
+            store
+                .persist("m3-g12", "tmpl", &tokens, &set, &set.layer_plan())
+                .expect(
+                    "persist must accept a LIVE K8V4 cache — sink, finalized tiles \
                  and a staged partial tail. Every real cache looks like this; a \
                  store that only takes tile-aligned lengths cannot persist one.",
-            )
+                )
         };
         assert!(!manifest.block_hashes.is_empty());
 
         let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
         let (mut loaded, matched) = store
-            .load_prefix("m3-g12", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+            .load_prefix("m3-g12", "tmpl", &tokens, &set.layer_plan())
             .expect("W1: the K8V4 candidate just committed must be found");
         assert_eq!(matched, tokens.len(), "W1: full prefix");
         assert_eq!(loaded.caches.len(), 1, "W2a: one cache per layer");
@@ -7216,12 +7398,12 @@ mod tests {
         {
             let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
             store
-                .persist("m3-g12b", "tmpl", &tokens, &set)
+                .persist("m3-g12b", "tmpl", &tokens, &set, &set.layer_plan())
                 .expect("persist must succeed");
         }
         let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
         let (mut loaded, matched) = store
-            .load_prefix("m3-g12b", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+            .load_prefix("m3-g12b", "tmpl", &tokens, &set.layer_plan())
             .expect("the K8V4 candidate must be found");
         assert_eq!(matched, tokens.len());
 
@@ -7381,17 +7563,17 @@ mod tests {
         let l_chunk = 6;
         let n_chunks = 4;
         let l_total = l_chunk * n_chunks; // 24
-                                          // Block-aligned (but NOT chunk-aligned) trim: cold-equivalence holds
-                                          // and this test pins it. Empirical finding (2026-07-04): at an
-                                          // UNALIGNED trim (7 here, or the live dense-adoption 160 with
-                                          // block_size 128), the resumed output legitimately diverges from a
-                                          // cold run (relative L2 ≈ 1.13 at this scale) because MSA's
-                                          // query-block pooling grid anchors at the chunk start — a shifted
-                                          // grid pools different positions together, selects different top-k
-                                          // blocks, and computes different (valid) attention. Cold-equivalence
-                                          // after partial adoption therefore requires flooring dense adoption
-                                          // to the MSA block size, mirroring the paged path's #225 flooring.
-                                          // Tracked as follow-up work.
+        // Block-aligned (but NOT chunk-aligned) trim: cold-equivalence holds
+        // and this test pins it. Empirical finding (2026-07-04): at an
+        // UNALIGNED trim (7 here, or the live dense-adoption 160 with
+        // block_size 128), the resumed output legitimately diverges from a
+        // cold run (relative L2 ≈ 1.13 at this scale) because MSA's
+        // query-block pooling grid anchors at the chunk start — a shifted
+        // grid pools different positions together, selects different top-k
+        // blocks, and computes different (valid) attention. Cold-equivalence
+        // after partial adoption therefore requires flooring dense adoption
+        // to the MSA block size, mirroring the paged path's #225 flooring.
+        // Tracked as follow-up work.
         let trim_target: i32 = 8;
 
         let input = make_test_input(1, l_total, hidden);
@@ -7979,11 +8161,7 @@ mod tests {
         let mut row = 0usize;
         for _h in 0..h_kv {
             for _t in 0..l {
-                let past = if local > 0 {
-                    (row as i32) % local
-                } else {
-                    0
-                };
+                let past = if local > 0 { (row as i32) % local } else { 0 };
                 sel_f.push(past as f32);
                 sel_f.push(local as f32);
                 row += 1;
@@ -8041,7 +8219,10 @@ mod tests {
         // The production-dim harness is the one whose number may bound
         // anything. The toy harness is run alongside ONLY to measure how far
         // it understates — a number that exists to be distrusted.
-        for (d128, harness) in [(false, "TOY  head_dim=4  bs=2"), (true, "PROD head_dim=128 bs=128")] {
+        for (d128, harness) in [
+            (false, "TOY  head_dim=4  bs=2"),
+            (true, "PROD head_dim=128 bs=128"),
+        ] {
             eprintln!(
                 "\n=== {harness} ===\n{:<34} {:>6} {:>12} {:>12} {:>12} {:>10}",
                 "CELL", "n", "max_abs", "max_rel", "ref_absmax", "L3_util"

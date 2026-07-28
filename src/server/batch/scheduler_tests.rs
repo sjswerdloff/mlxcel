@@ -62,7 +62,7 @@ fn make_test_sequence(id_val: u64) -> (SequenceInfo, mpsc::Receiver<GenerateEven
         already_cached_tokens: 0,
         response_tx: tx,
         cancelled: Arc::new(AtomicBool::new(false)),
-            orphaned: false,
+        orphaned: false,
         created_at: Instant::now(),
         prefill_start: None,
         first_token_time: None,
@@ -253,7 +253,7 @@ fn make_test_sequence_with_priority(
         already_cached_tokens: 0,
         response_tx: tx,
         cancelled: Arc::new(AtomicBool::new(false)),
-            orphaned: false,
+        orphaned: false,
         created_at: Instant::now(),
         prefill_start: None,
         first_token_time: None,
@@ -1463,7 +1463,6 @@ fn effective_kv_cache_mode_enabled_batch_quant_takes_precedence() {
     );
 }
 
-
 // ── k8v4: apply_kvarn_v_bits (K8V4 design §3.4 construction) ────────
 
 /// The width lands ONLY on KVarN8 caches in the mixed per-layer slice
@@ -1487,4 +1486,73 @@ fn apply_kvarn_v_bits_v8_is_noop() {
     let mut caches = vec![KVCache::new_with_mode(KVCacheMode::KVarN8)];
     crate::server::batch::scheduler::apply_kvarn_v_bits(&mut caches, 8);
     assert_eq!(caches[0].kvarn_v_bits(), 8);
+}
+
+// ── The nominal per-layer plan (v4 cold-store block address) ────────
+
+/// The legacy Fp16 default plans homogeneously — the allocation no-op.
+///
+/// `v_bits` is the inert default 8 on a non-KVarN8 layer, mirroring what
+/// `make_caches` actually hands back. The block address canonicalises Fp16
+/// widths, so this is describing reality rather than pre-normalising it.
+#[test]
+fn nominal_layer_plan_for_legacy_fp16_is_homogeneous() {
+    use mlxcel_core::cache::{BatchKvQuantConfig, KVCacheMode};
+    let plan = crate::server::batch::scheduler::resolve_nominal_layer_plan(
+        &BatchKvQuantConfig::default(),
+        KVCacheMode::Fp16,
+        8,
+        4,
+    );
+    assert_eq!(plan, vec![(KVCacheMode::Fp16, 8); 4]);
+}
+
+/// The configured KVarN8 width rides only the layers that resolved to
+/// KVarN8 — the same rule `apply_kvarn_v_bits` applies to real caches.
+#[test]
+fn nominal_layer_plan_carries_the_kvarn_width() {
+    use mlxcel_core::cache::{BatchKvQuantConfig, KVCacheMode};
+    let plan = crate::server::batch::scheduler::resolve_nominal_layer_plan(
+        &BatchKvQuantConfig::default(),
+        KVCacheMode::KVarN8,
+        4,
+        3,
+    );
+    assert_eq!(plan, vec![(KVCacheMode::KVarN8, 4); 3]);
+}
+
+/// `skip_last_layer` produces a HETEROGENEOUS plan with no model involved.
+///
+/// This is the point the old single-pair block address missed: mixed sets are
+/// not a MiniMax-M3 quirk. A config flag alone makes the last layer Fp16 while
+/// the rest stay quantized, so an address derived from layer 0 would have been
+/// a lie about the last layer for any model at all.
+///
+/// Named mutation: drop the `skip_last_layer` branch in
+/// `BatchKvQuantConfig::resolve_layer_modes` and the last entry stops
+/// differing — red.
+#[test]
+fn nominal_layer_plan_is_heterogeneous_under_skip_last_layer() {
+    use mlxcel_core::cache::{BatchKvQuantConfig, KVCacheMode, KvQuantScheme};
+    let cfg = BatchKvQuantConfig::new(KvQuantScheme::Uniform, 8, 64, true)
+        .expect("valid batch kv-quant config");
+    assert!(cfg.is_enabled(), "precondition: the config must be active");
+
+    let plan =
+        crate::server::batch::scheduler::resolve_nominal_layer_plan(&cfg, KVCacheMode::Fp16, 8, 4);
+    assert_eq!(
+        plan.len(),
+        4,
+        "the plan must stay per-layer, one entry per layer"
+    );
+    assert_eq!(
+        plan[3].0,
+        KVCacheMode::Fp16,
+        "skip_last_layer must leave the final layer unquantized"
+    );
+    assert_ne!(
+        plan[0], plan[3],
+        "this plan must be MIXED — a config flag alone produces heterogeneity, \
+         with no model-specific downgrade involved"
+    );
 }

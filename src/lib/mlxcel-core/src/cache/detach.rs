@@ -1910,6 +1910,23 @@ impl DetachedCacheSet {
         self.caches.iter().map(|c| c.nbytes()).sum()
     }
 
+    /// The per-layer `(mode, v_bits)` this set ACTUALLY carries.
+    ///
+    /// Ground truth for the v4 cold store's block address: `persist` checks
+    /// the caller's plan against this and refuses on disagreement, because the
+    /// read side can only ever work from a declared plan and a plan that has
+    /// drifted from reality produces addresses that miss SILENTLY.
+    ///
+    /// Exists as an accessor because `DetachedKVCache::mode` and
+    /// `kvarn_v_bits` are `pub(super)`: outside this module — the model tests,
+    /// the scheduler — there is otherwise no way to ask a set what it is.
+    pub fn layer_plan(&self) -> Vec<(KVCacheMode, u8)> {
+        self.caches
+            .iter()
+            .map(|c| (c.mode, c.kvarn_v_bits))
+            .collect()
+    }
+
     /// Number of layer caches carried by this set.
     pub fn num_layers(&self) -> usize {
         self.caches.len()

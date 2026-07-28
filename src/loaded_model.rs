@@ -303,6 +303,18 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, prefill_alignment())
     }
 
+    /// MUST be delegated for the same reason as `prefill_alignment` above: the
+    /// batch scheduler consults this enum for the v4 cold-store block address.
+    /// Inheriting the trait default here would hand the READ side the nominal
+    /// plan while the WRITE side observed M3's D1-downgraded one — addresses
+    /// that never match, every load a silent miss.
+    fn kv_cache_plan(
+        &self,
+        nominal: &[(mlxcel_core::cache::KVCacheMode, u8)],
+    ) -> Vec<(mlxcel_core::cache::KVCacheMode, u8)> {
+        delegate_language_model!(self, kv_cache_plan(nominal))
+    }
+
     fn output_suppressed_token_ids(&self) -> Vec<i32> {
         delegate_language_model!(self, output_suppressed_token_ids())
     }

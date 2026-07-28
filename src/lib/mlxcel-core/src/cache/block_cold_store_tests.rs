@@ -35,6 +35,30 @@
 // `SequenceId`, `SequenceStateBackend`) that `block_cold_store` imports.
 use super::*;
 
+/// The per-layer plan a set ACTUALLY has — the honest write-side plan.
+///
+/// **Scope, so a green using this is not read as wider than it is:** passing
+/// this to `persist` makes the plan-conformance check tautological at that
+/// call site, by construction. That is the right default for a test whose
+/// subject is something else, but it means these greens say nothing about the
+/// conformance guard. The guard is pinned separately by
+/// `a_set_that_contradicts_the_callers_plan_is_refused`, which states a plan
+/// that deliberately disagrees.
+fn plan_of(set: &DetachedCacheSet) -> Vec<(KVCacheMode, u8)> {
+    set.caches
+        .iter()
+        .map(|c| (c.mode, c.kvarn_v_bits))
+        .collect()
+}
+
+/// A homogeneous `n`-layer plan — the shape EVERY pre-existing fixture in this
+/// file has, and the reason the suite could not falsify the old single-pair
+/// address: nothing here ever built a mixed set, so nothing could reach the
+/// guard that refused one. `m3_shaped_mixed_set` is the fixture that does.
+fn homog(n: usize, mode: KVCacheMode, v_bits: u8) -> Vec<(KVCacheMode, u8)> {
+    vec![(mode, v_bits); n]
+}
+
 use crate::dtype;
 use crate::MlxArray;
 use crate::{array_to_raw_bytes, astype, eval, ffi, item_bool};
@@ -184,8 +208,7 @@ fn blank(mode: KVCacheMode) -> DetachedKVCache {
         cold_offset: 0,
         hot_threshold: 0,
         delegated_fp16_fast_path: false,
-        delegated_fp16_sidecar_policy:
-            crate::cache::turbo::DelegatedFp16SidecarPolicy::Predecode,
+        delegated_fp16_sidecar_policy: crate::cache::turbo::DelegatedFp16SidecarPolicy::Predecode,
         m3_idx_k: None,
         m3_idx_offset: 0,
         kvarn_sink_k: None,
@@ -465,7 +488,7 @@ fn reassembly_roundtrip_bit_identical() {
     //   [384, 640)     -> hist tiles 2..4
     //   [640, 650)     -> tail
     let blocks: &[(usize, usize)] = &[
-        (0, (TILE + 2 * TILE) as usize),   // 0..384
+        (0, (TILE + 2 * TILE) as usize),                   // 0..384
         ((TILE + 2 * TILE) as usize, (TILE + t) as usize), // 384..640
         ((TILE + t) as usize, total as usize),             // 640..650
     ];
@@ -483,12 +506,16 @@ fn reassembly_roundtrip_bit_identical() {
     let concat_two = |i0: usize, i1: usize, name: &str, sel: FieldSel| -> Vec<u8> {
         let a = sel(&extracted[i0].caches[0])
             .as_ref()
-            .unwrap_or_else(|| panic!("block{i0} dropped field `{name}` (extraction returned None)"))
+            .unwrap_or_else(|| {
+                panic!("block{i0} dropped field `{name}` (extraction returned None)")
+            })
             .as_ref()
             .unwrap();
         let b = sel(&extracted[i1].caches[0])
             .as_ref()
-            .unwrap_or_else(|| panic!("block{i1} dropped field `{name}` (extraction returned None)"))
+            .unwrap_or_else(|| {
+                panic!("block{i1} dropped field `{name}` (extraction returned None)")
+            })
             .as_ref()
             .unwrap();
         bytes(&crate::utils::concatenate(a, b, 2))
@@ -616,8 +643,7 @@ fn reassembly_roundtrip_red_control_perturbed_tile_mismatches() {
 
     let ex = extract_block(&perturbed, 0, (TILE + t) as usize).expect("extract ok");
     let reassembled_hist = bytes_of(&ex.caches[0].kvarn_hist_k, "hist_k");
-    let pristine_hist =
-        src_token_slice_bytes(&pristine.caches[0].kvarn_hist_k, 0, t);
+    let pristine_hist = src_token_slice_bytes(&pristine.caches[0].kvarn_hist_k, 0, t);
 
     assert_ne!(
         reassembled_hist, pristine_hist,
@@ -889,7 +915,11 @@ fn v_bits_preserved() {
         .unwrap();
     let shape = ffi::array_shape(hv);
     // hist portion of this block is 2 tiles => 256 tokens.
-    assert_eq!(shape[2], 2 * TILE, "hist_v axis-2 == block hist token count");
+    assert_eq!(
+        shape[2],
+        2 * TILE,
+        "hist_v axis-2 == block hist token count"
+    );
     assert_eq!(
         shape[3],
         VD / 8,
@@ -1042,9 +1072,9 @@ fn end_to_end_extract_write_read_assemble_preserves_payload_bytes() {
     // Three blocks spanning the whole sequence, crossing tile boundaries and
     // putting sink in the first and tail in the last.
     let plan: &[(usize, usize)] = &[
-        (0, (TILE + 2 * TILE) as usize),                   // sink + tiles 0..2
+        (0, (TILE + 2 * TILE) as usize), // sink + tiles 0..2
         ((TILE + 2 * TILE) as usize, (TILE + t) as usize), // tiles 2..4
-        ((TILE + t) as usize, total as usize),             // tail
+        ((TILE + t) as usize, total as usize), // tail
     ];
 
     let mut hashes: Vec<[u8; 32]> = Vec::new();
@@ -1321,12 +1351,14 @@ fn persist_then_load_prefix_reports_a_hit_fp16() {
     let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
 
     store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
 
     let (loaded, matched) = store
-        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0)
-        .expect("load_prefix MUST HIT the entry just persisted — a miss here is a write-only store");
+        .load_prefix("m3", "tmpl", &tokens, &homog(LAYERS, KVCacheMode::Fp16, 0))
+        .expect(
+            "load_prefix MUST HIT the entry just persisted — a miss here is a write-only store",
+        );
 
     assert!(
         matched > 0,
@@ -1366,7 +1398,11 @@ fn persist_then_load_prefix_reports_a_hit_kvarn8() {
     const LAYERS: usize = 2;
     const N_TILES: i32 = 31;
     let depth = TILE + N_TILES * TILE; // 4096
-    assert_eq!(depth as usize, 2 * DEFAULT_BLOCK_SIZE, "must span two blocks");
+    assert_eq!(
+        depth as usize,
+        2 * DEFAULT_BLOCK_SIZE,
+        "must span two blocks"
+    );
 
     let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
     let tokens: Vec<i32> = (0..depth).collect();
@@ -1375,17 +1411,25 @@ fn persist_then_load_prefix_reports_a_hit_kvarn8() {
     let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
 
     store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
 
     let (loaded, matched) = store
-        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+        .load_prefix(
+            "m3",
+            "tmpl",
+            &tokens,
+            &homog(LAYERS, KVCacheMode::KVarN8, 4),
+        )
         .expect(
             "load_prefix MUST HIT under KVarN8. A miss here is the §7.5 write-only bug \
              returning: persist addresses with the real mode, so load must too.",
         );
 
-    assert!(matched > 0, "zero match means the store was written and never used");
+    assert!(
+        matched > 0,
+        "zero match means the store was written and never used"
+    );
     assert_eq!(matched, tokens.len(), "the full prefix was persisted");
     assert_eq!(
         loaded.caches.len(),
@@ -1431,7 +1475,11 @@ fn round_trip_must_preserve_per_layer_m3_idx_state_including_dense_layers() {
     const INDEX_DIM: i32 = 8;
     const B_M3_IDX: i32 = 91;
     let depth = TILE + N_TILES * TILE; // 4096 == 2 * DEFAULT_BLOCK_SIZE
-    assert_eq!(depth as usize, 2 * DEFAULT_BLOCK_SIZE, "must span two blocks");
+    assert_eq!(
+        depth as usize,
+        2 * DEFAULT_BLOCK_SIZE,
+        "must span two blocks"
+    );
 
     let mut set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
 
@@ -1457,10 +1505,15 @@ fn round_trip_must_preserve_per_layer_m3_idx_state_including_dense_layers() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
     store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
     let (loaded, matched) = store
-        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+        .load_prefix(
+            "m3",
+            "tmpl",
+            &tokens,
+            &homog(LAYERS, KVCacheMode::KVarN8, 4),
+        )
         .expect("load_prefix must HIT — a miss makes this test vacuous");
     assert_eq!(matched, tokens.len(), "full prefix must match");
 
@@ -1548,10 +1601,10 @@ fn persisted_store_for_gc() -> (tempfile::TempDir, BlockColdStore, Manifest) {
     let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
     let tokens: Vec<i32> = (0..depth).collect();
     let dir = tempfile::TempDir::new().expect("tempdir");
-    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32])
-        .with_prune_mode(PruneMode::Delete);
+    let store =
+        BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]).with_prune_mode(PruneMode::Delete);
     let manifest = store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
     (dir, store, manifest)
 }
@@ -1640,9 +1693,7 @@ fn an_unreadable_manifest_aborts_gc_rather_than_freeing_its_blocks() {
 
     for b in &manifest.block_hashes {
         store.read_block(b).unwrap_or_else(|e| {
-            panic!(
-                "a block was deleted during a pass that could not prove reachability ({e})"
-            )
+            panic!("a block was deleted during a pass that could not prove reachability ({e})")
         });
     }
 }
@@ -1694,7 +1745,7 @@ fn a_committed_manifest_never_references_a_missing_block_under_concurrent_gc() {
         let set_a = kvarn_v4_set_distinct(2, N_TILES, 0);
         let tokens_a: Vec<i32> = (0..depth).collect();
         store
-            .persist("m3", "tmpl", &tokens_a, &set_a)
+            .persist("m3", "tmpl", &tokens_a, &set_a, &plan_of(&set_a))
             .expect("seed persist");
 
         // A DIVERGENT second sequence: shares the leading block, differs later,
@@ -1714,7 +1765,7 @@ fn a_committed_manifest_never_references_a_missing_block_under_concurrent_gc() {
             let _ = gc_store.gc_blocks();
         });
 
-        let published = store.persist("m3", "tmpl", &tokens_b, &set_b);
+        let published = store.persist("m3", "tmpl", &tokens_b, &set_b, &plan_of(&set_b));
 
         gc.join().expect("gc thread");
 
@@ -1794,10 +1845,13 @@ fn a_block_referenced_by_a_manifest_published_after_nomination_must_survive() {
     );
 
     let manifest = store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
     let blocks = manifest.block_hashes.clone();
-    assert!(!blocks.is_empty(), "precondition: the manifest must have blocks");
+    assert!(
+        !blocks.is_empty(),
+        "precondition: the manifest must have blocks"
+    );
 
     // Orphan them: with the manifest gone, every block is unreferenced and GC
     // will nominate it.
@@ -1881,13 +1935,25 @@ fn a_corrupt_longest_candidate_falls_back_to_a_verified_shorter_one() {
 
     let a: Vec<i32> = (0..A_LEN).collect();
     let m_a = store
-        .persist("m3", "tmpl", &a, &fp16_set(LAYERS, A_LEN))
+        .persist(
+            "m3",
+            "tmpl",
+            &a,
+            &fp16_set(LAYERS, A_LEN),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("branch A persists");
 
     let mut b: Vec<i32> = a[..SHARED].to_vec();
     b.extend((0..(B_LEN as usize - SHARED)).map(|i| 900_000 + i as i32));
     let m_b = store
-        .persist("m3", "tmpl", &b, &fp16_set(LAYERS, B_LEN))
+        .persist(
+            "m3",
+            "tmpl",
+            &b,
+            &fp16_set(LAYERS, B_LEN),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("branch B persists");
 
     assert_eq!(
@@ -1904,7 +1970,7 @@ fn a_corrupt_longest_candidate_falls_back_to_a_verified_shorter_one() {
     // CONTROL ON THE CONTROL, first: undamaged, B's tokens select B — the LONGEST.
     // Without this, a fallback result below could just be the store always choosing A.
     let (_, matched_clean) = store
-        .load_prefix("m3", "tmpl", &b, KVCacheMode::Fp16, 0)
+        .load_prefix("m3", "tmpl", &b, &homog(LAYERS, KVCacheMode::Fp16, 0))
         .expect("undamaged, B's tokens must hit");
     assert_eq!(
         matched_clean,
@@ -1947,15 +2013,14 @@ fn a_corrupt_longest_candidate_falls_back_to_a_verified_shorter_one() {
 
     // THE CONTRACT: the shorter, still-verifiable candidate is returned.
     let (loaded, matched) = store
-        .load_prefix("m3", "tmpl", &b, KVCacheMode::Fp16, 0)
+        .load_prefix("m3", "tmpl", &b, &homog(LAYERS, KVCacheMode::Fp16, 0))
         .expect(
             "with the longest candidate damaged, load_prefix must fall back to the \
              shorter VERIFIED one rather than failing the whole lookup",
         );
 
     assert_eq!(
-        matched,
-        SHARED,
+        matched, SHARED,
         "the fallback must report the SHORTER match — one shared block. A value of \
          {B_LEN} here means the damaged candidate's coverage was reported for state \
          that did not come from it, which is the partial adoption Alden named."
@@ -1983,7 +2048,7 @@ fn a_corrupt_longest_candidate_falls_back_to_a_verified_shorter_one() {
     store
         .delete_manifest(&m_a.hash())
         .expect("remove the fallback candidate");
-    let no_fallback = store.load_prefix("m3", "tmpl", &b, KVCacheMode::Fp16, 0);
+    let no_fallback = store.load_prefix("m3", "tmpl", &b, &homog(LAYERS, KVCacheMode::Fp16, 0));
     assert!(
         matches!(no_fallback, Err(ColdStoreError::NoMatch)),
         "with the only verifiable candidate gone, a damaged longest must be a clean \
@@ -2028,7 +2093,13 @@ fn a_flipped_byte_anywhere_in_a_block_header_must_be_caught() {
     let store = BlockColdStore::new(dir.path().to_path_buf(), [0xE1u8; 32]);
     let tokens: Vec<i32> = (0..LEN).collect();
     let manifest = store
-        .persist("m3", "tmpl", &tokens, &fp16_set(LAYERS, LEN))
+        .persist(
+            "m3",
+            "tmpl",
+            &tokens,
+            &fp16_set(LAYERS, LEN),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("persist");
 
     let block = manifest.block_hashes[0];
@@ -2045,7 +2116,9 @@ fn a_flipped_byte_anywhere_in_a_block_header_must_be_caught() {
     // token list from a good one: it has no chain and no `kv_mode_config` to re-derive
     // against. So this drives `load_prefix`, which is the path a caller actually takes and
     // the one where the protection had to land.
-    let hit = |s: &BlockColdStore| s.load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0);
+    let hit = |s: &BlockColdStore| {
+        s.load_prefix("m3", "tmpl", &tokens, &homog(LAYERS, KVCacheMode::Fp16, 0))
+    };
 
     assert!(
         hit(&store).is_ok(),
@@ -2078,7 +2151,11 @@ fn a_flipped_byte_anywhere_in_a_block_header_must_be_caught() {
         unprotected.len(),
         clean.len(),
         if unprotected.len() > 24 {
-            format!("{:?} … (+{} more)", &unprotected[..24], unprotected.len() - 24)
+            format!(
+                "{:?} … (+{} more)",
+                &unprotected[..24],
+                unprotected.len() - 24
+            )
         } else {
             format!("{unprotected:?}")
         }
@@ -2117,10 +2194,16 @@ fn assemble_blocks_itself_refuses_a_manifest_its_tokens_do_not_re_derive() {
     let store = BlockColdStore::new(dir.path().to_path_buf(), fingerprint);
     let tokens: Vec<i32> = (0..DEPTH).collect();
     let manifest = store
-        .persist("m3", "tmpl", &tokens, &fp16_set(LAYERS, DEPTH))
+        .persist(
+            "m3",
+            "tmpl",
+            &tokens,
+            &fp16_set(LAYERS, DEPTH),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("persist");
 
-    let kv_mode = cache_computation_id(&fingerprint, KVCacheMode::Fp16, 0);
+    let kv_mode = cache_computation_id(&fingerprint, &homog(LAYERS, KVCacheMode::Fp16, 0));
 
     // Control first: undamaged, the lower boundary accepts.
     assert!(
@@ -2141,13 +2224,11 @@ fn assemble_blocks_itself_refuses_a_manifest_its_tokens_do_not_re_derive() {
     bytes[44] ^= 0x01; // first token: 4 version + 32 hash + 8 count = offset 44
     std::fs::write(&header_path, &bytes).expect("write damaged header");
 
-    let err = store
-        .assemble_blocks(&manifest, &kv_mode)
-        .expect_err(
-            "assemble_blocks returned an adoptable cache set for a manifest whose stored \
+    let err = store.assemble_blocks(&manifest, &kv_mode).expect_err(
+        "assemble_blocks returned an adoptable cache set for a manifest whose stored \
              tokens do not re-derive its addresses. Every layer payload checksum passed — \
              that is the point. This is the fail-open seam returning.",
-        );
+    );
     let msg = format!("{err}");
     assert!(
         msg.contains("re-derive"),
@@ -2198,10 +2279,13 @@ fn a_writer_that_dedup_observed_a_block_cannot_publish_across_its_deletion() {
     let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
     let tokens: Vec<i32> = (0..depth).collect();
     let manifest = store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
     let blocks = manifest.block_hashes.clone();
-    assert!(!blocks.is_empty(), "precondition: the manifest must have blocks");
+    assert!(
+        !blocks.is_empty(),
+        "precondition: the manifest must have blocks"
+    );
 
     store
         .delete_manifest(&manifest.hash())
@@ -2296,7 +2380,10 @@ fn a_bumped_epoch_alone_aborts_the_pass_even_when_nothing_was_published() {
     let (dir, store, manifest) = persisted_store_for_gc();
     let store = Arc::new(store.with_min_gc_age(std::time::Duration::ZERO));
     let blocks = manifest.block_hashes.clone();
-    assert!(!blocks.is_empty(), "precondition: the manifest must have blocks");
+    assert!(
+        !blocks.is_empty(),
+        "precondition: the manifest must have blocks"
+    );
 
     // Orphan the blocks so GC nominates them.
     store
@@ -2372,7 +2459,10 @@ fn a_manifest_published_behind_a_quiet_epoch_still_survives_the_locked_reverify(
     let (dir, store, manifest) = persisted_store_for_gc();
     let store = Arc::new(store.with_min_gc_age(std::time::Duration::ZERO));
     let blocks = manifest.block_hashes.clone();
-    assert!(!blocks.is_empty(), "precondition: the manifest must have blocks");
+    assert!(
+        !blocks.is_empty(),
+        "precondition: the manifest must have blocks"
+    );
 
     store
         .delete_manifest(&manifest.hash())
@@ -2727,7 +2817,7 @@ fn a_publication_that_crashed_before_its_rename_pins_nothing_and_adopts_nothing(
     let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
     let tokens: Vec<i32> = (0..depth).collect();
     let manifest = store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
     let blocks = manifest.block_hashes.clone();
     assert!(
@@ -2775,7 +2865,12 @@ fn a_publication_that_crashed_before_its_rename_pins_nothing_and_adopts_nothing(
     // 2. Nothing is adoptable.
     assert!(
         store
-            .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+            .load_prefix(
+                "m3",
+                "tmpl",
+                &tokens,
+                &homog(LAYERS, KVCacheMode::KVarN8, 4)
+            )
             .is_err(),
         "load_prefix adopted a manifest whose publication CRASHED before its \
          rename. Those bytes were staged but never committed, and serving a \
@@ -2820,7 +2915,7 @@ fn a_committed_manifest_is_still_adopted_with_staged_residue_beside_it() {
     let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
     let tokens: Vec<i32> = (0..depth).collect();
     let manifest = store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
 
     // Drop a crashed publication's residue beside the committed manifest. It
@@ -2835,7 +2930,12 @@ fn a_committed_manifest_is_still_adopted_with_staged_residue_beside_it() {
     .expect("write staged");
 
     let (_set, matched) = store
-        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+        .load_prefix(
+            "m3",
+            "tmpl",
+            &tokens,
+            &homog(LAYERS, KVCacheMode::KVarN8, 4),
+        )
         .expect(
             "the COMMITTED manifest must still load with staged residue present. \
              If this is NoMatch, the staged-manifest fix rejects everything and \
@@ -2870,16 +2970,14 @@ fn a_manifest_whose_content_does_not_match_its_directory_is_not_a_candidate() {
     let set = kvarn_v4_set_distinct(LAYERS, N_TILES, 0);
     let tokens: Vec<i32> = (0..depth).collect();
     let manifest = store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
 
     // MISFILE IT. Move the committed manifest's bytes under a well-formed but
     // WRONG 32-byte hex address, and remove the correct one. The name parses,
     // the prefix is not `.tmp.`, the bytes decode — every check except the
     // content/name agreement passes.
-    let real_dir = store
-        .manifests_dir()
-        .join(hex_digest(&manifest.hash()));
+    let real_dir = store.manifests_dir().join(hex_digest(&manifest.hash()));
     let bytes = std::fs::read(real_dir.join("manifest.bin")).expect("read committed manifest");
     std::fs::remove_dir_all(&real_dir).expect("remove the correctly-filed manifest");
 
@@ -2899,7 +2997,12 @@ fn a_manifest_whose_content_does_not_match_its_directory_is_not_a_candidate() {
 
     assert!(
         store
-            .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+            .load_prefix(
+                "m3",
+                "tmpl",
+                &tokens,
+                &homog(LAYERS, KVCacheMode::KVarN8, 4)
+            )
             .is_err(),
         "load_prefix adopted a manifest filed under an address its own content \
          does not hash to. The directory name is the store's addressing claim; \
@@ -2945,6 +3048,7 @@ fn a_misfiled_manifest_is_not_a_prune_input_and_causes_no_deletion() {
             "tmpl",
             &keeper_tokens,
             &fp16_set(LAYERS, keeper_tokens.len() as i32),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
         )
         .expect("persist keeper");
 
@@ -2965,6 +3069,7 @@ fn a_misfiled_manifest_is_not_a_prune_input_and_causes_no_deletion() {
             "tmpl",
             &short_tokens,
             &fp16_set(LAYERS, short_tokens.len() as i32),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
         )
         .expect("persist unrelated");
 
@@ -2994,7 +3099,13 @@ fn a_real_committed_prefix_ancestor_is_still_pruned_after_the_migration() {
 
     let short: Vec<i32> = (0..DEFAULT_BLOCK_SIZE as i32).collect();
     store
-        .persist("m3", "tmpl", &short, &fp16_set(LAYERS, short.len() as i32))
+        .persist(
+            "m3",
+            "tmpl",
+            &short,
+            &fp16_set(LAYERS, short.len() as i32),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("persist ancestor");
     assert_eq!(
         count_manifests(&store),
@@ -3004,7 +3115,13 @@ fn a_real_committed_prefix_ancestor_is_still_pruned_after_the_migration() {
 
     let long: Vec<i32> = (0..2 * DEFAULT_BLOCK_SIZE as i32).collect();
     store
-        .persist("m3", "tmpl", &long, &fp16_set(LAYERS, long.len() as i32))
+        .persist(
+            "m3",
+            "tmpl",
+            &long,
+            &fp16_set(LAYERS, long.len() as i32),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("persist descendant");
 
     assert_eq!(
@@ -3077,7 +3194,7 @@ fn a_writer_cannot_publish_across_a_sweep_that_ran_in_another_process() {
     let set = kvarn_v4_set_distinct(XPROC_LAYERS, XPROC_N_TILES, 0);
     let tokens: Vec<i32> = (0..xproc_depth()).collect();
     let manifest = store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
     let blocks = manifest.block_hashes.clone();
     assert!(
@@ -3180,7 +3297,10 @@ fn writer_child_process() {
     // Wait for NOMINATION. Before the parent has nominated, the blocks are not
     // sweep candidates and the hazard this test is about does not exist yet —
     // publishing early would pass for the boring reason.
-    if !wait_for_file(&base.join("gc.nominated"), std::time::Duration::from_secs(30)) {
+    if !wait_for_file(
+        &base.join("gc.nominated"),
+        std::time::Duration::from_secs(30),
+    ) {
         std::fs::write(base.join("child.result"), b"error: parent never nominated").ok();
         return;
     }
@@ -3191,7 +3311,7 @@ fn writer_child_process() {
     // path check, holding no lock) followed by `write_manifest`.
     std::fs::write(base.join("child.publishing"), b"1").expect("signal publishing");
 
-    let outcome = match store.persist("m3", "tmpl", &tokens, &set) {
+    let outcome = match store.persist("m3", "tmpl", &tokens, &set, &plan_of(&set)) {
         Ok(_) => "published".to_string(),
         Err(e) => format!("refused: {e}"),
     };
@@ -3252,7 +3372,7 @@ fn two_processes_racing_publication_and_gc_preserve_the_invariant() {
     let set = kvarn_v4_set_distinct(XPROC_LAYERS, XPROC_N_TILES, 0);
     let tokens: Vec<i32> = (0..xproc_depth()).collect();
     let manifest = store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
     let blocks = manifest.block_hashes.clone();
     assert!(
@@ -3352,10 +3472,7 @@ fn two_processes_racing_publication_and_gc_preserve_the_invariant() {
     let result = std::fs::read_to_string(&result_path).expect("read child result");
 
     // THE INVARIANT — branch-independent, and checked over the whole store.
-    assert_no_committed_manifest_dangles(
-        &store,
-        &format!("The writer child reported: {result}."),
-    );
+    assert_no_committed_manifest_dangles(&store, &format!("The writer child reported: {result}."));
 
     if result == "published" {
         // The child won the lock. Its manifest is committed, so GC must have
@@ -3438,7 +3555,10 @@ fn a_tombstone_left_by_a_crash_is_inert_and_the_final_path_can_be_reoccupied() {
     let final_path = store.blocks_dir().join(&name);
     let tomb_path = store.blocks_dir().join(format!(".tombstone.{name}"));
     std::fs::rename(&final_path, &tomb_path).expect("tombstone rename");
-    assert!(tomb_path.exists() && !final_path.exists(), "crash state staged");
+    assert!(
+        tomb_path.exists() && !final_path.exists(),
+        "crash state staged"
+    );
 
     // PROPERTY 1: inert. The block is genuinely gone as far as the store is
     // concerned — the tombstone must not stand in for it.
@@ -3523,7 +3643,7 @@ fn an_active_load_lease_holds_off_the_sweep_until_it_is_released() {
         .with_min_gc_age(std::time::Duration::ZERO);
 
     let manifest = store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
     let victim = manifest.block_hashes[0];
 
@@ -3591,19 +3711,19 @@ fn a_v_bits_mismatch_is_a_clean_miss_never_a_wrong_adoption() {
     let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
 
     store
-        .persist("m3", "tmpl", &tokens, &set)
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
         .expect("persist must succeed");
 
     // Precondition: the SAME v_bits must hit, or a miss below proves nothing —
     // it would be indistinguishable from a store that never matches anything.
     let (_hit, matched) = store
-        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+        .load_prefix("m3", "tmpl", &tokens, &homog(2, KVCacheMode::KVarN8, 4))
         .expect("same-identity load must HIT, or this control is vacuous");
     assert_eq!(matched, tokens.len(), "precondition: full prefix matches");
 
     // Same mode, same tokens, same model, same template, same runtime — only
     // v_bits differs. This must NOT adopt.
-    let result = store.load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 8);
+    let result = store.load_prefix("m3", "tmpl", &tokens, &homog(2, KVCacheMode::KVarN8, 8));
     match result {
         Err(ColdStoreError::NoMatch) => {}
         Err(other) => panic!(
@@ -3619,20 +3739,29 @@ fn a_v_bits_mismatch_is_a_clean_miss_never_a_wrong_adoption() {
         ),
     }
 }
-
-/// A MIXED-WIDTH set must be REFUSED, not stored under layer 0's label.
+/// A mixed set is addressed by the WHOLE per-layer vector, never by layer 0.
 ///
-/// `persist` derives the cache-computation identity from `caches[0]` and applies
-/// it to the whole set. That is only sound if layer 0 speaks for the rest, and
-/// nothing checked it. A set with mixed `kvarn_v_bits` would be addressed k8v4
-/// while its later layers were k8v8 — an address that is true about the first
-/// layer and false about the others, trusted by every later reader.
+/// # The defect this originally caught, and what changed
 ///
-/// Same shape as the `m3_idx_offset` defect: layer 0 standing in for all layers.
-/// Refusing is right until the identity is genuinely per-layer; silently
-/// mislabelling is the failure that survives every byte assertion.
+/// `persist` used to derive the cache-computation identity from `caches[0]`
+/// and apply it to the whole set. That is only sound if layer 0 speaks for the
+/// rest, and nothing checked it: a set with mixed `kvarn_v_bits` would be
+/// addressed k8v4 while its later layers were k8v8 — an address true about the
+/// first layer and false about the others, trusted by every later reader. Same
+/// shape as the `m3_idx_offset` defect: layer 0 standing in for all layers.
+///
+/// The original guard REFUSED such a set, which was right while the address
+/// could not express one. It was also fatal: production sets are mixed by
+/// three independent routes (Boundary-V, `skip_last_layer`, M3's D1
+/// dense-prefix downgrade), so v4 refused every real M3 set and stored nothing
+/// at all. The fix was to make the address genuinely per-layer, which is what
+/// the original doc named as the precondition for allowing this.
+///
+/// So the assertion inverts and the SAFETY PROPERTY does not: a mixed set must
+/// be storable, AND must not share an address with the layer-0 reading of
+/// itself.
 #[test]
-fn a_mixed_v_bits_set_is_refused_rather_than_addressed_by_layer_zero() {
+fn a_mixed_v_bits_set_is_addressed_by_the_whole_vector_not_layer_zero() {
     const N_TILES: i32 = 31;
     let depth = TILE + N_TILES * TILE;
     let tokens: Vec<i32> = (0..depth).collect();
@@ -3640,32 +3769,49 @@ fn a_mixed_v_bits_set_is_refused_rather_than_addressed_by_layer_zero() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
 
-    // Homogeneous first: proves the refusal below is about the MIXTURE and not
-    // about this fixture being unstorable for some other reason.
+    // Homogeneous first: the control, so a success below is about the vector
+    // and not about this fixture being trivially storable either way.
     let ok_set = kvarn_v4_set_distinct(2, N_TILES, 0);
     store
-        .persist("m3", "tmpl", &tokens, &ok_set)
+        .persist("m3", "tmpl", &tokens, &ok_set, &plan_of(&ok_set))
         .expect("a homogeneous set must persist");
 
-    // Now the same set with layer 1 claiming a different V width.
+    // The same set with layer 1 claiming a different V width.
     let mut mixed = kvarn_v4_set_distinct(2, N_TILES, 0);
     assert_eq!(mixed.caches[0].kvarn_v_bits, 4, "fixture precondition");
     mixed.caches[1].kvarn_v_bits = 8;
 
     let dir2 = tempfile::TempDir::new().expect("tempdir");
     let store2 = BlockColdStore::new(dir2.path().to_path_buf(), [9u8; 32]);
-    let err = store2
-        .persist("m3", "tmpl", &tokens, &mixed)
-        .expect_err(
-            "a set whose layers disagree on v_bits must be REFUSED — storing it \
-             addresses the whole set by layer 0's width, mislabelling every other \
-             layer",
+    store2
+        .persist("m3", "tmpl", &tokens, &mixed, &plan_of(&mixed))
+        .expect(
+            "a mixed set must now be STORABLE — refusing it is what made v4 \
+             persist nothing at all for every real MiniMax-M3 cache",
         );
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("layer 1") && msg.contains("v_bits"),
-        "the refusal must name the offending layer and the field, or an operator \
-         cannot act on it — got: {msg}"
+
+    // THE SAFETY PROPERTY, unchanged from the original defect: the mixture must
+    // not be addressed as though layer 0 spoke for the set. If these collided,
+    // a k8v8 second layer would be reachable at the all-k8v4 address and read
+    // back in the wrong width — the silent mislabelling the refusal existed to
+    // prevent.
+    let rt = [9u8; 32];
+    assert_ne!(
+        cache_computation_id(&rt, &plan_of(&mixed)),
+        cache_computation_id(&rt, &homog(2, KVCacheMode::KVarN8, 4)),
+        "the mixed set shares an address with the layer-0 reading of itself"
+    );
+
+    // And it must be retrievable under its own plan, or "storable" is a claim
+    // about the write path only.
+    let (loaded, matched) = store2
+        .load_prefix("m3", "tmpl", &tokens, &plan_of(&mixed))
+        .expect("the mixed set must load back under its own plan");
+    assert_eq!(matched, tokens.len(), "the whole prefix must match");
+    assert_eq!(
+        loaded.layer_plan(),
+        mixed.layer_plan(),
+        "the loaded set must carry the same per-layer widths it was written with"
     );
 }
 
@@ -3685,15 +3831,17 @@ fn mode_mismatch_at_load_is_a_clean_miss_not_a_wrong_adoption() {
 
     let dir = tempfile::TempDir::new().expect("tempdir");
     let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
-    store.persist("m3", "tmpl", &tokens, &set).expect("persist");
+    store
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
+        .expect("persist");
 
     // Correct mode hits.
     store
-        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::KVarN8, 4)
+        .load_prefix("m3", "tmpl", &tokens, &homog(2, KVCacheMode::KVarN8, 4))
         .expect("KVarN8 load of a KVarN8 persist must hit");
 
     // Wrong mode must MISS, not adopt.
-    let wrong = store.load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0);
+    let wrong = store.load_prefix("m3", "tmpl", &tokens, &homog(2, KVCacheMode::Fp16, 0));
     assert!(
         matches!(wrong, Err(ColdStoreError::NoMatch)),
         "loading a KVarN8 cache under Fp16 must be NoMatch (re-prefill), never an \
@@ -3786,7 +3934,7 @@ fn concurrent_same_block_persist_leaves_a_readable_store() {
             handles.push(s.spawn(move || {
                 let set = fp16_set(LAYERS, DEPTH);
                 barrier.wait(); // maximise overlap on the persist itself
-                store.persist("m3", "tmpl", &tokens, &set)
+                store.persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
             }));
         }
         for h in handles {
@@ -3817,7 +3965,7 @@ fn concurrent_same_block_persist_leaves_a_readable_store() {
         // Must mirror what persist used, INCLUDING the store's runtime
         // fingerprint — block addresses now commit to the full
         // cache-computation identity, not just the mode name.
-        &cache_computation_id(&[21u8; 32], KVCacheMode::Fp16, 0),
+        &cache_computation_id(&[21u8; 32], &homog(LAYERS, KVCacheMode::Fp16, 0)),
     );
     let mut committed = 0usize;
     for hash in &expected {
@@ -3924,9 +4072,8 @@ const G31_DIR_ENV: &str = "MLXCEL_G31_DIR";
 /// Child workload: persist a multi-block cache, then exit. Never returns if
 /// the parent kills it first, which is the point.
 fn g31_child_workload() {
-    let base = std::path::PathBuf::from(
-        std::env::var(G31_DIR_ENV).expect("child needs MLXCEL_G31_DIR"),
-    );
+    let base =
+        std::path::PathBuf::from(std::env::var(G31_DIR_ENV).expect("child needs MLXCEL_G31_DIR"));
     let store = BlockColdStore::new(base, [31u8; 32]);
     // 8 blocks — enough work that a kill lands mid-persist rather than
     // always before or always after.
@@ -3934,7 +4081,7 @@ fn g31_child_workload() {
     let depth = BLOCKS * DEFAULT_BLOCK_SIZE as i32;
     let set = fp16_set(2, depth);
     let tokens: Vec<i32> = (0..depth).collect();
-    let _ = store.persist("m3", "tmpl", &tokens, &set);
+    let _ = store.persist("m3", "tmpl", &tokens, &set, &plan_of(&set));
 }
 
 #[test]
@@ -4035,8 +4182,10 @@ fn kill_9_mid_persist_never_leaves_a_readable_corrupt_block() {
         "no child was killed mid-persist at any delay — the workload finished too fast, \
          so this gate exercised NOTHING. Increase BLOCKS or shorten the delays."
     );
-    eprintln!("G3.1: killed {killed_runs}/{} runs, inspected {survivors} committed blocks",
-              delays_ms.len());
+    eprintln!(
+        "G3.1: killed {killed_runs}/{} runs, inspected {survivors} committed blocks",
+        delays_ms.len()
+    );
 }
 
 // ===========================================================================
@@ -4051,8 +4200,8 @@ fn kill_9_mid_persist_never_leaves_a_readable_corrupt_block() {
 #[test]
 fn cache_identity_commits_to_v_bits() {
     let rt = [1u8; 32];
-    let k8v4 = cache_computation_id(&rt, KVCacheMode::KVarN8, 4);
-    let k8v8 = cache_computation_id(&rt, KVCacheMode::KVarN8, 8);
+    let k8v4 = cache_computation_id(&rt, &[(KVCacheMode::KVarN8, 4)]);
+    let k8v8 = cache_computation_id(&rt, &[(KVCacheMode::KVarN8, 8)]);
     assert_ne!(
         k8v4, k8v8,
         "k8v4 and k8v8 lay out the V payload differently, so they MUST NOT share \
@@ -4063,8 +4212,8 @@ fn cache_identity_commits_to_v_bits() {
 
 #[test]
 fn cache_identity_commits_to_runtime_fingerprint() {
-    let a = cache_computation_id(&[1u8; 32], KVCacheMode::KVarN8, 4);
-    let b = cache_computation_id(&[2u8; 32], KVCacheMode::KVarN8, 4);
+    let a = cache_computation_id(&[1u8; 32], &[(KVCacheMode::KVarN8, 4)]);
+    let b = cache_computation_id(&[2u8; 32], &[(KVCacheMode::KVarN8, 4)]);
     assert_ne!(
         a, b,
         "different weights compute different KV bytes for identical tokens, so \
@@ -4076,8 +4225,8 @@ fn cache_identity_commits_to_runtime_fingerprint() {
 fn cache_identity_normalises_v_bits_under_fp16() {
     let rt = [1u8; 32];
     assert_eq!(
-        cache_computation_id(&rt, KVCacheMode::Fp16, 0),
-        cache_computation_id(&rt, KVCacheMode::Fp16, 8),
+        cache_computation_id(&rt, &[(KVCacheMode::Fp16, 0)]),
+        cache_computation_id(&rt, &[(KVCacheMode::Fp16, 8)]),
         "v_bits does not affect unquantized bytes, so it must not affect the \
          address — otherwise an Fp16 cache carrying a stale v_bits is unreachable \
          to a loader that correctly passes 0, and the cache misses for no reason"
@@ -4124,11 +4273,17 @@ fn different_runtimes_sharing_a_block_pool_do_not_collide() {
     let store_b = BlockColdStore::new(dir.path().to_path_buf(), [0xBBu8; 32]);
 
     store_a
-        .persist("m3", "tmpl", &tokens, &fp16_set_shifted(LAYERS, DEPTH, A_SHIFT))
+        .persist(
+            "m3",
+            "tmpl",
+            &tokens,
+            &fp16_set_shifted(LAYERS, DEPTH, A_SHIFT),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("runtime A persists");
 
     // B has NOT persisted. It must not be able to load A's blocks.
-    let leaked = store_b.load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0);
+    let leaked = store_b.load_prefix("m3", "tmpl", &tokens, &homog(LAYERS, KVCacheMode::Fp16, 0));
     assert!(
         matches!(leaked, Err(ColdStoreError::NoMatch)),
         "runtime B loaded a prefix it never persisted — that is runtime A's KV \
@@ -4147,10 +4302,16 @@ fn different_runtimes_sharing_a_block_pool_do_not_collide() {
     // B's own manifest points at A's bytes. So the assertion must be on CONTENT.
     let b_layer0_expected = bytes_of(&fp16_layer(DEPTH, B_SHIFT).keys, "b keys");
     store_b
-        .persist("m3", "tmpl", &tokens, &fp16_set_shifted(LAYERS, DEPTH, B_SHIFT))
+        .persist(
+            "m3",
+            "tmpl",
+            &tokens,
+            &fp16_set_shifted(LAYERS, DEPTH, B_SHIFT),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("runtime B persists");
     let (b_loaded, matched) = store_b
-        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+        .load_prefix("m3", "tmpl", &tokens, &homog(LAYERS, KVCacheMode::Fp16, 0))
         .expect("B must now hit its OWN blocks");
     assert_eq!(matched, tokens.len(), "B must match its own full prefix");
     assert_eq!(
@@ -4163,9 +4324,13 @@ fn different_runtimes_sharing_a_block_pool_do_not_collide() {
 
     // A must still hit its own, unharmed by B.
     let (_, matched_a) = store_a
-        .load_prefix("m3", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+        .load_prefix("m3", "tmpl", &tokens, &homog(LAYERS, KVCacheMode::Fp16, 0))
         .expect("A must still hit its own blocks");
-    assert_eq!(matched_a, tokens.len(), "A's entry must survive B's persist");
+    assert_eq!(
+        matched_a,
+        tokens.len(),
+        "A's entry must survive B's persist"
+    );
 }
 
 // ===========================================================================
@@ -4220,13 +4385,25 @@ fn growth_from_an_exact_block_multiple_prunes_the_old_manifest() {
 
     let t1: Vec<i32> = (0..TURN1).collect();
     store
-        .persist("m3", "tmpl", &t1, &fp16_set(LAYERS, TURN1))
+        .persist(
+            "m3",
+            "tmpl",
+            &t1,
+            &fp16_set(LAYERS, TURN1),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("turn 1 persists");
     assert_eq!(count_manifests(&store), 1, "one manifest after turn 1");
 
     let t2: Vec<i32> = (0..TURN2).collect();
     store
-        .persist("m3", "tmpl", &t2, &fp16_set(LAYERS, TURN2))
+        .persist(
+            "m3",
+            "tmpl",
+            &t2,
+            &fp16_set(LAYERS, TURN2),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("turn 2 persists");
 
     assert_eq!(
@@ -4259,16 +4436,36 @@ fn growth_from_a_partial_tail_block_still_prunes_the_old_manifest() {
 
     let t1: Vec<i32> = (0..TURN1).collect();
     let m1 = store
-        .persist("m3", "tmpl", &t1, &fp16_set(LAYERS, TURN1))
+        .persist(
+            "m3",
+            "tmpl",
+            &t1,
+            &fp16_set(LAYERS, TURN1),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("turn 1 persists");
-    assert_eq!(m1.block_hashes.len(), 2, "turn 1 must have a partial 2nd block");
+    assert_eq!(
+        m1.block_hashes.len(),
+        2,
+        "turn 1 must have a partial 2nd block"
+    );
     assert_eq!(count_manifests(&store), 1, "one manifest after turn 1");
 
     // Turn 2 continues the SAME conversation — t1 is a strict token prefix of t2.
     let t2: Vec<i32> = (0..TURN2).collect();
-    assert_eq!(&t2[..t1.len()], &t1[..], "turn 2 must extend turn 1's tokens");
+    assert_eq!(
+        &t2[..t1.len()],
+        &t1[..],
+        "turn 2 must extend turn 1's tokens"
+    );
     let m2 = store
-        .persist("m3", "tmpl", &t2, &fp16_set(LAYERS, TURN2))
+        .persist(
+            "m3",
+            "tmpl",
+            &t2,
+            &fp16_set(LAYERS, TURN2),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("turn 2 persists");
 
     // The mechanism, asserted directly so a failure names the cause.
@@ -4318,7 +4515,13 @@ fn a_divergent_branch_sharing_a_leading_block_is_never_pruned() {
     // Branch A: 0..2560
     let a: Vec<i32> = (0..OLD_LEN).collect();
     let m_a = store
-        .persist("m3", "tmpl", &a, &fp16_set(LAYERS, OLD_LEN))
+        .persist(
+            "m3",
+            "tmpl",
+            &a,
+            &fp16_set(LAYERS, OLD_LEN),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("branch A persists");
 
     // Branch B: identical for the first full block, then DIVERGENT, and longer.
@@ -4329,7 +4532,13 @@ fn a_divergent_branch_sharing_a_leading_block_is_never_pruned() {
     assert_ne!(&b[..a.len()], &a[..], "B must NOT extend A");
 
     let m_b = store
-        .persist("m3", "tmpl", &b, &fp16_set(LAYERS, NEW_LEN))
+        .persist(
+            "m3",
+            "tmpl",
+            &b,
+            &fp16_set(LAYERS, NEW_LEN),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("branch B persists");
 
     assert_eq!(
@@ -4372,7 +4581,13 @@ fn pruning_a_partial_tail_manifest_releases_the_orphaned_block() {
 
     let t1: Vec<i32> = (0..TURN1).collect();
     let m1 = store
-        .persist("m3", "tmpl", &t1, &fp16_set(LAYERS, TURN1))
+        .persist(
+            "m3",
+            "tmpl",
+            &t1,
+            &fp16_set(LAYERS, TURN1),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("turn 1 persists");
     let orphan = m1.block_hashes[1];
     assert_eq!(
@@ -4383,7 +4598,13 @@ fn pruning_a_partial_tail_manifest_releases_the_orphaned_block() {
 
     let t2: Vec<i32> = (0..TURN2).collect();
     store
-        .persist("m3", "tmpl", &t2, &fp16_set(LAYERS, TURN2))
+        .persist(
+            "m3",
+            "tmpl",
+            &t2,
+            &fp16_set(LAYERS, TURN2),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("turn 2 persists");
 
     assert_eq!(
@@ -4426,11 +4647,23 @@ fn observe_mode_reports_a_prune_without_performing_it() {
 
     let t1: Vec<i32> = (0..TURN1).collect();
     let m1 = store
-        .persist("m3", "tmpl", &t1, &fp16_set(LAYERS, TURN1))
+        .persist(
+            "m3",
+            "tmpl",
+            &t1,
+            &fp16_set(LAYERS, TURN1),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("turn 1 persists");
     let t2: Vec<i32> = (0..TURN2).collect();
     store
-        .persist("m3", "tmpl", &t2, &fp16_set(LAYERS, TURN2))
+        .persist(
+            "m3",
+            "tmpl",
+            &t2,
+            &fp16_set(LAYERS, TURN2),
+            &homog(LAYERS, KVCacheMode::Fp16, 0),
+        )
         .expect("turn 2 persists");
 
     assert_eq!(
@@ -4527,7 +4760,7 @@ fn observe_mode_reports_a_prune_without_performing_it() {
 fn timing_probe_verification_cost() {
     use std::time::Instant;
 
-    let kv_mode = cache_computation_id(&[9u8; 32], KVCacheMode::Fp16, 0);
+    let kv_mode = cache_computation_id(&[9u8; 32], &[(KVCacheMode::Fp16, 0)]);
 
     // Cost of the ADDED work: re-deriving the address chain over the token list.
     for &n in &[4096usize, 32_768, 131_072, 300_000] {
@@ -4560,14 +4793,16 @@ fn timing_probe_verification_cost() {
     let toks: Vec<i32> = (0..DEPTH).collect();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
-    store.persist("m3", "tmpl", &toks, &set).expect("persist");
+    store
+        .persist("m3", "tmpl", &toks, &set, &plan_of(&set))
+        .expect("persist");
 
-    let _ = store.load_prefix("m3", "tmpl", &toks, KVCacheMode::Fp16, 0);
+    let _ = store.load_prefix("m3", "tmpl", &toks, &homog(LAYERS, KVCacheMode::Fp16, 0));
     let t = Instant::now();
     const LOADS: u32 = 5;
     for _ in 0..LOADS {
         let _ = store
-            .load_prefix("m3", "tmpl", &toks, KVCacheMode::Fp16, 0)
+            .load_prefix("m3", "tmpl", &toks, &homog(LAYERS, KVCacheMode::Fp16, 0))
             .expect("hit");
     }
     let per_load = t.elapsed() / LOADS;
@@ -4579,7 +4814,11 @@ fn timing_probe_verification_cost() {
         if let Ok(rd) = std::fs::read_dir(p) {
             for e in rd.flatten() {
                 let md = e.metadata().expect("metadata");
-                total += if md.is_dir() { dir_bytes(&e.path()) } else { md.len() };
+                total += if md.is_dir() {
+                    dir_bytes(&e.path())
+                } else {
+                    md.len()
+                };
             }
         }
         total
@@ -4604,4 +4843,260 @@ fn timing_probe_verification_cost() {
         LAYERS,
         per_load.as_secs_f64() * 1000.0
     );
+}
+
+// ── The mixed-set gap: fixtures built FROM the design's assumption ───────
+//
+// Every fixture above this line is HOMOGENEOUS — `fp16_set` is all Fp16,
+// `kvarn_v4_set*` is all k8v4. That is why 1167 green tests could not
+// falsify a block address that carried ONE (mode, v_bits) pair for a whole
+// set: nothing in the suite could construct a set that reached the guard.
+// The fixtures were derived from the same assumption the design made, so no
+// number of them was evidence about it. Same-direction confirmation at
+// suite scale.
+//
+// Production is heterogeneous by three independent routes: Boundary-V
+// (`turbo::boundary::resolve_layer_modes`), `skip_last_layer`
+// (`BatchKvQuantConfig::resolve_layer_modes`), and MiniMax-M3's D1
+// dense-prefix downgrade. v4 met the third first, and `persist` refused
+// every M3 set it was ever handed — the store wrote NOTHING on the live
+// server, 2026-07-28.
+
+/// A set shaped like a REAL MiniMax-M3 one: the first `dense_layers` are
+/// Fp16 (D1 downgrades them — no index projections, so KVarN8 buys nothing
+/// and costs an O(T) window dequant), the rest are k8v4.
+///
+/// Deliberately mixed, and at M3's real shape rather than a token 2-layer
+/// stand-in, so it exercises the case the production log actually produced:
+/// `layer 3 has (KVarN8, v_bits=4) but layer 0 has (Fp16, v_bits=8)`.
+///
+/// Note the Fp16 layers carry `kvarn_v_bits = 8`, not 0 —
+/// `downgrade_kvarn8_to_fp16_if_empty` resets the width to 8 alongside the
+/// mode. Reproduced here on purpose: it is what makes canonicalisation
+/// load-bearing per layer rather than a tidiness.
+fn m3_shaped_mixed_set(dense_layers: usize, kvarn_layers: usize, n_tiles: i32) -> DetachedCacheSet {
+    let depth = TILE + n_tiles * TILE;
+    let mut caches = Vec::with_capacity(dense_layers + kvarn_layers);
+    for i in 0..dense_layers {
+        let mut c = fp16_layer(depth, i as i32 * 5);
+        // As the live downgrade leaves it.
+        c.kvarn_v_bits = 8;
+        caches.push(c);
+    }
+    for i in 0..kvarn_layers {
+        caches.push(kvarn_v4_layer_shifted(
+            n_tiles,
+            0,
+            (dense_layers + i) as i32 * 3,
+        ));
+    }
+    let now = Instant::now();
+    DetachedCacheSet {
+        caches,
+        backend: SequenceStateBackend::DenseKvCache,
+        prompt_len: depth as usize,
+        current_offset: depth,
+        created_at: now,
+        detached_at: now,
+        origin_seq_id: SequenceId::from_raw(13),
+    }
+}
+
+/// THE REGRESSION TEST. A mixed set must round-trip.
+///
+/// **Red-capability, stated concretely:** against the pre-fix code this fails
+/// at the FIRST assertion — `persist` returned
+/// `layer 3 has (KVarN8, v_bits=4) but layer 0 has (Fp16, v_bits=8) ...
+/// Refusing rather than mislabelling`, which is the verbatim error the live
+/// M3 server produced. It cannot pass vacuously: a store that refuses, or one
+/// that stores under a layer-0-only address and then misses on load, fails
+/// here.
+#[test]
+fn a_set_shaped_like_a_real_m3_persists_and_loads_back_bit_identical() {
+    const DENSE: usize = 3;
+    const KVARN: usize = 5;
+    const N_TILES: i32 = 15; // depth 2048 = one whole block
+
+    let set = m3_shaped_mixed_set(DENSE, KVARN, N_TILES);
+    let plan = set.layer_plan();
+
+    // Precondition: this fixture must actually be MIXED, or the test is a
+    // homogeneous one wearing a new name.
+    assert_ne!(
+        plan[0], plan[DENSE],
+        "fixture precondition: layer 0 and layer {DENSE} must differ, or this \
+         test does not exercise heterogeneity at all"
+    );
+
+    let depth = TILE + N_TILES * TILE;
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [23u8; 32]);
+
+    store.persist("m3", "tmpl", &tokens, &set, &plan).expect(
+        "persist must ACCEPT a mixed set. Pre-fix this refused every real M3 \
+         cache set, so v4 persisted nothing at all on the live server.",
+    );
+
+    let (loaded, matched) = store
+        .load_prefix("m3", "tmpl", &tokens, &plan)
+        .expect("load_prefix must HIT — a miss here is the write-only store again");
+
+    assert_eq!(
+        matched,
+        tokens.len(),
+        "the whole persisted prefix must match"
+    );
+    assert_eq!(
+        loaded.layer_plan(),
+        plan,
+        "the loaded set must carry the SAME per-layer modes it was written with"
+    );
+    for (i, (a, b)) in set.caches.iter().zip(loaded.caches.iter()).enumerate() {
+        assert_eq!(
+            a.nbytes(),
+            b.nbytes(),
+            "layer {i}: byte count changed across the round trip"
+        );
+    }
+}
+
+/// The widening itself: two plans that differ in ONE layer must address
+/// differently.
+///
+/// **Red-capability:** under the pre-fix single-pair address both of these
+/// rendered `mode:Fp16|vbits:0` — identical, because only layer 0 was ever
+/// consulted. Two sets with genuinely different bytes shared one address,
+/// which is the silent wrong-adoption the identity exists to prevent.
+#[test]
+fn two_plans_differing_only_after_layer_zero_address_differently() {
+    let rt = [5u8; 32];
+    let all_fp16 = vec![(KVCacheMode::Fp16, 0); 4];
+    let mut mixed = all_fp16.clone();
+    mixed[3] = (KVCacheMode::KVarN8, 4);
+
+    assert_eq!(
+        all_fp16[0], mixed[0],
+        "precondition: layer 0 is IDENTICAL, so a layer-0-only address cannot \
+         tell these apart — that is the whole point"
+    );
+    assert_ne!(
+        cache_computation_id(&rt, &all_fp16),
+        cache_computation_id(&rt, &mixed),
+        "plans differing only past layer 0 collided — the address is still \
+         reading layer 0 and calling it the set"
+    );
+}
+
+/// Layer COUNT is part of the identity too: the same repeated layer at two
+/// different depths is a different set.
+#[test]
+fn plans_of_different_lengths_address_differently() {
+    let rt = [5u8; 32];
+    assert_ne!(
+        cache_computation_id(&rt, &homog(2, KVCacheMode::KVarN8, 4)),
+        cache_computation_id(&rt, &homog(3, KVCacheMode::KVarN8, 4)),
+        "a 2-layer and a 3-layer plan of the same layer must not collide"
+    );
+}
+
+/// Canonicalisation survives the widening, PER LAYER.
+///
+/// An Fp16 layer left at `v_bits = 8` by the D1 downgrade and an Fp16 layer
+/// spelled `v_bits = 0` by a plan describe identical bytes. If they addressed
+/// differently, every M3 load would miss — the write-only failure wearing a
+/// different hat.
+#[test]
+fn an_fp16_layers_stale_width_does_not_change_the_address() {
+    let rt = [5u8; 32];
+    let as_downgraded = [(KVCacheMode::Fp16, 8), (KVCacheMode::KVarN8, 4)];
+    let as_planned = [(KVCacheMode::Fp16, 0), (KVCacheMode::KVarN8, 4)];
+    assert_eq!(
+        cache_computation_id(&rt, &as_downgraded),
+        cache_computation_id(&rt, &as_planned),
+        "an Fp16 layer's inert v_bits changed the address; a real M3 set is \
+         written by the first spelling and looked up by the second"
+    );
+}
+
+/// THE GUARD STILL BITES. A plan that contradicts the set is refused.
+///
+/// This is the non-tautological counterpart to every `plan_of(&set)` call
+/// above: those make the conformance check trivially satisfied by
+/// construction, so they say nothing about it. This one states a plan that
+/// disagrees, and requires the refusal.
+///
+/// It matters because the READ side can only ever work from a declared plan.
+/// A plan that has drifted from reality does not fail loudly on its own — it
+/// produces addresses that never match, and a cold-store miss is silently soft
+/// in production (it just re-prefills). So the drift has to be caught here, at
+/// the one place that can see both.
+#[test]
+fn a_set_that_contradicts_the_callers_plan_is_refused() {
+    const DENSE: usize = 3;
+    const KVARN: usize = 5;
+    const N_TILES: i32 = 15;
+
+    let set = m3_shaped_mixed_set(DENSE, KVARN, N_TILES);
+    let depth = TILE + N_TILES * TILE;
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [23u8; 32]);
+
+    // A LIE about one layer: claims layer 0 is k8v4 when it is really Fp16.
+    let mut lying_plan = set.layer_plan();
+    lying_plan[0] = (KVCacheMode::KVarN8, 4);
+
+    let err = store
+        .persist("m3", "tmpl", &tokens, &set, &lying_plan)
+        .expect_err("a plan that contradicts the set MUST be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("layer 0"),
+        "the refusal must name the divergent layer so an operator can act on \
+         it; got: {msg}"
+    );
+
+    // CONTROL, expected answer DIFFERS: the honest plan is accepted, so the
+    // refusal above is the guard biting and not a store that refuses
+    // everything.
+    store
+        .persist("m3", "tmpl", &tokens, &set, &set.layer_plan())
+        .expect("the honest plan must be accepted, or the refusal proves nothing");
+}
+
+/// A plan of the wrong LENGTH is refused, with the same reasoning.
+#[test]
+fn a_plan_that_describes_a_different_layer_count_is_refused() {
+    const DENSE: usize = 3;
+    const KVARN: usize = 5;
+    const N_TILES: i32 = 15;
+
+    let set = m3_shaped_mixed_set(DENSE, KVARN, N_TILES);
+    let depth = TILE + N_TILES * TILE;
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [23u8; 32]);
+
+    let mut short_plan = set.layer_plan();
+    short_plan.pop();
+
+    let err = store
+        .persist("m3", "tmpl", &tokens, &set, &short_plan)
+        .expect_err("a plan describing fewer layers than the set MUST be refused");
+    assert!(
+        err.to_string().contains("layers"),
+        "the refusal must say what disagreed; got: {err}"
+    );
+}
+
+/// The log rendering stays readable at M3's real shape — the thing the v1
+/// address gave for free and a digest does not.
+#[test]
+fn a_mixed_plan_renders_as_collapsed_runs() {
+    let plan = m3_shaped_mixed_set(3, 5, 15).layer_plan();
+    assert_eq!(describe_kv_layer_plan(&plan), "Fp16x3,KVarN8v4x5");
 }

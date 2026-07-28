@@ -188,6 +188,49 @@ pub(crate) fn apply_kvarn_v_bits(caches: &mut [mlxcel_core::cache::KVCache], v_b
     }
 }
 
+/// The NOMINAL per-layer `(mode, v_bits)` table — what the scheduler
+/// allocates, before any model-specific structural downgrade.
+///
+/// This is the single source for BOTH cache allocation
+/// ([`BatchScheduler::apply_kv_cache_mode_to`]) and the v4 cold-store block
+/// address ([`BatchScheduler::kv_layer_plan`]). Kept as one pure function for
+/// the reason the file already applies to `resolve_effective_kv_cache_mode`:
+/// if allocation and the address computed the table separately they could
+/// drift, and a drifted address is a SILENT total cache miss, not a loud
+/// failure.
+///
+/// Mirrors `apply_kvarn_v_bits`: the configured width applies only to layers
+/// that actually resolved to `KVarN8`; every other layer keeps the inert
+/// default of 8.
+pub(crate) fn resolve_nominal_layer_plan(
+    batch_kv_quant: &BatchKvQuantConfig,
+    legacy_kv_cache_mode: KVCacheMode,
+    kvarn_v_bits: u8,
+    n_layers: usize,
+) -> Vec<(KVCacheMode, u8)> {
+    let modes = if batch_kv_quant.is_enabled() {
+        batch_kv_quant.resolve_layer_modes(n_layers)
+    } else if legacy_kv_cache_mode == KVCacheMode::Fp16 {
+        // Legacy Fp16 is the allocation no-op: `make_caches` already hands
+        // back Fp16 caches and `apply_kv_cache_mode_to` returns early.
+        vec![KVCacheMode::Fp16; n_layers]
+    } else {
+        let requested = mlxcel_core::cache::turbo::boundary_v_layers_from_env();
+        mlxcel_core::cache::turbo::resolve_layer_modes(legacy_kv_cache_mode, n_layers, requested)
+    };
+    modes
+        .into_iter()
+        .map(|mode| {
+            let v_bits = if mode == KVCacheMode::KVarN8 {
+                kvarn_v_bits
+            } else {
+                8
+            };
+            (mode, v_bits)
+        })
+        .collect()
+}
+
 /// Derive the causal prefix that may actually be adopted.
 ///
 /// The result is bounded by matching tokens, state actually present, and one
@@ -1497,9 +1540,8 @@ impl BatchScheduler {
                     );
                     for req in waiters {
                         if let Some(tx) = Self::response_tx_from_request(&req) {
-                            let _ = tx.send(GenerateEvent::Error(
-                                "Server shutting down".to_string(),
-                            ));
+                            let _ =
+                                tx.send(GenerateEvent::Error("Server shutting down".to_string()));
                         }
                     }
                 }
@@ -1662,9 +1704,7 @@ impl BatchScheduler {
             // prefill is always correct). Defensive today: no current model
             // sets both (M3 is KV-path; snapshot users are recurrent-state
             // families with alignment 1).
-            if matched_len >= tokens.len()
-                || (alignment > 1 && matched_len % alignment != 0)
-            {
+            if matched_len >= tokens.len() || (alignment > 1 && matched_len % alignment != 0) {
                 tracing::info!(
                     matched = matched_len,
                     alignment,
@@ -1755,19 +1795,16 @@ impl BatchScheduler {
         let mut ssd_match_len = 0usize;
         let mut ssd_detached: Option<DetachedCacheSet> = None;
         // COLD-STORE LOAD. v4 is opt-in and REPLACES v3 when present. It needs
-        // the cache identity (`kv_mode`, `v_bits`) because it addresses blocks by
-        // it and has a mode-mismatch miss path; both are already scheduler state,
-        // which is why this is a call-shape change and not a design question.
+        // the PER-LAYER plan, not a single (mode, v_bits) pair, because that is
+        // what the block address commits to. A single pair could not describe
+        // any real M3 set — its dense-prefix layers are Fp16 while the rest are
+        // KVarN8 — and `persist` refused every one of them, so v4 stored
+        // nothing at all until the address was widened.
         let cold_result = if !cold_identity_supported {
             None
         } else if let Some(bs) = &self.block_cold_store {
-            Some(bs.load_prefix(
-                &ctx.model_id,
-                &ctx.template_sig,
-                tokens,
-                self.kv_cache_mode,
-                self.kvarn_v_bits,
-            ))
+            let plan = self.kv_layer_plan();
+            Some(bs.load_prefix(&ctx.model_id, &ctx.template_sig, tokens, &plan))
         } else {
             self.cold_store
                 .as_ref()
@@ -1786,8 +1823,9 @@ impl BatchScheduler {
                             expected_layers = self.model.num_layers(),
                             "cold-store: loaded layer count or state lengths are invalid; ignoring SSD candidate"
                         );
-                    } else if let Some(stored_state_len) =
-                        usize::try_from(stored_state_len).ok().filter(|len| *len > 0)
+                    } else if let Some(stored_state_len) = usize::try_from(stored_state_len)
+                        .ok()
+                        .filter(|len| *len > 0)
                     {
                         if let Some(match_len) = reusable_prefix_len(
                             raw_match_len,
@@ -1848,7 +1886,8 @@ impl BatchScheduler {
                 .adopt(&self.model as &dyn crate::generate::LanguageModel, detached)
             {
                 Ok(seq_id) => {
-                    self.batch_observability.record_prompt_cache_hit(ssd_match_len);
+                    self.batch_observability
+                        .record_prompt_cache_hit(ssd_match_len);
                     return Some((seq_id, ssd_match_len));
                 }
                 Err(err) => {
@@ -2392,11 +2431,14 @@ impl BatchScheduler {
             && ctx.lora_id.is_none()
         {
             if let DetachedKvSet::Dense(dense) = &kv_set {
-                // v4 replaces v3 when installed. `persist` is arg-identical
-                // across the two; only the return differs (v4 hands back the
-                // Manifest), and it is discarded here exactly as v3's unit was.
+                // v4 replaces v3 when installed. It additionally takes the
+                // per-layer plan — the same slice the load side addresses with
+                // — and checks it against the live caches, so a plan that has
+                // drifted from reality fails LOUD here instead of silently
+                // producing addresses the read side can never match.
                 let persisted = if let Some(bs) = &self.block_cold_store {
-                    bs.persist(&ctx.model_id, &ctx.template_sig, &tokens, dense)
+                    let plan = self.kv_layer_plan();
+                    bs.persist(&ctx.model_id, &ctx.template_sig, &tokens, dense, &plan)
                         .map(|_| ())
                 } else if let Some(cs) = &self.cold_store {
                     cs.persist(&ctx.model_id, &ctx.template_sig, &tokens, dense)
@@ -2770,35 +2812,52 @@ impl BatchScheduler {
         }
         let n_layers = caches.len();
 
-        // when the batched KV quant config is active, it
-        // takes precedence over the legacy `kv_cache_mode` path. The
-        // resolved table already encodes the per-layer mode (with the
-        // last-layer skip applied), so apply it directly.
-        if self.batch_kv_quant.is_enabled() {
-            let layer_modes = self.batch_kv_quant.resolve_layer_modes(n_layers);
-            for (cache, mode) in caches.iter_mut().zip(layer_modes) {
-                cache.mode = mode;
-            }
-            // k8v4: width rides the mode application (no-op for v_bits=8;
-            // the table cannot produce KVarN8 today — future-proof rule).
-            apply_kvarn_v_bits(caches, self.kvarn_v_bits);
+        // Legacy Fp16 is the no-op: `make_caches` already returns Fp16 caches
+        // and there is no width to apply. Kept as an explicit early return so
+        // the common path touches nothing.
+        if !self.batch_kv_quant.is_enabled() && self.kv_cache_mode == KVCacheMode::Fp16 {
             return;
         }
 
-        // Legacy path: nominal mode + Boundary-V
-        // protection only.
-        let nominal = self.kv_cache_mode;
-        if nominal == KVCacheMode::Fp16 {
-            return;
-        }
-        let requested = mlxcel_core::cache::turbo::boundary_v_layers_from_env();
-        let layer_modes =
-            mlxcel_core::cache::turbo::resolve_layer_modes(nominal, n_layers, requested);
-        for (cache, mode) in caches.iter_mut().zip(layer_modes) {
+        // ONE TABLE, shared with `kv_layer_plan`, which is what the v4 cold
+        // store addresses blocks by. Computing it separately here would let
+        // allocation and the block address drift, and a drifted address misses
+        // every block SILENTLY. See `resolve_nominal_layer_plan`.
+        let plan = resolve_nominal_layer_plan(
+            &self.batch_kv_quant,
+            self.kv_cache_mode,
+            self.kvarn_v_bits,
+            n_layers,
+        );
+        for (cache, (mode, _)) in caches.iter_mut().zip(plan) {
             cache.mode = mode;
         }
-        // k8v4: width rides the mode application (no-op for v_bits=8).
+        // k8v4: width rides the mode application (no-op for v_bits=8; only
+        // caches that resolved to KVarN8 are touched).
         apply_kvarn_v_bits(caches, self.kvarn_v_bits);
+    }
+
+    /// The per-layer `(mode, v_bits)` plan this runtime will actually produce —
+    /// the v4 cold store's block address.
+    ///
+    /// Nominal table (config policies) composed with the model's own structural
+    /// downgrades ([`mlxcel_core::generate::LanguageModel::kv_cache_plan`]).
+    /// Both cold-store sides take the same slice: `load_prefix` uses it to
+    /// compute addresses before any layer exists, and `persist` checks it
+    /// against the live caches and fails loud on disagreement.
+    fn kv_layer_plan(&self) -> Vec<(KVCacheMode, u8)> {
+        // `model.num_layers()` rather than a live cache count: the plan is
+        // needed at LOAD time, before a sequence is allocated. The scheduler
+        // already treats a `detached.num_layers() != model.num_layers()`
+        // mismatch as invalid, and `persist` re-checks the length against the
+        // real set, so a divergence surfaces rather than mislabelling.
+        let nominal = resolve_nominal_layer_plan(
+            &self.batch_kv_quant,
+            self.kv_cache_mode,
+            self.kvarn_v_bits,
+            self.model.num_layers(),
+        );
+        self.model.kv_cache_plan(&nominal)
     }
 
     /// Prepare Turbo4Delegated cache state before a sequence enters decode.
@@ -3101,8 +3160,7 @@ impl BatchScheduler {
 
         // Change 1: Check if a prefill is in progress for this exact prompt.
         // If so, park the request — the prefill will donate and re-dispatch.
-        if self.decouple_prefill_on_disconnect
-            && self.prefill_in_progress.contains_key(&token_hash)
+        if self.decouple_prefill_on_disconnect && self.prefill_in_progress.contains_key(&token_hash)
         {
             tracing::info!(
                 token_hash,
@@ -5779,7 +5837,9 @@ impl BatchScheduler {
         let cancelled_ids: Vec<SequenceId> = self
             .active_batch
             .iter_sequences()
-            .filter(|s| !s.state.is_finished() && s.cancelled.load(Ordering::Relaxed) && !s.orphaned)
+            .filter(|s| {
+                !s.state.is_finished() && s.cancelled.load(Ordering::Relaxed) && !s.orphaned
+            })
             .map(|s| s.seq_id)
             .collect();
 
@@ -5826,7 +5886,8 @@ impl BatchScheduler {
                 // Other code reads cancelled (finalize_completed); orphaned flag
                 // prevents re-cancellation there.
                 let _ = seq.response_tx.send(GenerateEvent::Error(
-                    "Request cancelled: client disconnected (prefill orphaned, will donate)".to_string(),
+                    "Request cancelled: client disconnected (prefill orphaned, will donate)"
+                        .to_string(),
                 ));
                 seq.orphaned = true;
                 self.orphaned_prefill_count += 1;

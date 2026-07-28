@@ -16,7 +16,7 @@ use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
-use super::cold_store::{ColdStoreError, PruneMode, serialize_cache_set_layers, read_kv_cache};
+use super::cold_store::{read_kv_cache, serialize_cache_set_layers, ColdStoreError, PruneMode};
 use super::{DetachedCacheSet, DetachedKVCache, KVCacheMode, SequenceId, SequenceStateBackend};
 use crate::ffi::MlxArray;
 use crate::utils::slice_axis;
@@ -72,15 +72,13 @@ pub fn block_hash_merkle(
     hasher.finalize().into()
 }
 
-/// Build the kv_mode_config string for a given KV cache mode.
+/// Canonical `(mode, v_bits)` for ONE layer — the unit the block address is
+/// built from.
 ///
-/// This string is included in the block hash to prevent collisions between
-/// blocks from different KV modes (e.g., KVarN8 vs fp16).
-/// Complete identity of everything that determines a block's BYTES.
-///
-/// A block address must commit to this in full, because blocks live in ONE
-/// GLOBAL POOL keyed only by hash. Two runtimes that compute different bytes
-/// for the same tokens must not be able to reach the same address.
+/// A block address must commit to what determines its bytes in full, because
+/// blocks live in ONE GLOBAL POOL keyed only by hash. Two runtimes that compute
+/// different bytes for the same tokens must not be able to reach the same
+/// address.
 ///
 /// # Why this replaced `kv_mode_config_string`
 ///
@@ -97,13 +95,40 @@ pub fn block_hash_merkle(
 ///   return, silently skipped writing, and left its manifest pointing at the
 ///   FIRST runtime's KV data. A silent cross-model wrong adoption.
 ///
+/// # Why `v1` became `v2`: one pair for the whole set was never enough
+///
+/// `v1` was `mode:{:?}|vbits:{}` — a SINGLE pair, taken from layer 0 and
+/// applied to the entire set. `persist` asserted the set was homogeneous so
+/// that layer 0 could legitimately speak for the rest, and refused otherwise.
+///
+/// That precondition is false in production, and not only for one model. THREE
+/// independent mechanisms hand the runtime a heterogeneous set:
+///
+/// * **Boundary-V** (`turbo::boundary::resolve_layer_modes`) gives boundary
+///   layers a different mode from the interior for quality.
+/// * **`skip_last_layer`** (`BatchKvQuantConfig::resolve_layer_modes`) forces
+///   the final layer to `Fp16` while the rest stay quantized.
+/// * **D1 dense-prefix downgrade** (MiniMax-M3): a layer with no index
+///   projections can never take the gathered path, so an empty KVarN8 cache is
+///   downgraded to `Fp16` at first touch. M3's first three layers are dense, so
+///   EVERY M3 cache set is mixed by construction.
+///
+/// v4 met the third one first, and `persist` correctly refused every M3 set:
+/// the store persisted nothing at all. The guard was right; the address was one
+/// field too narrow. Widening it to the whole per-layer vector is what lets the
+/// guard become a conformance check instead of a blanket refusal.
+///
+/// The version prefix is the anti-aliasing mechanism, so it moves with the
+/// field set: a `v1` address and a `v2` address can never collide.
+///
 /// # Domain separation
 ///
-/// Fields are tagged and `|`-delimited, and every value here renders without
-/// a `|`: the fingerprint is hex, `v_bits` is a `u8`, and `KVCacheMode`'s
-/// derived `Debug` is a bare variant name. So no two distinct tuples can
-/// render to the same string. The `v1` prefix versions the scheme itself —
-/// bump it if the field set changes, so old and new addresses cannot alias.
+/// Fields are tagged and `|`-delimited, and every value renders without a `|`:
+/// the fingerprint and the plan digest are hex, the layer count is a `usize`.
+/// The plan is digested rather than spelled out so the address stays bounded
+/// at any layer count; the digest itself is length-prefixed per layer (below)
+/// so no two distinct plans can hash to the same input string.
+///
 /// # Canonicalisation — why `v_bits` is normalised rather than passed through
 ///
 /// The identity must commit to what DETERMINES the bytes and to nothing else.
@@ -117,26 +142,101 @@ pub fn block_hash_merkle(
 /// Fp16 persist at v_bits=8 unreachable to a loader that correctly considered
 /// v_bits irrelevant and passed 0. Found by exactly that miss.
 ///
+/// This is now load-bearing per LAYER, not just per set. A D1-downgraded layer
+/// is left at `(Fp16, v_bits=8)` — `downgrade_kvarn8_to_fp16_if_empty` resets
+/// the width to 8, not 0 (`cache.rs`) — while a plan naturally spells the same
+/// layer `(Fp16, 0)`. Without canonicalisation those two describe identical
+/// bytes and would address differently, which is the write-only failure again.
+///
 /// So: quantized modes commit to `v_bits`; unquantized modes normalise it to 0.
 /// The `match` is exhaustive on purpose — a new mode forces this decision to be
 /// made rather than inherited.
-pub fn cache_computation_id(
-    runtime_fingerprint: &[u8; 32],
-    mode: super::KVCacheMode,
-    v_bits: u8,
-) -> String {
+pub fn canonical_layer_identity(mode: super::KVCacheMode, v_bits: u8) -> (super::KVCacheMode, u8) {
     let effective_v_bits = match mode {
         // Unquantized: the V width is not part of the data.
         super::KVCacheMode::Fp16 => 0,
         // Quantized: v_bits selects the payload layout, so it IS the identity.
         _ => v_bits,
     };
+    (mode, effective_v_bits)
+}
+
+/// Complete identity of everything that determines a block's BYTES, over the
+/// WHOLE per-layer plan. See `canonical_layer_identity` for the versioning and
+/// canonicalisation rationale.
+///
+/// `plan[i]` is the `(mode, v_bits)` layer `i`'s cache will actually be in when
+/// its bytes are written. Both sides of the store must pass the same plan:
+/// `persist` derives it from the live cache set and checks it against the
+/// caller's, `load_prefix` takes the caller's directly.
+pub fn cache_computation_id(
+    runtime_fingerprint: &[u8; 32],
+    plan: &[(super::KVCacheMode, u8)],
+) -> String {
+    let mut hasher = Sha256::new();
+    // Length-prefix the whole plan, then each layer's rendered mode, so a
+    // plan can never hash to the same input as a different plan whose
+    // variant names happen to concatenate identically.
+    hasher.update((plan.len() as u64).to_le_bytes());
+    for &(mode, v_bits) in plan {
+        let (mode, effective_v_bits) = canonical_layer_identity(mode, v_bits);
+        let name = format!("{mode:?}");
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update([effective_v_bits]);
+    }
+    let plan_digest: [u8; 32] = hasher.finalize().into();
     format!(
-        "v1|rt:{}|mode:{:?}|vbits:{}",
+        "v2|rt:{}|n:{}|plan:{}",
         hex_digest(runtime_fingerprint),
-        mode,
-        effective_v_bits
+        plan.len(),
+        hex_digest(&plan_digest)
     )
+}
+
+/// Human-readable rendering of a per-layer plan, for logs and error messages.
+///
+/// Deliberately NOT part of the address: `cache_computation_id` has exactly one
+/// rendering so there is only one way for two plans to collide. This exists
+/// because the `v1` address was greppable in a log and the `v2` digest is not,
+/// and losing that would make a mismatch far harder to diagnose.
+///
+/// Runs of identical layers are collapsed, so M3's real plan reads as
+/// `Fp16x3,KVarN8v4x57` rather than sixty entries.
+pub fn describe_kv_layer_plan(plan: &[(super::KVCacheMode, u8)]) -> String {
+    let mut out = String::new();
+    let mut run: Option<((super::KVCacheMode, u8), usize)> = None;
+    let mut flush = |out: &mut String, entry: ((super::KVCacheMode, u8), usize)| {
+        let ((mode, v_bits), count) = entry;
+        if !out.is_empty() {
+            out.push(',');
+        }
+        match mode {
+            super::KVCacheMode::Fp16 => out.push_str(&format!("{mode:?}")),
+            _ => out.push_str(&format!("{mode:?}v{v_bits}")),
+        }
+        if count > 1 {
+            out.push_str(&format!("x{count}"));
+        }
+    };
+    for &(mode, v_bits) in plan {
+        let layer = canonical_layer_identity(mode, v_bits);
+        match run {
+            Some((current, count)) if current == layer => run = Some((current, count + 1)),
+            Some(entry) => {
+                flush(&mut out, entry);
+                run = Some((layer, 1));
+            }
+            None => run = Some((layer, 1)),
+        }
+    }
+    if let Some(entry) = run {
+        flush(&mut out, entry);
+    }
+    if out.is_empty() {
+        out.push_str("<empty>");
+    }
+    out
 }
 
 /// Validate that a block size is 2048 or a power-of-2 multiple, and a
@@ -385,7 +485,8 @@ impl BlockColdStore {
 
         // SAFETY: `file` owns a valid fd for the duration of this call, and the
         // returned guard keeps it alive until the lock is released in Drop.
-        let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+        let rc =
+            unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
         if rc != 0 {
             let err = io::Error::last_os_error();
             tracing::error!(
@@ -526,7 +627,11 @@ impl BlockColdStore {
     /// epoch costs a live block.
     fn bump_publication_epoch(&self) -> Result<(), ColdStoreError> {
         let cur = self.read_publication_epoch();
-        let next = if cur == u64::MAX { 1 } else { cur.wrapping_add(1) };
+        let next = if cur == u64::MAX {
+            1
+        } else {
+            cur.wrapping_add(1)
+        };
         let tmp = self.base_dir.join(".tmp.publication.epoch");
         write_file(&tmp, &next.to_le_bytes())?;
         fs::rename(&tmp, self.epoch_path())?;
@@ -568,7 +673,9 @@ impl BlockColdStore {
         let layer_bytes = serialize_cache_set_layers(cache_set)?;
 
         // Write to temp dir, then atomic rename
-        let tmp_dir = self.blocks_dir().join(format!(".tmp.{}", hex_digest(block_hash)));
+        let tmp_dir = self
+            .blocks_dir()
+            .join(format!(".tmp.{}", hex_digest(block_hash)));
         fs::create_dir_all(&tmp_dir)?;
 
         // Write block header
@@ -593,10 +700,7 @@ impl BlockColdStore {
 
         // Write layers
         for (index, bytes) in layer_bytes.iter().enumerate() {
-            write_file(
-                &tmp_dir.join(format!("layer_{index:04}.bin")),
-                bytes,
-            )?;
+            write_file(&tmp_dir.join(format!("layer_{index:04}.bin")), bytes)?;
         }
 
         // Atomic rename
@@ -795,10 +899,7 @@ impl BlockColdStore {
     /// under. Every MANIFEST-directory consumer should reach content through
     /// here rather than decoding `manifest.bin` directly — see
     /// [`committed_manifest_hash`].
-    pub fn read_manifest(
-        &self,
-        manifest_hash: &[u8; 32],
-    ) -> Result<Manifest, ColdStoreError> {
+    pub fn read_manifest(&self, manifest_hash: &[u8; 32]) -> Result<Manifest, ColdStoreError> {
         let manifest_dir = self.manifests_dir().join(hex_digest(manifest_hash));
         if !manifest_dir.exists() {
             return Err(ColdStoreError::NoMatch);
@@ -940,7 +1041,9 @@ impl BlockColdStore {
             return Ok(());
         }
 
-        let entries: Vec<_> = fs::read_dir(&manifests_dir)?.filter_map(|e| e.ok()).collect();
+        let entries: Vec<_> = fs::read_dir(&manifests_dir)?
+            .filter_map(|e| e.ok())
+            .collect();
 
         for entry in entries {
             // MIGRATED TO THE SHARED PREDICATE — Alden, 2026-07-28, blocker 2.
@@ -1095,49 +1198,71 @@ impl BlockColdStore {
         template_sig: &str,
         tokens: &[i32],
         cache_set: &DetachedCacheSet,
+        plan: &[(super::KVCacheMode, u8)],
     ) -> Result<Manifest, ColdStoreError> {
         // WRITE side of the cache-computation identity. Must stay symmetric
         // with the READ side in load_prefix or the store becomes write-only.
         //
-        // The identity is taken from layer 0 and applied to the WHOLE set, so
-        // layer 0 must actually speak for the rest. Nothing enforced that. A
-        // set with mixed widths would be addressed "k8v4" while layers 1..n
-        // were something else — the address would be a true statement about the
-        // first layer and a lie about the others, and every later reader would
-        // trust it. That is the same shape as the m3_idx_offset defect (116924f):
-        // layer 0 standing in for all layers, unchecked.
+        // ASYMMETRY IS THE HAZARD, AND IT IS SILENT. Only `persist` can see the
+        // real per-layer state; `load_prefix` runs before any layer is touched
+        // and must be told the plan. If the two disagree the computed addresses
+        // simply never match: `matched_blocks` is 0, every candidate is dropped,
+        // the caller sees `NoMatch` — indistinguishable from a legitimately cold
+        // cache. That is exactly how the hardcoded-Fp16 bug hid (handoff §7.5),
+        // so the plan is CHECKED against reality here rather than trusted.
         //
-        // Homogeneity is the real precondition of a single per-set identity, so
-        // it is asserted here rather than assumed. If a genuinely heterogeneous
-        // set ever needs storing, the identity must become per-layer — this
-        // refuses rather than silently mislabels in the meantime.
-        if let Some((i, bad)) = cache_set
-            .caches
+        // This replaced a homogeneity assertion. That guard was correct about
+        // its own premise — a single per-set pair means layer 0 speaks for every
+        // layer, which is the m3_idx_offset shape (116924f) — but the premise
+        // itself was false: Boundary-V, `skip_last_layer` and M3's D1
+        // dense-prefix downgrade each produce genuinely mixed sets. Refusing
+        // them meant v4 persisted NOTHING on M3. Now the address carries the
+        // whole vector, so a mixed set is storable and what must be asserted is
+        // that the caller's plan matches the bytes about to be written.
+        // ONE derivation of "what this set actually is" — `layer_plan`, which
+        // is also what every caller outside this module must use, so the check
+        // here and the plan a caller builds cannot come from two definitions
+        // that drift apart.
+        let actual_plan = cache_set.layer_plan();
+        if actual_plan.len() != plan.len() {
+            return Err(invalid_data(format!(
+                "persist: cache set has {} layers but the caller's plan describes {}. \
+                 The plan addresses the ENTIRE set, so a length disagreement means \
+                 the address would describe a different set than the one being \
+                 written. Refusing rather than mislabelling.",
+                actual_plan.len(),
+                plan.len()
+            )));
+        }
+        if let Some((i, actual, expected)) = actual_plan
             .iter()
+            .zip(plan.iter())
             .enumerate()
-            .find(|(_, c)| {
-                c.mode != cache_set.caches[0].mode
-                    || c.kvarn_v_bits != cache_set.caches[0].kvarn_v_bits
+            .map(|(i, (&(a_mode, a_bits), &(e_mode, e_bits)))| {
+                (
+                    i,
+                    canonical_layer_identity(a_mode, a_bits),
+                    canonical_layer_identity(e_mode, e_bits),
+                )
             })
+            .find(|(_, actual, expected)| actual != expected)
         {
             return Err(invalid_data(format!(
-                "persist: layer {i} has ({:?}, v_bits={}) but layer 0 has ({:?}, \
-                 v_bits={}). The cache-computation identity is derived from layer 0 \
-                 and addresses the ENTIRE set, so a mixed set would be stored under \
-                 an address that describes only its first layer. Refusing rather \
-                 than mislabelling.",
-                bad.mode,
-                bad.kvarn_v_bits,
-                cache_set.caches[0].mode,
-                cache_set.caches[0].kvarn_v_bits
+                "persist: layer {i} is ({:?}, v_bits={}) but the caller's plan says \
+                 ({:?}, v_bits={}). Plan for the whole set: {}. The plan IS the block \
+                 address, so writing under it would store bytes that do not match the \
+                 address describing them — and the READ side, which can only use the \
+                 plan, would then miss its own data silently. Refusing rather than \
+                 mislabelling.",
+                actual.0,
+                actual.1,
+                expected.0,
+                expected.1,
+                describe_kv_layer_plan(plan)
             )));
         }
 
-        let cache_id = cache_computation_id(
-            &self.runtime_fingerprint,
-            cache_set.caches[0].mode,
-            cache_set.caches[0].kvarn_v_bits,
-        );
+        let cache_id = cache_computation_id(&self.runtime_fingerprint, plan);
         let block_hashes = compute_block_hashes(tokens, self.block_size, &cache_id);
 
         // Extract and write each block
@@ -1495,10 +1620,13 @@ impl BlockColdStore {
 
     /// Load the best matching manifest and assemble its blocks into a cache.
     ///
-    /// `kv_mode` MUST be the mode the CALLING RUNTIME is currently using.
-    /// Block addresses commit to the KV mode (see `block_hash_merkle`), and
-    /// `persist` addresses with `cache_set.caches[0].mode`, so load must
-    /// address with the live mode or it cannot match its own manifests.
+    /// `plan` MUST be the per-layer `(mode, v_bits)` vector the CALLING RUNTIME
+    /// will actually produce — including any structural downgrade the model
+    /// applies later (M3's D1 dense-prefix layers), because `persist` addresses
+    /// with the vector it observes AFTER those downgrades have happened. Load
+    /// runs before any layer is touched, so it cannot observe them and must be
+    /// told. `LanguageModel::kv_cache_plan` is what tells it; `persist` checks
+    /// the same plan against reality, which is what keeps the two sides honest.
     ///
     /// This parameter replaces a hardcoded `KVCacheMode::Fp16` at the hashing
     /// site. Under KVarN8 that hardcode made the store WRITE-ONLY: computed
@@ -1515,14 +1643,12 @@ impl BlockColdStore {
         model_id: &str,
         template_sig: &str,
         tokens: &[i32],
-        kv_mode: super::KVCacheMode,
-        v_bits: u8,
+        plan: &[(super::KVCacheMode, u8)],
     ) -> Result<(DetachedCacheSet, usize), ColdStoreError> {
         // READ side of the cache-computation identity — must mirror persist's
         // WRITE side exactly. Built once here so the symmetry is visible in
         // one place rather than inline at the hashing site.
-        let load_cache_id =
-            cache_computation_id(&self.runtime_fingerprint, kv_mode, v_bits);
+        let load_cache_id = cache_computation_id(&self.runtime_fingerprint, plan);
 
         // ACTIVE-LOAD LEASE, held for the whole of this call. The hazard is the
         // gap between reading a manifest and opening the blocks it names: a
@@ -1582,7 +1708,11 @@ impl BlockColdStore {
             let matched_blocks = manifest
                 .block_hashes
                 .iter()
-                .zip(compute_block_hashes(tokens, self.block_size, &load_cache_id))
+                .zip(compute_block_hashes(
+                    tokens,
+                    self.block_size,
+                    &load_cache_id,
+                ))
                 .take_while(|(a, b)| a == &b)
                 .count();
 
@@ -2186,7 +2316,9 @@ fn merge_layer_across_blocks(
     // coherent, so summing the K-side regions is a statement about the LAYER
     // rather than about three of its fields.
     let assembled = if merged.mode == KVCacheMode::KVarN8 {
-        axis2_of(&merged.kvarn_sink_k) + axis2_of(&merged.kvarn_hist_k) + axis2_of(&merged.kvarn_tail_k)
+        axis2_of(&merged.kvarn_sink_k)
+            + axis2_of(&merged.kvarn_hist_k)
+            + axis2_of(&merged.kvarn_tail_k)
     } else {
         axis2_of(&merged.keys)
     };
@@ -2373,11 +2505,26 @@ pub fn extract_block(
 
     let mut caches = Vec::with_capacity(cache_set.caches.len());
     for layer in &cache_set.caches {
-        let keys = layer.keys.as_ref().map(|k| slice_axis(k, 2, start as i32, end as i32));
-        let values = layer.values.as_ref().map(|v| slice_axis(v, 2, start as i32, end as i32));
-        let key_scales = layer.key_scales.as_ref().map(|s| slice_axis(s, 2, start as i32, end as i32));
-        let val_scales = layer.val_scales.as_ref().map(|s| slice_axis(s, 2, start as i32, end as i32));
-        let m3_idx_k = layer.m3_idx_k.as_ref().map(|m| slice_axis(m, 2, start as i32, end as i32));
+        let keys = layer
+            .keys
+            .as_ref()
+            .map(|k| slice_axis(k, 2, start as i32, end as i32));
+        let values = layer
+            .values
+            .as_ref()
+            .map(|v| slice_axis(v, 2, start as i32, end as i32));
+        let key_scales = layer
+            .key_scales
+            .as_ref()
+            .map(|s| slice_axis(s, 2, start as i32, end as i32));
+        let val_scales = layer
+            .val_scales
+            .as_ref()
+            .map(|s| slice_axis(s, 2, start as i32, end as i32));
+        let m3_idx_k = layer
+            .m3_idx_k
+            .as_ref()
+            .map(|m| slice_axis(m, 2, start as i32, end as i32));
 
         // KVarN8 keeps its state in three separate region tensors
         // ([sink | history tiles | tail]), so it cannot be served by the dense
@@ -2590,8 +2737,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn write_bounded_string(writer: &mut impl Write, value: &str) -> Result<(), ColdStoreError> {
-    let len = u32::try_from(value.len())
-        .map_err(|_| invalid_data("string exceeds u32".into()))?;
+    let len = u32::try_from(value.len()).map_err(|_| invalid_data("string exceeds u32".into()))?;
     writer.write_all(&len.to_le_bytes())?;
     writer.write_all(value.as_bytes())?;
     Ok(())
@@ -2635,8 +2781,8 @@ fn read_u128(reader: &mut impl Read) -> io::Result<u128> {
 }
 
 fn bounded_usize(value: u64, maximum: usize, field: &str) -> Result<usize, ColdStoreError> {
-    let value = usize::try_from(value)
-        .map_err(|_| invalid_data(format!("{field} does not fit usize")))?;
+    let value =
+        usize::try_from(value).map_err(|_| invalid_data(format!("{field} does not fit usize")))?;
     if value > maximum {
         return Err(invalid_data(format!(
             "{field} {value} exceeds limit {maximum}"
@@ -2668,8 +2814,8 @@ pub fn compute_block_hashes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::cold_store::tests::make_test_cache_set;
     use crate::cache::cold_store::runtime_fingerprint_from_manifest;
+    use crate::cache::cold_store::tests::make_test_cache_set;
 
     #[test]
     fn block_hash_merkle_chain_prefix_dependent() {
@@ -2677,7 +2823,7 @@ mod tests {
         // NOT a discrimination control — the caller's chain logic is tested below.
         let tokens_a = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let tokens_b = vec![9, 10, 11, 12, 5, 6, 7, 8];
-        let kv_mode = cache_computation_id(&[0u8; 32], KVCacheMode::Fp16, 0);
+        let kv_mode = cache_computation_id(&[0u8; 32], &[(KVCacheMode::Fp16, 0)]);
         let block_size = 4;
 
         let hash_a0 = block_hash_merkle(&[0u8; 32], block_size, &kv_mode, &tokens_a[0..4]);
@@ -2701,7 +2847,7 @@ mod tests {
         // Under Merkle-chain, they differ.
         let tokens_a = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let tokens_b = vec![9, 10, 11, 12, 5, 6, 7, 8];
-        let kv_mode = cache_computation_id(&[0u8; 32], KVCacheMode::Fp16, 0);
+        let kv_mode = cache_computation_id(&[0u8; 32], &[(KVCacheMode::Fp16, 0)]);
         let block_size = 4;
 
         let addrs_a = compute_block_hashes(&tokens_a, block_size, &kv_mode);
@@ -2717,7 +2863,7 @@ mod tests {
     #[test]
     fn block_hash_merkle_chain_same_prefix_same_hash() {
         let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let kv_mode = cache_computation_id(&[0u8; 32], KVCacheMode::Fp16, 0);
+        let kv_mode = cache_computation_id(&[0u8; 32], &[(KVCacheMode::Fp16, 0)]);
         let block_size = 4;
 
         let hash_a0 = block_hash_merkle(&[0u8; 32], block_size, &kv_mode, &tokens[0..4]);
@@ -2734,8 +2880,8 @@ mod tests {
         let tokens = vec![1, 2, 3, 4];
         let block_size = 4;
 
-        let kv_fp16 = cache_computation_id(&[0u8; 32], super::super::KVCacheMode::Fp16, 0);
-        let kv_kvarn8 = cache_computation_id(&[0u8; 32], KVCacheMode::KVarN8, 4);
+        let kv_fp16 = cache_computation_id(&[0u8; 32], &[(super::super::KVCacheMode::Fp16, 0)]);
+        let kv_kvarn8 = cache_computation_id(&[0u8; 32], &[(KVCacheMode::KVarN8, 4)]);
 
         let hash_fp16 = block_hash_merkle(&[0u8; 32], block_size, &kv_fp16, &tokens);
         let hash_kvarn8 = block_hash_merkle(&[0u8; 32], block_size, &kv_kvarn8, &tokens);
@@ -2745,7 +2891,7 @@ mod tests {
     #[test]
     fn block_hash_includes_block_size() {
         let tokens = vec![1, 2, 3, 4];
-        let kv_mode = cache_computation_id(&[0u8; 32], KVCacheMode::Fp16, 0);
+        let kv_mode = cache_computation_id(&[0u8; 32], &[(KVCacheMode::Fp16, 0)]);
 
         let hash_4 = block_hash_merkle(&[0u8; 32], 4, &kv_mode, &tokens);
         let hash_8 = block_hash_merkle(&[0u8; 32], 8, &kv_mode, &tokens);
@@ -2769,7 +2915,7 @@ mod tests {
     #[test]
     fn compute_block_hashes_basic() {
         let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let kv_mode = cache_computation_id(&[0u8; 32], KVCacheMode::Fp16, 0);
+        let kv_mode = cache_computation_id(&[0u8; 32], &[(KVCacheMode::Fp16, 0)]);
         let hashes = compute_block_hashes(&tokens, 4, &kv_mode);
         assert_eq!(hashes.len(), 2);
         assert_ne!(hashes[0], hashes[1]);
