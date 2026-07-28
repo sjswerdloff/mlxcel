@@ -202,11 +202,18 @@ pub(crate) fn apply_kvarn_v_bits(caches: &mut [mlxcel_core::cache::KVCache], v_b
 /// Mirrors `apply_kvarn_v_bits`: the configured width applies only to layers
 /// that actually resolved to `KVarN8`; every other layer keeps the inert
 /// default of 8.
+/// `boundary_v_layers` is passed IN rather than read from the environment here
+/// (Alden, 2026-07-28). The legacy Turbo Boundary-V branch was the one path
+/// this function owned that no test of it reached, because reaching it meant
+/// setting an env var. Taking it as an argument makes the branch deterministic
+/// — the same move `parse_boundary_v_str` already makes next door. Callers pass
+/// `turbo::boundary_v_layers_from_env()`.
 pub(crate) fn resolve_nominal_layer_plan(
     batch_kv_quant: &BatchKvQuantConfig,
     legacy_kv_cache_mode: KVCacheMode,
     kvarn_v_bits: u8,
     n_layers: usize,
+    boundary_v_layers: i32,
 ) -> Vec<(KVCacheMode, u8)> {
     let modes = if batch_kv_quant.is_enabled() {
         batch_kv_quant.resolve_layer_modes(n_layers)
@@ -215,8 +222,11 @@ pub(crate) fn resolve_nominal_layer_plan(
         // back Fp16 caches and `apply_kv_cache_mode_to` returns early.
         vec![KVCacheMode::Fp16; n_layers]
     } else {
-        let requested = mlxcel_core::cache::turbo::boundary_v_layers_from_env();
-        mlxcel_core::cache::turbo::resolve_layer_modes(legacy_kv_cache_mode, n_layers, requested)
+        mlxcel_core::cache::turbo::resolve_layer_modes(
+            legacy_kv_cache_mode,
+            n_layers,
+            boundary_v_layers,
+        )
     };
     modes
         .into_iter()
@@ -229,6 +239,38 @@ pub(crate) fn resolve_nominal_layer_plan(
             (mode, v_bits)
         })
         .collect()
+}
+
+/// The FULL v4 cold-store block-address plan: generic config policy composed
+/// with the model's own structural downgrades.
+///
+/// Extracted so the whole chain is reachable from a test (Alden, 2026-07-28).
+/// Routing a test through `LoadedModel` proves the enum delegation, but leaves
+/// the SCHEDULER seam unpinned: making `kv_layer_plan` return `nominal` instead
+/// of calling the model kept every test green while production went write-only
+/// again. One call here crosses all four layers — generic policy →
+/// scheduler planner → enum delegation → the model's D1 composition.
+///
+/// `model.num_layers()` rather than a live cache count: the plan is needed at
+/// LOAD time, before a sequence is allocated. The scheduler already treats a
+/// `detached.num_layers() != model.num_layers()` mismatch as invalid, and
+/// `persist` re-checks the length against the real set, so a divergence
+/// surfaces rather than mislabelling.
+pub(crate) fn resolve_kv_layer_plan(
+    model: &dyn mlxcel_core::generate::LanguageModel,
+    batch_kv_quant: &BatchKvQuantConfig,
+    legacy_kv_cache_mode: KVCacheMode,
+    kvarn_v_bits: u8,
+    boundary_v_layers: i32,
+) -> Vec<(KVCacheMode, u8)> {
+    let nominal = resolve_nominal_layer_plan(
+        batch_kv_quant,
+        legacy_kv_cache_mode,
+        kvarn_v_bits,
+        model.num_layers(),
+        boundary_v_layers,
+    );
+    model.kv_cache_plan(&nominal)
 }
 
 /// Derive the causal prefix that may actually be adopted.
@@ -2828,6 +2870,7 @@ impl BatchScheduler {
             self.kv_cache_mode,
             self.kvarn_v_bits,
             n_layers,
+            mlxcel_core::cache::turbo::boundary_v_layers_from_env(),
         );
         for (cache, (mode, _)) in caches.iter_mut().zip(plan) {
             cache.mode = mode;
@@ -2846,18 +2889,13 @@ impl BatchScheduler {
     /// compute addresses before any layer exists, and `persist` checks it
     /// against the live caches and fails loud on disagreement.
     fn kv_layer_plan(&self) -> Vec<(KVCacheMode, u8)> {
-        // `model.num_layers()` rather than a live cache count: the plan is
-        // needed at LOAD time, before a sequence is allocated. The scheduler
-        // already treats a `detached.num_layers() != model.num_layers()`
-        // mismatch as invalid, and `persist` re-checks the length against the
-        // real set, so a divergence surfaces rather than mislabelling.
-        let nominal = resolve_nominal_layer_plan(
+        resolve_kv_layer_plan(
+            &self.model,
             &self.batch_kv_quant,
             self.kv_cache_mode,
             self.kvarn_v_bits,
-            self.model.num_layers(),
-        );
-        self.model.kv_cache_plan(&nominal)
+            mlxcel_core::cache::turbo::boundary_v_layers_from_env(),
+        )
     }
 
     /// Prepare Turbo4Delegated cache state before a sequence enters decode.

@@ -5225,3 +5225,125 @@ fn the_address_declares_format_v3() {
         "the address must declare its format version; got {id}"
     );
 }
+
+// ── Serializer reach: expressible is not storable (Alden, 2026-07-28) ────
+
+/// A Turbo plan is REFUSED before any block is written, and leaves nothing
+/// behind.
+///
+/// The gap: widening the address made Turbo plans expressible, but
+/// `extract_block` and `merge_layer_across_blocks` set `v_packed`, `v_norms`,
+/// `v_rescale`, `k_packed` and `k_norms` to `None` — the code says so itself.
+/// A Turbo persist would publish blocks carrying none of their payload.
+/// Severity is committed-unusable data and a disk leak rather than shown-wrong
+/// inference, because the extent/coherence checks should usually make the load
+/// fail; "should usually" is not a safety argument.
+///
+/// The no-residue half is the point. A refusal that still wrote blocks or a
+/// manifest would leak disk and leave addresses referring to unreadable data.
+///
+/// Named mutation: delete the `block_serializer_supports` gate in `persist` and
+/// this goes red on the residue assertions, not merely on the error.
+#[test]
+fn a_turbo_plan_is_refused_before_any_block_is_written() {
+    const N_TILES: i32 = 15;
+    let depth = TILE + N_TILES * TILE;
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    for mode in [
+        KVCacheMode::Turbo4Asym,
+        KVCacheMode::Turbo3Asym,
+        KVCacheMode::Turbo4,
+        KVCacheMode::Turbo4Delegated,
+    ] {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlockColdStore::new(dir.path().to_path_buf(), [51u8; 32]);
+
+        // The SET is Fp16 — the point is the PLAN's mode, checked before any
+        // write. Using a matching Turbo set is impossible here anyway: the
+        // fixture builders cannot produce Turbo sidecars, which is the same
+        // fact the serializer is missing.
+        let mut set = fp16_set(2, depth);
+        for c in set.caches.iter_mut() {
+            c.mode = mode;
+        }
+
+        let err = store
+            .persist("m3", "tmpl", &tokens, &set, &homog(2, mode, 8))
+            .expect_err("a Turbo plan must be refused — the block serializer \
+                         cannot carry its sidecars");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("serializer") || msg.contains("sidecar"),
+            "the refusal must say WHY, so nobody reads it as a transient \
+             failure; got: {msg}"
+        );
+
+        // NO RESIDUE. This is what separates a gate from a late failure.
+        let blocks = std::fs::read_dir(store.blocks_dir())
+            .map(|d| d.count())
+            .unwrap_or(0);
+        let manifests = std::fs::read_dir(store.manifests_dir())
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(blocks, 0, "{mode:?}: refusal left blocks on disk");
+        assert_eq!(manifests, 0, "{mode:?}: refusal left a manifest on disk");
+    }
+}
+
+/// CONTROL, expected answer DIFFERS: the modes the block path does carry still
+/// persist. Without this, the refusals above are satisfied by a store that
+/// refuses everything.
+///
+/// Scope, stated: this asserts Fp16 and KVarN8 only. `Int8` is ACCEPTED by the
+/// gate but is deliberately NOT asserted here — it is structurally plausible
+/// (it rides keys/values/key_scales/val_scales) but has no round-trip evidence
+/// in this file, and a green here would read as evidence it does not have.
+#[test]
+fn the_modes_the_block_path_carries_still_persist() {
+    const N_TILES: i32 = 15;
+    let depth = TILE + N_TILES * TILE;
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    // Fp16
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [52u8; 32]);
+    let set = fp16_set(2, depth);
+    store
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
+        .expect("Fp16 must still persist — the Turbo gate must not over-reach");
+
+    // KVarN8
+    let dir2 = tempfile::TempDir::new().expect("tempdir");
+    let store2 = BlockColdStore::new(dir2.path().to_path_buf(), [52u8; 32]);
+    let set2 = kvarn_v4_set_distinct(2, N_TILES, 0);
+    store2
+        .persist("m3", "tmpl", &tokens, &set2, &plan_of(&set2))
+        .expect("KVarN8 must still persist — the Turbo gate must not over-reach");
+
+    // And the M3 mixed shape, which is the whole reason the address was
+    // widened, must survive the new gate.
+    let dir3 = tempfile::TempDir::new().expect("tempdir");
+    let store3 = BlockColdStore::new(dir3.path().to_path_buf(), [52u8; 32]);
+    let set3 = m3_shaped_mixed_set(3, 5, N_TILES);
+    store3
+        .persist("m3", "tmpl", &tokens, &set3, &plan_of(&set3))
+        .expect("the real M3 mixed shape must still persist");
+}
+
+/// The gate is exhaustive and matches the serializer's actual reach.
+///
+/// Spelled per mode so adding a variant cannot inherit "supported" silently —
+/// the failure mode of a wrong default here is publishing blocks that can never
+/// be read back.
+#[test]
+fn block_serializer_reach_is_declared_per_mode() {
+    assert!(block_serializer_supports(KVCacheMode::Fp16));
+    assert!(block_serializer_supports(KVCacheMode::KVarN8));
+    // Accepted, NOT claimed proven — see `block_serializer_supports`.
+    assert!(block_serializer_supports(KVCacheMode::Int8));
+    assert!(!block_serializer_supports(KVCacheMode::Turbo4Asym));
+    assert!(!block_serializer_supports(KVCacheMode::Turbo3Asym));
+    assert!(!block_serializer_supports(KVCacheMode::Turbo4));
+    assert!(!block_serializer_supports(KVCacheMode::Turbo4Delegated));
+}

@@ -3822,7 +3822,31 @@ impl LanguageModel for MiniMaxM3Model {
         &self,
         nominal: &[(mlxcel_core::cache::KVCacheMode, u8)],
     ) -> Vec<(mlxcel_core::cache::KVCacheMode, u8)> {
-        if kvarn_all_layers_forced() {
+        // The env read happens HERE and the decision is made in a pure helper.
+        // `kvarn_all_layers_forced` caches in a `OnceLock`, so a test cannot
+        // toggle it in-process — which left the escape-hatch branch untestable
+        // and therefore untested (Alden, 2026-07-28). Same shape as
+        // `parse_boundary_v_str` next door: keep the env at the boundary, put
+        // the logic somewhere deterministic.
+        self.kv_cache_plan_with(nominal, kvarn_all_layers_forced())
+    }
+}
+
+impl MiniMaxM3Model {
+    /// The D1 planning decision, with the escape hatch as an ARGUMENT.
+    ///
+    /// `all_layers_forced` mirrors `MLXCEL_KVARN_ALL_LAYERS=1`: when set, the
+    /// forward path leaves every layer KVarN8, so the plan must not downgrade
+    /// anything either. Getting that backwards is not a quiet inconsistency —
+    /// the plan would say Fp16 where reality is KVarN8, `persist` would refuse
+    /// every set, and `load_prefix` would address blocks that were never
+    /// written. v4 stores nothing, silently, exactly as before the fix.
+    pub(crate) fn kv_cache_plan_with(
+        &self,
+        nominal: &[(mlxcel_core::cache::KVCacheMode, u8)],
+        all_layers_forced: bool,
+    ) -> Vec<(mlxcel_core::cache::KVCacheMode, u8)> {
+        if all_layers_forced {
             return nominal.to_vec();
         }
         nominal
@@ -5304,6 +5328,329 @@ mod tests {
             model.kv_cache_plan(&nominal),
             nominal,
             "every layer is MSA-eligible, so D1 downgrades nothing"
+        );
+    }
+
+
+
+
+    /// The `MLXCEL_KVARN_ALL_LAYERS=1` escape hatch: when D1 is DISABLED in the
+    /// forward path, the declared plan must not downgrade either.
+    ///
+    /// Alden's blocker, 2026-07-28: this branch had no test at all. It is not a
+    /// quiet inconsistency if it is wrong — the plan would say Fp16 where
+    /// reality is KVarN8, `persist` would refuse every set on the conformance
+    /// check, and `load_prefix` would address blocks that were never written.
+    /// v4 stores nothing, silently. Precisely the failure this whole change
+    /// exists to remove, reintroduced through the A/B switch.
+    ///
+    /// Testable because the env read now happens in the trait method and the
+    /// decision lives in `kv_cache_plan_with` — `kvarn_all_layers_forced`
+    /// caches in a `OnceLock`, so in-process env toggling is unreliable and a
+    /// test that set the variable would be lying about what it proved.
+    ///
+    /// Named mutation, RUN: delete the `all_layers_forced` early return and
+    /// this goes red while the forced=false tests stay green.
+    #[test]
+    fn kv_cache_plan_respects_the_all_layers_escape_hatch() {
+        use mlxcel_core::cache::KVCacheMode;
+
+        const DENSE: usize = 3;
+        const MSA: usize = 5;
+        let model = m3_model_with_dense_prefix(DENSE, MSA);
+        let nominal = vec![(KVCacheMode::KVarN8, 4); DENSE + MSA];
+
+        let forced = model.kv_cache_plan_with(&nominal, true);
+        assert_eq!(
+            forced, nominal,
+            "with the escape hatch on, the forward path keeps every layer \
+             KVarN8, so the plan must not downgrade the dense prefix — a plan \
+             that disagrees with reality makes persist refuse every set"
+        );
+
+        // CONTROL, expected answer DIFFERS: the same model and nominal with the
+        // hatch off must downgrade, or the assertion above is satisfied by a
+        // helper that never downgrades anything.
+        let unforced = model.kv_cache_plan_with(&nominal, false);
+        assert_eq!(
+            unforced[0].0,
+            KVCacheMode::Fp16,
+            "with the hatch off, D1 must downgrade the dense prefix"
+        );
+        assert_ne!(
+            forced, unforced,
+            "the hatch must actually change the plan, or this test cannot tell \
+             the two branches apart"
+        );
+    }
+
+    /// THE FULL CHAIN: generic policy → scheduler planner → enum delegation →
+    /// M3's D1 composition, in one call.
+    ///
+    /// Alden, 2026-07-28, refining twice. Routing a test through `LoadedModel`
+    /// proves the delegation but NOT the scheduler seam: making
+    /// `kv_layer_plan` return `nominal` instead of consulting the model kept
+    /// every test green while production went write-only again. This calls
+    /// `resolve_kv_layer_plan` — the exact body `BatchScheduler::kv_layer_plan`
+    /// runs — so all four layers are crossed by one assertion.
+    ///
+    /// # Why THIS shape and not the three-region one
+    ///
+    /// Checked rather than assumed, and it changed the test: **the production
+    /// planner cannot currently hand M3 a heterogeneous KVarN8 nominal.**
+    /// `BatchKvQuantConfig::base_mode` returns only `Int8` / `Fp16` /
+    /// `Turbo4Asym` — never `KVarN8` — so `skip_last_layer` never applies to a
+    /// KVarN8 plan; and `turbo::boundary_mode_for(KVarN8)` returns the nominal
+    /// unchanged, so Boundary-V is a no-op there too. A KVarN8 nominal is
+    /// therefore always homogeneous today, and **D1 is the only thing that
+    /// makes an M3 plan heterogeneous.**
+    ///
+    /// So the production-real crossing is: homogeneous KVarN8 in, mixed out.
+    /// The three-region case is kept next door as defensive coverage of the
+    /// hook, explicitly labelled as a shape the config path cannot produce —
+    /// building a "production-shaped" fixture from an unchecked belief about
+    /// production is the exact mistake that started this whole change.
+    ///
+    /// Named mutations, both RUN:
+    /// * `resolve_kv_layer_plan` returns `nominal` → **RED** (dense prefix
+    ///   stays KVarN8)
+    /// * `LoadedModel::kv_cache_plan` delegation deleted → **RED** (the enum
+    ///   falls back to the trait default, which is the identity)
+    #[test]
+    fn the_scheduler_planner_crosses_policy_delegation_and_d1_for_a_real_m3() {
+        use mlxcel_core::cache::{BatchKvQuantConfig, KVCacheMode};
+
+        const DENSE: usize = 3;
+        const MSA: usize = 5;
+        const N: usize = DENSE + MSA;
+
+        let model = m3_model_with_dense_prefix(DENSE, MSA);
+        let loaded = crate::loaded_model::LoadedModel::MiniMaxM3(model);
+
+        // Exactly what the scheduler holds for a k8v4 server: legacy mode
+        // KVarN8 at width 4, batched quant disabled, Boundary-V requested
+        // (a no-op for KVarN8, and that being a no-op is part of what makes
+        // the homogeneous-nominal claim above true).
+        let plan = crate::server::batch::scheduler::resolve_kv_layer_plan(
+            &loaded,
+            &BatchKvQuantConfig::default(),
+            KVCacheMode::KVarN8,
+            4,
+            2,
+        );
+
+        assert_eq!(plan.len(), N, "the plan must be per-layer for the model");
+
+        for (i, entry) in plan.iter().enumerate().take(DENSE) {
+            assert_eq!(
+                *entry,
+                (KVCacheMode::Fp16, 8),
+                "layer {i} is dense-prefix. Fp16 here requires the generic \
+                 planner to have produced a KVarN8 nominal AND the enum to \
+                 have delegated AND D1 to have run. KVarN8 here means one of \
+                 those three did not happen, and v4 is write-only again."
+            );
+        }
+        for (i, entry) in plan.iter().enumerate().skip(DENSE) {
+            assert_eq!(
+                *entry,
+                (KVCacheMode::KVarN8, 4),
+                "layer {i} is MSA-eligible and must keep the configured mode \
+                 and width"
+            );
+        }
+
+        // The chain must have CHANGED something, or every assertion above
+        // could be satisfied by a planner that never consulted the model.
+        let nominal_only = vec![(KVCacheMode::KVarN8, 4); N];
+        assert_ne!(
+            plan, nominal_only,
+            "the plan equals the untransformed nominal — the scheduler seam, \
+             the enum delegation, or D1 is not in the path"
+        );
+    }
+
+    /// COMPOSITION: a config-driven heterogeneous nominal fed THROUGH the
+    /// model's structural downgrade.
+    ///
+    /// The gap this closes, found by auditing my own fixtures rather than by a
+    /// failure: every other `kv_cache_plan` test feeds a HOMOGENEOUS nominal
+    /// (`vec![(mode, bits); n]`), and the config-side test
+    /// (`nominal_layer_plan_is_heterogeneous_under_skip_last_layer`) never
+    /// touches a model. So the two mechanisms were each covered alone and their
+    /// COMPOSITION was covered by nothing — the same shape as the defect that
+    /// started all this, where every fixture was built from the assumption
+    /// under test.
+    ///
+    /// ⚠️ **SCOPE CORRECTION — this is DEFENSIVE coverage, not a production
+    /// shape.** An earlier version of this comment called the three-region case
+    /// "the real production case". I never checked, and it is not true today:
+    /// `BatchKvQuantConfig::base_mode` returns only `Int8` / `Fp16` /
+    /// `Turbo4Asym` — never `KVarN8` — so `skip_last_layer` cannot apply to a
+    /// KVarN8 plan, and `turbo::boundary_mode_for(KVarN8)` returns the nominal
+    /// unchanged, so Boundary-V is a no-op there too. A KVarN8 nominal reaching
+    /// M3 is therefore always HOMOGENEOUS, and D1 is the only thing that makes
+    /// an M3 plan mixed.
+    ///
+    /// Calling an unchecked belief about production "the real production case"
+    /// is exactly the mistake that started this whole change. The
+    /// production-real crossing lives in
+    /// `the_scheduler_planner_crosses_policy_delegation_and_d1_for_a_real_m3`.
+    /// This test stays because the hook must behave if a future config ever
+    /// does produce a mixed KVarN8 nominal — worth covering, not worth
+    /// mislabelling.
+    ///
+    /// The three regions it constructs:
+    ///   * layers 0..DENSE      Fp16   — D1, model-structural (no index projections)
+    ///   * layers DENSE..last   KVarN8 — the configured mode
+    ///   * last layer           Fp16   — `skip_last_layer`, config-driven
+    ///
+    /// The two mechanisms must COMMUTE with the model hook in the sense that
+    /// matters: the hook must downgrade the dense prefix WITHOUT disturbing a
+    /// layer the config already forced to Fp16, and without re-quantizing it.
+    ///
+    /// Named mutations, each RUN rather than reasoned — the first draft of this
+    /// comment claimed blanket-forcing Fp16 would red the interior rows, and
+    /// running it showed that is false (it reds
+    /// `kv_cache_plan_leaves_non_kvarn_dense_layers_untouched` instead, because
+    /// this fixture's dense layers are KVarN8 either way). Measured:
+    ///
+    /// * hook returns `nominal.to_vec()` → **dense-prefix rows RED**
+    /// * downgrade extended past the dense prefix (drop `is_dense_prefix`) →
+    ///   **interior rows RED**
+    /// * blanket-force Fp16 on the dense prefix (drop the mode condition) →
+    ///   this test stays **GREEN**; that condition is pinned by
+    ///   `kv_cache_plan_leaves_non_kvarn_dense_layers_untouched`, not here.
+    ///
+    /// The third line is the off-diagonal: it says what this test does NOT
+    /// cover, so its green is not read as wider than it is.
+    #[test]
+    fn kv_cache_plan_composes_with_a_config_driven_heterogeneous_nominal() {
+        use mlxcel_core::cache::KVCacheMode;
+
+        const DENSE: usize = 3;
+        const MSA: usize = 5;
+        const N: usize = DENSE + MSA;
+        let model = m3_model_with_dense_prefix(DENSE, MSA);
+
+        // A nominal shaped as the scheduler would hand it over with
+        // `skip_last_layer` active: quantized everywhere except the final
+        // layer. Built explicitly rather than via `vec![_; n]` — the uniform
+        // constructor is exactly what hid this case.
+        let mut nominal = vec![(KVCacheMode::KVarN8, 4); N];
+        nominal[N - 1] = (KVCacheMode::Fp16, 8);
+        assert_ne!(
+            nominal[0],
+            nominal[N - 1],
+            "precondition: the NOMINAL must already be heterogeneous, or this \
+             test is the homogeneous one again under a longer name"
+        );
+
+        // THROUGH THE ENUM, not the concrete model: production's scheduler
+        // calls LoadedModel. A direct-model call leaves the delegation in
+        // loaded_model.rs unpinned — deleting it kept all five earlier tests
+        // green while production silently took the default plan (Alden,
+        // 2026-07-28; measured, not argued). Same seam as
+        // prefill_alignment_delegates_through_loaded_model.
+        let loaded = crate::loaded_model::LoadedModel::MiniMaxM3(model);
+        let dyn_model: &dyn LanguageModel = &loaded;
+        let plan = dyn_model.kv_cache_plan(&nominal);
+        assert_eq!(plan.len(), N, "the plan must stay per-layer");
+
+        // Region 1: D1 downgraded the dense prefix.
+        for (i, entry) in plan.iter().enumerate().take(DENSE) {
+            assert_eq!(
+                entry.0,
+                KVCacheMode::Fp16,
+                "layer {i} is dense-prefix; D1 must downgrade it even when the \
+                 nominal arrived heterogeneous"
+            );
+        }
+
+        // Region 2: the MSA interior keeps the configured mode AND width.
+        for (i, entry) in plan.iter().enumerate().take(N - 1).skip(DENSE) {
+            assert_eq!(
+                *entry,
+                (KVCacheMode::KVarN8, 4),
+                "layer {i} is MSA-eligible and not the skipped last layer, so \
+                 it must keep the configured mode and width"
+            );
+        }
+
+        // Region 3: the config's skipped last layer is untouched by the model.
+        // The hook must not re-quantize what the config deliberately left
+        // unquantized — a downgrade rule that only ADDS Fp16 layers cannot, but
+        // that is a property worth pinning rather than assuming.
+        assert_eq!(
+            plan[N - 1],
+            (KVCacheMode::Fp16, 8),
+            "the last layer was forced Fp16 by skip_last_layer; the model hook \
+             must leave it alone"
+        );
+
+        // And the whole point: THREE distinct regions survived composition.
+        assert_eq!(
+            plan[0].0,
+            KVCacheMode::Fp16,
+            "region boundary check: dense prefix"
+        );
+        assert_eq!(
+            plan[DENSE].0,
+            KVCacheMode::KVarN8,
+            "region boundary check: MSA interior"
+        );
+        assert_ne!(
+            plan[DENSE], plan[N - 1],
+            "the interior and the skipped last layer must remain different, or \
+             composition has flattened the plan"
+        );
+    }
+
+    /// The composed plan must also be ADDRESSABLE as itself — a three-region
+    /// plan must not share a block address with either of the two-region plans
+    /// it could be mistaken for.
+    ///
+    /// Covers the failure where composition produces the right Vec but the
+    /// address collapses it: a plan that reads correctly and addresses wrongly
+    /// is the silent-miss class, not a loud one.
+    #[test]
+    fn a_three_region_plan_addresses_distinctly_from_its_two_region_neighbours() {
+        use mlxcel_core::cache::KVCacheMode;
+        use mlxcel_core::cache::block_cold_store::cache_computation_id;
+
+        const DENSE: usize = 3;
+        const MSA: usize = 5;
+        const N: usize = DENSE + MSA;
+        let model = m3_model_with_dense_prefix(DENSE, MSA);
+
+        let mut nominal = vec![(KVCacheMode::KVarN8, 4); N];
+        nominal[N - 1] = (KVCacheMode::Fp16, 8);
+        // Through the ENUM — see the composition test above.
+        let loaded = crate::loaded_model::LoadedModel::MiniMaxM3(model);
+        let dyn_model: &dyn LanguageModel = &loaded;
+        let composed = dyn_model.kv_cache_plan(&nominal);
+
+        // Neighbour A: D1 only — no skip_last_layer.
+        let d1_only = dyn_model.kv_cache_plan(&vec![(KVCacheMode::KVarN8, 4); N]);
+        // Neighbour B: skip_last_layer only — no dense prefix to downgrade.
+        let skip_only = {
+            let mut v = vec![(KVCacheMode::KVarN8, 4); N];
+            v[N - 1] = (KVCacheMode::Fp16, 8);
+            v
+        };
+
+        let rt = [43u8; 32];
+        assert_ne!(
+            cache_computation_id(&rt, &composed),
+            cache_computation_id(&rt, &d1_only),
+            "the composed plan shares an address with the D1-only plan — the \
+             skipped last layer is not reaching the address"
+        );
+        assert_ne!(
+            cache_computation_id(&rt, &composed),
+            cache_computation_id(&rt, &skip_only),
+            "the composed plan shares an address with the skip-only plan — the \
+             dense-prefix downgrade is not reaching the address"
         );
     }
 

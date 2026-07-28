@@ -1503,6 +1503,7 @@ fn nominal_layer_plan_for_legacy_fp16_is_homogeneous() {
         KVCacheMode::Fp16,
         8,
         4,
+        0,
     );
     assert_eq!(plan, vec![(KVCacheMode::Fp16, 8); 4]);
 }
@@ -1517,6 +1518,7 @@ fn nominal_layer_plan_carries_the_kvarn_width() {
         KVCacheMode::KVarN8,
         4,
         3,
+        0,
     );
     assert_eq!(plan, vec![(KVCacheMode::KVarN8, 4); 3]);
 }
@@ -1539,7 +1541,7 @@ fn nominal_layer_plan_is_heterogeneous_under_skip_last_layer() {
     assert!(cfg.is_enabled(), "precondition: the config must be active");
 
     let plan =
-        crate::server::batch::scheduler::resolve_nominal_layer_plan(&cfg, KVCacheMode::Fp16, 8, 4);
+        crate::server::batch::scheduler::resolve_nominal_layer_plan(&cfg, KVCacheMode::Fp16, 8, 4, 0);
     assert_eq!(
         plan.len(),
         4,
@@ -1554,5 +1556,90 @@ fn nominal_layer_plan_is_heterogeneous_under_skip_last_layer() {
         plan[0], plan[3],
         "this plan must be MIXED — a config flag alone produces heterogeneity, \
          with no model-specific downgrade involved"
+    );
+}
+
+/// The legacy Turbo Boundary-V branch, reached deterministically.
+///
+/// Alden's non-blocking gap, 2026-07-28: `resolve_nominal_layer_plan` now owns
+/// BOTH allocation and the block address, but nothing exercised its Boundary-V
+/// path. The lower-level `turbo::boundary` tests prove the policy is correct;
+/// they do not prove this new caller invokes it. A mutation to a homogeneous
+/// Turbo plan would keep the store internally consistent — same table on both
+/// sides, addresses match, nothing misses — while silently deleting the
+/// boundary quality protection. So this is a QUALITY regression the store's own
+/// consistency cannot detect, which is exactly why it needs its own test.
+///
+/// Deterministic because `boundary_v_layers` is now an argument rather than an
+/// env read.
+///
+/// Named mutation, RUN: pass `0` for `boundary_v_layers` (or make the branch
+/// return a homogeneous plan) and the boundary rows go red.
+#[test]
+fn nominal_layer_plan_applies_boundary_v_on_the_legacy_turbo_path() {
+    use mlxcel_core::cache::{BatchKvQuantConfig, KVCacheMode};
+
+    const N: usize = 8;
+    const BOUNDARY: i32 = 2;
+
+    let plan = crate::server::batch::scheduler::resolve_nominal_layer_plan(
+        &BatchKvQuantConfig::default(),
+        KVCacheMode::Turbo4,
+        8,
+        N,
+        BOUNDARY,
+    );
+
+    assert_eq!(plan.len(), N, "the plan must stay per-layer");
+
+    // First and last BOUNDARY layers are protected at Fp16
+    // (`turbo::boundary::boundary_mode_for(Turbo4) == Fp16`).
+    for i in 0..BOUNDARY as usize {
+        assert_eq!(
+            plan[i].0,
+            KVCacheMode::Fp16,
+            "layer {i} is in the leading boundary band and must stay Fp16"
+        );
+        let j = N - 1 - i;
+        assert_eq!(
+            plan[j].0,
+            KVCacheMode::Fp16,
+            "layer {j} is in the trailing boundary band and must stay Fp16"
+        );
+    }
+
+    // The interior keeps the nominal quantized mode.
+    for (i, entry) in plan
+        .iter()
+        .enumerate()
+        .take(N - BOUNDARY as usize)
+        .skip(BOUNDARY as usize)
+    {
+        assert_eq!(
+            entry.0,
+            KVCacheMode::Turbo4,
+            "layer {i} is interior and must keep the configured Turbo4"
+        );
+    }
+
+    // CONTROL, expected answer DIFFERS: boundary 0 means no protection, so the
+    // plan is homogeneous. Without this, the assertions above would also pass
+    // against a function that returned Fp16 everywhere.
+    let unprotected = crate::server::batch::scheduler::resolve_nominal_layer_plan(
+        &BatchKvQuantConfig::default(),
+        KVCacheMode::Turbo4,
+        8,
+        N,
+        0,
+    );
+    assert_eq!(
+        unprotected,
+        vec![(KVCacheMode::Turbo4, 8); N],
+        "with no boundary band the plan must be homogeneous Turbo4"
+    );
+    assert_ne!(
+        plan, unprotected,
+        "Boundary-V must actually change the plan, or this caller is not \
+         invoking it"
     );
 }

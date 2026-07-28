@@ -118,6 +118,17 @@ pub fn block_hash_merkle(
 /// field too narrow. Widening it to the whole per-layer vector is what lets the
 /// guard become a conformance check instead of a blanket refusal.
 ///
+/// **CORRECTION (Alden, 2026-07-28): expressible is not storable.** An earlier
+/// version of this comment listed all three routes as producing a mixed set the
+/// store could now hold. That is false for Boundary-V, which applies ONLY to
+/// Turbo modes — and the block serializer drops every Turbo sidecar (see
+/// `block_serializer_supports`). The widened address can NAME a Turbo plan; the
+/// serializer cannot carry one, and `persist` now refuses it before writing.
+/// So of the three routes above, two are genuinely storable today
+/// (`skip_last_layer` over Int8/Fp16, and D1 over KVarN8/Fp16) and Boundary-V
+/// is gated. The address change was necessary for all three; it was sufficient
+/// for two.
+///
 /// The version prefix is the anti-aliasing mechanism, so it moves with the
 /// field set AND with the preimage encoding: `v1`, `v2` and `v3` addresses can
 /// never collide.
@@ -200,6 +211,41 @@ pub fn canonical_layer_identity(mode: super::KVCacheMode, v_bits: u8) -> (super:
         M::KVarN8 => v_bits,
     };
     (mode, effective_v_bits)
+}
+
+/// Can the BLOCK SERIALIZER actually carry this mode's payload?
+///
+/// Distinct from "can the address express it" — the widened per-layer address
+/// can name any mode, and `extract_block` / `merge_layer_across_blocks` cannot
+/// carry the Turbo sidecars (`v_packed`, `v_norms`, `v_rescale`, `k_packed`,
+/// `k_norms` are set to `None` at both sites). Alden caught the gap between
+/// those two facts, and it falsified a claim I had written: the branch doc
+/// listed Boundary-V as one of three routes producing a *storable* mixed set,
+/// and Boundary-V applies ONLY to Turbo modes. Expressible, not storable.
+///
+/// Exhaustive, no wildcard: a new mode must not inherit "supported" by default,
+/// because the failure mode is publishing blocks that can never be read back.
+///
+/// **`Int8` is accepted, NOT claimed proven.** It is structurally plausible —
+/// it rides `keys` / `values` / `key_scales` / `val_scales`, all of which the
+/// block path does carry — but this function is a gate against a known-missing
+/// serializer, not a certificate. Int8 deserves its own round-trip evidence
+/// before anyone writes that it works; scope for this checkpoint is the Turbo
+/// refusal only.
+fn block_serializer_supports(mode: super::KVCacheMode) -> bool {
+    use super::KVCacheMode as M;
+    match mode {
+        // Carried by the block path today.
+        M::Fp16 => true,
+        M::KVarN8 => true,
+        // Structurally plausible, unproven — see the note above.
+        M::Int8 => true,
+        // Sidecars dropped by extract_block / merge_layer_across_blocks.
+        M::Turbo4Asym => false,
+        M::Turbo3Asym => false,
+        M::Turbo4 => false,
+        M::Turbo4Delegated => false,
+    }
 }
 
 /// Stable wire tag for a mode in the address preimage.
@@ -1329,6 +1375,42 @@ impl BlockColdStore {
                 actual.1,
                 expected.0,
                 expected.1,
+                describe_kv_layer_plan(plan)
+            )));
+        }
+
+        // SERIALIZER REACH, checked BEFORE the first byte is written.
+        //
+        // Alden, 2026-07-28. Widening the address made Turbo plans
+        // *expressible*; it did not make them *storable*. `extract_block` and
+        // `merge_layer_across_blocks` both set `v_packed` / `v_norms` /
+        // `v_rescale` / `k_packed` / `k_norms` to `None` — the code says so in
+        // its own comment, "Turbo sidecars not extracted for blocks". A Turbo
+        // plan would therefore publish blocks carrying none of its payload.
+        //
+        // Severity is committed-unusable data and a disk leak rather than
+        // demonstrated wrong inference: the extent and coherence checks should
+        // usually make the load fail rather than adopt (Turbo4Asym has K but no
+        // V; the symmetric packed modes assemble to zero). "Should usually" is
+        // not a safety argument, and a store that writes what it can never read
+        // is broken either way.
+        //
+        // This refusal is deliberately NARROW — a gate, not Turbo support. It
+        // is placed before `compute_block_hashes` so a rejected plan leaves no
+        // blocks, no manifest and no directories behind.
+        if let Some((i, mode)) = plan
+            .iter()
+            .enumerate()
+            .find(|(_, (m, _))| !block_serializer_supports(*m))
+            .map(|(i, (m, _))| (i, *m))
+        {
+            return Err(invalid_data(format!(
+                "persist: layer {i} is {mode:?}, whose payload the block \
+                 serializer cannot carry — extract_block and \
+                 merge_layer_across_blocks drop every Turbo sidecar \
+                 (v_packed, v_norms, v_rescale, k_packed, k_norms). Writing it \
+                 would publish blocks that can never be read back. Plan: {}. \
+                 Refusing before any block is written.",
                 describe_kv_layer_plan(plan)
             )));
         }
