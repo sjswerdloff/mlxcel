@@ -5358,3 +5358,146 @@ fn block_serializer_reach_is_declared_per_mode() {
     assert!(!block_serializer_supports(KVCacheMode::Turbo4));
     assert!(!block_serializer_supports(KVCacheMode::Turbo4Delegated));
 }
+
+/// THE CONFORMANCE GUARD, exercised across every way a plan can diverge.
+///
+/// Written because I caught myself telling a reviewer "I know this is thin,
+/// don't spend time on it". Disclosing a weakness is not fixing it, and it
+/// asks the reviewer to bless what they are there to reject. Every other
+/// persist call site in this file passes `plan_of(&set)`, which satisfies the
+/// check by construction and therefore says nothing about it. Before this,
+/// the guard was pinned by ONE divergence (layer 0, mode) plus a length case.
+///
+/// A guard that decides whether blocks get published under an address that
+/// describes them deserves a matrix, not an example. Each row states a plan
+/// that disagrees with the set in exactly one way, and requires:
+///   * refusal,
+///   * the message to NAME the divergent layer, and
+///   * NO residue — refusing after writing blocks would leak disk and leave
+///     addresses pointing at data nothing can read.
+#[test]
+fn the_conformance_guard_bites_on_every_kind_of_divergence() {
+    const DENSE: usize = 3;
+    const KVARN: usize = 5;
+    const N: usize = DENSE + KVARN;
+    const N_TILES: i32 = 15;
+    let depth = TILE + N_TILES * TILE;
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    // (label, mutate the honest plan, expected layer named in the message)
+    let cases: Vec<(&str, Box<dyn Fn(&mut Vec<(KVCacheMode, u8)>)>, usize)> = vec![
+        (
+            "layer 0 mode differs",
+            Box::new(|p: &mut Vec<(KVCacheMode, u8)>| p[0] = (KVCacheMode::KVarN8, 4)),
+            0,
+        ),
+        (
+            "middle layer mode differs",
+            Box::new(|p: &mut Vec<(KVCacheMode, u8)>| p[DENSE] = (KVCacheMode::Fp16, 0)),
+            DENSE,
+        ),
+        (
+            "LAST layer mode differs — the skip_last_layer shape",
+            Box::new(|p: &mut Vec<(KVCacheMode, u8)>| p[N - 1] = (KVCacheMode::Fp16, 0)),
+            N - 1,
+        ),
+        (
+            "v_bits only, same mode — the k8v4/k8v8 collision shape",
+            Box::new(|p: &mut Vec<(KVCacheMode, u8)>| p[DENSE] = (KVCacheMode::KVarN8, 8)),
+            DENSE,
+        ),
+        (
+            "a dense-prefix layer claimed as quantized — the D1 shape",
+            Box::new(|p: &mut Vec<(KVCacheMode, u8)>| p[1] = (KVCacheMode::KVarN8, 4)),
+            1,
+        ),
+    ];
+
+    for (label, mutate, expected_layer) in cases {
+        let set = m3_shaped_mixed_set(DENSE, KVARN, N_TILES);
+        let mut plan = set.layer_plan();
+        mutate(&mut plan);
+        assert_ne!(
+            plan,
+            set.layer_plan(),
+            "{label}: the case must actually diverge, or it proves nothing"
+        );
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlockColdStore::new(dir.path().to_path_buf(), [71u8; 32]);
+
+        let err = store
+            .persist("m3", "tmpl", &tokens, &set, &plan)
+            .expect_err(&format!("{label}: a contradicting plan MUST be refused"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("layer {expected_layer}")),
+            "{label}: the refusal must name layer {expected_layer} so an \
+             operator can act on it; got: {msg}"
+        );
+
+        // NO RESIDUE — the refusal must precede publication, not follow it.
+        let blocks = std::fs::read_dir(store.blocks_dir())
+            .map(|d| d.count())
+            .unwrap_or(0);
+        let manifests = std::fs::read_dir(store.manifests_dir())
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(blocks, 0, "{label}: refusal left blocks on disk");
+        assert_eq!(manifests, 0, "{label}: refusal left a manifest on disk");
+    }
+}
+
+/// A plan LONGER than the set is refused too — the length check must bite in
+/// both directions, not just when the plan is short.
+#[test]
+fn a_plan_longer_than_the_set_is_refused() {
+    const N_TILES: i32 = 15;
+    let depth = TILE + N_TILES * TILE;
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    let set = m3_shaped_mixed_set(3, 5, N_TILES);
+    let mut long_plan = set.layer_plan();
+    long_plan.push((KVCacheMode::KVarN8, 4));
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [72u8; 32]);
+
+    let err = store
+        .persist("m3", "tmpl", &tokens, &set, &long_plan)
+        .expect_err("a plan describing MORE layers than the set must be refused");
+    assert!(
+        err.to_string().contains("layers"),
+        "the refusal must say what disagreed; got: {err}"
+    );
+    assert_eq!(
+        std::fs::read_dir(store.blocks_dir()).map(|d| d.count()).unwrap_or(0),
+        0,
+        "refusal left blocks on disk"
+    );
+}
+
+/// The honest plan is accepted for the SAME fixture every divergence case
+/// above uses — so those refusals are the guard biting, not a store that
+/// refuses this fixture for some unrelated reason.
+///
+/// This is the off-diagonal for the whole matrix, and its expected answer
+/// DIFFERS from every row of it.
+#[test]
+fn the_honest_plan_is_accepted_for_the_same_fixture_the_matrix_rejects() {
+    const N_TILES: i32 = 15;
+    let depth = TILE + N_TILES * TILE;
+    let tokens: Vec<i32> = (0..depth).collect();
+
+    let set = m3_shaped_mixed_set(3, 5, N_TILES);
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [71u8; 32]);
+
+    store
+        .persist("m3", "tmpl", &tokens, &set, &set.layer_plan())
+        .expect("the honest plan must be accepted, or the matrix proves nothing");
+    assert!(
+        std::fs::read_dir(store.blocks_dir()).map(|d| d.count()).unwrap_or(0) > 0,
+        "an accepted persist must actually write blocks"
+    );
+}

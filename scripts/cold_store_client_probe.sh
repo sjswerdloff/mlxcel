@@ -221,6 +221,40 @@ adoption_count() {  # $1 = pattern; echoes ONE integer, or -1 if no log
   printf '%s\n' "$n"
 }
 
+# SELF-TEST BEFORE ANY RESULT IS REPORTED (Violet, 2026-07-28).
+#
+# All-three-zero — nothing selected, nothing adopted, nothing declined — has
+# two causes that look identical: the store really did nothing, or THE COUNTER
+# IS BLIND (wrong path, rotated log, process writing elsewhere). "Adoption never
+# happened" and "the instrument observed nothing" are different claims, and
+# without a control this script can only ever produce the second while printing
+# the first. That is exactly how it produced a maximum-severity safety verdict
+# about the store on 2026-07-28 that was entirely its own measurement error.
+#
+# So: a pattern that MUST be present (absent => the log is not being read) and a
+# pattern that MUST be absent (present => the matcher over-matches). The probe
+# cannot report on the store until it can first report on itself.
+verify_log_instrument() {
+  [[ -z "${LOG:-}" ]] && return 0   # already reported UNVERIFIED downstream
+  local pos neg
+  pos="$(adoption_count 'v4 block written')"
+  neg="$(adoption_count 'zzz_pattern_that_must_never_appear_zzz')"
+  if [[ "$pos" == "-1" ]]; then
+    bad "instrument: LOG is set but unreadable — every count below is meaningless"
+    return 1
+  fi
+  if (( pos <= 0 )); then
+    bad "instrument: POSITIVE CONTROL FAILED — '$LOG' contains no 'v4 block written' lines, so this counter is BLIND. Every zero below means 'observed nothing', NOT 'nothing happened'. Do not read any store finding from this run."
+    return 1
+  fi
+  if (( neg != 0 )); then
+    bad "instrument: NEGATIVE CONTROL FAILED — a pattern that cannot exist matched $neg times; the matcher is over-matching and every count is inflated."
+    return 1
+  fi
+  ok "instrument: log is readable and discriminating (positive control $pos, negative control $neg)"
+  return 0
+}
+
 require_adoption_since() {  # $1 label, $2 baseline count, $3 pattern, $4 meaning
   local label="$1" before="$2" pat="$3" meaning="$4" after
   after="$(adoption_count "$pat")"
@@ -254,6 +288,11 @@ timed_chat() {  # $1 label, $2 prompt -> sets REPLY_TEXT, prints elapsed
   printf '  %s took %.1fs (reported, not asserted)\n' "$1" \
     "$(python3 -c "print($t1-$t0)")"
 }
+
+# The instrument must classify ITSELF before it classifies the store.
+# Placed AFTER the function definitions: bash executes sequentially, so a call
+# above them is "command not found", which would have silently set RC=1.
+verify_log_instrument || RC=1
 
 # --- 1. PERSIST -------------------------------------------------------------
 note "1/3 PERSIST — a finished sequence must leave cold-store files on disk"
