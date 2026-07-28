@@ -6137,6 +6137,245 @@ mod tests {
         g1_1_disk_adoption_equivalence(make_test_sparse_attention_d128(), 512, "d128");
     }
 
+    // ================================================================
+    // G1.5 — GC INTEGRATION: a sweep against a REAL persisted cache
+    // ================================================================
+    //
+    // THE GAP THIS CLOSES, stated so the scope is not overclaimed. v4 GC had
+    // 14 contract tests driving `gc_blocks()` — nomination windows, epoch
+    // staleness, the under-lock re-verify, tombstones, cross-process `flock`,
+    // refcount-hint independence. **Every one of them uses a synthetic
+    // `DetachedCacheSet`.** `grep -n 'gc_blocks' src/models/minimax_m3.rs`
+    // returned NOTHING before this test: the sweeper had never once run against
+    // state produced by a real attention layer, so "the sweep does not damage a
+    // live cache" was a contract claim with no component-level evidence.
+    //
+    // This is still NOT an end-to-end test. There is no scheduler and no
+    // sampler here, and `BlockColdStore` still has zero production callers —
+    // see the G1.0/G1.1 header. It closes the layer between contract and
+    // production, and no more.
+    //
+    // WHY BIT-IDENTITY IS THE RIGHT CONTRACT: the sweep must be INVISIBLE to a
+    // reachable cache. Not "close enough after a sweep" — a sweep that perturbs
+    // adopted state at all has deleted or rewritten something it had no right
+    // to touch, and the size of the perturbation is not the interesting fact.
+
+    /// A sweep that really collects orphans leaves a reachable cache bit-identical.
+    ///
+    /// THREE ARMS, the third being the new one:
+    ///   A — continuous cache, never detached (the reference)
+    ///   B — disk round trip, NO sweep (isolates the round trip)
+    ///   C — disk round trip WITH a real `gc_blocks()` between persist and load
+    ///
+    /// B vs C isolates the sweep: identical persist, identical adoption, the only
+    /// difference is that a sweeper ran in between. A vs C corroborates end to end.
+    ///
+    /// ⚠️ NON-VACUITY IS THE WHOLE DESIGN. A sweep that collects NOTHING would
+    /// satisfy every assertion below while proving nothing whatsoever — the same
+    /// shape as a `load_prefix` that returns `NoMatch` unconditionally satisfying a
+    /// staged-manifest test. So a second, DIVERGENT sequence is persisted and its
+    /// manifest deleted, creating genuine orphans, and the test asserts they were
+    /// readable BEFORE the sweep and are gone AFTER it. If GC ever silently stops
+    /// collecting, this test fails on that precondition rather than going green.
+    #[test]
+    fn a_sweep_that_collects_orphans_leaves_a_reachable_cache_bit_identical() {
+        use mlxcel_core::cache::block_cold_store::BlockColdStore;
+        use mlxcel_core::cache::cold_store::PruneMode;
+        use mlxcel_core::cache::{DetachedCacheSet, KVCacheMode, SequenceId, SequenceStateBackend};
+
+        let mut attn = make_test_sparse_attention();
+        let hidden = 16;
+        attn.block_size = 128;
+
+        let l_chunk: i32 = 128;
+        let n_chunks: i32 = 4;
+        let split: i32 = 2;
+        let l_total = l_chunk * n_chunks;
+        let prefix_len = l_chunk * split;
+
+        let input = make_test_input(1, l_total, hidden);
+        let chunk = |i: i32| {
+            mlxcel_core::slice(
+                &input,
+                &[0, i * l_chunk, 0],
+                &[1, (i + 1) * l_chunk, hidden],
+            )
+        };
+
+        // ---- ARM A: continuous ------------------------------------------
+        let mut cache_a = KVCache::new();
+        let mut outs_a: Vec<UniquePtr<MlxArray>> = Vec::new();
+        for i in 0..n_chunks {
+            outs_a.push(attn.forward(&chunk(i), &mut cache_a, None));
+        }
+
+        // A detached set built from a real forward, reused for both disk arms.
+        let detach_prefix = |attn: &mut SparseAttention| {
+            let mut src = KVCache::new();
+            let mut outs: Vec<UniquePtr<MlxArray>> = Vec::new();
+            for i in 0..split {
+                outs.push(attn.forward(&chunk(i), &mut src, None));
+            }
+            let now = std::time::Instant::now();
+            let set = DetachedCacheSet {
+                caches: vec![src.clone_handle()],
+                backend: SequenceStateBackend::DenseKvCache,
+                prompt_len: prefix_len as usize,
+                current_offset: prefix_len,
+                created_at: now,
+                detached_at: now,
+                origin_seq_id: SequenceId::from_raw(1),
+            };
+            (set, outs)
+        };
+
+        let tokens: Vec<i32> = (0..prefix_len).collect();
+
+        // ---- ARM B: disk round trip, NO sweep ---------------------------
+        let (set_b, mut outs_b) = detach_prefix(&mut attn);
+        let dir_b = tempfile::TempDir::new().expect("tempdir b");
+        {
+            let store = BlockColdStore::new(dir_b.path().to_path_buf(), [11u8; 32]);
+            store
+                .persist("m3-g15", "tmpl", &tokens, &set_b)
+                .expect("arm B persist");
+        }
+        let store_b = BlockColdStore::new(dir_b.path().to_path_buf(), [11u8; 32]);
+        let (loaded_b, matched_b) = store_b
+            .load_prefix("m3-g15", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+            .expect("arm B: load_prefix must return the candidate");
+        assert_eq!(matched_b, prefix_len as usize, "arm B partial match");
+        let mut cache_b = KVCache::new();
+        cache_b
+            .install_detached(loaded_b.caches.into_iter().next().expect("arm B cache"))
+            .expect("arm B adoption");
+        for i in split..n_chunks {
+            outs_b.push(attn.forward(&chunk(i), &mut cache_b, None));
+        }
+
+        // ---- ARM C: disk round trip WITH a real sweep -------------------
+        let (set_c, mut outs_c) = detach_prefix(&mut attn);
+        let dir_c = tempfile::TempDir::new().expect("tempdir c");
+        // ZERO age floor: under the production floor these freshly-written
+        // orphans are too young to nominate, GC collects nothing, and the
+        // non-vacuity precondition below fails — loudly, which is correct.
+        let keeper = {
+            let store = BlockColdStore::new(dir_c.path().to_path_buf(), [11u8; 32])
+                .with_prune_mode(PruneMode::Delete)
+                .with_min_gc_age(std::time::Duration::ZERO);
+            store
+                .persist("m3-g15", "tmpl", &tokens, &set_c)
+                .expect("arm C persist (keeper)")
+        };
+
+        // GIVE THE SWEEP SOMETHING REAL TO COLLECT. A divergent token range, so
+        // it shares no leading block with the keeper — a shared block would stay
+        // referenced and the sweep would have nothing to remove.
+        let (set_orphan, _outs_orphan) = detach_prefix(&mut attn);
+        let orphan_tokens: Vec<i32> = (9000..9000 + prefix_len).collect();
+        let orphan_blocks = {
+            let store = BlockColdStore::new(dir_c.path().to_path_buf(), [11u8; 32])
+                .with_prune_mode(PruneMode::Delete)
+                .with_min_gc_age(std::time::Duration::ZERO);
+            let m = store
+                .persist("m3-g15", "tmpl", &orphan_tokens, &set_orphan)
+                .expect("persist the soon-to-be orphan");
+            store
+                .delete_manifest(&m.hash())
+                .expect("orphan it: delete its manifest, leaving the blocks unreferenced");
+            m.block_hashes.clone()
+        };
+        assert!(
+            !orphan_blocks.is_empty(),
+            "precondition: the orphan manifest must have had blocks"
+        );
+        for b in &keeper.block_hashes {
+            assert!(
+                !orphan_blocks.contains(b),
+                "precondition: keeper and orphan must not share a block, or the \
+                 sweep has nothing unreferenced to remove"
+            );
+        }
+
+        let store_c = BlockColdStore::new(dir_c.path().to_path_buf(), [11u8; 32])
+            // PruneMode::Observe is the DEFAULT and `gc_blocks` HONOURS it —
+            // log what would be collected, delete nothing. The first run of this
+            // test used the default and the non-vacuity guard fired: "the sweep
+            // collected NOTHING". That is the guard doing its job on the test
+            // author rather than on the code. Deletion must be opted into.
+            .with_prune_mode(PruneMode::Delete)
+            .with_min_gc_age(std::time::Duration::ZERO);
+
+        // NON-VACUITY, before: the orphans are really on disk and readable.
+        for b in &orphan_blocks {
+            assert!(
+                store_c.read_block(b).is_ok(),
+                "precondition: the orphaned blocks must be readable BEFORE the \
+                 sweep, or 'the sweep removed them' is unfalsifiable"
+            );
+        }
+
+        store_c.gc_blocks().expect("the sweep must not error");
+
+        // NON-VACUITY, after: the sweep ACTUALLY COLLECTED. Without this the
+        // whole test is satisfied by a GC that does nothing at all.
+        for b in &orphan_blocks {
+            assert!(
+                store_c.read_block(b).is_err(),
+                "the sweep collected NOTHING. Every assertion below would pass \
+                 against a GC that never deletes, so this test would certify that \
+                 a sweep is harmless without a sweep ever having happened."
+            );
+        }
+
+        // THE CLAIM: the reachable cache is untouched.
+        for b in &keeper.block_hashes {
+            store_c.read_block(b).unwrap_or_else(|e| {
+                panic!(
+                    "the sweep collected a block belonging to a COMMITTED manifest \
+                     ({e}). This is the failure the whole GC protocol exists to \
+                     prevent, reached for the first time against state produced by \
+                     a real attention layer."
+                )
+            });
+        }
+
+        let (loaded_c, matched_c) = store_c
+            .load_prefix("m3-g15", "tmpl", &tokens, KVCacheMode::Fp16, 0)
+            .expect("arm C: the reachable candidate must still load AFTER a sweep");
+        assert_eq!(
+            matched_c, prefix_len as usize,
+            "arm C: the sweep shortened the matched prefix — state survived the \
+             sweep only partially, which is worse than losing it outright"
+        );
+        let mut cache_c = KVCache::new();
+        cache_c
+            .install_detached(loaded_c.caches.into_iter().next().expect("arm C cache"))
+            .expect("arm C adoption after the sweep");
+        for i in split..n_chunks {
+            outs_c.push(attn.forward(&chunk(i), &mut cache_c, None));
+        }
+
+        // ---- EQUIVALENCE -------------------------------------------------
+        let cat_a = concat_outs(&outs_a);
+        let cat_b = concat_outs(&outs_b);
+        let cat_c = concat_outs(&outs_c);
+
+        assert!(
+            arrays_bit_identical(&cat_b, &cat_c),
+            "B vs C: a sweep that ran between persist and load changed the \
+             computation. Persist and adoption are identical on both arms, so this \
+             isolates the sweep itself. relative L2 = {}",
+            output_l2_diff(&cat_b, &cat_c) / l2_norm(&cat_b).max(1e-6)
+        );
+        assert!(
+            arrays_bit_identical(&cat_a, &cat_c),
+            "A vs C: end-to-end disk adoption across a real sweep diverged from the \
+             continuous reference. relative L2 = {}",
+            output_l2_diff(&cat_a, &cat_c) / l2_norm(&cat_a).max(1e-6)
+        );
+    }
+
     // ----------------------------------------------------------------
     // G1.0 NEGATIVE CONTROLS — each measured red, none assumed
     // ----------------------------------------------------------------
