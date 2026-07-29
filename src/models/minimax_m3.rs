@@ -6191,9 +6191,15 @@ mod tests {
     // FORK, and which arm runs is a runtime property, not a source fact.
     //
     //     block_cold_store.is_some()  -> 1928, v4's 4-arg `load_prefix`
-    //                                    (takes `&plan`; BlockColdStoreError)
     //     otherwise                   -> 1932, v3's 3-arg `load_prefix`
-    //                                    (`cold_store::ColdStoreError`)
+    //
+    // ⚠️ THE ERROR TYPE DOES NOT DISTINGUISH THEM, and an earlier revision of
+    // this correction said it did — it named a `BlockColdStoreError` that does
+    // not exist anywhere in the tree. BOTH return
+    // `Result<_, cold_store::ColdStoreError>`; v4 reuses v3's error type. The
+    // original sentence this block corrects cited the error arm as its evidence
+    // for "resolves to v3", and that evidence was never able to discriminate.
+    // ARITY IS THE ONLY RELIABLE TELL: 4 args (with `&plan`) is v4, 3 is v3.
     //
     // Default config takes the v3 arm, so the old sentence was true of the
     // default and false under `MLXCEL_V4_COLD_STORE=1` — the configuration
