@@ -437,11 +437,36 @@ impl Manifest {
     ///
     /// manifest_hash = SHA-256(runtime_fingerprint || model_id || template_sig || block_hashes[0] || ... || block_hashes[N-1])
     pub fn hash(&self) -> [u8; 32] {
+        Self::hash_of(
+            &self.runtime_fingerprint,
+            &self.model_id,
+            &self.template_sig,
+            &self.block_hashes,
+        )
+    }
+
+    /// The same address, computed from PARTS rather than from a built manifest.
+    ///
+    /// This is what makes the store content-addressable from the read side: a
+    /// caller holding a request's block-hash chain can compute the address an
+    /// identical conversation would have been filed under and go straight to
+    /// it, instead of scanning every manifest to discover it by comparison.
+    ///
+    /// `hash()` delegates here rather than duplicating the field order. Two
+    /// implementations of one address would drift, and the failure would be
+    /// silent: a direct lookup that always misses looks exactly like a store
+    /// that has never seen the conversation.
+    pub fn hash_of(
+        runtime_fingerprint: &[u8; 32],
+        model_id: &str,
+        template_sig: &str,
+        block_hashes: &[[u8; 32]],
+    ) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(self.runtime_fingerprint);
-        hasher.update(self.model_id.as_bytes());
-        hasher.update(self.template_sig.as_bytes());
-        for bh in &self.block_hashes {
+        hasher.update(runtime_fingerprint);
+        hasher.update(model_id.as_bytes());
+        hasher.update(template_sig.as_bytes());
+        for bh in block_hashes {
             hasher.update(bh);
         }
         hasher.finalize().into()
@@ -1881,6 +1906,28 @@ impl BlockColdStore {
         plan: &[(super::KVCacheMode, u8)],
         floor_tokens: usize,
     ) -> Result<Option<(DetachedCacheSet, usize)>, ColdStoreError> {
+        // ---- TIER 0: decided with arithmetic, touching NO filesystem at all.
+        //
+        // A match here is `matched_blocks * block_size` clamped to the request
+        // length, so `tokens.len()` is this store's absolute ceiling — there is
+        // no manifest, present or future, that can return more. If the floor
+        // already meets it, nothing can beat memory and there is nothing to
+        // learn by looking.
+        //
+        // Placed above `acquire_read_lease` deliberately: the lease exists to
+        // protect reads from the sweep, and this path performs none.
+        //
+        // WHY ARITHMETIC AND NOT A MEASUREMENT. It would be easy to profile
+        // the scan on this machine, find it cheap, and conclude the tiers are
+        // not worth having. That conclusion would silently encode "the cache
+        // lives on fast local NVMe" — a DEPLOYMENT property this code does not
+        // control and cannot see. The model already loads from an external
+        // volume. I/O avoided is avoided on every medium; I/O measured is
+        // measured on exactly one.
+        if floor_tokens >= tokens.len() {
+            return Ok(None);
+        }
+
         // READ side of the cache-computation identity — must mirror persist's
         // WRITE side exactly. Built once here so the symmetry is visible in
         // one place rather than inline at the hashing site.
@@ -1912,6 +1959,66 @@ impl BlockColdStore {
         // conversations persisted — which is exactly the direction Kindled
         // serving moves in.
         let request_block_hashes = compute_block_hashes(tokens, self.block_size, &load_cache_id);
+
+        // ---- TIER 1: ONE addressed read instead of a scan of every manifest.
+        //
+        // If the floor already covers every WHOLE block the request contains,
+        // the only way this store can beat it is by matching the PARTIAL TAIL
+        // chunk as well — and matching every chunk including the tail means
+        // matching the ENTIRE request. That manifest is content-addressed, so
+        // its address is computable from the chain we just built. Go straight
+        // to it.
+        //
+        // WHY THIS IS LOSSLESS, unlike simply skipping. A manifest for a
+        // LONGER stored conversation chunks uniformly from zero, so its chunk
+        // at the tail index is full-width where the request's is partial —
+        // different bytes, no match. Such a manifest therefore tops out at
+        // `whole_block_ceiling`, which is `<= floor_tokens` whenever we are in
+        // this branch, so it could not have won. The one case where a longer
+        // manifest COULD match every chunk is a request that is an exact
+        // multiple of `block_size` (no partial tail) — and there
+        // `whole_block_ceiling == tokens.len()`, so Tier 0 has already
+        // returned and we never arrive here.
+        //
+        // Therefore: found means a genuine win, and not-found means provably
+        // nothing to win. Same guarantee as the payload gate below.
+        let whole_block_ceiling = (tokens.len() / self.block_size) * self.block_size;
+        if floor_tokens >= whole_block_ceiling {
+            let exact = Manifest::hash_of(
+                &self.runtime_fingerprint,
+                model_id,
+                template_sig,
+                &request_block_hashes,
+            );
+            // `read_manifest` validates content-hash against the directory
+            // name, and identity is an INPUT to that hash, so anything found
+            // at this address necessarily carries our fingerprint, model and
+            // template. No separate identity filter is needed here.
+            let Ok(manifest) = self.read_manifest(&exact) else {
+                return Ok(None);
+            };
+            return match self.assemble_blocks(&manifest, &load_cache_id) {
+                Ok(cache_set) => {
+                    tracing::info!(
+                        manifest_hash = %manifest.hash_hex(),
+                        matched_tokens = tokens.len(),
+                        "COLD-STORE v4 SERVED from manifest (exact-address hit, no scan)"
+                    );
+                    Ok(Some((cache_set, tokens.len())))
+                }
+                Err(e) => {
+                    // Fail-closed, same as the scan path. There is no shorter
+                    // candidate worth falling through to: every other manifest
+                    // is capped at `whole_block_ceiling <= floor_tokens`.
+                    tracing::warn!(
+                        manifest_hash = %manifest.hash_hex(),
+                        error = %e,
+                        "COLD-STORE v4 exact-address candidate failed to load; nothing shorter can beat the floor"
+                    );
+                    Ok(None)
+                }
+            };
+        }
 
         // Collect candidates
         let mut candidates = Vec::new();

@@ -5673,3 +5673,129 @@ fn floor_below_the_ceiling_still_loads() {
          full prefix must come back"
     );
 }
+
+/// Tier 0 must answer from arithmetic alone, touching no filesystem.
+///
+/// Proven by pointing the store at a path that DOES NOT EXIST. Any code that
+/// looks will fail or report absence; only code that never looks can return
+/// `Ok(None)`.
+///
+/// THE CONTROL IS THE SAME STORE WITH A DIFFERENT FLOOR. Identical path,
+/// identical tokens, identical plan — floor 0 must go looking and come back
+/// with an error, floor >= len must answer without looking. That difference is
+/// the whole assertion; without the control, `Ok(None)` from a broken store
+/// would be indistinguishable from `Ok(None)` from a working gate.
+///
+/// MUTATION: delete the Tier 0 early return and the first assertion reddens,
+/// because the call falls through to the lease and the manifests-dir check.
+#[test]
+fn tier0_answers_without_touching_the_filesystem() {
+    let tokens: Vec<i32> = (0..100).collect();
+    let missing = std::path::PathBuf::from("/nonexistent-mlxcel-tier0-probe/store");
+    let store = BlockColdStore::new(missing, [3u8; 32]);
+    let plan = homog(1, KVCacheMode::Fp16, 0);
+
+    let gated = store.load_prefix_longer_than("m3", "tmpl", &tokens, &plan, tokens.len());
+    assert!(
+        matches!(gated, Ok(None)),
+        "floor >= request length must be answered by arithmetic, with no \
+         filesystem contact at all. Got {:?} — which means this path went and \
+         looked at a store it had already been told it could not use.",
+        gated.as_ref().map(|o| o.as_ref().map(|(_, m)| *m))
+    );
+
+    let control = store.load_prefix_longer_than("m3", "tmpl", &tokens, &plan, 0);
+    assert!(
+        control.is_err(),
+        "CONTROL FAILED: with floor 0 this call MUST reach the filesystem and \
+         fail on a nonexistent store. It returned {:?}, so the assertion above \
+         proves nothing about whether Tier 0 skipped the I/O.",
+        control.as_ref().map(|o| o.as_ref().map(|(_, m)| *m))
+    );
+}
+
+/// Tier 1 must be LOSSLESS: a floor at the whole-block ceiling still returns
+/// the full match when the store holds this exact conversation.
+///
+/// This is the property that made the tier worth building rather than simply
+/// skipping the scan. Skipping would have cost up to `len % block_size` tokens
+/// of reuse in precisely this case; going to the exact address costs nothing.
+///
+/// The request deliberately has a PARTIAL TAIL (`+ 7`) so that
+/// `whole_block_ceiling < len` and Tier 0 does not fire — otherwise this would
+/// silently be a Tier 0 test wearing a Tier 1 name.
+///
+/// HONEST LIMIT: this asserts the RESULT, not the route. Removing Tier 1 leaves
+/// it green, because the full scan finds the same manifest. It is a correctness
+/// test, not a proof that the scan was skipped — the scan's absence is not
+/// observable from the return value.
+#[test]
+fn tier1_is_lossless_at_the_whole_block_ceiling() {
+    const LAYERS: usize = 2;
+    const DEPTH: i32 = 2 * DEFAULT_BLOCK_SIZE as i32 + 7;
+
+    let set = fp16_set(LAYERS, DEPTH);
+    let tokens: Vec<i32> = (0..DEPTH).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [21u8; 32]);
+    store
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
+        .expect("persist must succeed");
+
+    let whole_block_ceiling = (tokens.len() / DEFAULT_BLOCK_SIZE) * DEFAULT_BLOCK_SIZE;
+    assert!(
+        whole_block_ceiling < tokens.len(),
+        "test setup is wrong: no partial tail, so Tier 0 would fire and this \
+         would not exercise Tier 1 at all"
+    );
+
+    let plan = homog(LAYERS, KVCacheMode::Fp16, 0);
+    let loaded = store
+        .load_prefix_longer_than("m3", "tmpl", &tokens, &plan, whole_block_ceiling)
+        .expect("an exact-address hit must not error");
+
+    let (_, matched) = loaded.expect(
+        "Ok(None) here means the exact-address lookup MISSED a conversation \
+         this store had just persisted — the computed address does not agree \
+         with the address persist filed it under",
+    );
+    assert_eq!(
+        matched,
+        tokens.len(),
+        "an exact match must return the FULL request length, including the \
+         partial tail block; anything less is the loss this tier exists to avoid"
+    );
+}
+
+/// Tier 1 with nothing to find must decline, not error and not fabricate.
+#[test]
+fn tier1_declines_when_no_exact_manifest_exists() {
+    const LAYERS: usize = 2;
+    const DEPTH: i32 = 2 * DEFAULT_BLOCK_SIZE as i32 + 7;
+
+    let set = fp16_set(LAYERS, DEPTH);
+    let stored: Vec<i32> = (0..DEPTH).collect();
+    // Same length, DIFFERENT content — so the block chain, and therefore the
+    // manifest address, differ.
+    let asked: Vec<i32> = (0..DEPTH).map(|t| t + 1_000_000).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [22u8; 32]);
+    store
+        .persist("m3", "tmpl", &stored, &set, &plan_of(&set))
+        .expect("persist must succeed");
+
+    let whole_block_ceiling = (asked.len() / DEFAULT_BLOCK_SIZE) * DEFAULT_BLOCK_SIZE;
+    let plan = homog(LAYERS, KVCacheMode::Fp16, 0);
+    let got = store.load_prefix_longer_than("m3", "tmpl", &asked, &plan, whole_block_ceiling);
+
+    assert!(
+        matches!(got, Ok(None)),
+        "a request whose exact address is absent must decline cleanly. Got \
+         {:?} — an Err would mean the miss is being reported as a failure, and \
+         an Ok(Some) would mean the address lookup matched a conversation it \
+         should not have.",
+        got.as_ref().map(|o| o.as_ref().map(|(_, m)| *m))
+    );
+}
