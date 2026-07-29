@@ -6049,7 +6049,7 @@ fn session_index_records_and_reads_back() {
     let b = [2u8; 32];
     store.record_session_manifest("sess-1", &a).expect("record a");
     store.record_session_manifest("sess-1", &b).expect("record b");
-    assert_eq!(store.session_manifests_through("sess-1", u64::MAX).expect("read"), vec![a, b]);
+    assert_eq!(store.session_associations("sess-1").map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>()).expect("read"), vec![a, b]);
 }
 
 #[test]
@@ -6059,7 +6059,7 @@ fn unknown_session_reads_as_empty_not_error() {
     let (_dir, store) = empty_store();
     assert!(
         store
-            .session_manifests_through("never-seen", u64::MAX)
+            .session_associations("never-seen").map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>())
             .expect("unknown session must not error")
             .is_empty()
     );
@@ -6074,7 +6074,7 @@ fn recording_the_same_manifest_twice_is_idempotent() {
     for _ in 0..5 {
         store.record_session_manifest("sess-1", &h).expect("record");
     }
-    assert_eq!(store.session_manifests_through("sess-1", u64::MAX).expect("read"), vec![h]);
+    assert_eq!(store.session_associations("sess-1").map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>()).expect("read"), vec![h]);
 }
 
 #[test]
@@ -6086,8 +6086,8 @@ fn sessions_are_isolated_from_each_other() {
     let theirs = [5u8; 32];
     store.record_session_manifest("clement", &mine).expect("a");
     store.record_session_manifest("cora", &theirs).expect("b");
-    assert_eq!(store.session_manifests_through("clement", u64::MAX).expect("r1"), vec![mine]);
-    assert_eq!(store.session_manifests_through("cora", u64::MAX).expect("r2"), vec![theirs]);
+    assert_eq!(store.session_associations("clement").map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>()).expect("r1"), vec![mine]);
+    assert_eq!(store.session_associations("cora").map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>()).expect("r2"), vec![theirs]);
 }
 
 #[test]
@@ -6099,8 +6099,8 @@ fn a_shared_manifest_is_listed_under_every_session_that_used_it() {
     let shared = [6u8; 32];
     store.record_session_manifest("clement", &shared).expect("a");
     store.record_session_manifest("cora", &shared).expect("b");
-    assert_eq!(store.session_manifests_through("clement", u64::MAX).expect("r1"), vec![shared]);
-    assert_eq!(store.session_manifests_through("cora", u64::MAX).expect("r2"), vec![shared]);
+    assert_eq!(store.session_associations("clement").map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>()).expect("r1"), vec![shared]);
+    assert_eq!(store.session_associations("cora").map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>()).expect("r2"), vec![shared]);
 }
 
 #[test]
@@ -6112,7 +6112,7 @@ fn session_keys_with_path_separators_do_not_escape_the_index_directory() {
     let nasty = "../../../etc/passwd";
     let h = [8u8; 32];
     store.record_session_manifest(nasty, &h).expect("record");
-    assert_eq!(store.session_manifests_through(nasty, u64::MAX).expect("read"), vec![h]);
+    assert_eq!(store.session_associations(nasty).map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>()).expect("read"), vec![h]);
 
     let entries: Vec<_> = std::fs::read_dir(store.sessions_dir())
         .expect("sessions dir")
@@ -6159,7 +6159,7 @@ fn unicode_and_whitespace_session_keys_round_trip() {
         let h = [9u8; 32];
         store.record_session_manifest(key, &h).expect("record");
         assert_eq!(
-            store.session_manifests_through(key, u64::MAX).expect("read"),
+            store.session_associations(key).map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>()).expect("read"),
             vec![h],
             "key {key:?} must round-trip"
         );
@@ -6193,13 +6193,13 @@ fn a_truncated_index_errors_rather_than_under_reporting() {
     let file = std::fs::read_dir(store.sessions_dir())
         .expect("sessions dir")
         .map(|e| e.expect("entry").path())
-        .next()
-        .expect("one file");
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("idx"))
+        .expect("index file");
     let mut body = std::fs::read(&file).expect("read");
     body.truncate(body.len() - 8); // lose half of the last entry
     std::fs::write(&file, &body).expect("write");
 
-    let got = store.session_manifests_through("sess-1", u64::MAX);
+    let got = store.session_associations("sess-1");
     assert!(
         got.is_err(),
         "a truncated index must ERROR, not silently under-report; got {:?}",
@@ -6219,8 +6219,8 @@ fn a_forged_magic_or_version_deletes_nothing() {
     let file = std::fs::read_dir(store.sessions_dir())
         .expect("sessions dir")
         .map(|e| e.expect("entry").path())
-        .next()
-        .expect("one file");
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("gen"))
+        .expect("registry file");
 
     let good = std::fs::read(&file).expect("read");
 
@@ -6228,7 +6228,7 @@ fn a_forged_magic_or_version_deletes_nothing() {
     bad_magic[0] = b'X';
     std::fs::write(&file, &bad_magic).expect("write");
     assert!(
-        store.session_manifests_through("sess-1", u64::MAX).is_err(),
+        store.releasable_manifests("sess-1").is_err(),
         "bad magic must error, not read as an empty session"
     );
 
@@ -6236,7 +6236,7 @@ fn a_forged_magic_or_version_deletes_nothing() {
     bad_version[8] = 99;
     std::fs::write(&file, &bad_version).expect("write");
     assert!(
-        store.session_manifests_through("sess-1", u64::MAX).is_err(),
+        store.releasable_manifests("sess-1").is_err(),
         "unsupported version must error, not read as an empty session"
     );
 }
@@ -6261,7 +6261,7 @@ fn a_generation_cutoff_protects_a_reused_session_key() {
         .close_current_generation("reused-key", 0, [7u8; 32])
         .expect("close gen 0");
     assert_eq!(closed.current_generation, 1, "close must advance");
-    assert_eq!(closed.closed_through, 0, "cutoff must record what closed");
+    assert_eq!(closed.closed_through, Some(0), "cutoff must record what closed");
 
     let second = store
         .record_session_manifest("reused-key", &new_conv)
@@ -6273,17 +6273,9 @@ fn a_generation_cutoff_protects_a_reused_session_key() {
     );
 
     assert_eq!(
-        store
-            .session_manifests_through("reused-key", 0)
-            .expect("cutoff 0"),
+        store.releasable_manifests("reused-key").expect("releasable"),
         vec![old_conv],
-        "a cutoff at generation 0 must not reach generation 1"
-    );
-    assert_eq!(
-        store
-            .session_manifests_through("reused-key", 1)
-            .expect("cutoff 1"),
-        vec![old_conv, new_conv]
+        "only the CLOSED generation is releasable; generation 1 is open"
     );
 }
 
@@ -6301,8 +6293,9 @@ fn the_same_manifest_in_two_generations_is_two_associations() {
     store.record_session_manifest("k", &m).expect("gen 1");
     assert_eq!(store.session_associations("k").expect("read").len(), 2);
     assert_eq!(
-        store.session_manifests_through("k", 0).expect("cutoff"),
-        vec![m]
+        store.releasable_manifests("k").expect("releasable"),
+        vec![m],
+        "only the closed generation's copy is releasable"
     );
 }
 
@@ -6335,7 +6328,7 @@ fn a_lost_registry_mints_a_new_incarnation_and_disowns_the_old_associations() {
 
     assert!(
         store
-            .session_manifests_through("k", u64::MAX)
+            .releasable_manifests("k")
             .expect("read")
             .is_empty(),
         "the previous incarnation's associations must NOT be cleanable by the \
@@ -6358,7 +6351,7 @@ fn close_is_compare_and_swap_and_a_disagreeing_caller_mutates_nothing() {
     );
     let after_future = store.session_registry("k").expect("reg");
     assert_eq!(after_future.current_generation, 0, "no mutation");
-    assert_eq!(after_future.closed_through, u64::MAX, "no cutoff minted");
+    assert_eq!(after_future.closed_through, None, "no cutoff minted");
 
     store
         .close_current_generation("k", 0, [2u8; 32])
@@ -6369,7 +6362,7 @@ fn close_is_compare_and_swap_and_a_disagreeing_caller_mutates_nothing() {
     );
     let after_stale = store.session_registry("k").expect("reg");
     assert_eq!(after_stale.current_generation, 1, "still exactly one advance");
-    assert_eq!(after_stale.closed_through, 0);
+    assert_eq!(after_stale.closed_through, Some(0));
 }
 
 #[test]
@@ -6415,8 +6408,8 @@ fn the_index_file_does_not_store_the_raw_session_key() {
     let file = std::fs::read_dir(store.sessions_dir())
         .expect("sessions dir")
         .map(|e| e.expect("entry").path())
-        .next()
-        .expect("one file");
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("idx"))
+        .expect("index file");
     let bytes = std::fs::read(&file).expect("read");
     assert!(
         !bytes
@@ -6426,7 +6419,7 @@ fn the_index_file_does_not_store_the_raw_session_key() {
     );
     // Lookup still works, so the digest genuinely suffices.
     assert_eq!(
-        store.session_manifests_through(key, u64::MAX).expect("read"),
+        store.session_associations(key).map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>()).expect("read"),
         vec![[1u8; 32]]
     );
 }
@@ -6452,7 +6445,7 @@ fn a_session_key_containing_a_newline_cannot_forge_index_entries() {
         .record_session_manifest(&malicious, &real)
         .expect("record");
 
-    let got = store.session_manifests_through(&malicious, u64::MAX).expect("read");
+    let got = store.session_associations(&malicious).map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>()).expect("read");
     assert_eq!(
         got,
         vec![real],
@@ -6464,7 +6457,54 @@ fn a_session_key_containing_a_newline_cannot_forge_index_entries() {
     // And the injected prefix must not be readable as a DIFFERENT session that
     // now owns the real manifest.
     assert!(
-        store.session_manifests_through("evil", u64::MAX).expect("read evil").is_empty(),
+        store.session_associations("evil").map(|v| v.into_iter().map(|a| a.manifest_hash).collect::<Vec<_>>()).expect("read evil").is_empty(),
         "the pre-newline fragment must not resolve to a session"
+    );
+}
+
+#[test]
+fn a_fresh_registry_makes_nothing_releasable_even_with_associations() {
+    // THE P0. The old API took a caller-supplied cutoff, and the natural call
+    // — session_manifests_through(key, registry.closed_through) — returned
+    // EVERYTHING on a fresh registry, because the on-disk sentinel is u64::MAX
+    // and every generation compares <= to it. A cleanup written against that
+    // shape would have released the currently OPEN generation before any close
+    // had occurred. The source comment asserted the opposite of the arithmetic.
+    //
+    // Nothing closed must mean nothing releasable. Not "cutoff at current".
+    let (_dir, store) = empty_store();
+    store.record_session_manifest("k", &[1u8; 32]).expect("a");
+    store.record_session_manifest("k", &[2u8; 32]).expect("b");
+
+    let reg = store.session_registry("k").expect("registry");
+    assert_eq!(reg.closed_through, None, "fresh registry has closed nothing");
+    assert_eq!(
+        store.session_associations("k").expect("assoc").len(),
+        2,
+        "precondition: the associations exist, so an empty result is not vacuous"
+    );
+    assert!(
+        store.releasable_manifests("k").expect("releasable").is_empty(),
+        "a session that has closed NOTHING must have NOTHING releasable"
+    );
+}
+
+#[test]
+fn closing_makes_exactly_the_closed_generation_releasable() {
+    // The other side of the same gate: once a generation IS closed, its
+    // manifests become releasable and the newly-opened one does not.
+    let (_dir, store) = empty_store();
+    let old = [1u8; 32];
+    let new = [2u8; 32];
+    store.record_session_manifest("k", &old).expect("gen 0");
+    store
+        .close_current_generation("k", 0, [9u8; 32])
+        .expect("close 0");
+    store.record_session_manifest("k", &new).expect("gen 1");
+
+    assert_eq!(
+        store.releasable_manifests("k").expect("releasable"),
+        vec![old],
+        "the closed generation is releasable; the open one is not"
     );
 }

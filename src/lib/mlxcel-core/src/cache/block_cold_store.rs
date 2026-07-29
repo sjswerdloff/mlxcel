@@ -961,7 +961,7 @@ impl BlockColdStore {
         let fresh = SessionRegistry {
             incarnation: mint_incarnation()?,
             current_generation: 0,
-            closed_through: CLOSED_THROUGH_NONE,
+            closed_through: None,
             last_event_id: [0u8; 32],
         };
         write_session_registry_file(&path, &key_digest, &fresh)?;
@@ -1024,7 +1024,7 @@ impl BlockColdStore {
         let updated = SessionRegistry {
             incarnation: current.incarnation,
             current_generation: next,
-            closed_through: expected_generation,
+            closed_through: Some(expected_generation),
             last_event_id: event_id,
         };
         write_session_registry_file(&path, &key_digest, &updated)?;
@@ -1160,8 +1160,15 @@ impl BlockColdStore {
     /// generation N must not reach manifests a NEW conversation persisted at
     /// N+1 under the same key. Identity proves who; only the generation proves
     /// when.
-    /// Manifest hashes associated with the CURRENT incarnation of
-    /// `session_key` at or before `through_generation`.
+    /// Manifest hashes of the CURRENT incarnation that are RELEASABLE — i.e.
+    /// belong to a generation this session has actually closed.
+    ///
+    /// THE CUTOFF IS DERIVED, NEVER SUPPLIED. The previous signature took a
+    /// caller-provided `through_generation`, and the natural call —
+    /// `session_manifests_through(key, registry.closed_through)` — returned
+    /// EVERYTHING on a fresh registry, because the on-disk sentinel is
+    /// `u64::MAX` and every generation compares `<=` to it. A deletion-authority
+    /// query must not be constructible with the wrong bound.
     ///
     /// Filters on incarnation as well as generation. An association carrying a
     /// different incarnation belongs to a previous lifetime of this key — one
@@ -1172,20 +1179,24 @@ impl BlockColdStore {
     /// Returns EMPTY when no registry exists, rather than minting one: asking
     /// what is cleanable is a read, and a read must not create the state that
     /// decides the answer.
-    pub fn session_manifests_through(
+    pub fn releasable_manifests(
         &self,
         session_key: &str,
-        through_generation: u64,
     ) -> Result<Vec<[u8; 32]>, ColdStoreError> {
         let path = self.session_registry_path(session_key);
         let key_digest = Self::session_key_digest(session_key);
         let Some(registry) = read_session_registry_file(&path, &key_digest)? else {
             return Ok(Vec::new());
         };
+        // NOTHING CLOSED => NOTHING RELEASABLE. Not "cutoff at the current
+        // generation" and not a sentinel comparison — an empty answer.
+        let Some(cutoff) = registry.closed_through else {
+            return Ok(Vec::new());
+        };
         Ok(self
             .session_associations(session_key)?
             .into_iter()
-            .filter(|a| a.incarnation == registry.incarnation && a.generation <= through_generation)
+            .filter(|a| a.incarnation == registry.incarnation && a.generation <= cutoff)
             .map(|a| a.manifest_hash)
             .collect())
     }
@@ -3459,10 +3470,19 @@ const SESSION_INDEX_VERSION: u32 = 2;
 const SESSION_REGISTRY_MAGIC: &[u8; 8] = b"MLXSGEN1";
 const SESSION_REGISTRY_VERSION: u32 = 1;
 
-/// Sentinel for "no generation has been closed yet". Chosen at the top of the
-/// range so the ordinary comparison `generation <= closed_through` is false
-/// for every real generation without a special case at each call site.
-const CLOSED_THROUGH_NONE: u64 = u64::MAX;
+/// ON-DISK sentinel for "no generation has been closed yet".
+///
+/// IT IS ONLY A DISK ENCODING. An earlier comment here claimed this value was
+/// chosen so that `generation <= closed_through` would be FALSE for every real
+/// generation, removing the need for a special case. That is exactly backwards:
+/// `u64::MAX` makes the comparison TRUE for every generation, so a cutoff read
+/// straight off a fresh registry authorizes releasing everything — including
+/// the currently OPEN generation.
+///
+/// The in-memory representation is therefore [`Option<u64>`], where `None`
+/// cannot be compared against at all, and the sentinel never escapes decoding.
+/// (Alden, 2026-07-30.)
+const CLOSED_THROUGH_NONE_ON_DISK: u64 = u64::MAX;
 
 /// Server-minted nonce distinguishing one lifetime of a session key from
 /// another.
@@ -3516,12 +3536,18 @@ pub struct SessionRegistry {
     pub incarnation: IncarnationId,
     /// The generation new associations are recorded under. Always open.
     pub current_generation: u64,
-    /// Highest generation known closed, or [`CLOSED_THROUGH_NONE`].
+    /// Highest generation known closed. `None` when nothing has closed.
+    ///
+    /// An `Option` rather than a sentinel integer BECAUSE THIS VALUE IS
+    /// DELETION AUTHORITY. A sentinel participates in `<=` and answers
+    /// plausibly; `None` cannot be compared against at all, so "nothing is
+    /// closed" cannot be silently read as "everything is closed". The sentinel
+    /// exists only in the on-disk encoding and is converted at the boundary.
     ///
     /// Stored explicitly rather than inferred as `current_generation - 1` so
     /// that "G is closed" and "G+1 is open" are one atomic image, and so the
     /// cleanup authorization is inspectable rather than reconstructed.
-    pub closed_through: u64,
+    pub closed_through: Option<u64>,
     /// Event id of the last accepted close; all-zero when none.
     pub last_event_id: [u8; 32],
 }
@@ -3530,7 +3556,7 @@ impl SessionRegistry {
     /// Whether `generation` is closed and therefore eligible as a cleanup
     /// input.
     pub fn is_closed(&self, generation: u64) -> bool {
-        self.closed_through != CLOSED_THROUGH_NONE && generation <= self.closed_through
+        self.closed_through.is_some_and(|c| generation <= c)
     }
 }
 
@@ -3687,10 +3713,15 @@ fn read_session_registry_file(
     let mut incarnation = [0u8; 16];
     incarnation.copy_from_slice(&raw[44..60]);
     let current_generation = u64::from_le_bytes(raw[60..68].try_into().expect("8 bytes"));
-    let closed_through = u64::from_le_bytes(raw[68..76].try_into().expect("8 bytes"));
+    let closed_through_raw = u64::from_le_bytes(raw[68..76].try_into().expect("8 bytes"));
+    let closed_through = if closed_through_raw == CLOSED_THROUGH_NONE_ON_DISK {
+        None
+    } else {
+        Some(closed_through_raw)
+    };
     let mut last_event_id = [0u8; 32];
     last_event_id.copy_from_slice(&raw[76..108]);
-    if closed_through != CLOSED_THROUGH_NONE && closed_through >= current_generation {
+    if closed_through.is_some_and(|c| c >= current_generation) {
         // The current generation is always OPEN by construction, so a cutoff
         // that reaches it would authorize cleaning associations still being
         // written.
@@ -3716,7 +3747,11 @@ fn write_session_registry_file(
     out.extend_from_slice(key_digest);
     out.extend_from_slice(&reg.incarnation);
     out.extend_from_slice(&reg.current_generation.to_le_bytes());
-    out.extend_from_slice(&reg.closed_through.to_le_bytes());
+    out.extend_from_slice(
+        &reg.closed_through
+            .unwrap_or(CLOSED_THROUGH_NONE_ON_DISK)
+            .to_le_bytes(),
+    );
     out.extend_from_slice(&reg.last_event_id);
     let tmp = path.with_extension("gen.tmp");
     write_file(&tmp, &out)?;

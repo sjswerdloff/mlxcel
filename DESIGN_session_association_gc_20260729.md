@@ -219,6 +219,79 @@ Stuart's, not mine.** How much of real traffic resolves to anonymous is
 measurable from the `session_source` / `header_session_present` fields now on
 the lookup log — measure before choosing.
 
+## SOURCE-REVIEW BLOCKERS (Alden, 2026-07-30, against pushed `68b4c28`/`5e35b98`)
+
+None of these is deletion corruption **today**, because nothing deletes. All of
+them are blockers before closure/cleanup authority. **The current association
+data must not yet be described as authoritative.**
+
+**FIXED — P0, the cutoff sentinel.** `CLOSED_THROUGH_NONE = u64::MAX` with a
+source comment claiming `generation <= closed_through` would be *false* for
+every real generation. It is TRUE for every generation. `is_closed()`
+special-cased it; `session_manifests_through(key, cutoff)` did not — so the
+natural cleanup call on a fresh registry returned every OPEN manifest as
+releasable. Now `Option<u64>` in memory (the sentinel exists only in the disk
+encoding), and `releasable_manifests(key)` DERIVES the cutoff and returns empty
+on `None`. Gate test + mutation in place.
+
+### Still open — must be closed before delete mode
+
+- **P1 — the generation is chosen at donation time, not bound to the request.**
+  `record_session_manifest` reads whatever generation is current when the
+  persist finishes. The single lock hold fixed a close landing between registry
+  read and index write; it does NOT cover a close between request admission and
+  donation. An old-generation request finishing after compaction is filed under
+  the NEW generation. Needs a server-issued opaque ticket
+  `(key digest, incarnation, generation)` captured at request entry and
+  validated under lock at record time — refuse the late association rather than
+  silently relabel it.
+- **P1 — `user` is being treated as GC-scoped while the source says it is not.**
+  `key.rs` documents `user` as end-user scope and says per-conversation deletion
+  would remove every conversation for that user. `recordable_session_key`
+  nonetheless accepts it. **Recordability must depend on SOURCE / proven
+  granularity, not on the string being non-empty and non-sentinel.** At minimum
+  `User` and `Anonymous` are not compaction scopes; `SessionHeader` may be;
+  `PromptCacheKey` needs an explicit contract rather than an assumption.
+- **P1 — fixed-width framing has no whole-record integrity.** Magic, version and
+  length are checked, but a same-length bit flip in an incarnation, generation,
+  cutoff, event id or manifest hash still parses. That can disown a live
+  association, alter a cutoff, or forge an association to a different manifest.
+  Needs a digest over the complete authority record, verified before any field
+  is interpreted, plus a byte-mutation test over every stored byte with
+  non-semantic exceptions explicitly enumerated (ideally none). Related: an
+  index key-digest mismatch currently returns EMPTY — an authority reader must
+  ABORT, never convert corruption into "nothing associated".
+- **P1 — the association mutex is per-`BlockColdStore`-instance only.** It
+  excludes neither a second handle in-process nor another process. Two handles
+  can mint different incarnations, race the deterministic temp paths, or lose a
+  read-modify-write entry. Needs two-handle and cross-process tests before these
+  files are treated as authoritative.
+- **P1 — "a missing association leaks only" is FALSE under dedup.** The claim
+  protects a manifest with ZERO associations. Counterexample: A holds a CLOSED
+  association to shared M; B persists M but B's association write fails; a scan
+  sees only A's closed association and classifies M releasable. So the composite
+  protocol must either make manifest+association success coherent, create a
+  durable unmanaged pin on association failure, or mark cleanup globally
+  unhealthy after any association-publication failure. **The unconditional
+  "will leak" claim must not be retained.**
+- **P2 — exact replay is documented idempotent, implemented as an error.**
+  `close_current_generation` rejects every `expected != current`, and the test
+  expects an exact replay to error. Either implement replay recognition via
+  `last_event_id` or narrow the documented claim. CAS still prevents mutation,
+  so this is not deletion corruption.
+- **P2 — a malformed session header silently becomes absence.**
+  `to_str().ok()` reports `header_session_present=false` on invalid bytes and
+  falls through. A malformed PRESENT header is not an absent one; reject it or
+  carry a distinct malformed-present state, loudly.
+- **P2 — no production-path tests.** Coverage is parser/resolver/type plus a
+  hand-assembled context. Nothing exercises route → context → scheduler →
+  recorder across Chat/Responses/Anthropic, sync and stream, so the suite stays
+  green if a route drops propagation or the scheduler wiring disappears.
+- **P2 — index allocation is unbounded.** `fs::read` takes the whole file, the
+  entry count has no configured maximum, `Vec::with_capacity(count)` trusts it,
+  and encoding truncates `entries.len() as u32`. Bound bytes and entry count
+  before allocating; use checked conversion.
+
 ## DELETE-MODE ENTRY GATE
 
 **No cleanup wiring lands until the composite transaction below exists and its
