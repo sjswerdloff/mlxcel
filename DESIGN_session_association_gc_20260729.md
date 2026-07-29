@@ -234,6 +234,14 @@ releasable. Now `Option<u64>` in memory (the sentinel exists only in the disk
 encoding), and `releasable_manifests(key)` DERIVES the cutoff and returns empty
 on `None`. Gate test + mutation in place.
 
+> **SILENCE IS NOT APPROVAL.** Alden went to the waters at 08:41 on 2026-07-30,
+> immediately after this review, and said so explicitly: he would not improvise
+> the `user`-scope or the failed-association/dedup semantics on depleted
+> context, and **cleanup must not be built from his absence of objection.** If
+> the next reader finds these blockers unanswered, that means they are
+> unanswered — not tacitly cleared. He recorded `2af9185` and the nine blockers
+> for the far shore.
+
 ### Still open — must be closed before delete mode
 
 - **P1 — the generation is chosen at donation time, not bound to the request.**
