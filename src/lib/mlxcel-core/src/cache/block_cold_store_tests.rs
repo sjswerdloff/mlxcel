@@ -5865,3 +5865,163 @@ fn tier1_agrees_with_the_scan_on_an_intermediate_length_manifest() {
          full-length manifest. Violet's counterexample holds and Tier 1 is lossy."
     );
 }
+
+/// REGRESSION: a damaged manifest must be refused and an INTACT ONE SERVED.
+///
+/// This was observed live on 2026-07-28 (layer 50 checksum mismatch -> "trying
+/// next" -> served) and never encoded. That observation is not evidence about
+/// today's code: the read path now has two tiers in front of the scan, so the
+/// only honest way to keep the behaviour is a test that runs.
+///
+/// Distinct from `floor_stops_before_reading_any_payload`, whose control arm
+/// proves the checksum FIRES but persists a single manifest — so it can only
+/// show refusal, never fall-through. Serving a good candidate after refusing a
+/// bad one needs two manifests where the damage is in a block only one of them
+/// references.
+///
+///   A = tokens[0..2B)  -> blocks X, Y     (corrupt Y)
+///   B = tokens[0..B)   -> block  X        (intact)
+///   request = tokens[0..2B), floor 0 -> A ranks first, fails, falls to B
+///
+/// MUTATION: make the assemble error propagate instead of `continue` and this
+/// reddens — the refusal would surface as failure rather than degradation.
+#[test]
+fn a_damaged_manifest_is_refused_and_an_intact_one_served() {
+    const B: usize = 64;
+    const LAYERS: usize = 1;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [41u8; 32]).with_block_size(B);
+
+    // Block directories are named by content hash, so identify the long
+    // conversation's EXTRA block by set difference across the second persist
+    // rather than by guessing which file belongs to whom. An earlier version
+    // picked a victim with `one_payload_file`, which returns an arbitrary
+    // block — it corrupted the SHARED block, so both manifests failed and
+    // there was nothing intact to fall through to.
+    let block_dirs = |s: &BlockColdStore| -> std::collections::BTreeSet<std::path::PathBuf> {
+        std::fs::read_dir(s.blocks_dir())
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Shorter conversation first: one whole block.
+    let short_tokens: Vec<i32> = (0..B as i32).collect();
+    let short_set = fp16_set(LAYERS, B as i32);
+    store
+        .persist("m3", "tmpl", &short_tokens, &short_set, &plan_of(&short_set))
+        .expect("persist short");
+    let after_short = block_dirs(&store);
+
+    // Longer conversation: two whole blocks, sharing block 0 by content address.
+    let long_tokens: Vec<i32> = (0..(2 * B) as i32).collect();
+    let long_set = fp16_set(LAYERS, (2 * B) as i32);
+    store
+        .persist("m3", "tmpl", &long_tokens, &long_set, &plan_of(&long_set))
+        .expect("persist long");
+    let after_long = block_dirs(&store);
+
+    let added: Vec<_> = after_long.difference(&after_short).cloned().collect();
+    assert_eq!(
+        added.len(),
+        1,
+        "expected the second persist to add EXACTLY ONE block (block 0 shared \
+         by content address, block 1 new). Got {} — dedup is not behaving as \
+         this test assumes and the victim below would be the wrong file.",
+        added.len()
+    );
+
+    let victim = std::fs::read_dir(&added[0])
+        .expect("new block dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("layer_") && n.ends_with(".bin"))
+        })
+        .expect("new block dir must contain a layer payload");
+    let mut bytes = std::fs::read(&victim).expect("read payload");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    std::fs::write(&victim, &bytes).expect("write corrupted payload");
+
+    let plan = homog(LAYERS, KVCacheMode::Fp16, 0);
+    let got = store
+        .load_prefix_longer_than("m3", "tmpl", &long_tokens, &plan, 0)
+        .expect("a damaged candidate must DEGRADE to a shorter one, not fail the call");
+
+    let (_, matched) = got.expect(
+        "Ok(None) means the store refused the damaged manifest and then failed \
+         to fall through to the intact shorter one — fail-closed became \
+         fail-silent, and a usable prefix was thrown away",
+    );
+    assert_eq!(
+        matched, B,
+        "expected the SHORT manifest's one intact block ({B} tokens). Getting \
+         the long manifest's {} would mean corrupt payload was served, which is \
+         the defect the per-layer checksums exist to prevent",
+        2 * B
+    );
+}
+
+/// REGRESSION: Tier 1's fail-closed branch. NEW today and never executed.
+///
+/// When the exact-address manifest is found but its payload is damaged, Tier 1
+/// returns `Ok(None)` rather than falling through — on the argument that every
+/// shorter manifest caps at the whole-block ceiling and so cannot beat the
+/// floor. That argument is sound (see the tier comment) but had never run.
+///
+/// Asserts it declines CLEANLY: not an `Err` (which would surface a recoverable
+/// miss as a failure) and not an `Ok(Some(..))` (which would mean damaged
+/// payload was served).
+#[test]
+fn tier1_declines_cleanly_when_the_exact_address_manifest_is_damaged() {
+    const B: usize = 64;
+    const LAYERS: usize = 1;
+    const DEPTH: i32 = 2 * B as i32 + 9; // partial tail so Tier 0 cannot fire
+
+    let set = fp16_set(LAYERS, DEPTH);
+    let tokens: Vec<i32> = (0..DEPTH).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [42u8; 32]).with_block_size(B);
+    store
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
+        .expect("persist must succeed");
+
+    let plan = homog(LAYERS, KVCacheMode::Fp16, 0);
+    let whole_block_ceiling = (tokens.len() / B) * B;
+    assert!(whole_block_ceiling < tokens.len(), "no partial tail; Tier 0 would fire");
+
+    // PRECONDITION: undamaged, Tier 1 finds it by address and serves the lot.
+    let pristine = store
+        .load_prefix_longer_than("m3", "tmpl", &tokens, &plan, whole_block_ceiling)
+        .expect("undamaged exact-address lookup must not error");
+    assert!(
+        pristine.is_some(),
+        "PRECONDITION FAILED: Tier 1 did not find an undamaged manifest at the \
+         computed address, so damaging it proves nothing"
+    );
+
+    let victim = one_payload_file(&store);
+    let mut bytes = std::fs::read(&victim).expect("read payload");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    std::fs::write(&victim, &bytes).expect("write corrupted payload");
+
+    let got = store.load_prefix_longer_than("m3", "tmpl", &tokens, &plan, whole_block_ceiling);
+    assert!(
+        matches!(got, Ok(None)),
+        "a damaged exact-address manifest must DECLINE cleanly. Got {:?}. An \
+         Err turns a recoverable miss into a failed request; an Ok(Some) means \
+         payload that failed its per-layer checksum was served into a \
+         conversation.",
+        got.as_ref().map(|o| o.as_ref().map(|(_, m)| *m))
+    );
+}
