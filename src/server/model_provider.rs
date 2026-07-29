@@ -133,7 +133,23 @@ pub struct ModelProvider {
 fn build_block_cold_store(
     model_path: &std::path::Path,
 ) -> Option<Arc<mlxcel_core::cache::block_cold_store::BlockColdStore>> {
-    if std::env::var("MLXCEL_V4_COLD_STORE").as_deref() != Ok("1") {
+    // BOTH states announce themselves. The enabled path below logs; without
+    // this arm the DISABLED path returned `None` in total silence, so a boot
+    // with the cold store off looked identical on the console to a healthy one
+    // — and the variable travels by ENVIRONMENT, unlike every other setting
+    // here, which is passed as an explicit flag. A launcher that sets it
+    // without exporting it produces exactly this silent-off state.
+    //
+    // "If it silently stopped working, what on the console would say so?"
+    // Previously: nothing.
+    let requested = std::env::var("MLXCEL_V4_COLD_STORE");
+    if requested.as_deref() != Ok("1") {
+        tracing::info!(
+            requested = ?requested.as_deref().unwrap_or("<unset>"),
+            "v4 block cold store DISABLED — MLXCEL_V4_COLD_STORE is not \"1\". \
+             The v3 store remains in use. If you expected v4, check that the \
+             variable is EXPORTED and not merely assigned."
+        );
         return None;
     }
     let path_str = model_path.to_string_lossy().to_string();

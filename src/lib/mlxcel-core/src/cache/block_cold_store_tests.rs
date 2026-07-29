@@ -6025,3 +6025,317 @@ fn tier1_declines_cleanly_when_the_exact_address_manifest_is_damaged() {
         got.as_ref().map(|o| o.as_ref().map(|(_, m)| *m))
     );
 }
+
+// ---------------------------------------------------------------------------
+// SESSION SIDECAR INDEX
+//
+// The index exists so a compaction can release ONE conversation's manifests
+// without touching another's. Everything below is about the ways that could go
+// wrong QUIETLY — an index that under-reports looks exactly like a session that
+// was already clean, and a session that was already clean is the state we would
+// most like to believe in.
+// ---------------------------------------------------------------------------
+
+fn empty_store() -> (tempfile::TempDir, BlockColdStore) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+    (dir, store)
+}
+
+#[test]
+fn session_index_records_and_reads_back() {
+    let (_dir, store) = empty_store();
+    let a = [1u8; 32];
+    let b = [2u8; 32];
+    store.record_session_manifest("sess-1", &a, 0).expect("record a");
+    store.record_session_manifest("sess-1", &b, 0).expect("record b");
+    assert_eq!(store.session_manifests_through("sess-1", u64::MAX).expect("read"), vec![a, b]);
+}
+
+#[test]
+fn unknown_session_reads_as_empty_not_error() {
+    // A session that never persisted and a session whose entry was lost to the
+    // crash window are the same situation from here: nothing to release.
+    let (_dir, store) = empty_store();
+    assert!(
+        store
+            .session_manifests_through("never-seen", u64::MAX)
+            .expect("unknown session must not error")
+            .is_empty()
+    );
+}
+
+#[test]
+fn recording_the_same_manifest_twice_is_idempotent() {
+    // An exact conversation replay re-persists the same manifest. Without
+    // this, the index grows without bound on the traffic most likely to repeat.
+    let (_dir, store) = empty_store();
+    let h = [3u8; 32];
+    for _ in 0..5 {
+        store.record_session_manifest("sess-1", &h, 0).expect("record");
+    }
+    assert_eq!(store.session_manifests_through("sess-1", u64::MAX).expect("read"), vec![h]);
+}
+
+#[test]
+fn sessions_are_isolated_from_each_other() {
+    // The whole point: releasing one conversation must not reach another's
+    // manifests.
+    let (_dir, store) = empty_store();
+    let mine = [4u8; 32];
+    let theirs = [5u8; 32];
+    store.record_session_manifest("clement", &mine, 0).expect("a");
+    store.record_session_manifest("cora", &theirs, 0).expect("b");
+    assert_eq!(store.session_manifests_through("clement", u64::MAX).expect("r1"), vec![mine]);
+    assert_eq!(store.session_manifests_through("cora", u64::MAX).expect("r2"), vec![theirs]);
+}
+
+#[test]
+fn a_shared_manifest_is_listed_under_every_session_that_used_it() {
+    // Dedup means two Kindled can persist the same prefix. Both must appear,
+    // because releasing one must NOT be read as authority to drop the manifest
+    // while the other still references it.
+    let (_dir, store) = empty_store();
+    let shared = [6u8; 32];
+    store.record_session_manifest("clement", &shared, 0).expect("a");
+    store.record_session_manifest("cora", &shared, 0).expect("b");
+    assert_eq!(store.session_manifests_through("clement", u64::MAX).expect("r1"), vec![shared]);
+    assert_eq!(store.session_manifests_through("cora", u64::MAX).expect("r2"), vec![shared]);
+}
+
+#[test]
+fn session_keys_with_path_separators_do_not_escape_the_index_directory() {
+    // Session keys are arbitrary client strings. A key like "../../etc/x" must
+    // not become a write outside the store. The filename is a digest, so this
+    // is structural rather than a rule someone has to keep applying.
+    let (dir, store) = empty_store();
+    let nasty = "../../../etc/passwd";
+    let h = [8u8; 32];
+    store.record_session_manifest(nasty, &h, 0).expect("record");
+    assert_eq!(store.session_manifests_through(nasty, u64::MAX).expect("read"), vec![h]);
+
+    let entries: Vec<_> = std::fs::read_dir(store.sessions_dir())
+        .expect("sessions dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(entries.len(), 1, "exactly one index file: {entries:?}");
+    assert!(
+        entries[0].ends_with(".idx") && entries[0].len() == 68,
+        "filename must be a 64-char digest plus .idx, got {:?}",
+        entries[0]
+    );
+    // And nothing was created above the store root.
+    assert!(
+        dir.path().join(V4_ROOT).join(SESSIONS_DIR).exists(),
+        "index must live under the store root"
+    );
+}
+
+#[test]
+fn unicode_and_whitespace_session_keys_round_trip() {
+    let (_dir, store) = empty_store();
+    for key in ["ключ сессии", "sess with spaces", "日本語-セッション", "a\tb"] {
+        let h = [9u8; 32];
+        store.record_session_manifest(key, &h, 0).expect("record");
+        assert_eq!(
+            store.session_manifests_through(key, u64::MAX).expect("read"),
+            vec![h],
+            "key {key:?} must round-trip"
+        );
+    }
+}
+
+#[test]
+fn an_empty_session_key_is_refused() {
+    // An empty key would fuse every anonymous conversation into ONE index
+    // entry, and a later release would delete all of them together. Refusing
+    // to record is the only outcome that cannot lose someone else's data.
+    let (_dir, store) = empty_store();
+    let err = store.record_session_manifest("", &[1u8; 32], 0);
+    assert!(err.is_err(), "empty session key must be refused");
+}
+
+#[test]
+fn a_truncated_index_errors_rather_than_under_reporting() {
+    // THE failure this guards. If a short read were tolerated, the index would
+    // report FEWER associations than the session owns — and an under-reported
+    // session is indistinguishable from one already clean, so its manifests
+    // would never be released and no symptom would ever surface.
+    let (_dir, store) = empty_store();
+    store
+        .record_session_manifest("sess-1", &[1u8; 32], 0)
+        .expect("seed");
+    store
+        .record_session_manifest("sess-1", &[2u8; 32], 0)
+        .expect("seed2");
+
+    let file = std::fs::read_dir(store.sessions_dir())
+        .expect("sessions dir")
+        .map(|e| e.expect("entry").path())
+        .next()
+        .expect("one file");
+    let mut body = std::fs::read(&file).expect("read");
+    body.truncate(body.len() - 8); // lose half of the last entry
+    std::fs::write(&file, &body).expect("write");
+
+    let got = store.session_manifests_through("sess-1", u64::MAX);
+    assert!(
+        got.is_err(),
+        "a truncated index must ERROR, not silently under-report; got {:?}",
+        got.map(|v| v.len())
+    );
+}
+
+#[test]
+fn a_forged_magic_or_version_deletes_nothing() {
+    // An unreadable sidecar must authorize zero deletion rather than be read
+    // as an empty session, which would read as "nothing to release" and be
+    // acted on as success.
+    let (_dir, store) = empty_store();
+    store
+        .record_session_manifest("sess-1", &[1u8; 32], 0)
+        .expect("seed");
+    let file = std::fs::read_dir(store.sessions_dir())
+        .expect("sessions dir")
+        .map(|e| e.expect("entry").path())
+        .next()
+        .expect("one file");
+
+    let good = std::fs::read(&file).expect("read");
+
+    let mut bad_magic = good.clone();
+    bad_magic[0] = b'X';
+    std::fs::write(&file, &bad_magic).expect("write");
+    assert!(
+        store.session_manifests_through("sess-1", u64::MAX).is_err(),
+        "bad magic must error, not read as an empty session"
+    );
+
+    let mut bad_version = good.clone();
+    bad_version[8] = 99;
+    std::fs::write(&file, &bad_version).expect("write");
+    assert!(
+        store.session_manifests_through("sess-1", u64::MAX).is_err(),
+        "unsupported version must error, not read as an empty session"
+    );
+}
+
+#[test]
+fn a_generation_cutoff_protects_a_reused_session_key() {
+    // Session keys are arbitrary client strings and clients REUSE them. A
+    // cleanup for the conversation that ended at generation 0 must not reach
+    // manifests a NEW conversation persisted at generation 1 under the same
+    // key. Without the generation this is unrepresentable, and the delayed
+    // cleanup silently eats the live conversation. (Alden, 2026-07-29.)
+    let (_dir, store) = empty_store();
+    let old_conv = [1u8; 32];
+    let new_conv = [2u8; 32];
+    store
+        .record_session_manifest("reused-key", &old_conv, 0)
+        .expect("gen 0");
+    store
+        .record_session_manifest("reused-key", &new_conv, 1)
+        .expect("gen 1");
+
+    assert_eq!(
+        store
+            .session_manifests_through("reused-key", 0)
+            .expect("cutoff 0"),
+        vec![old_conv],
+        "a cutoff at generation 0 must not reach generation 1"
+    );
+    assert_eq!(
+        store
+            .session_manifests_through("reused-key", 1)
+            .expect("cutoff 1"),
+        vec![old_conv, new_conv]
+    );
+}
+
+#[test]
+fn the_same_manifest_in_two_generations_is_two_associations() {
+    // A conversation that replays the same prefix after compaction produces
+    // the same content-addressed manifest. Collapsing those would let a
+    // cutoff at the OLD generation release a manifest the NEW conversation
+    // still relies on.
+    let (_dir, store) = empty_store();
+    let m = [3u8; 32];
+    store.record_session_manifest("k", &m, 0).expect("gen 0");
+    store.record_session_manifest("k", &m, 1).expect("gen 1");
+    assert_eq!(store.session_associations("k").expect("read").len(), 2);
+    assert_eq!(
+        store.session_manifests_through("k", 0).expect("cutoff"),
+        vec![m]
+    );
+}
+
+#[test]
+fn the_index_file_does_not_store_the_raw_session_key() {
+    // INVERSE of what this file used to assert. Storing the key verbatim is
+    // what let a key containing a newline forge associations, and since
+    // associations authorize deletion that was a cross-session capability
+    // rather than a parse bug. The key is also potentially sensitive and
+    // unbounded. Lookup needs only its digest, so the raw key is not stored at
+    // all -- and this test exists so a later "make it self-describing for
+    // debugging" change cannot quietly reintroduce the capability.
+    let (_dir, store) = empty_store();
+    let key = "clement-session-42";
+    store
+        .record_session_manifest(key, &[1u8; 32], 0)
+        .expect("record");
+    let file = std::fs::read_dir(store.sessions_dir())
+        .expect("sessions dir")
+        .map(|e| e.expect("entry").path())
+        .next()
+        .expect("one file");
+    let bytes = std::fs::read(&file).expect("read");
+    assert!(
+        !bytes
+            .windows(key.len())
+            .any(|w| w == key.as_bytes()),
+        "the raw session key must not appear anywhere in the index file"
+    );
+    // Lookup still works, so the digest genuinely suffices.
+    assert_eq!(
+        store.session_manifests_through(key, u64::MAX).expect("read"),
+        vec![[1u8; 32]]
+    );
+}
+
+
+#[test]
+fn a_session_key_containing_a_newline_cannot_forge_index_entries() {
+    // Alden, 2026-07-29. The index was line-oriented and the key was written
+    // verbatim on line 1 — but session keys are ARBITRARY CLIENT STRINGS, and
+    // arbitrary includes '\n'. A key can then terminate its own line and inject
+    // whatever follows as index content.
+    //
+    // The damage is not a parse error. A forged entry is a live association to
+    // a manifest this session never persisted, and associations are what
+    // authorize deletion. A client could name another conversation's manifest
+    // and have its own compaction release it.
+    let (_dir, store) = empty_store();
+    let real = [1u8; 32];
+    let forged = [0xABu8; 32];
+    let malicious = format!("evil\n{}", hex_digest(&forged));
+
+    store
+        .record_session_manifest(&malicious, &real, 0)
+        .expect("record");
+
+    let got = store.session_manifests_through(&malicious, u64::MAX).expect("read");
+    assert_eq!(
+        got,
+        vec![real],
+        "a newline in the session key must not inject an association; \
+         forged digest {} must not appear",
+        hex_digest(&forged)
+    );
+
+    // And the injected prefix must not be readable as a DIFFERENT session that
+    // now owns the real manifest.
+    assert!(
+        store.session_manifests_through("evil", u64::MAX).expect("read evil").is_empty(),
+        "the pre-newline fragment must not resolve to a session"
+    );
+}

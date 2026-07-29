@@ -30,6 +30,10 @@ const V4_FORMAT_VERSION: u32 = 4;
 const V4_ROOT: &str = "cold-storage-v4";
 const BLOCKS_DIR: &str = "blocks";
 const MANIFESTS_DIR: &str = "manifests";
+/// Sidecar index mapping a client's session key to the manifests persisted
+/// under it. Deliberately NOT part of manifest identity — see
+/// [`BlockColdStore::sessions_dir`].
+const SESSIONS_DIR: &str = "sessions";
 const COMMIT_MAGIC: &[u8; 16] = b"MLXCEL-COMMIT-V4";
 
 const DEFAULT_BLOCK_SIZE: usize = 2048;
@@ -573,6 +577,19 @@ pub struct BlockColdStore {
     block_size: usize,
     prune_mode: PruneMode,
     persist_lock: Mutex<()>,
+    /// Serializes read-modify-write on ONE session's sidecar index file.
+    ///
+    /// Deliberately its own mutex rather than reusing [`Self::persist_lock`].
+    /// The two guard unrelated things, and sharing one would mean that the day
+    /// `persist` starts taking `persist_lock` — it does not today — a `persist`
+    /// that also recorded an index entry would deadlock against itself, since
+    /// `std::sync::Mutex` is not reentrant. Separate locks make that
+    /// impossible instead of leaving it as something to remember.
+    ///
+    /// This is NOT the publication lock. Recording an index entry must not
+    /// serialize against manifest publication or GC sweeps — see
+    /// [`Self::sessions_dir`] for why the index sits outside that protocol.
+    session_index_lock: Mutex<()>,
     /// Minimum age before an unreferenced block may even be NOMINATED.
     ///
     /// Defence in depth, explicitly NOT a correctness gate (Alden, finding 4:
@@ -596,6 +613,7 @@ impl BlockColdStore {
             block_size: DEFAULT_BLOCK_SIZE,
             prune_mode: PruneMode::default(),
             persist_lock: Mutex::new(()),
+            session_index_lock: Mutex::new(()),
             // Conservative by default. Zero-age deletion is NOT advertised as
             // safe for production; tests that need immediate collection opt in
             // explicitly via `with_min_gc_age`.
@@ -815,6 +833,198 @@ impl BlockColdStore {
 
     pub fn manifests_dir(&self) -> PathBuf {
         self.base_dir.join(V4_ROOT).join(MANIFESTS_DIR)
+    }
+
+    /// Directory of the session sidecar index: `session_key -> {manifest hash}`.
+    ///
+    /// WHY A SIDECAR AND NOT A MANIFEST FIELD. A manifest's address is a hash
+    /// over its identity fields, so putting the session key inside one would
+    /// make it session-SCOPED at Tier 1's exact-address lookup — and then no
+    /// Kindled could ever hit a prefix another persisted. The content most
+    /// worth sharing is precisely the part they hold in common, so that cost
+    /// would fall exactly where the benefit is. Keeping the key outside leaves
+    /// manifests purely content-addressed and Tier 1 untouched.
+    ///
+    /// LOCK PLACEMENT — READ THIS BEFORE ADDING CLEANUP.
+    ///
+    /// Recording currently runs OUTSIDE the publication critical section. That
+    /// is safe TODAY for one reason only: nothing treats an association as
+    /// authority to delete anything. The only readers are lookups.
+    ///
+    /// I originally argued this placement was correct BY DESIGN, on the
+    /// grounds that the index is a mere GC hint. Alden overturned it
+    /// (2026-07-29) and the correction is load-bearing: **an association is
+    /// not a hint once cleanup trusts it.** To prove a manifest is
+    /// unreferenced, a sweep must read every association file under the
+    /// exclusive lock — and an association being written concurrently, outside
+    /// that lock, is exactly what such a scan would miss. The scan would then
+    /// "prove" a live manifest unreferenced.
+    ///
+    /// So this is a PRECONDITION, not an opinion: association publication MUST
+    /// move under the store lock, in one non-reentrant protocol with manifest
+    /// publication, before any cleanup path may act on it. Adding cleanup
+    /// while recording still sits out here is how a live conversation's cache
+    /// gets collected.
+    ///
+    /// The write ORDER is still right and stays: entries are appended only
+    /// AFTER the manifest is committed, so the crash window leaks rather than
+    /// dangles.
+    ///
+    /// The full cleanup protocol — one forward authoritative scan, an
+    /// association epoch that must be bumped BEFORE any association becomes
+    /// visible, and an abort-the-whole-pass rule when the epoch moves — is in
+    /// `DESIGN_session_association_gc_20260729.md`. Read it before writing
+    /// cleanup; the epoch requirement in particular is not reconstructable
+    /// from this file.
+    ///
+    /// AN ASSOCIATION IS NOT OWNERSHIP. Manifests are content-addressed and
+    /// therefore globally shared — two Kindled sending the same prefix persist
+    /// the same manifest. Releasing one session's association is NOT authority
+    /// to delete the manifest; that needs an authoritative check, under the
+    /// lock, that no live association remains anywhere. Deleting on one
+    /// session's say-so removes a manifest another Kindled is still using.
+    ///
+    /// NOT AUTHORITATIVE ABOUT BLOCKS EITHER. Block lifetime stays with
+    /// `gc_blocks`, which re-derives its mark from committed manifests under
+    /// the lock and treats refcounts as hints. That is the pattern this index
+    /// should follow rather than replace.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.base_dir.join(V4_ROOT).join(SESSIONS_DIR)
+    }
+
+    /// Path of one session's index file.
+    ///
+    /// Named by the DIGEST of the session key rather than the key itself.
+    /// Session keys are arbitrary client strings — they may contain path
+    /// separators, whitespace, control characters, or exceed a filename
+    /// length limit. Sanitizing would leave a rule someone has to remember and
+    /// keep correct; hashing makes an unsafe path unrepresentable instead.
+    fn session_key_digest(session_key: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(session_key.as_bytes());
+        hasher.finalize().into()
+    }
+
+    fn session_index_path(&self, session_key: &str) -> PathBuf {
+        let digest = Self::session_key_digest(session_key);
+        self.sessions_dir()
+            .join(format!("{}.idx", hex_digest(&digest)))
+    }
+
+    /// Record that `manifest_hash` was persisted under `session_key` during
+    /// compaction epoch `generation`.
+    ///
+    /// This records an ASSOCIATION, not ownership. A manifest is
+    /// content-addressed and therefore globally shared: two Kindled who send
+    /// the same prefix persist the same manifest. Releasing one session's
+    /// association must never be read as authority to delete the manifest —
+    /// that requires an authoritative check, under the store lock, that no
+    /// live association remains anywhere. (Alden, 2026-07-29: "if the sidecar
+    /// itself says delete M, it is deletion authority, not a hint".)
+    ///
+    /// Idempotent per `(manifest, generation)`, so an exact conversation
+    /// replay cannot grow the file without bound.
+    ///
+    /// Call this only AFTER the manifest is committed — see
+    /// [`Self::sessions_dir`] for why that order is the survivable one.
+    pub fn record_session_manifest(
+        &self,
+        session_key: &str,
+        manifest_hash: &[u8; 32],
+        generation: u64,
+    ) -> Result<(), ColdStoreError> {
+        if session_key.is_empty() {
+            return Err(invalid_data(
+                "record_session_manifest: empty session key. An empty key would \
+                 fuse unrelated conversations into one index entry, and a later \
+                 release would delete all of them together."
+                    .into(),
+            ));
+        }
+        let key_digest = Self::session_key_digest(session_key);
+        let path = self.session_index_path(session_key);
+        fs::create_dir_all(self.sessions_dir())?;
+
+        // Serialize appends. Two requests on one session can persist
+        // concurrently, and read-modify-write on a shared file is where an
+        // entry silently vanishes.
+        let _guard = self.session_index_lock.lock().map_err(|_| {
+            invalid_data("record_session_manifest: session index lock poisoned".into())
+        })?;
+
+        let mut existing = read_session_index_file(&path)?;
+        if existing
+            .key_digest
+            .is_some_and(|recorded| recorded != key_digest)
+        {
+            // The file under this path claims a different key. Refusing beats
+            // merging: the alternative silently fuses two conversations and a
+            // later release deletes them together.
+            return Err(invalid_data(format!(
+                "record_session_manifest: index file {} claims a different \
+                 session key digest. Refusing to merge two sessions.",
+                path.display()
+            )));
+        }
+        let entry = SessionAssociation {
+            manifest_hash: *manifest_hash,
+            generation,
+        };
+        if existing.associations.contains(&entry) {
+            return Ok(());
+        }
+        existing.associations.push(entry);
+
+        let bytes = encode_session_index_file(&key_digest, &existing.associations);
+        let tmp = path.with_extension("idx.tmp");
+        write_file(&tmp, &bytes)?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Associations recorded under `session_key`, in the order recorded.
+    ///
+    /// An unknown session yields an EMPTY vector rather than an error: a
+    /// session that never persisted anything and a session whose entry was
+    /// lost to the crash window are the same situation from here, and both
+    /// mean "nothing to release".
+    ///
+    /// A file whose stored key digest does not match also yields empty rather
+    /// than its contents — handing back associations that may belong to
+    /// someone else is the one outcome that could authorize deleting their
+    /// cache.
+    pub fn session_associations(
+        &self,
+        session_key: &str,
+    ) -> Result<Vec<SessionAssociation>, ColdStoreError> {
+        let path = self.session_index_path(session_key);
+        let parsed = read_session_index_file(&path)?;
+        let expected = Self::session_key_digest(session_key);
+        match parsed.key_digest {
+            Some(d) if d != expected => Ok(Vec::new()),
+            _ => Ok(parsed.associations),
+        }
+    }
+
+    /// Manifest hashes associated with `session_key` at or before
+    /// `through_generation`.
+    ///
+    /// The cutoff is the point. A session key is an arbitrary client string
+    /// and clients reuse them, so a cleanup for a conversation that ended at
+    /// generation N must not reach manifests a NEW conversation persisted at
+    /// N+1 under the same key. Identity proves who; only the generation proves
+    /// when.
+    pub fn session_manifests_through(
+        &self,
+        session_key: &str,
+        through_generation: u64,
+    ) -> Result<Vec<[u8; 32]>, ColdStoreError> {
+        Ok(self
+            .session_associations(session_key)?
+            .into_iter()
+            .filter(|a| a.generation <= through_generation)
+            .map(|a| a.manifest_hash)
+            .collect())
     }
 
     pub fn block_size(&self) -> usize {
@@ -3074,6 +3284,128 @@ fn now_nanos() -> u128 {
 
 fn hex_digest(digest: &[u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+const SESSION_INDEX_MAGIC: &[u8; 8] = b"MLXSIDX1";
+const SESSION_INDEX_VERSION: u32 = 1;
+
+/// One association: a manifest, and the session generation that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAssociation {
+    pub manifest_hash: [u8; 32],
+    /// Compaction epoch this association belongs to.
+    ///
+    /// A bare `session_key -> manifest` mapping cannot tell a PRE-compaction
+    /// conversation from a NEW one that reuses the same key afterwards —
+    /// session keys are arbitrary client strings and clients do reuse them.
+    /// Without a generation, a delayed cleanup for the old conversation can
+    /// cross the compaction boundary and remove the new one's data. Identity
+    /// proves who; only a generation proves WHEN, and reachability is a
+    /// question about when. (Alden, 2026-07-29.)
+    pub generation: u64,
+}
+
+/// One parsed session index file.
+struct SessionIndexFile {
+    /// Digest of the session key this file claims to belong to; `None` when
+    /// the file does not exist.
+    key_digest: Option<[u8; 32]>,
+    associations: Vec<SessionAssociation>,
+}
+
+/// Read and parse a session index file, tolerating absence but nothing else.
+///
+/// BINARY, FIXED-WIDTH, AND IT STORES NO RAW KEY. The first version of this
+/// was line-oriented with the session key written verbatim on line 1, and a
+/// key containing a newline could terminate its own line and inject entries —
+/// forging an association to a manifest the session never persisted. Since
+/// associations authorize deletion, that is a path to releasing another
+/// Kindled's cache. Fixed-width binary makes the injection unrepresentable
+/// rather than filtered, and not storing the key also removes an unbounded
+/// write and a possibly-sensitive value at rest. (Alden, 2026-07-29.)
+///
+/// A MALFORMED file is an ERROR, never a partial read. Returning what parsed
+/// would under-report the session's associations, and an under-reported
+/// session is indistinguishable from a clean one — so nothing would ever be
+/// released and no symptom would ever appear.
+fn read_session_index_file(path: &Path) -> Result<SessionIndexFile, ColdStoreError> {
+    let raw = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(SessionIndexFile {
+                key_digest: None,
+                associations: Vec::new(),
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    const HEADER: usize = 8 + 4 + 32 + 4;
+    const ENTRY: usize = 32 + 8;
+    let malformed = |why: &str| {
+        invalid_data(format!(
+            "session index {} is malformed ({why}). Refusing to parse: a partial \
+             read would under-report this session's associations, and an \
+             under-reported session looks exactly like a clean one.",
+            path.display()
+        ))
+    };
+    if raw.len() < HEADER {
+        return Err(malformed("shorter than its header"));
+    }
+    if &raw[0..8] != SESSION_INDEX_MAGIC {
+        return Err(malformed("bad magic"));
+    }
+    let version = u32::from_le_bytes(raw[8..12].try_into().expect("4 bytes"));
+    if version != SESSION_INDEX_VERSION {
+        return Err(malformed(&format!("unsupported version {version}")));
+    }
+    let mut key_digest = [0u8; 32];
+    key_digest.copy_from_slice(&raw[12..44]);
+    let count = u32::from_le_bytes(raw[44..48].try_into().expect("4 bytes")) as usize;
+    let expected = HEADER
+        .checked_add(count.checked_mul(ENTRY).ok_or_else(|| {
+            malformed("declared entry count overflows")
+        })?)
+        .ok_or_else(|| malformed("declared length overflows"))?;
+    if raw.len() != expected {
+        // Length disagreeing with the declared count is exactly the truncation
+        // case. Trusting the count and reading what is there is how a
+        // half-written file becomes a confident short answer.
+        return Err(malformed(&format!(
+            "declares {count} entries ({expected} bytes) but is {} bytes",
+            raw.len()
+        )));
+    }
+    let mut associations = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = HEADER + i * ENTRY;
+        let mut manifest_hash = [0u8; 32];
+        manifest_hash.copy_from_slice(&raw[off..off + 32]);
+        let generation =
+            u64::from_le_bytes(raw[off + 32..off + 40].try_into().expect("8 bytes"));
+        associations.push(SessionAssociation {
+            manifest_hash,
+            generation,
+        });
+    }
+    Ok(SessionIndexFile {
+        key_digest: Some(key_digest),
+        associations,
+    })
+}
+
+/// Serialize a session index file.
+fn encode_session_index_file(key_digest: &[u8; 32], entries: &[SessionAssociation]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48 + entries.len() * 40);
+    out.extend_from_slice(SESSION_INDEX_MAGIC);
+    out.extend_from_slice(&SESSION_INDEX_VERSION.to_le_bytes());
+    out.extend_from_slice(key_digest);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        out.extend_from_slice(&e.manifest_hash);
+        out.extend_from_slice(&e.generation.to_le_bytes());
+    }
+    out
 }
 
 /// THE predicate for "this directory entry is a COMMITTED manifest", and the
