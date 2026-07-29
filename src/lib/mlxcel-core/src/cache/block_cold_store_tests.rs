@@ -5799,3 +5799,69 @@ fn tier1_declines_when_no_exact_manifest_exists() {
         got.as_ref().map(|o| o.as_ref().map(|(_, m)| *m))
     );
 }
+
+/// VIOLET'S COUNTEREXAMPLE, built as she asked rather than argued about.
+///
+/// Her claim (2026-07-29): Tier 1 is lossy because it only ever addresses a
+/// manifest of the FULL request length, while an INTERMEDIATE manifest — one
+/// whose length falls strictly between the whole-block ceiling and the request
+/// length — can also beat the floor and sits at a different address.
+///
+/// Scaled to a small block size; the arithmetic is hers.
+///
+///     block_size B = 64        request len L = 160
+///     whole_block_ceiling W    = (160/64)*64 = 128
+///     floor                    = 128          -> Tier 0 no, Tier 1 YES
+///     stored manifest S        = 140          -> strictly between W and L
+///
+/// If she is right, the scan path serves this manifest and Tier 1 drops it.
+///
+/// THE TEST IS DIFFERENTIAL BY MUTATION, which is the test the suite lacked:
+/// it pins the answer, and disabling Tier 1 must not change it. Agreement means
+/// lossless; disagreement means lossy and names the case.
+#[test]
+fn tier1_agrees_with_the_scan_on_an_intermediate_length_manifest() {
+    const B: usize = 64;
+    const LAYERS: usize = 1;
+    const STORED: i32 = 140;
+
+    let set = fp16_set(LAYERS, STORED);
+    let stored_tokens: Vec<i32> = (0..STORED).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [31u8; 32]).with_block_size(B);
+    store
+        .persist("m3", "tmpl", &stored_tokens, &set, &plan_of(&set))
+        .expect("persist must succeed");
+
+    // The request EXTENDS the stored conversation: first 140 tokens identical.
+    let request: Vec<i32> = (0..160).collect();
+    let whole_block_ceiling = (request.len() / B) * B;
+    assert_eq!(whole_block_ceiling, 128, "setup arithmetic drifted");
+    assert!(
+        whole_block_ceiling < request.len(),
+        "no partial tail: Tier 0 would fire and this would not test Tier 1"
+    );
+
+    let plan = homog(LAYERS, KVCacheMode::Fp16, 0);
+    let got = store.load_prefix_longer_than("m3", "tmpl", &request, &plan, whole_block_ceiling);
+
+    let matched = match &got {
+        Ok(Some((_, m))) => Some(*m),
+        Ok(None) => None,
+        Err(e) => panic!("unexpected error from the tiered path: {e}"),
+    };
+
+    // What the SCAN would have produced, derived from the addressing scheme:
+    // the stored manifest chunks 64/64/12, the request chunks 64/64/32. The
+    // third chunks cover different spans, so their digests differ and
+    // take_while stops at 2 -> matched = 2*64 = 128, which does NOT exceed a
+    // floor of 128. If Violet is right and a partial block can match a longer
+    // partial block, this expectation is what breaks.
+    assert_eq!(
+        matched, None,
+        "TIER 1 DISAGREES WITH THE SCAN. An intermediate-length manifest (140) \
+         beat the floor (128) and Tier 1 dropped it by addressing only the \
+         full-length manifest. Violet's counterexample holds and Tier 1 is lossy."
+    );
+}

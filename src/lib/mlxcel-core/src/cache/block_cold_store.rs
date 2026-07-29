@@ -1969,16 +1969,38 @@ impl BlockColdStore {
         // its address is computable from the chain we just built. Go straight
         // to it.
         //
-        // WHY THIS IS LOSSLESS, unlike simply skipping. A manifest for a
-        // LONGER stored conversation chunks uniformly from zero, so its chunk
-        // at the tail index is full-width where the request's is partial —
-        // different bytes, no match. Such a manifest therefore tops out at
-        // `whole_block_ceiling`, which is `<= floor_tokens` whenever we are in
-        // this branch, so it could not have won. The one case where a longer
-        // manifest COULD match every chunk is a request that is an exact
-        // multiple of `block_size` (no partial tail) — and there
-        // `whole_block_ceiling == tokens.len()`, so Tier 0 has already
-        // returned and we never arrive here.
+        // WHY THIS IS LOSSLESS, unlike simply skipping.
+        //
+        // ⚠️ AN EARLIER VERSION OF THIS COMMENT ARGUED ONLY THE `S >= L` CASE
+        // and then asserted the general claim. Violet audited it 2026-07-29 and
+        // produced a counterexample from the gap: a manifest whose length falls
+        // STRICTLY BETWEEN the ceiling and the request length. The conclusion
+        // survives — the differential test below shows Tier 1 and the scan agree
+        // on exactly her case — but the written justification did not cover it,
+        // and a reader auditing this reasoning could not have closed it. The
+        // full argument, over all three positions of a stored length S against
+        // a request length L, with W = whole_block_ceiling and B = block_size:
+        //
+        //   S > L   chunk W/B is full-width for the manifest, partial for the
+        //           request -> mismatch -> matched = W.
+        //   S = L   the exact match. THIS is what the address finds.
+        //   W <= S < L
+        //           BOTH chunks at W/B are partial, but they span [W,S) and
+        //           [W,L) with S != L -> different digests -> matched = W.
+        //           (This is the class the old argument missed.)
+        //   S < W   if S % B == 0, every chunk matches and matched = S <= W;
+        //           otherwise the manifest's partial chunk sits at an index
+        //           where the request's chunk is full-width -> mismatch ->
+        //           matched = floor(S/B)*B < W.
+        //
+        // Every non-exact manifest therefore caps at W, and W <= floor_tokens
+        // whenever we are in this branch — so none of them could have won. A
+        // partial block never matches a longer partial block at the same index,
+        // which is the single fact the whole argument rests on.
+        //
+        // The `L % B == 0` case (no partial tail, where a longer manifest COULD
+        // match every chunk) cannot arrive here: there W == L, so Tier 0 has
+        // already returned.
         //
         // Therefore: found means a genuine win, and not-found means provably
         // nothing to win. Same guarantee as the payload gate below.
