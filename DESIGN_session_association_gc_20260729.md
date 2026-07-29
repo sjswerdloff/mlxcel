@@ -81,16 +81,35 @@ would miss. The scan would then "prove" a live manifest unreferenced.
 I originally argued the outside-the-lock placement was correct by design. It is
 not. It is a temporary state with a precondition attached.
 
-### 2. `write_manifest`'s existing-path fast return must join the protocol
+### 2. The persist+association / manifest-deletion TRANSACTION GAP
 
-Verified in source: `write_manifest` returns `Ok(())` on `manifest_dir.exists()`
-**before** taking its lock, and `delete_manifest` takes no lock at all. Reachable
-interleaving:
+**Named carefully.** This is *not* the "`write_manifest` existing-path race",
+and calling it that misdirects whoever picks it up. `write_manifest`'s
+existing-path fast return is **one implementation site the future protocol must
+absorb**, not an independently demonstrated defect today.
 
-1. B persists M; `write_manifest` sees M exists, returns success.
-2. A's compaction deletes M.
-3. B writes `B → M` on the strength of that success.
-4. B holds a live association to an absent manifest.
+Why there is no defect to demonstrate today: if `write_manifest(existing M)`
+overlaps `delete_manifest(M)`, a final absent M is still a **linearizable
+history** — order the successful write before the overlapping delete. No
+standalone write API can promise that another authorized operation will not
+delete the object after its linearization point, even if that delete returns
+before the write's caller resumes. There is no violated postcondition here.
+
+The gap is in a **composite operation that does not exist yet**:
+
+```
+ensure/publish M  →  publish open-generation association G → M
+```
+
+Once manifest deletion exists, a delete landing *between those two steps*
+produces the forbidden committed state `association(G, M) && !manifest(M)`.
+**That** composite is entitled to promise its caller that success means both
+artifacts committed coherently under an open generation. `write_manifest` alone
+is entitled to promise no such thing.
+
+Verified in source (true, but as context rather than as a defect):
+`write_manifest` returns `Ok(())` on `manifest_dir.exists()` before taking its
+lock, and `delete_manifest` takes no lock at all.
 
 ### 3. Generation lifecycle must be server-owned and authenticated
 
@@ -199,6 +218,36 @@ them yet chosen:
 Stuart's, not mine.** How much of real traffic resolves to anonymous is
 measurable from the `session_source` / `header_session_present` fields now on
 the lookup log — measure before choosing.
+
+## DELETE-MODE ENTRY GATE
+
+**No cleanup wiring lands until the composite transaction below exists and its
+two deterministic interleaving tests pass.** This is a test specification
+attached to the feature whose contract gives it meaning — not a warning left
+untested.
+
+The transaction: `ensure/publish M` then `publish (session, open generation) →
+M`, as ONE non-reentrant operation under the exclusive store lock. Its contract:
+
+1. **success ⇒** M is committed *and* `G → M` is committed, at one
+   linearization point;
+2. **close/delete wins first ⇒** the late publication REFUSES success for G and
+   publishes no association;
+3. **publication wins first ⇒** close/manifest-GC observes the association and
+   cannot tombstone M as unassociated.
+
+Test with a **deterministic seam, never timing**:
+
+1. pause after M is ensured but before association publication;
+2. run close / manifest-GC to its lock boundary;
+3. release the publisher;
+4. assert one of the two legal serial outcomes — and make
+   `association(G, M) && !manifest(M)` **unrepresentable**, not merely absent.
+
+Until that protocol exists, a sequential `ensure; delete; associate` test proves
+only that three separately-callable operations can be ordered that way. It tests
+no current contract, and a test asserting today's unlocked behaviour would
+**fossilize the weakness rather than protect anything**.
 
 ## The cleanup protocol, when preconditions are met
 
