@@ -86,9 +86,17 @@ pub(crate) fn structured_error_to_response(err: StructuredOutputError) -> ErrorR
 /// slices, which yields `MultimodalDigest::empty()` and a key byte-identical to
 /// the pre-#124 path. Callers must therefore build the context **after**
 /// preparing the request so the resolved bytes are available.
+///
+/// `header_session_id` is the per-conversation identity from the request
+/// HEADERS, which only the outermost handler can see — extract it there with
+/// [`parse_session_header`] and pass the value down, exactly as `priority`
+/// already travels. It is a required argument rather than an optional
+/// convenience so a route cannot quietly skip the header channel and drop its
+/// traffic into the anonymous bucket.
 pub(crate) fn build_prompt_cache_request_context(
     state: &AppState,
     request: &ChatCompletionRequest,
+    header_session_id: Option<&str>,
     image_data: &[Vec<u8>],
     audio_data: &[Vec<u8>],
 ) -> Option<PromptCacheRequestContext> {
@@ -111,8 +119,15 @@ pub(crate) fn build_prompt_cache_request_context(
         request.tool_choice.as_ref(),
         request.tools.as_deref(),
     );
-    let session_key =
-        resolve_session_key(request.resolve_prompt_cache_key(), request.resolve_user()).to_string();
+    // Presence is recorded from the SAME input the resolver sees, so the two
+    // fields cannot drift into disagreeing about one request.
+    let header_session_present = header_session_id.is_some_and(|h| !h.is_empty());
+    let (session_key, session_source) = resolve_session_key(
+        request.resolve_prompt_cache_key(),
+        header_session_id,
+        request.resolve_user(),
+    );
+    let session_key = session_key.to_string();
     // Digest the resolved multimodal payload. Empty slices (text-only) hash to
     // `MultimodalDigest::empty()`, leaving the composed key unchanged.
     let mm_digest = multimodal_digest_from_vecs(image_data, audio_data);
@@ -121,8 +136,32 @@ pub(crate) fn build_prompt_cache_request_context(
         lora_id: None,
         template_sig: template_signature,
         session_key,
+        session_source,
+        header_session_present,
         mm_digest,
     })
+}
+
+/// Extract the per-conversation identity a client supplied in the request
+/// HEADERS, if any.
+///
+/// `X-Session-Id` first, `x-session-affinity` as the fallback. opencode sends
+/// both with the same value; reading either means one of them going missing
+/// does not silently drop the conversation into the anonymous bucket.
+///
+/// Whitespace-only values are treated as absent for the same reason
+/// [`resolve_session_key`] rejects empty strings: a header a proxy filled in
+/// with nothing must not become a bucket everyone shares.
+pub(crate) fn parse_session_header(headers: &HeaderMap) -> Option<String> {
+    for name in ["x-session-id", "x-session-affinity"] {
+        if let Some(v) = headers.get(name)
+            && let Ok(s) = v.to_str()
+            && !s.trim().is_empty()
+        {
+            return Some(s.trim().to_string());
+        }
+    }
+    None
 }
 
 /// Decode a single token ID to its text representation using the tokenizer.
@@ -320,12 +359,30 @@ pub async fn chat_completions(
     };
 
     let priority = parse_priority_header(&headers);
+    // Headers are visible ONLY here. Resolve the per-conversation identity now
+    // and carry it as a value, the same way `priority` travels.
+    let header_session_id = parse_session_header(&headers);
     if request.stream {
-        stream_chat_completion(state, request, priority, budget_override, structured).await
+        stream_chat_completion(
+            state,
+            request,
+            priority,
+            header_session_id,
+            budget_override,
+            structured,
+        )
+        .await
     } else {
-        non_stream_chat_completion(state, request, priority, budget_override, structured)
-            .await
-            .into_response()
+        non_stream_chat_completion(
+            state,
+            request,
+            priority,
+            header_session_id,
+            budget_override,
+            structured,
+        )
+        .await
+        .into_response()
     }
 }
 
@@ -342,6 +399,7 @@ async fn non_stream_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
     priority: RequestPriority,
+    header_session_id: Option<String>,
     budget_override: ReasoningBudgetOverride,
     structured: Option<
         std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
@@ -375,6 +433,7 @@ async fn non_stream_chat_completion(
     let prompt_cache_ctx = build_prompt_cache_request_context(
         &state,
         &request,
+        header_session_id.as_deref(),
         &prepared.image_data,
         &prepared.audio_data,
     );
@@ -525,6 +584,7 @@ async fn stream_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
     priority: RequestPriority,
+    header_session_id: Option<String>,
     budget_override: ReasoningBudgetOverride,
     structured: Option<
         std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
@@ -560,6 +620,7 @@ async fn stream_chat_completion(
     let prompt_cache_ctx = build_prompt_cache_request_context(
         &state,
         &request,
+        header_session_id.as_deref(),
         &prepared.image_data,
         &prepared.audio_data,
     );
@@ -1082,6 +1143,83 @@ pub(crate) fn build_generate_options(
             thinking_enter_block_on_start: false,
         },
     )
+}
+
+#[cfg(test)]
+mod session_header_tests {
+    use super::parse_session_header;
+    use axum::http::HeaderMap;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn reads_x_session_id() {
+        let h = headers(&[("x-session-id", "sess-abc")]);
+        assert_eq!(parse_session_header(&h).as_deref(), Some("sess-abc"));
+    }
+
+    #[test]
+    fn header_lookup_is_case_insensitive() {
+        // Clients send `X-Session-Id`; HeaderMap normalizes. If this ever
+        // stopped holding, every real request would silently miss the header
+        // and land on the anonymous bucket with nothing to say so.
+        let h = headers(&[("X-Session-Id", "sess-abc")]);
+        assert_eq!(parse_session_header(&h).as_deref(), Some("sess-abc"));
+    }
+
+    #[test]
+    fn falls_back_to_x_session_affinity() {
+        let h = headers(&[("x-session-affinity", "sess-xyz")]);
+        assert_eq!(parse_session_header(&h).as_deref(), Some("sess-xyz"));
+    }
+
+    #[test]
+    fn x_session_id_wins_when_both_present() {
+        // opencode sends both with the SAME value, so this ordering is
+        // normally unobservable. Pinning it means a future divergence between
+        // the two headers resolves deterministically instead of by map order.
+        let h = headers(&[
+            ("x-session-id", "from-id"),
+            ("x-session-affinity", "from-affinity"),
+        ]);
+        assert_eq!(parse_session_header(&h).as_deref(), Some("from-id"));
+    }
+
+    #[test]
+    fn absent_headers_yield_none() {
+        assert_eq!(parse_session_header(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn blank_and_whitespace_values_are_absent_not_a_shared_bucket() {
+        // The failure this prevents is not a crash. A proxy that inserts the
+        // header with an empty value would otherwise give EVERY such request
+        // the same non-anonymous session key — silently fusing unrelated
+        // conversations into one cache bucket, and later into one GC delete.
+        for blank in ["", "   ", "\t"] {
+            let h = headers(&[("x-session-id", blank)]);
+            assert_eq!(
+                parse_session_header(&h),
+                None,
+                "blank value {blank:?} must not become a session key"
+            );
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed() {
+        let h = headers(&[("x-session-id", "  sess-abc  ")]);
+        assert_eq!(parse_session_header(&h).as_deref(), Some("sess-abc"));
+    }
 }
 
 #[cfg(test)]

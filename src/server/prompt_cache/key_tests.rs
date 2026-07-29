@@ -151,40 +151,98 @@ fn token_order_matters() {
 
 #[test]
 fn resolve_session_key_prefers_prompt_cache_key() {
-    let got = resolve_session_key(Some("pck"), Some("user-1"));
-    assert_eq!(got, "pck");
+    let got = resolve_session_key(Some("pck"), Some("hdr"), Some("user-1"));
+    assert_eq!(got, ("pck", SessionKeySource::PromptCacheKey));
 }
 
 #[test]
 fn resolve_session_key_falls_back_to_user() {
-    let got = resolve_session_key(None, Some("user-1"));
-    assert_eq!(got, "user-1");
+    let got = resolve_session_key(None, None, Some("user-1"));
+    assert_eq!(got, ("user-1", SessionKeySource::User));
 }
 
 #[test]
 fn resolve_session_key_uses_anonymous_sentinel_when_both_absent() {
-    let got = resolve_session_key(None, None);
-    assert_eq!(got, ANONYMOUS_SESSION_SENTINEL);
+    let got = resolve_session_key(None, None, None);
+    assert_eq!(got, (ANONYMOUS_SESSION_SENTINEL, SessionKeySource::Anonymous));
     // The sentinel is non-empty so it distinguishes from a `None` session.
-    assert!(!got.is_empty());
+    assert!(!got.0.is_empty());
 }
 
 #[test]
 fn resolve_session_key_treats_empty_prompt_cache_key_as_absent() {
-    let got = resolve_session_key(Some(""), Some("user-1"));
-    assert_eq!(got, "user-1");
+    let got = resolve_session_key(Some(""), None, Some("user-1"));
+    assert_eq!(got, ("user-1", SessionKeySource::User));
 }
 
 #[test]
 fn resolve_session_key_treats_empty_user_as_absent() {
-    let got = resolve_session_key(None, Some(""));
-    assert_eq!(got, ANONYMOUS_SESSION_SENTINEL);
+    let got = resolve_session_key(None, None, Some(""));
+    assert_eq!(got, (ANONYMOUS_SESSION_SENTINEL, SessionKeySource::Anonymous));
 }
 
 #[test]
 fn resolve_session_key_all_empty_returns_sentinel() {
-    let got = resolve_session_key(Some(""), Some(""));
-    assert_eq!(got, ANONYMOUS_SESSION_SENTINEL);
+    let got = resolve_session_key(Some(""), Some(""), Some(""));
+    assert_eq!(got, (ANONYMOUS_SESSION_SENTINEL, SessionKeySource::Anonymous));
+}
+
+// --- the header channel -----------------------------------------------------
+
+#[test]
+fn resolve_session_key_uses_header_when_no_body_hint() {
+    // The case the whole change exists for: opencode sends X-Session-Id and
+    // nothing in the body. Before this channel existed, this landed on the
+    // anonymous sentinel, which is what the live probe observed.
+    let got = resolve_session_key(None, Some("sess-abc"), None);
+    assert_eq!(got, ("sess-abc", SessionKeySource::SessionHeader));
+}
+
+#[test]
+fn resolve_session_key_header_outranks_user() {
+    // `user` is an END-USER identifier and therefore COARSER than a
+    // conversation. If it won here, a per-conversation GC delete would remove
+    // every conversation that user ever cached. This ordering is the thing
+    // standing between compaction-scoped GC and a much larger blast radius.
+    let got = resolve_session_key(None, Some("sess-abc"), Some("user-1"));
+    assert_eq!(got, ("sess-abc", SessionKeySource::SessionHeader));
+}
+
+#[test]
+fn resolve_session_key_body_hint_outranks_header() {
+    // A client that sets `prompt_cache_key` is making a deliberate statement
+    // about caching, so it outranks the header we merely observe. This is also
+    // the row that makes header PRESENCE worth logging separately: here the
+    // header arrived and did not win, and the source alone cannot say so.
+    let got = resolve_session_key(Some("pck"), Some("sess-abc"), None);
+    assert_eq!(got, ("pck", SessionKeySource::PromptCacheKey));
+}
+
+#[test]
+fn resolve_session_key_treats_empty_header_as_absent() {
+    // A proxy that fills the header in with nothing must not create a bucket
+    // that every such request shares.
+    let got = resolve_session_key(None, Some(""), Some("user-1"));
+    assert_eq!(got, ("user-1", SessionKeySource::User));
+}
+
+#[test]
+fn session_key_source_names_are_stable_and_distinct() {
+    // These strings go into logs that a human reads to answer "did this client
+    // supply per-conversation identity". Two sources sharing a name would make
+    // the log unable to answer it.
+    let all = [
+        SessionKeySource::PromptCacheKey,
+        SessionKeySource::SessionHeader,
+        SessionKeySource::User,
+        SessionKeySource::Anonymous,
+    ];
+    let names: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+    let mut uniq = names.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    assert_eq!(uniq.len(), names.len(), "source names must be distinct");
+    assert!(names.iter().all(|n| !n.is_empty()));
 }
 
 // ---------------------------------------------------------------------------

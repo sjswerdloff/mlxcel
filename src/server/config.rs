@@ -79,6 +79,32 @@ pub struct PromptCacheRequestContext {
     /// the scheduler can compose a [`crate::server::prompt_cache::key::PromptCacheKey`]
     /// on demand without reaching back into the route layer.
     pub session_key: String,
+    /// Which channel `session_key` came from — body hint, request header,
+    /// `user`, or nothing at all.
+    ///
+    /// Carried purely so the scheduler can NAME it on the cache-decision log
+    /// line it already emits. Whether a given client supplies per-conversation
+    /// identity is a fact about that client, and inferring it from the outside
+    /// is how we get it wrong; this makes live traffic report it instead. It
+    /// takes no part in composing the cache key — two requests that resolve to
+    /// the same `session_key` through different channels are the same session.
+    pub session_source: crate::server::prompt_cache::key::SessionKeySource,
+    /// Whether an `X-Session-Id` / `x-session-affinity` header was present on
+    /// the request AT ALL, independently of whether it won.
+    ///
+    /// Recorded separately from [`Self::session_source`] because the source
+    /// alone cannot answer the question it looks like it answers. A request
+    /// whose header was stripped upstream and a request that never carried one
+    /// both resolve through the body and log an identical `session_source`;
+    /// only presence tells them apart. The row that closes the question is
+    /// `present = true` with a body-derived source — it proves the headers do
+    /// reach us and that the body simply outranks them.
+    ///
+    /// NOTE ON READING THIS FIELD: it is informative only over traffic that
+    /// actually occurs. If no client exercises the header path, there are no
+    /// rows, and NO ROWS IS NOT EVIDENCE OF ABSENCE — it is an un-run
+    /// instrument. Nothing here is wired to break the silence.
+    pub header_session_present: bool,
     /// Stable digest of the request's resolved multimodal payload (image +
     /// audio bytes), built by
     /// [`crate::server::prompt_cache::key::multimodal_digest`] over the

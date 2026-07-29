@@ -1803,6 +1803,17 @@ impl BatchScheduler {
             lora_id = ?ctx.lora_id,
             template_sig_short = %template_sig_short,
             session_key = %ctx.session_key,
+            // WHICH channel supplied `session_key`, and — separately — whether
+            // a session HEADER was on the request at all. Both are needed:
+            // `session_source=prompt_cache_key` alone cannot distinguish a
+            // request whose header was stripped upstream from one that never
+            // carried a header, and those are different worlds. The row that
+            // settles it is `header_session_present=true` with a body-derived
+            // source: headers demonstrably arrive, the body merely outranks
+            // them. Absence of any such row is an UN-RUN instrument, not
+            // evidence — nothing here is wired to break that silence.
+            session_source = %ctx.session_source.as_str(),
+            header_session_present = ctx.header_session_present,
             token_preview = ?token_preview,
             "prompt-cache: lookup attempt"
         );

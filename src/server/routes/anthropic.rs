@@ -60,6 +60,7 @@ use crate::server::types::anthropic_stream::{
 
 use super::chat::{
     MAX_TOOLS, build_generate_options, build_prompt_cache_request_context, parse_priority_header,
+    parse_session_header,
 };
 
 /// POST /v1/messages
@@ -112,6 +113,11 @@ pub async fn anthropic_messages(
 
     let include_thinking = thinking_enabled(&request);
     let priority = parse_priority_header(&headers);
+    // Headers are visible ONLY here — resolve the per-conversation identity
+    // now and carry it down as a value, exactly as `priority` does. opencode
+    // sends these headers on Anthropic-shaped endpoints too, so this path
+    // needs the channel every bit as much as the OpenAI-shaped one.
+    let header_session_id = parse_session_header(&headers);
 
     if request.stream {
         stream_messages(
@@ -119,6 +125,7 @@ pub async fn anthropic_messages(
             request,
             translated,
             priority,
+            header_session_id,
             budget_override,
             include_thinking,
         )
@@ -129,6 +136,7 @@ pub async fn anthropic_messages(
             request,
             translated,
             priority,
+            header_session_id,
             budget_override,
             include_thinking,
         )
@@ -141,6 +149,7 @@ async fn non_stream_messages(
     request: AnthropicRequest,
     translated: AnthropicTranslated,
     priority: crate::server::batch::RequestPriority,
+    header_session_id: Option<String>,
     budget_override: ReasoningBudgetOverride,
     include_thinking: bool,
 ) -> Response {
@@ -174,6 +183,7 @@ async fn non_stream_messages(
     options.prompt_cache_ctx = build_anthropic_prompt_cache_request_context(
         &state,
         &translated.chat_request,
+        header_session_id.as_deref(),
         &prepared.image_data,
         &prepared.audio_data,
     );
@@ -259,6 +269,7 @@ async fn stream_messages(
     request: AnthropicRequest,
     translated: AnthropicTranslated,
     priority: crate::server::batch::RequestPriority,
+    header_session_id: Option<String>,
     budget_override: ReasoningBudgetOverride,
     include_thinking: bool,
 ) -> Response {
@@ -289,6 +300,7 @@ async fn stream_messages(
     options.prompt_cache_ctx = build_anthropic_prompt_cache_request_context(
         &state,
         &translated.chat_request,
+        header_session_id.as_deref(),
         &prepared.image_data,
         &prepared.audio_data,
     );
@@ -559,10 +571,17 @@ fn translate_request(state: &AppState, request: &AnthropicRequest) -> AnthropicT
 fn build_anthropic_prompt_cache_request_context(
     state: &AppState,
     request: &crate::server::types::ChatCompletionRequest,
+    header_session_id: Option<&str>,
     image_data: &[Vec<u8>],
     audio_data: &[Vec<u8>],
 ) -> Option<crate::server::config::PromptCacheRequestContext> {
-    let mut context = build_prompt_cache_request_context(state, request, image_data, audio_data)?;
+    let mut context = build_prompt_cache_request_context(
+        state,
+        request,
+        header_session_id,
+        image_data,
+        audio_data,
+    )?;
     context.template_sig = state
         .config
         .claude_code_prompt_normalization

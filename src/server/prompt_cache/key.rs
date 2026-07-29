@@ -395,33 +395,83 @@ fn write_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 /// this same sentinel upstream (see [`resolve_session_key`]).
 pub const ANONYMOUS_SESSION_SENTINEL: &str = "__mlxcel_anon__";
 
-/// Resolve the cache-key `session_key` from the OpenAI-compatible request
-/// hints.
+/// Which channel supplied the value returned by [`resolve_session_key`].
+///
+/// Exists to be LOGGED. Whether a given client hands us a per-conversation
+/// identity is a question about that client's internals, and reasoning about
+/// those from the outside is how we get it wrong. Emitting the channel we
+/// actually resolved turns it into an observation of live traffic instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKeySource {
+    /// `prompt_cache_key` in the request body.
+    PromptCacheKey,
+    /// `X-Session-Id` / `x-session-affinity` request header.
+    SessionHeader,
+    /// OpenAI-standard `user` field in the request body.
+    User,
+    /// Nothing usable was supplied; [`ANONYMOUS_SESSION_SENTINEL`] was used.
+    Anonymous,
+}
+
+impl SessionKeySource {
+    /// Stable lowercase name for structured logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PromptCacheKey => "prompt_cache_key",
+            Self::SessionHeader => "session_header",
+            Self::User => "user",
+            Self::Anonymous => "anonymous",
+        }
+    }
+}
+
+/// Resolve the cache-key `session_key` from the per-request identity hints,
+/// reporting which channel it came from.
 ///
 /// Precedence (first non-empty wins):
-///   1. `prompt_cache_key` — explicit client hint (addition).
-///   2. `user` — OpenAI-standard stable end-user identifier.
-///   3. [`ANONYMOUS_SESSION_SENTINEL`] — shared fallback bucket.
+///   1. `prompt_cache_key` — explicit body hint; a client that sets this is
+///      making a deliberate statement about caching, so it outranks anything
+///      inferred.
+///   2. `header_session_id` — `X-Session-Id` / `x-session-affinity`. This is
+///      the CONVERSATION granularity, which is what compaction-scoped GC
+///      needs: deleting one conversation's manifests must not touch another's.
+///   3. `user` — OpenAI-standard stable END-USER identifier, deliberately
+///      last. It is COARSER than a conversation: bucketing by it would make a
+///      per-conversation delete remove every conversation that user ever
+///      cached. It stays a fallback precisely because it is the wrong
+///      granularity for the GC that consumes this value.
+///   4. [`ANONYMOUS_SESSION_SENTINEL`] — shared fallback bucket.
 ///
-/// Empty strings in either input are treated as "not supplied" so a caller
+/// Empty strings in any input are treated as "not supplied" so a caller
 /// cannot accidentally collide everyone into an empty-string bucket and the
 /// anonymous sentinel is used instead. The returned string is borrowed from
 /// the inputs when possible; only the sentinel path yields a `&'static str`.
+///
+/// Taking all three as REQUIRED arguments is deliberate: a two-argument form
+/// kept beside this one would let a call site silently omit the header
+/// channel and land real traffic on the anonymous bucket with nothing to
+/// notice it. The compiler refusing to build is the check.
 pub fn resolve_session_key<'a>(
     prompt_cache_key: Option<&'a str>,
+    header_session_id: Option<&'a str>,
     user: Option<&'a str>,
-) -> &'a str {
+) -> (&'a str, SessionKeySource) {
     if let Some(k) = prompt_cache_key
         && !k.is_empty()
     {
-        return k;
+        return (k, SessionKeySource::PromptCacheKey);
+    }
+    if let Some(h) = header_session_id
+        && !h.is_empty()
+    {
+        return (h, SessionKeySource::SessionHeader);
     }
     if let Some(u) = user
         && !u.is_empty()
     {
-        return u;
+        return (u, SessionKeySource::User);
     }
-    ANONYMOUS_SESSION_SENTINEL
+    (ANONYMOUS_SESSION_SENTINEL, SessionKeySource::Anonymous)
 }
 
 // ---------------------------------------------------------------------------

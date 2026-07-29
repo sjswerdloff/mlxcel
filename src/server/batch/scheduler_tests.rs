@@ -938,6 +938,8 @@ fn compose_prompt_cache_key_folds_request_multimodal_digest() {
         lora_id: None,
         template_sig: "tpl".to_string(),
         session_key: "sess".to_string(),
+        session_source: crate::server::prompt_cache::key::SessionKeySource::PromptCacheKey,
+        header_session_present: false,
         mm_digest: MultimodalDigest::empty(),
     };
     let image_a = PromptCacheRequestContext {

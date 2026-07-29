@@ -1185,7 +1185,10 @@ fn deserialize_request_with_both_prompt_cache_key_and_user() {
 
     // Session-key composition uses prompt_cache_key first.
     use crate::server::prompt_cache::key::resolve_session_key;
-    let session = resolve_session_key(req.resolve_prompt_cache_key(), req.resolve_user());
+    // `None` for the header channel: these cases cover what the REQUEST BODY
+    // alone resolves to. The header channel has its own tests in `key_tests`.
+    let (session, _source) =
+        resolve_session_key(req.resolve_prompt_cache_key(), None, req.resolve_user());
     assert_eq!(session, "pck-abc");
 }
 
@@ -1245,7 +1248,10 @@ fn empty_prompt_cache_key_falls_back_to_user() {
     assert_eq!(req.resolve_prompt_cache_key(), None);
     assert_eq!(req.resolve_user(), Some("user-fallback"));
     use crate::server::prompt_cache::key::resolve_session_key;
-    let session = resolve_session_key(req.resolve_prompt_cache_key(), req.resolve_user());
+    // `None` for the header channel: these cases cover what the REQUEST BODY
+    // alone resolves to. The header channel has its own tests in `key_tests`.
+    let (session, _source) =
+        resolve_session_key(req.resolve_prompt_cache_key(), None, req.resolve_user());
     assert_eq!(session, "user-fallback");
 }
 
@@ -1259,7 +1265,10 @@ fn session_key_collapses_to_anonymous_sentinel_without_hints() {
     assert_eq!(req.resolve_prompt_cache_key(), None);
     assert_eq!(req.resolve_user(), None);
     use crate::server::prompt_cache::key::{ANONYMOUS_SESSION_SENTINEL, resolve_session_key};
-    let session = resolve_session_key(req.resolve_prompt_cache_key(), req.resolve_user());
+    // `None` for the header channel: these cases cover what the REQUEST BODY
+    // alone resolves to. The header channel has its own tests in `key_tests`.
+    let (session, _source) =
+        resolve_session_key(req.resolve_prompt_cache_key(), None, req.resolve_user());
     assert_eq!(session, ANONYMOUS_SESSION_SENTINEL);
 }
 

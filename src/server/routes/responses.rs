@@ -60,6 +60,7 @@ use crate::server::types::responses_stream::ResponseStreamEvent;
 
 use super::chat::{
     build_generate_options, build_prompt_cache_request_context, parse_priority_header,
+    parse_session_header,
 };
 
 /// POST /v1/responses
@@ -128,6 +129,9 @@ pub async fn create_response(
     };
 
     let priority = parse_priority_header(&headers);
+    // Headers are visible ONLY here — resolve the per-conversation identity
+    // now and carry it down as a value, exactly as `priority` does.
+    let header_session_id = parse_session_header(&headers);
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let created_at = chrono::Utc::now().timestamp() as f64;
 
@@ -139,6 +143,7 @@ pub async fn create_response(
             response_id,
             created_at,
             priority,
+            header_session_id,
             budget_override,
             structured,
         )
@@ -151,6 +156,7 @@ pub async fn create_response(
             response_id,
             created_at,
             priority,
+            header_session_id,
             budget_override,
             structured,
         )
@@ -166,6 +172,7 @@ async fn non_stream_create_response(
     response_id: String,
     created_at: f64,
     priority: crate::server::batch::RequestPriority,
+    header_session_id: Option<String>,
     budget_override: ReasoningBudgetOverride,
     structured: Option<
         std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
@@ -203,6 +210,7 @@ async fn non_stream_create_response(
     options.prompt_cache_ctx = build_prompt_cache_request_context(
         &state,
         &translated.chat_request,
+        header_session_id.as_deref(),
         &prepared.image_data,
         &prepared.audio_data,
     );
@@ -274,6 +282,7 @@ async fn stream_create_response(
     response_id: String,
     created_at: f64,
     priority: crate::server::batch::RequestPriority,
+    header_session_id: Option<String>,
     budget_override: ReasoningBudgetOverride,
     structured: Option<
         std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
@@ -308,6 +317,7 @@ async fn stream_create_response(
     options.prompt_cache_ctx = build_prompt_cache_request_context(
         &state,
         &translated.chat_request,
+        header_session_id.as_deref(),
         &prepared.image_data,
         &prepared.audio_data,
     );

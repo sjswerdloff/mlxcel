@@ -235,7 +235,16 @@ pub(crate) async fn prepare_chat_request_with_cache(
 fn maybe_log_defaulting_once(request: &ChatCompletionRequest) {
     let pck = request.resolve_prompt_cache_key();
     let user = request.resolve_user();
-    let session = resolve_session_key(pck, user).to_string();
+    // No header channel here BY CONSTRUCTION: this runs deep in request
+    // preparation, which never sees the HTTP headers. The consequence is
+    // bounded and stated rather than left to be rediscovered — sessions
+    // identified ONLY by `X-Session-Id` all share the anonymous DEDUP bucket,
+    // so this informational line fires once for all of them instead of once
+    // each. It is a log-frequency effect, not a cache-identity one: the cache
+    // key itself is resolved in the route layer, where the headers ARE
+    // visible, and is unaffected by anything decided here.
+    let (session, _source) = resolve_session_key(pck, None, user);
+    let session = session.to_string();
     let Ok(mut set) = log_once_sessions().lock() else {
         return;
     };
