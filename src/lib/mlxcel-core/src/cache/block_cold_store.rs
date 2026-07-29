@@ -1065,6 +1065,20 @@ impl BlockColdStore {
                     .into(),
             ));
         }
+        // KNOWN WEAKNESS, stated rather than glossed. An empty key is refused
+        // here, but a SHARED-BUCKET SENTINEL — the server's anonymous
+        // session marker — has the identical hazard and can only be recognised
+        // by the caller, because this crate does not and should not know the
+        // server's key vocabulary. Today `scheduler.rs` excludes it before
+        // calling.
+        //
+        // So the answer to "what must someone still remember?" is: to exclude
+        // shared-bucket identities at the call site. That is a rule, not a
+        // structure, and rules are what get forgotten. If a second caller
+        // appears, the right fix is a caller-side type that can only be
+        // constructed from a real conversation identity — not a copy of the
+        // sentinel string down here, which would be a second source free to
+        // drift from the first.
         let key_digest = Self::session_key_digest(session_key);
         let path = self.session_index_path(session_key);
         fs::create_dir_all(self.sessions_dir())?;

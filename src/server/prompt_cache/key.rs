@@ -474,6 +474,56 @@ pub fn resolve_session_key<'a>(
     (ANONYMOUS_SESSION_SENTINEL, SessionKeySource::Anonymous)
 }
 
+/// A resolved session key that is GC-SCOPED: it names one conversation, so an
+/// association recorded under it can later be released as a unit.
+///
+/// The private field is the point. It cannot be constructed except through
+/// [`recordable_session_key`], so a caller cannot hand a SHARED-BUCKET
+/// identity to the association recorder by forgetting a check. The shared
+/// bucket is the hazard: every caller without a session key resolves to
+/// [`ANONYMOUS_SESSION_SENTINEL`], so recording under it would build ONE index
+/// entry fusing unrelated callers, and releasing "that session" would drop all
+/// of them.
+///
+/// NAMED FOR WHAT IT IS. This is not a capability and not proof of "real
+/// identity" — `prompt_cache_key` and `user` are client-controlled namespace
+/// hints and remain so. It prevents shared-bucket RECORDING. It authenticates
+/// nothing, and closure authority is a separate prerequisite that does not
+/// exist yet. (Alden, 2026-07-29.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordableSessionKey<'a>(&'a str);
+
+impl<'a> RecordableSessionKey<'a> {
+    /// The underlying key. Deliberately the only accessor, and deliberately
+    /// not `Deref` — reaching the raw string should look like a decision.
+    pub fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
+/// Classify a RESOLVED session key as recordable, or not.
+///
+/// Returns `None` for the anonymous sentinel and for empty input. Both are
+/// shared buckets rather than conversations, and neither can ever be a unit of
+/// release: no event proves "that anonymous session is dead", because there is
+/// no such session.
+///
+/// A caller that explicitly sends the literal sentinel as its own
+/// `prompt_cache_key` is observationally identical to fallback-anonymous once
+/// resolved, so it is treated as anonymous too. That is the conservative
+/// direction — it declines to record rather than creating release authority
+/// over a bucket others share.
+///
+/// Lives BESIDE the resolver on purpose: the sentinel vocabulary belongs to
+/// this module, and copying it into `mlxcel-core` would create a second source
+/// free to drift from this one.
+pub fn recordable_session_key(resolved: &str) -> Option<RecordableSessionKey<'_>> {
+    if resolved.is_empty() || resolved == ANONYMOUS_SESSION_SENTINEL {
+        return None;
+    }
+    Some(RecordableSessionKey(resolved))
+}
+
 // ---------------------------------------------------------------------------
 // Template signature
 // ---------------------------------------------------------------------------

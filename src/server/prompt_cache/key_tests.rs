@@ -226,6 +226,79 @@ fn resolve_session_key_treats_empty_header_as_absent() {
     assert_eq!(got, ("user-1", SessionKeySource::User));
 }
 
+// --- recordable (GC-scoped) classification ----------------------------------
+
+#[test]
+fn an_ordinary_scoped_key_is_recordable() {
+    let got = recordable_session_key("sess-abc").map(|r| r.as_str());
+    assert_eq!(got, Some("sess-abc"));
+}
+
+#[test]
+fn the_anonymous_sentinel_is_not_recordable() {
+    // The shared bucket. Recording under it would fuse unrelated callers into
+    // one index entry, and releasing "that session" would drop all of them.
+    assert!(recordable_session_key(ANONYMOUS_SESSION_SENTINEL).is_none());
+}
+
+#[test]
+fn an_explicit_client_supplied_sentinel_is_also_not_recordable() {
+    // A client may send the literal sentinel as its own prompt_cache_key. Once
+    // resolved it is observationally identical to fallback-anonymous, so it
+    // gets the conservative treatment: decline to record rather than create
+    // release authority over a bucket other callers share.
+    let (resolved, _) = resolve_session_key(Some(ANONYMOUS_SESSION_SENTINEL), None, None);
+    assert!(recordable_session_key(resolved).is_none());
+}
+
+#[test]
+fn an_empty_key_is_not_recordable() {
+    assert!(recordable_session_key("").is_none());
+}
+
+#[test]
+fn a_near_match_to_the_sentinel_is_recordable() {
+    // The classifier must match the sentinel EXACTLY. A prefix or contains
+    // test would silently swallow real conversations whose keys happen to
+    // begin with it — declining to record is safe for the sentinel and is
+    // silent DATA LOSS of releasability for everyone else.
+    for near in [
+        "__mlxcel_anon___",
+        "__mlxcel_anon",
+        "__mlxcel_anon__x",
+        "x__mlxcel_anon__",
+        " __mlxcel_anon__",
+    ] {
+        assert_eq!(
+            recordable_session_key(near).map(|r| r.as_str()),
+            Some(near),
+            "{near:?} is NOT the sentinel and must remain recordable"
+        );
+    }
+}
+
+#[test]
+fn resolved_keys_from_every_real_channel_are_recordable() {
+    // Whichever channel supplied it, a real conversation identity must be
+    // recordable — otherwise the association index silently covers only some
+    // of the traffic it claims to cover.
+    for (pck, hdr, user) in [
+        (Some("pck-1"), None, None),
+        (None, Some("hdr-1"), None),
+        (None, None, Some("user-1")),
+    ] {
+        let (resolved, source) = resolve_session_key(pck, hdr, user);
+        assert!(
+            recordable_session_key(resolved).is_some(),
+            "a key resolved from {source:?} must be recordable"
+        );
+    }
+    // ...and the anonymous fallback must not be.
+    let (resolved, source) = resolve_session_key(None, None, None);
+    assert_eq!(source, SessionKeySource::Anonymous);
+    assert!(recordable_session_key(resolved).is_none());
+}
+
 #[test]
 fn session_key_source_names_are_stable_and_distinct() {
     // These strings go into logs that a human reads to answer "did this client

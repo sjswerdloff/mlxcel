@@ -2728,7 +2728,60 @@ impl BatchScheduler {
                 let persisted = if let Some(bs) = &self.block_cold_store {
                     let plan = self.kv_layer_plan();
                     bs.persist(&ctx.model_id, &ctx.template_sig, &tokens, dense, &plan)
-                        .map(|_| ())
+                        .map(|manifest| {
+                            // Record the session ASSOCIATION, after the
+                            // manifest is committed. Order matters: the crash
+                            // window then leaks an unassociated manifest rather
+                            // than leaving an association pointing at nothing.
+                            //
+                            // ANONYMOUS TRAFFIC IS DELIBERATELY NOT RECORDED.
+                            // The sentinel is a SHARED bucket by construction —
+                            // every caller without a session key lands on it —
+                            // so it names no conversation and can never be a
+                            // unit of release. Recording it would build one
+                            // index entry fusing unrelated callers, and a
+                            // cleanup for "that session" would drop all of
+                            // them.
+                            //
+                            // The exclusion is a TYPE, not a check here:
+                            // `recordable_session_key` returns `None` for
+                            // shared buckets and its result cannot be
+                            // constructed any other way, so a future caller
+                            // cannot reach the recorder by forgetting an `if`.
+                            //
+                            // CAUTION FOR WHOEVER WRITES CLEANUP: not recorded
+                            // does NOT mean collectable. A manifest named by no
+                            // association is UNMANAGED — anonymous, or an index
+                            // write that failed — and must be retained. Only a
+                            // manifest positively named by a CLOSED-generation
+                            // association and by no open one may be released.
+                            // Treating absence of evidence as release authority
+                            // would delete exactly the manifests whose
+                            // bookkeeping failed. (Alden, 2026-07-29.)
+                            if let Some(recordable) =
+                                crate::server::prompt_cache::key::recordable_session_key(
+                                    &ctx.session_key,
+                                )
+                            {
+                                if let Err(e) = bs
+                                    .record_session_manifest(recordable.as_str(), &manifest.hash())
+                                {
+                                    // NON-FATAL and loud. A missing association
+                                    // means this manifest is never
+                                    // session-released — it leaks. That costs
+                                    // disk and loses nothing, so it must not
+                                    // fail a request that has already
+                                    // successfully persisted its cache.
+                                    tracing::warn!(
+                                        session_key = %ctx.session_key,
+                                        error = %e,
+                                        "cold-store: manifest persisted but its session \
+                                         association was NOT recorded — this manifest \
+                                         will leak rather than be released on compaction"
+                                    );
+                                }
+                            }
+                        })
                 } else if let Some(cs) = &self.cold_store {
                     cs.persist(&ctx.model_id, &ctx.template_sig, &tokens, dense)
                 } else {

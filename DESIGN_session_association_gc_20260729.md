@@ -155,6 +155,51 @@ observe-only. Accumulation is the correct safe failure.**
 
 ---
 
+## UNASSOCIATED IS NOT RELEASABLE — three states, not two
+
+**The single most dangerous simplification available here.** Cleanup must
+distinguish:
+
+- **LIVE** — named by an open-generation association.
+- **RELEASABLE** — positively named by a CLOSED-generation association, and by
+  no open or non-releasable one.
+- **UNMANAGED / UNKNOWN** — named by no association at all. **Retain. Leak.**
+
+If cleanup treats "not in the live association set" as sufficient to delete, it
+deletes from *absence of evidence* — and the things missing from that set are
+exactly anonymous traffic and **manifests whose index write failed**. That
+directly contradicts the "a missing index write leaks only" guarantee this
+design rests on: the failure would stop being a leak and start being data loss,
+in precisely the case where bookkeeping already went wrong.
+
+Release requires a POSITIVE closed-generation naming. Nothing weaker.
+
+### The dedup case the call-site exclusion does not cover
+
+1. scoped session A records manifest M;
+2. anonymous traffic later persists the same content-addressed M, recording
+   nothing;
+3. A closes;
+4. cleanup sees only A's closed association and deletes M — which anonymous
+   traffic was still using.
+
+Under compaction-only authority, anonymous traffic supplied no death proof, so
+it cannot have consented to that deletion. Three conservative options, none of
+them yet chosen:
+
+- **do not persist anonymous traffic into v4 at all** (Alden's preference,
+  unless anonymous durability has measured value — it avoids permanent pins and
+  keeps compaction GC's authority exact; anonymous may still LOAD an existing
+  manifest under the read lease, it just creates no future-liveness claim);
+- record an explicit NON-RELEASABLE / unscoped pin for M;
+- define and separately authorize a general cache-eviction policy that may
+  evict anonymous artifacts.
+
+**This is a policy decision with cache-hit-rate consequences, so it is
+Stuart's, not mine.** How much of real traffic resolves to anonymous is
+measurable from the `session_source` / `header_session_present` fields now on
+the lookup log — measure before choosing.
+
 ## The cleanup protocol, when preconditions are met
 
 One forward authoritative scan per pass. No authoritative reverse index — a
