@@ -5501,3 +5501,175 @@ fn the_honest_plan_is_accepted_for_the_same_fixture_the_matrix_rejects() {
         "an accepted persist must actually write blocks"
     );
 }
+
+// ============================================================================
+// A-PRIORI FLOOR — the gate that stops before payload
+// ============================================================================
+
+/// Returns one persisted layer payload file, or panics.
+///
+/// Scoped to `blocks/` on purpose: `manifests/` also holds `.bin` files, and
+/// corrupting a manifest exercises a DIFFERENT guard (decode / hash-vs-name),
+/// which would let the test below pass for the wrong reason.
+/// Takes the STORE, not a base path: `blocks_dir()` is the store's own
+/// accessor and the only authority on the layout. The first version of this
+/// helper hand-built `base/blocks`, which silently omitted the `V4_ROOT`
+/// component and failed on a store that had persisted perfectly well — a
+/// second source for one fact, drifting from the first on its first use.
+fn one_payload_file(store: &BlockColdStore) -> std::path::PathBuf {
+    let blocks = store.blocks_dir();
+    for block_dir in std::fs::read_dir(&blocks).expect("blocks dir must exist after persist") {
+        let block_dir = block_dir.expect("block dir entry");
+        if !block_dir.file_type().expect("file type").is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(block_dir.path()).expect("block contents") {
+            let p = f.expect("layer entry").path();
+            let is_layer = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("layer_") && n.ends_with(".bin"));
+            if is_layer {
+                return p;
+            }
+        }
+    }
+    panic!(
+        "no layer payload found under {} — ABORTING rather than corrupting an \
+         unknown file. This is a FAILURE, not a skip: the control below cannot run.",
+        blocks.display()
+    );
+}
+
+/// The floor must stop BEFORE any payload is read — proven by side effect.
+///
+/// A gate that merely *returns early* is indistinguishable from one that reads
+/// everything and discards it, if you only inspect the return value. So the
+/// payload itself is made into the instrument: one byte of one layer is
+/// flipped, which makes READING observable as a checksum error.
+///
+/// Then the SAME load runs twice against the SAME store, differing in exactly
+/// one argument:
+///
+///   floor = 0            -> payload IS read -> corruption bites  -> `Err`
+///   floor >= ceiling     -> payload NOT read -> corruption unseen -> `Ok(None)`
+///
+/// THE CONTROL IS LOAD-BEARING. Without the `floor = 0` arm, `Ok(None)` proves
+/// nothing — a store that had silently lost its data would return it too. The
+/// control establishes that the corrupted block is genuinely on the read path,
+/// so the gated call's silence means "not read" rather than "not there".
+///
+/// MUTATION: delete the `candidates.retain(..)` gate in
+/// `load_prefix_longer_than` and the second assertion goes RED with the same
+/// checksum error the control asserts. That is the bug this test exists for.
+///
+/// This is also, incidentally, the first test anywhere that asserts the
+/// per-layer checksum refusal fires at all — the control arm depends on it.
+#[test]
+fn floor_stops_before_reading_any_payload() {
+    const LAYERS: usize = 2;
+    const DEPTH: i32 = 2 * DEFAULT_BLOCK_SIZE as i32;
+
+    let set = fp16_set(LAYERS, DEPTH);
+    let tokens: Vec<i32> = (0..DEPTH).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
+    store
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
+        .expect("persist must succeed");
+
+    let plan = homog(LAYERS, KVCacheMode::Fp16, 0);
+
+    // ---- PRECONDITION, before any damage. Establishes that a candidate
+    // exists AND is loadable. Without this the control below is ambiguous:
+    // `Err(NoMatch)` is returned both by "read the corruption and refused"
+    // and by "there was never anything here", so a persist that silently did
+    // nothing would satisfy the control just as well as a working checksum.
+    let pristine = store
+        .load_prefix_longer_than("m3", "tmpl", &tokens, &plan, 0)
+        .expect("PRECONDITION: an undamaged store must load without error");
+    assert!(
+        pristine.is_some(),
+        "PRECONDITION FAILED: nothing loadable was persisted, so neither the \
+         control nor the gate assertion below tests what it claims"
+    );
+
+    let victim = one_payload_file(&store);
+    let mut bytes = std::fs::read(&victim).expect("read payload");
+    assert!(
+        !bytes.is_empty(),
+        "payload {} is empty; there is nothing to corrupt and the control \
+         would pass vacuously",
+        victim.display()
+    );
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    std::fs::write(&victim, &bytes).expect("write corrupted payload");
+
+    // ---- CONTROL: no floor, so the payload is read and the damage is hit.
+    // Meaningful only because the precondition above already showed this exact
+    // call returning `Ok(Some(..))` on the same store: the ONLY thing that
+    // changed is one flipped byte, so the flip is what moved it to `Err`.
+    let unfloored = store.load_prefix_longer_than("m3", "tmpl", &tokens, &plan, 0);
+    assert!(
+        unfloored.is_err(),
+        "CONTROL FAILED: with floor=0 the store must read the payload and \
+         refuse the corrupted block, but it returned {:?}. Either the \
+         per-layer checksum stopped checking or the corruption missed the \
+         read path — - either way the gate assertion below would be vacuous.",
+        unfloored.as_ref().map(|o| o.as_ref().map(|(_, m)| *m))
+    );
+
+    // ---- THE GATE: identical call, floor at the ceiling. Ties prefer memory,
+    // so a candidate that merely EQUALS what memory holds must not be loaded.
+    let floored = store.load_prefix_longer_than("m3", "tmpl", &tokens, &plan, tokens.len());
+    assert!(
+        matches!(floored, Ok(None)),
+        "floor >= ceiling must return Ok(None) WITHOUT reading payload, but \
+         got {:?}. An Err here means the corrupted block WAS read — the gate \
+         did not gate, and every warm multi-turn request is still paying a \
+         full prefix read it throws away.",
+        floored.as_ref().map(|o| o.as_ref().map(|(_, m)| *m))
+    );
+}
+
+/// A floor BELOW the ceiling must still load — the gate must not become a
+/// blanket refusal.
+///
+/// Companion to the test above and deliberately its opposite: that one proves
+/// the gate CAN stop, this proves it does not stop when it should not. A gate
+/// that always returned `Ok(None)` would satisfy the first test perfectly.
+#[test]
+fn floor_below_the_ceiling_still_loads() {
+    const LAYERS: usize = 2;
+    const DEPTH: i32 = 2 * DEFAULT_BLOCK_SIZE as i32;
+
+    let set = fp16_set(LAYERS, DEPTH);
+    let tokens: Vec<i32> = (0..DEPTH).collect();
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [9u8; 32]);
+    store
+        .persist("m3", "tmpl", &tokens, &set, &plan_of(&set))
+        .expect("persist must succeed");
+
+    let plan = homog(LAYERS, KVCacheMode::Fp16, 0);
+    let floor = tokens.len() - 1;
+
+    let loaded = store
+        .load_prefix_longer_than("m3", "tmpl", &tokens, &plan, floor)
+        .expect("a candidate above the floor must not error");
+
+    let (_, matched) = loaded.expect(
+        "a candidate whose match EXCEEDS the floor must be loaded; Ok(None) \
+         here means the gate refuses work it should do, silently costing \
+         every cold hit",
+    );
+    assert_eq!(
+        matched,
+        tokens.len(),
+        "the full prefix was persisted and the floor was below it, so the \
+         full prefix must come back"
+    );
+}

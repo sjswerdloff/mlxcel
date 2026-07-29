@@ -340,6 +340,12 @@ cold_probe_outcomes! {
     NotProbed,
     /// Probed, and genuinely nothing shares a prefix.
     NoMatch,
+    /// Candidates existed, but none could beat the in-memory match, so the
+    /// store stopped before reading any payload. Placed next to `NoMatch`
+    /// deliberately: this is the state it must never be collapsed into. An
+    /// absence and a deliberate non-load look identical on a console unless
+    /// they are kept apart here.
+    SkippedMemoryWins,
     /// A candidate was LOADED and then discarded (invalid layers, empty or
     /// unrepresentable stored length, alignment/min-prefix decline, truncation
     /// failure). NOT a miss.
@@ -1895,9 +1901,28 @@ impl BatchScheduler {
             }
         }
 
+        // WHAT MEMORY ALREADY HAS. Hoisted above the cold probe because it is
+        // now an INPUT to it, not just the other side of the comparison at the
+        // bottom. Same expression the winner-pick uses; computed once.
+        let mem_match_len = mem_candidate.as_ref().map(|(_, len)| *len).unwrap_or(0);
+
         // Always probe SSD too, even when in-memory found something.
         // The SSD may have a longer match from a previous conversation
         // that was persisted but evicted from the in-memory store.
+        //
+        // PROBE, YES — BUT DO NOT PAY FOR STATE WE CANNOT USE. The cold store
+        // scans manifests and compares block hashes to size its match, all of
+        // it metadata; only then does it read payload. Handing it
+        // `mem_match_len` as a floor lets it stop at that boundary when it
+        // cannot beat memory. Before this, a warm multi-turn conversation read
+        // its entire matched prefix off disk — every block, all 60 layers —
+        // and dropped it at `use_ssd` below, once per request, growing with
+        // conversation depth.
+        //
+        // The floor cannot cost us a hit: it is checked against the phase-one
+        // CEILING, and alignment, `min_prefix`, the validity checks and
+        // fail-closed fall-through can only shrink what comes back. If the
+        // ceiling cannot beat memory, the final length could not have either.
         let cold_identity_supported =
             ctx.mm_digest == MultimodalDigest::empty() && ctx.lora_id.is_none();
         let mut ssd_match_len = 0usize;
@@ -1925,16 +1950,40 @@ impl BatchScheduler {
             None
         } else if let Some(bs) = &self.block_cold_store {
             let plan = self.kv_layer_plan();
-            Some(bs.load_prefix(&ctx.model_id, &ctx.template_sig, tokens, &plan))
+            Some(bs.load_prefix_longer_than(
+                &ctx.model_id,
+                &ctx.template_sig,
+                tokens,
+                &plan,
+                mem_match_len,
+            ))
         } else {
+            // v3 has no floor: it is the legacy whole-entry path and is left
+            // exactly as it was. `.map(Some)` only lifts it into the shared
+            // shape so both arms match the same way below — v3 never yields
+            // `Ok(None)`.
             self.cold_store
                 .as_ref()
-                .map(|cs| cs.load_prefix(&ctx.model_id, &ctx.template_sig, tokens))
+                .map(|cs| cs.load_prefix(&ctx.model_id, &ctx.template_sig, tokens).map(Some))
         };
 
         if let Some(cold_load) = cold_result {
             match cold_load {
-                Ok((mut detached, raw_match_len)) => {
+                // GATED, NOT MISSED. Candidates existed; none could beat what
+                // memory already holds, so no payload was read. This gets its
+                // own line and its own outcome because the failure this file
+                // keeps repeating is several distinct causes sharing one
+                // console appearance — a silent decline read as a miss, a miss
+                // read as an absent store. `SkippedMemoryWins` must never
+                // license the dual-miss claim: memory HIT here.
+                Ok(None) => {
+                    tracing::info!(
+                        mem_match_len,
+                        "prompt-cache: SSD cold-store NOT LOADED — candidates exist but none beat the in-memory match; no payload read"
+                    );
+                    ssd_outcome = ColdProbeOutcome::SkippedMemoryWins;
+                }
+                Ok(Some((mut detached, raw_match_len))) => {
                     let stored_state_len = detached.seq_len();
                     if detached.num_layers() != self.model.num_layers()
                         || !detached.has_consistent_seq_len()
@@ -2059,7 +2108,9 @@ impl BatchScheduler {
 
         // Pick the winner based on match length.
         // Ties prefer memory (faster, no I/O needed).
-        let mem_match_len = mem_candidate.as_ref().map(|(_, len)| *len).unwrap_or(0);
+        // `mem_match_len` is hoisted above the cold probe — it is the floor
+        // handed to the store, and re-deriving it here would be a second
+        // source for one fact.
         let use_ssd = ssd_match_len > mem_match_len;
 
         if use_ssd {

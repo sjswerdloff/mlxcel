@@ -1831,6 +1831,56 @@ impl BlockColdStore {
         tokens: &[i32],
         plan: &[(super::KVCacheMode, u8)],
     ) -> Result<(DetachedCacheSet, usize), ColdStoreError> {
+        // Floor of 0 filters nothing: a candidate only reaches the list with
+        // `matched_blocks >= 1`, so its clamped match is always `> 0`. This is
+        // exactly the pre-floor behaviour and `Ok(None)` is unreachable here.
+        match self.load_prefix_longer_than(model_id, template_sig, tokens, plan, 0)? {
+            Some(hit) => Ok(hit),
+            None => Err(ColdStoreError::NoMatch),
+        }
+    }
+
+    /// `load_prefix`, but reads NO payload unless some candidate beats
+    /// `floor_tokens`.
+    ///
+    /// WHY THIS EXISTS. The scheduler probes both tiers and adopts the longer
+    /// match, so a cold-store candidate that cannot beat the in-memory match is
+    /// discarded — but `load_prefix` had already `assemble_blocks`'d it, which
+    /// reads every block of every layer off disk and materialises a full
+    /// `DetachedCacheSet`. On a warm multi-turn conversation, where memory
+    /// legitimately wins, that is the entire matched prefix read and thrown
+    /// away on every single request, growing with conversation depth.
+    ///
+    /// The match length needed to make that decision is already known without
+    /// touching a payload: it comes from comparing manifest block hashes
+    /// against `compute_block_hashes(tokens, ..)`. This splits the cheap half
+    /// from the expensive half and lets the caller stop in between.
+    ///
+    /// WHY THE GATE IS SAFE. `floor_tokens` is compared against the phase-one
+    /// CEILING. Everything downstream — alignment flooring, `min_prefix`, the
+    /// loaded-state validity checks, fail-closed fall-through to a shorter
+    /// candidate — can only ever REDUCE the length finally offered. So
+    /// `ceiling <= floor` implies `final <= floor`, and the caller's
+    /// `ssd > mem` test could not have selected this candidate anyway.
+    ///
+    /// Returns:
+    /// * `Ok(Some(..))` — a candidate beat the floor and was assembled.
+    /// * `Ok(None)`     — candidates existed, none could beat the floor.
+    ///                    **No payload was read.** Distinct from `NoMatch`
+    ///                    on purpose: "present but not worth loading" and
+    ///                    "absent" are different states and must not share
+    ///                    one appearance. Four causes wearing one console
+    ///                    signature is a mistake this file has already paid
+    ///                    for once.
+    /// * `Err(NoMatch)` — no candidate shares any prefix.
+    pub fn load_prefix_longer_than(
+        &self,
+        model_id: &str,
+        template_sig: &str,
+        tokens: &[i32],
+        plan: &[(super::KVCacheMode, u8)],
+        floor_tokens: usize,
+    ) -> Result<Option<(DetachedCacheSet, usize)>, ColdStoreError> {
         // READ side of the cache-computation identity — must mirror persist's
         // WRITE side exactly. Built once here so the symmetry is visible in
         // one place rather than inline at the hashing site.
@@ -1916,6 +1966,29 @@ impl BlockColdStore {
                 .then_with(|| b.0.timestamp_nanos.cmp(&a.0.timestamp_nanos))
         });
 
+        // ---- A-PRIORI GATE: everything above is metadata; everything below
+        // ---- reads payload. This is the only line between the two.
+        //
+        // Clamped exactly as the success path clamps (`matched_tokens.min(len)`),
+        // so the number compared here is the same number the caller would have
+        // received. Sorting stays on the RAW value so candidate ORDER is
+        // unchanged — clamping before the sort could re-order two candidates
+        // that clamp to the same value, silently changing which manifest is
+        // served.
+        //
+        // `had_candidates` keeps "present but outranked" distinguishable from
+        // "absent". Collapsing them would make this gate indistinguishable from
+        // a genuine miss on the console.
+        let had_candidates = !candidates.is_empty();
+        candidates.retain(|(_, matched)| matched.min(&tokens.len()) > &floor_tokens);
+        if candidates.is_empty() {
+            return if had_candidates {
+                Ok(None)
+            } else {
+                Err(ColdStoreError::NoMatch)
+            };
+        }
+
         // Try to load each candidate
         for (manifest, matched_tokens) in candidates {
             // `assemble_blocks` is fail-closed: what it returns is already
@@ -1944,7 +2017,7 @@ impl BlockColdStore {
                         matched_tokens = matched,
                         "COLD-STORE v4 SERVED from manifest"
                     );
-                    return Ok((cache_set, matched));
+                    return Ok(Some((cache_set, matched)));
                 }
                 Err(e) => {
                     tracing::warn!(

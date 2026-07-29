@@ -1378,11 +1378,16 @@ fn dual_miss_claim_requires_both_tiers_to_support_it() {
     // assertion is EXACT, not `>= 7`: a loose bound cannot detect an omission,
     // which is what let the previous version pass while missing a variant.
     let all = O::ALL;
-    assert_eq!(all.len(), 7, "variant count changed; update this table deliberately");
+    // 8 since 2026-07-29: `SkippedMemoryWins` was added when the cold store
+    // learned to stop before reading payload it cannot use. This assertion is
+    // the mechanism that made that addition deliberate rather than silent — it
+    // went red on the new variant and had to be answered, which is exactly what
+    // an exact count is for.
+    assert_eq!(all.len(), 8, "variant count changed; update this table deliberately");
 
     for mem_missed in [true, false] {
         for o in all.iter().copied() {
-            // The claim is licensed by EXACTLY ONE of the fourteen combinations.
+            // The claim is licensed by EXACTLY ONE of the sixteen combinations.
             let expected = mem_missed && o == O::NoMatch;
             assert_eq!(
                 ok(mem_missed, o), expected,
@@ -1399,5 +1404,16 @@ fn dual_miss_claim_requires_both_tiers_to_support_it() {
         !ok(true, O::LoadedDeclined),
         "DECLINED must never co-occur with the dual-miss claim — the SSD tier \
          had a candidate and threw it away, so 'nothing shares any prefix' is false"
+    );
+
+    // Same shape, new cause. The a-priori gate stops before reading payload,
+    // which makes it CHEAPER than a decline but no less of a candidate: the
+    // manifests are there and they share a prefix. If this ever licensed the
+    // aggregate, the console would report "nothing shares any prefix" about a
+    // store that had just been outranked, not emptied.
+    assert!(
+        !ok(true, O::SkippedMemoryWins),
+        "SKIPPED must never co-occur with the dual-miss claim — candidates \
+         existed and were outranked, so 'nothing shares any prefix' is false"
     );
 }
