@@ -911,8 +911,133 @@ impl BlockColdStore {
             .join(format!("{}.idx", hex_digest(&digest)))
     }
 
-    /// Record that `manifest_hash` was persisted under `session_key` during
-    /// compaction epoch `generation`.
+    fn session_registry_path(&self, session_key: &str) -> PathBuf {
+        let digest = Self::session_key_digest(session_key);
+        self.sessions_dir()
+            .join(format!("{}.gen", hex_digest(&digest)))
+    }
+
+    /// Read this session's registry, minting a fresh incarnation at generation
+    /// 0 if none exists.
+    ///
+    /// A missing registry yields a NEW incarnation rather than a reused
+    /// generation-0 namespace — absence cannot prove first-ever use, only that
+    /// state is not here now. A CORRUPT registry is an error and is never
+    /// replaced: overwriting it would discard the very cutoff that says which
+    /// generations may be cleaned, and manufacture a fresh-looking session on
+    /// top of associations whose lifetime we can no longer establish.
+    pub fn session_registry(&self, session_key: &str) -> Result<SessionRegistry, ColdStoreError> {
+        if session_key.is_empty() {
+            return Err(invalid_data(
+                "session_registry: empty session key".to_string(),
+            ));
+        }
+        let _guard = self.session_index_lock.lock().map_err(|_| {
+            invalid_data("session_registry: session index lock poisoned".into())
+        })?;
+        self.session_registry_locked(session_key)
+    }
+
+    /// [`Self::session_registry`] assuming the session index lock is ALREADY
+    /// held.
+    ///
+    /// Exists so that reading the current generation and writing the
+    /// association it belongs to happen under ONE hold. Doing them under two
+    /// sequential holds leaves a window in which a close advances the
+    /// generation between them, and the association then lands under a
+    /// generation already declared closed — immediately eligible for the
+    /// cleanup it should have been protected from.
+    ///
+    /// `std::sync::Mutex` is not reentrant, so this must never be called by a
+    /// path that has not already taken the lock, nor by one that will take it
+    /// again.
+    fn session_registry_locked(&self, session_key: &str) -> Result<SessionRegistry, ColdStoreError> {
+        let path = self.session_registry_path(session_key);
+        let key_digest = Self::session_key_digest(session_key);
+        if let Some(existing) = read_session_registry_file(&path, &key_digest)? {
+            return Ok(existing);
+        }
+        fs::create_dir_all(self.sessions_dir())?;
+        let fresh = SessionRegistry {
+            incarnation: mint_incarnation()?,
+            current_generation: 0,
+            closed_through: CLOSED_THROUGH_NONE,
+            last_event_id: [0u8; 32],
+        };
+        write_session_registry_file(&path, &key_digest, &fresh)?;
+        Ok(fresh)
+    }
+
+    /// Close the current generation: one atomic fence, no intermediate state.
+    ///
+    /// Advances `current_generation` to `expected + 1` and records
+    /// `closed_through = expected` in a single durable replacement, so every
+    /// crash lands somewhere unambiguous — before the rename the generation is
+    /// still open and the caller retries; after it, closure committed and
+    /// cleanup may simply lag.
+    ///
+    /// COMPARE-AND-SWAP, and it is the ONLY safety property here. `event_id`
+    /// gives an exact retry the same semantic result and lets an audit tell a
+    /// retry from an unrelated stale request; it does NOT make an
+    /// unauthenticated caller safe. Deciding WHO may call this is
+    /// authentication's job and happens strictly before this point — which is
+    /// why no endpoint exposes it yet.
+    pub fn close_current_generation(
+        &self,
+        session_key: &str,
+        expected_generation: u64,
+        event_id: [u8; 32],
+    ) -> Result<SessionRegistry, ColdStoreError> {
+        let path = self.session_registry_path(session_key);
+        let key_digest = Self::session_key_digest(session_key);
+        let _guard = self.session_index_lock.lock().map_err(|_| {
+            invalid_data("close_current_generation: session index lock poisoned".into())
+        })?;
+        let current: SessionRegistry = read_session_registry_file(&path, &key_digest)?
+            .ok_or_else(|| {
+            invalid_data(
+                "close_current_generation: no registry for this session. Refusing to \
+                 create one here — closing a generation that was never opened would \
+                 mint a cutoff authorizing cleanup of associations whose lifetime is \
+                 unknown."
+                    .to_string(),
+            )
+        })?;
+        if expected_generation != current.current_generation {
+            // Stale (already closed) and future (never opened) both mutate
+            // NOTHING. A normal request that merely disagrees about the
+            // generation must never be able to close one.
+            return Err(invalid_data(format!(
+                "close_current_generation: expected generation {} but current is {}. \
+                 No mutation, no deletion.",
+                expected_generation, current.current_generation
+            )));
+        }
+        let next = current.current_generation.checked_add(1).ok_or_else(|| {
+            invalid_data(
+                "close_current_generation: generation counter exhausted. Refusing to \
+                 wrap — wrapping to zero would reopen the oldest generations as if \
+                 current."
+                    .to_string(),
+            )
+        })?;
+        let updated = SessionRegistry {
+            incarnation: current.incarnation,
+            current_generation: next,
+            closed_through: expected_generation,
+            last_event_id: event_id,
+        };
+        write_session_registry_file(&path, &key_digest, &updated)?;
+        Ok(updated)
+    }
+
+    /// Record that `manifest_hash` was persisted under `session_key`.
+    ///
+    /// The incarnation and generation come from the SERVER's registry, never
+    /// from the caller. Accepting a caller-supplied generation would bake the
+    /// wrong authority boundary into the recording API — and it would do so
+    /// while cleanup is disabled, which is exactly when the mistake looks
+    /// harmless. (Alden, 2026-07-29.)
     ///
     /// This records an ASSOCIATION, not ownership. A manifest is
     /// content-addressed and therefore globally shared: two Kindled who send
@@ -931,8 +1056,7 @@ impl BlockColdStore {
         &self,
         session_key: &str,
         manifest_hash: &[u8; 32],
-        generation: u64,
-    ) -> Result<(), ColdStoreError> {
+    ) -> Result<SessionAssociation, ColdStoreError> {
         if session_key.is_empty() {
             return Err(invalid_data(
                 "record_session_manifest: empty session key. An empty key would \
@@ -945,12 +1069,19 @@ impl BlockColdStore {
         let path = self.session_index_path(session_key);
         fs::create_dir_all(self.sessions_dir())?;
 
-        // Serialize appends. Two requests on one session can persist
+        // ONE hold covering BOTH the generation read and the association
+        // write. Two sequential holds would leave a window in which a close
+        // advances the generation between them, landing this association under
+        // a generation already declared closed.
+        //
+        // It also serializes appends: two requests on one session can persist
         // concurrently, and read-modify-write on a shared file is where an
         // entry silently vanishes.
         let _guard = self.session_index_lock.lock().map_err(|_| {
             invalid_data("record_session_manifest: session index lock poisoned".into())
         })?;
+        let registry = self.session_registry_locked(session_key)?;
+        let generation = registry.current_generation;
 
         let mut existing = read_session_index_file(&path)?;
         if existing
@@ -967,11 +1098,12 @@ impl BlockColdStore {
             )));
         }
         let entry = SessionAssociation {
+            incarnation: registry.incarnation,
             manifest_hash: *manifest_hash,
             generation,
         };
         if existing.associations.contains(&entry) {
-            return Ok(());
+            return Ok(entry);
         }
         existing.associations.push(entry);
 
@@ -979,7 +1111,7 @@ impl BlockColdStore {
         let tmp = path.with_extension("idx.tmp");
         write_file(&tmp, &bytes)?;
         fs::rename(&tmp, &path)?;
-        Ok(())
+        Ok(entry)
     }
 
     /// Associations recorded under `session_key`, in the order recorded.
@@ -1014,15 +1146,32 @@ impl BlockColdStore {
     /// generation N must not reach manifests a NEW conversation persisted at
     /// N+1 under the same key. Identity proves who; only the generation proves
     /// when.
+    /// Manifest hashes associated with the CURRENT incarnation of
+    /// `session_key` at or before `through_generation`.
+    ///
+    /// Filters on incarnation as well as generation. An association carrying a
+    /// different incarnation belongs to a previous lifetime of this key — one
+    /// whose registry was lost — and must never be handed to a cleanup acting
+    /// for the current session. Those entries remain roots and leak, which is
+    /// the safe direction.
+    ///
+    /// Returns EMPTY when no registry exists, rather than minting one: asking
+    /// what is cleanable is a read, and a read must not create the state that
+    /// decides the answer.
     pub fn session_manifests_through(
         &self,
         session_key: &str,
         through_generation: u64,
     ) -> Result<Vec<[u8; 32]>, ColdStoreError> {
+        let path = self.session_registry_path(session_key);
+        let key_digest = Self::session_key_digest(session_key);
+        let Some(registry) = read_session_registry_file(&path, &key_digest)? else {
+            return Ok(Vec::new());
+        };
         Ok(self
             .session_associations(session_key)?
             .into_iter()
-            .filter(|a| a.generation <= through_generation)
+            .filter(|a| a.incarnation == registry.incarnation && a.generation <= through_generation)
             .map(|a| a.manifest_hash)
             .collect())
     }
@@ -3287,11 +3436,97 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 }
 
 const SESSION_INDEX_MAGIC: &[u8; 8] = b"MLXSIDX1";
-const SESSION_INDEX_VERSION: u32 = 1;
+/// v2 carries the incarnation on every association. v1 (generation only) is
+/// rejected rather than upgraded: it cannot say WHICH incarnation of a session
+/// key its entries belong to, and guessing would hand a recreated session
+/// authority over a lost one's manifests.
+const SESSION_INDEX_VERSION: u32 = 2;
 
-/// One association: a manifest, and the session generation that produced it.
+const SESSION_REGISTRY_MAGIC: &[u8; 8] = b"MLXSGEN1";
+const SESSION_REGISTRY_VERSION: u32 = 1;
+
+/// Sentinel for "no generation has been closed yet". Chosen at the top of the
+/// range so the ordinary comparison `generation <= closed_through` is false
+/// for every real generation without a special case at each call site.
+const CLOSED_THROUGH_NONE: u64 = u64::MAX;
+
+/// Server-minted nonce distinguishing one lifetime of a session key from
+/// another.
+///
+/// ABSENCE OF A REGISTRY FILE IS NOT PROOF OF FIRST-EVER USE — it can equally
+/// mean the state was lost or deleted. Reusing `(key_digest, generation 0)` in
+/// that case lets stale associations from the previous lifetime collide with
+/// the recreated session, and a cleanup for the new one would then claim
+/// authority over the old one's manifests. A fresh incarnation makes the two
+/// lifetimes different namespaces, so old associations remain roots that leak
+/// rather than data a new session may release. (Alden, 2026-07-29.)
+pub type IncarnationId = [u8; 16];
+
+/// Mint a fresh incarnation from OS entropy.
+///
+/// FAILS CLOSED. If entropy is unavailable this returns an error rather than
+/// falling back to something derived from time or a counter: a predictable or
+/// repeatable incarnation would silently reintroduce exactly the namespace
+/// collision the incarnation exists to prevent, and it would do so in the
+/// degraded case nobody is watching.
+fn mint_incarnation() -> Result<IncarnationId, ColdStoreError> {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    let mut f = fs::File::open("/dev/urandom").map_err(|e| {
+        invalid_data(format!(
+            "cannot open /dev/urandom to mint a session incarnation ({e}). \
+             Refusing to substitute a derived value: a predictable incarnation \
+             reintroduces the cross-lifetime collision it exists to prevent."
+        ))
+    })?;
+    f.read_exact(&mut buf).map_err(|e| {
+        invalid_data(format!(
+            "short read from /dev/urandom while minting a session incarnation ({e})."
+        ))
+    })?;
+    Ok(buf)
+}
+
+/// Durable per-session generation state.
+///
+/// THE STATE MACHINE IS NOT `OPEN -> CLOSING -> CLOSED`. Persisting an
+/// intermediate CLOSING state creates a crash case where a session is stuck
+/// non-open and BOTH automatic repairs guess at intent: rolling back reopens a
+/// generation the client believes dead, resuming completes a transition nobody
+/// re-authorized. Instead the current generation is ALWAYS open, and a
+/// monotonically advancing `closed_through` says which earlier generations are
+/// finished. Closure is then a single atomic replacement, and every crash
+/// lands in an unambiguous state. (Alden, 2026-07-29.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionRegistry {
+    pub incarnation: IncarnationId,
+    /// The generation new associations are recorded under. Always open.
+    pub current_generation: u64,
+    /// Highest generation known closed, or [`CLOSED_THROUGH_NONE`].
+    ///
+    /// Stored explicitly rather than inferred as `current_generation - 1` so
+    /// that "G is closed" and "G+1 is open" are one atomic image, and so the
+    /// cleanup authorization is inspectable rather than reconstructed.
+    pub closed_through: u64,
+    /// Event id of the last accepted close; all-zero when none.
+    pub last_event_id: [u8; 32],
+}
+
+impl SessionRegistry {
+    /// Whether `generation` is closed and therefore eligible as a cleanup
+    /// input.
+    pub fn is_closed(&self, generation: u64) -> bool {
+        self.closed_through != CLOSED_THROUGH_NONE && generation <= self.closed_through
+    }
+}
+
+/// One association: a manifest, and the session lifetime that produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionAssociation {
+    /// Which lifetime of this session key produced it. Without this, an
+    /// association surviving from a lost registry is indistinguishable from
+    /// one belonging to the recreated session that reused the same key.
+    pub incarnation: IncarnationId,
     pub manifest_hash: [u8; 32],
     /// Compaction epoch this association belongs to.
     ///
@@ -3340,7 +3575,7 @@ fn read_session_index_file(path: &Path) -> Result<SessionIndexFile, ColdStoreErr
         Err(e) => return Err(e.into()),
     };
     const HEADER: usize = 8 + 4 + 32 + 4;
-    const ENTRY: usize = 32 + 8;
+    const ENTRY: usize = 16 + 8 + 32;
     let malformed = |why: &str| {
         invalid_data(format!(
             "session index {} is malformed ({why}). Refusing to parse: a partial \
@@ -3379,11 +3614,13 @@ fn read_session_index_file(path: &Path) -> Result<SessionIndexFile, ColdStoreErr
     let mut associations = Vec::with_capacity(count);
     for i in 0..count {
         let off = HEADER + i * ENTRY;
+        let mut incarnation = [0u8; 16];
+        incarnation.copy_from_slice(&raw[off..off + 16]);
+        let generation = u64::from_le_bytes(raw[off + 16..off + 24].try_into().expect("8 bytes"));
         let mut manifest_hash = [0u8; 32];
-        manifest_hash.copy_from_slice(&raw[off..off + 32]);
-        let generation =
-            u64::from_le_bytes(raw[off + 32..off + 40].try_into().expect("8 bytes"));
+        manifest_hash.copy_from_slice(&raw[off + 24..off + 56]);
         associations.push(SessionAssociation {
+            incarnation,
             manifest_hash,
             generation,
         });
@@ -3394,16 +3631,96 @@ fn read_session_index_file(path: &Path) -> Result<SessionIndexFile, ColdStoreErr
     })
 }
 
+/// Read a session registry file, or `None` when it does not exist.
+///
+/// A file that exists but does not parse, or whose stored key digest does not
+/// match, is an ERROR and is never treated as absent. Absent means "mint a
+/// fresh incarnation"; if corruption took that path it would manufacture a
+/// clean-looking session on top of associations whose lifetime can no longer
+/// be established, and discard the cutoff that says which generations may be
+/// cleaned.
+fn read_session_registry_file(
+    path: &Path,
+    expect_key_digest: &[u8; 32],
+) -> Result<Option<SessionRegistry>, ColdStoreError> {
+    let raw = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    const LEN: usize = 8 + 4 + 32 + 16 + 8 + 8 + 32;
+    let bad = |why: &str| {
+        invalid_data(format!(
+            "session registry {} is unusable ({why}). Refusing to treat it as \
+             absent: minting a fresh incarnation here would discard the cutoff \
+             that authorizes cleanup and would look like a brand-new session.",
+            path.display()
+        ))
+    };
+    if raw.len() != LEN {
+        return Err(bad("wrong length"));
+    }
+    if &raw[0..8] != SESSION_REGISTRY_MAGIC {
+        return Err(bad("bad magic"));
+    }
+    let version = u32::from_le_bytes(raw[8..12].try_into().expect("4 bytes"));
+    if version != SESSION_REGISTRY_VERSION {
+        return Err(bad(&format!("unsupported version {version}")));
+    }
+    if &raw[12..44] != expect_key_digest.as_slice() {
+        return Err(bad("stored key digest does not match this session key"));
+    }
+    let mut incarnation = [0u8; 16];
+    incarnation.copy_from_slice(&raw[44..60]);
+    let current_generation = u64::from_le_bytes(raw[60..68].try_into().expect("8 bytes"));
+    let closed_through = u64::from_le_bytes(raw[68..76].try_into().expect("8 bytes"));
+    let mut last_event_id = [0u8; 32];
+    last_event_id.copy_from_slice(&raw[76..108]);
+    if closed_through != CLOSED_THROUGH_NONE && closed_through >= current_generation {
+        // The current generation is always OPEN by construction, so a cutoff
+        // that reaches it would authorize cleaning associations still being
+        // written.
+        return Err(bad("closed_through reaches the current (open) generation"));
+    }
+    Ok(Some(SessionRegistry {
+        incarnation,
+        current_generation,
+        closed_through,
+        last_event_id,
+    }))
+}
+
+/// Write a session registry file atomically.
+fn write_session_registry_file(
+    path: &Path,
+    key_digest: &[u8; 32],
+    reg: &SessionRegistry,
+) -> Result<(), ColdStoreError> {
+    let mut out = Vec::with_capacity(108);
+    out.extend_from_slice(SESSION_REGISTRY_MAGIC);
+    out.extend_from_slice(&SESSION_REGISTRY_VERSION.to_le_bytes());
+    out.extend_from_slice(key_digest);
+    out.extend_from_slice(&reg.incarnation);
+    out.extend_from_slice(&reg.current_generation.to_le_bytes());
+    out.extend_from_slice(&reg.closed_through.to_le_bytes());
+    out.extend_from_slice(&reg.last_event_id);
+    let tmp = path.with_extension("gen.tmp");
+    write_file(&tmp, &out)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Serialize a session index file.
 fn encode_session_index_file(key_digest: &[u8; 32], entries: &[SessionAssociation]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(48 + entries.len() * 40);
+    let mut out = Vec::with_capacity(48 + entries.len() * 56);
     out.extend_from_slice(SESSION_INDEX_MAGIC);
     out.extend_from_slice(&SESSION_INDEX_VERSION.to_le_bytes());
     out.extend_from_slice(key_digest);
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for e in entries {
-        out.extend_from_slice(&e.manifest_hash);
+        out.extend_from_slice(&e.incarnation);
         out.extend_from_slice(&e.generation.to_le_bytes());
+        out.extend_from_slice(&e.manifest_hash);
     }
     out
 }

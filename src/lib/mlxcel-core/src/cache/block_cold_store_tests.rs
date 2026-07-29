@@ -6047,8 +6047,8 @@ fn session_index_records_and_reads_back() {
     let (_dir, store) = empty_store();
     let a = [1u8; 32];
     let b = [2u8; 32];
-    store.record_session_manifest("sess-1", &a, 0).expect("record a");
-    store.record_session_manifest("sess-1", &b, 0).expect("record b");
+    store.record_session_manifest("sess-1", &a).expect("record a");
+    store.record_session_manifest("sess-1", &b).expect("record b");
     assert_eq!(store.session_manifests_through("sess-1", u64::MAX).expect("read"), vec![a, b]);
 }
 
@@ -6072,7 +6072,7 @@ fn recording_the_same_manifest_twice_is_idempotent() {
     let (_dir, store) = empty_store();
     let h = [3u8; 32];
     for _ in 0..5 {
-        store.record_session_manifest("sess-1", &h, 0).expect("record");
+        store.record_session_manifest("sess-1", &h).expect("record");
     }
     assert_eq!(store.session_manifests_through("sess-1", u64::MAX).expect("read"), vec![h]);
 }
@@ -6084,8 +6084,8 @@ fn sessions_are_isolated_from_each_other() {
     let (_dir, store) = empty_store();
     let mine = [4u8; 32];
     let theirs = [5u8; 32];
-    store.record_session_manifest("clement", &mine, 0).expect("a");
-    store.record_session_manifest("cora", &theirs, 0).expect("b");
+    store.record_session_manifest("clement", &mine).expect("a");
+    store.record_session_manifest("cora", &theirs).expect("b");
     assert_eq!(store.session_manifests_through("clement", u64::MAX).expect("r1"), vec![mine]);
     assert_eq!(store.session_manifests_through("cora", u64::MAX).expect("r2"), vec![theirs]);
 }
@@ -6097,8 +6097,8 @@ fn a_shared_manifest_is_listed_under_every_session_that_used_it() {
     // while the other still references it.
     let (_dir, store) = empty_store();
     let shared = [6u8; 32];
-    store.record_session_manifest("clement", &shared, 0).expect("a");
-    store.record_session_manifest("cora", &shared, 0).expect("b");
+    store.record_session_manifest("clement", &shared).expect("a");
+    store.record_session_manifest("cora", &shared).expect("b");
     assert_eq!(store.session_manifests_through("clement", u64::MAX).expect("r1"), vec![shared]);
     assert_eq!(store.session_manifests_through("cora", u64::MAX).expect("r2"), vec![shared]);
 }
@@ -6111,19 +6111,40 @@ fn session_keys_with_path_separators_do_not_escape_the_index_directory() {
     let (dir, store) = empty_store();
     let nasty = "../../../etc/passwd";
     let h = [8u8; 32];
-    store.record_session_manifest(nasty, &h, 0).expect("record");
+    store.record_session_manifest(nasty, &h).expect("record");
     assert_eq!(store.session_manifests_through(nasty, u64::MAX).expect("read"), vec![h]);
 
     let entries: Vec<_> = std::fs::read_dir(store.sessions_dir())
         .expect("sessions dir")
         .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
         .collect();
-    assert_eq!(entries.len(), 1, "exactly one index file: {entries:?}");
-    assert!(
-        entries[0].ends_with(".idx") && entries[0].len() == 68,
-        "filename must be a 64-char digest plus .idx, got {:?}",
-        entries[0]
-    );
+    // Assert the INVARIANT rather than a file count. The count changed
+    // legitimately when the registry file joined the index file, and a count
+    // assertion would break again for the next legitimate addition while
+    // saying nothing about path safety. What must hold is that EVERY name is
+    // the digest of this key — a traversal would show up as a name that is not.
+    assert!(!entries.is_empty(), "expected at least the index file");
+    let expected_stem = entries[0].split('.').next().expect("stem").to_string();
+    for name in &entries {
+        let (stem, ext) = name.rsplit_once('.').expect("name must have an extension");
+        assert_eq!(
+            stem.len(),
+            64,
+            "every session file must be named by a 64-char digest, got {name:?}"
+        );
+        assert!(
+            stem.chars().all(|c| c.is_ascii_hexdigit()),
+            "digest name must be hex, got {name:?}"
+        );
+        assert_eq!(
+            stem, expected_stem,
+            "all files for one key must share its digest, got {name:?}"
+        );
+        assert!(
+            matches!(ext, "idx" | "gen"),
+            "unexpected file type in the sessions dir: {name:?}"
+        );
+    }
     // And nothing was created above the store root.
     assert!(
         dir.path().join(V4_ROOT).join(SESSIONS_DIR).exists(),
@@ -6136,7 +6157,7 @@ fn unicode_and_whitespace_session_keys_round_trip() {
     let (_dir, store) = empty_store();
     for key in ["ключ сессии", "sess with spaces", "日本語-セッション", "a\tb"] {
         let h = [9u8; 32];
-        store.record_session_manifest(key, &h, 0).expect("record");
+        store.record_session_manifest(key, &h).expect("record");
         assert_eq!(
             store.session_manifests_through(key, u64::MAX).expect("read"),
             vec![h],
@@ -6151,7 +6172,7 @@ fn an_empty_session_key_is_refused() {
     // entry, and a later release would delete all of them together. Refusing
     // to record is the only outcome that cannot lose someone else's data.
     let (_dir, store) = empty_store();
-    let err = store.record_session_manifest("", &[1u8; 32], 0);
+    let err = store.record_session_manifest("", &[1u8; 32]);
     assert!(err.is_err(), "empty session key must be refused");
 }
 
@@ -6163,10 +6184,10 @@ fn a_truncated_index_errors_rather_than_under_reporting() {
     // would never be released and no symptom would ever surface.
     let (_dir, store) = empty_store();
     store
-        .record_session_manifest("sess-1", &[1u8; 32], 0)
+        .record_session_manifest("sess-1", &[1u8; 32])
         .expect("seed");
     store
-        .record_session_manifest("sess-1", &[2u8; 32], 0)
+        .record_session_manifest("sess-1", &[2u8; 32])
         .expect("seed2");
 
     let file = std::fs::read_dir(store.sessions_dir())
@@ -6193,7 +6214,7 @@ fn a_forged_magic_or_version_deletes_nothing() {
     // acted on as success.
     let (_dir, store) = empty_store();
     store
-        .record_session_manifest("sess-1", &[1u8; 32], 0)
+        .record_session_manifest("sess-1", &[1u8; 32])
         .expect("seed");
     let file = std::fs::read_dir(store.sessions_dir())
         .expect("sessions dir")
@@ -6224,18 +6245,32 @@ fn a_forged_magic_or_version_deletes_nothing() {
 fn a_generation_cutoff_protects_a_reused_session_key() {
     // Session keys are arbitrary client strings and clients REUSE them. A
     // cleanup for the conversation that ended at generation 0 must not reach
-    // manifests a NEW conversation persisted at generation 1 under the same
-    // key. Without the generation this is unrepresentable, and the delayed
-    // cleanup silently eats the live conversation. (Alden, 2026-07-29.)
+    // manifests a NEW conversation persisted afterwards under the same key.
+    // Driven through the real close lifecycle rather than hand-set numbers,
+    // because the generation is the SERVER's to choose.
     let (_dir, store) = empty_store();
     let old_conv = [1u8; 32];
     let new_conv = [2u8; 32];
-    store
-        .record_session_manifest("reused-key", &old_conv, 0)
+
+    let first = store
+        .record_session_manifest("reused-key", &old_conv)
         .expect("gen 0");
-    store
-        .record_session_manifest("reused-key", &new_conv, 1)
+    assert_eq!(first.generation, 0);
+
+    let closed = store
+        .close_current_generation("reused-key", 0, [7u8; 32])
+        .expect("close gen 0");
+    assert_eq!(closed.current_generation, 1, "close must advance");
+    assert_eq!(closed.closed_through, 0, "cutoff must record what closed");
+
+    let second = store
+        .record_session_manifest("reused-key", &new_conv)
         .expect("gen 1");
+    assert_eq!(second.generation, 1);
+    assert_eq!(
+        second.incarnation, first.incarnation,
+        "closing a generation must NOT change the incarnation"
+    );
 
     assert_eq!(
         store
@@ -6255,17 +6290,111 @@ fn a_generation_cutoff_protects_a_reused_session_key() {
 #[test]
 fn the_same_manifest_in_two_generations_is_two_associations() {
     // A conversation that replays the same prefix after compaction produces
-    // the same content-addressed manifest. Collapsing those would let a
-    // cutoff at the OLD generation release a manifest the NEW conversation
-    // still relies on.
+    // the same content-addressed manifest. Collapsing those would let a cutoff
+    // at the OLD generation release a manifest the NEW conversation relies on.
     let (_dir, store) = empty_store();
     let m = [3u8; 32];
-    store.record_session_manifest("k", &m, 0).expect("gen 0");
-    store.record_session_manifest("k", &m, 1).expect("gen 1");
+    store.record_session_manifest("k", &m).expect("gen 0");
+    store
+        .close_current_generation("k", 0, [1u8; 32])
+        .expect("close");
+    store.record_session_manifest("k", &m).expect("gen 1");
     assert_eq!(store.session_associations("k").expect("read").len(), 2);
     assert_eq!(
         store.session_manifests_through("k", 0).expect("cutoff"),
         vec![m]
+    );
+}
+
+#[test]
+fn a_lost_registry_mints_a_new_incarnation_and_disowns_the_old_associations() {
+    // ABSENCE IS NOT PROOF OF FIRST-EVER USE. If the registry is lost, the
+    // session key is recreated — and the associations left behind belong to a
+    // lifetime whose state we can no longer establish. Reusing generation 0
+    // would let the NEW session claim cleanup authority over the OLD one's
+    // manifests. A fresh incarnation makes them different namespaces, so the
+    // orphans leak instead. (Alden, 2026-07-29.)
+    let (_dir, store) = empty_store();
+    let old = [1u8; 32];
+    let first = store.record_session_manifest("k", &old).expect("record");
+
+    // Lose the registry, keep the association index.
+    let reg = std::fs::read_dir(store.sessions_dir())
+        .expect("dir")
+        .map(|e| e.expect("entry").path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("gen"))
+        .expect("registry file");
+    std::fs::remove_file(&reg).expect("remove registry");
+
+    let reborn = store.session_registry("k").expect("fresh registry");
+    assert_ne!(
+        reborn.incarnation, first.incarnation,
+        "a lost registry must mint a NEW incarnation, not reuse the old namespace"
+    );
+    assert_eq!(reborn.current_generation, 0);
+
+    assert!(
+        store
+            .session_manifests_through("k", u64::MAX)
+            .expect("read")
+            .is_empty(),
+        "the previous incarnation's associations must NOT be cleanable by the \
+         recreated session"
+    );
+    // They are still on disk — leaked, not silently adopted.
+    assert_eq!(store.session_associations("k").expect("raw").len(), 1);
+}
+
+#[test]
+fn close_is_compare_and_swap_and_a_disagreeing_caller_mutates_nothing() {
+    // A normal request that merely disagrees about the generation must never
+    // be able to close one. Stale and future both mutate NOTHING.
+    let (_dir, store) = empty_store();
+    store.record_session_manifest("k", &[1u8; 32]).expect("seed");
+
+    assert!(
+        store.close_current_generation("k", 5, [1u8; 32]).is_err(),
+        "a FUTURE expected generation must be rejected"
+    );
+    let after_future = store.session_registry("k").expect("reg");
+    assert_eq!(after_future.current_generation, 0, "no mutation");
+    assert_eq!(after_future.closed_through, u64::MAX, "no cutoff minted");
+
+    store
+        .close_current_generation("k", 0, [2u8; 32])
+        .expect("first close");
+    assert!(
+        store.close_current_generation("k", 0, [2u8; 32]).is_err(),
+        "a STALE expected generation must be rejected, even on exact replay"
+    );
+    let after_stale = store.session_registry("k").expect("reg");
+    assert_eq!(after_stale.current_generation, 1, "still exactly one advance");
+    assert_eq!(after_stale.closed_through, 0);
+}
+
+#[test]
+fn a_corrupt_registry_errors_rather_than_minting_a_fresh_session() {
+    // Treating corruption as absence would discard the cutoff that authorizes
+    // cleanup and manufacture a clean-looking session on top of associations
+    // whose lifetime can no longer be established.
+    let (_dir, store) = empty_store();
+    store.record_session_manifest("k", &[1u8; 32]).expect("seed");
+    let reg = std::fs::read_dir(store.sessions_dir())
+        .expect("dir")
+        .map(|e| e.expect("entry").path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("gen"))
+        .expect("registry file");
+    let mut bytes = std::fs::read(&reg).expect("read");
+    bytes[0] = b'X';
+    std::fs::write(&reg, &bytes).expect("write");
+
+    assert!(
+        store.session_registry("k").is_err(),
+        "a corrupt registry must ERROR, not be replaced with a fresh incarnation"
+    );
+    assert!(
+        store.record_session_manifest("k", &[2u8; 32]).is_err(),
+        "recording must not proceed on an unusable registry"
     );
 }
 
@@ -6281,7 +6410,7 @@ fn the_index_file_does_not_store_the_raw_session_key() {
     let (_dir, store) = empty_store();
     let key = "clement-session-42";
     store
-        .record_session_manifest(key, &[1u8; 32], 0)
+        .record_session_manifest(key, &[1u8; 32])
         .expect("record");
     let file = std::fs::read_dir(store.sessions_dir())
         .expect("sessions dir")
@@ -6320,7 +6449,7 @@ fn a_session_key_containing_a_newline_cannot_forge_index_entries() {
     let malicious = format!("evil\n{}", hex_digest(&forged));
 
     store
-        .record_session_manifest(&malicious, &real, 0)
+        .record_session_manifest(&malicious, &real)
         .expect("record");
 
     let got = store.session_manifests_through(&malicious, u64::MAX).expect("read");

@@ -94,6 +94,43 @@ interleaving:
 
 ### 3. Generation lifecycle must be server-owned and authenticated
 
+**BUILT (recording side).** The registry now exists: `sessions/<digest>.gen`
+holding `incarnation | current_generation | closed_through | last_event_id`.
+
+Three things about it are load-bearing and were all corrections to my sketch:
+
+**The state machine is NOT `OPEN → CLOSING → CLOSED`.** Persisting an
+intermediate state creates a crash case where both automatic repairs guess at
+intent — rolling back reopens a generation the client believes dead, resuming
+completes a transition nobody re-authorized. Instead the current generation is
+**always open**, and a monotonic `closed_through` says which earlier ones are
+finished. Closure is one atomic replacement; every crash lands unambiguous.
+
+**Absence mints a fresh INCARNATION.** A missing registry cannot prove
+first-ever use — it can equally mean lost state. Reusing `(key_digest,
+generation 0)` would let a recreated session claim cleanup authority over the
+previous lifetime's manifests. Every association therefore carries a 16-byte
+incarnation minted from `/dev/urandom`, and minting **fails closed** rather
+than deriving from time or a counter: a predictable incarnation reintroduces
+exactly the collision it exists to prevent, in the degraded case nobody
+watches. Orphaned associations from a lost lifetime leak; they are never
+adopted.
+
+**The recording API does not accept a caller-supplied generation.** Doing so
+would bake the wrong authority boundary in *while cleanup is disabled* — which
+is precisely when the mistake looks harmless. The server reads it from its own
+registry, under the same lock hold that writes the association (two sequential
+holds leave a window in which a close advances the generation between the read
+and the write, landing the association under a generation already closed).
+
+`close_current_generation(key, expected, event_id)` is implemented and tested:
+CAS on `expected == current`, stale and future both mutate nothing, no wrap at
+`u64::MAX`. **No endpoint exposes it.** `event_id` gives exact-retry idempotence
+and audit; it is explicitly *not* authorization.
+
+**Still blocked:** who may call it. That is authentication, and it is Stuart's
+decision, not something to invent.
+
 `session_key` is cache-namespace input, **not proof of deletion authority**. A
 normal inference request carrying "generation 12" must never authorize closing
 11.
@@ -164,11 +201,23 @@ deletion, a client could name another Kindled's manifest and have its own
 compaction release it. Proven with a red test before the fix
 (`a_session_key_containing_a_newline_cannot_forge_index_entries`).
 
-Now: `magic(8) | version(4) | key_digest(32) | count(4) | count × (manifest(32),
-generation(8))`. Filename is the key digest, so an unsafe path is
-unrepresentable rather than sanitized. **No raw key is stored at all** —
-lookup needs only the digest, which also removes an unbounded write and a
-possibly-sensitive value at rest.
+Now (**v2**): `magic(8) | version(4) | key_digest(32) | count(4) | count ×
+(incarnation(16), generation(8), manifest(32))`. Filename is the key digest, so
+an unsafe path is unrepresentable rather than sanitized. **No raw key is stored
+at all** — lookup needs only the digest, which also removes an unbounded write
+and a possibly-sensitive value at rest.
+
+v1 (generation only, no incarnation) is **rejected, not upgraded**: it cannot
+say which lifetime of a key its entries belong to, and guessing would hand a
+recreated session authority over a lost one's manifests. The bump happened
+before any cleanup code existed, which is far cheaper than migrating a field
+after it becomes deletion authority.
+
+Registry file: `magic(8) | version(4) | key_digest(32) | incarnation(16) |
+current_generation(8) | closed_through(8) | last_event_id(32)`. A
+`closed_through` that reaches the current generation is refused on read — the
+current generation is always open by construction, so such a cutoff would
+authorize cleaning associations still being written.
 
 A malformed file is an **error, never a partial read**: an under-reporting index
 is indistinguishable from a clean session, so nothing would ever be released and
@@ -180,9 +229,12 @@ no symptom would ever appear.
 
 | Required before delete mode | Status |
 |---|---|
-| Reused session key; old-generation cutoff cannot touch new generation | **covered** |
+| Reused session key; old-generation cutoff cannot touch new generation | **covered** — driven through the real close lifecycle |
 | Corrupt / truncated / forged magic / forged version deletes nothing | **covered** |
 | Newline, spaces, unicode, empty session keys | **covered** |
+| Lost registry mints a new incarnation; old associations disowned not adopted | **covered** |
+| Close is CAS; stale and future callers mutate nothing | **covered** |
+| Corrupt registry errors rather than minting a fresh session | **covered** |
 | Missing index write leaks only | partial — read side only |
 | A and B share M; compact A → M still loadable for B | **not done** |
 | Compact last association; N shares block X → X survives | **not done** |
