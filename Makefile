@@ -152,24 +152,42 @@ debug: build ## Alias for build (debug mode)
 # Test Targets
 # ============================================================================
 
+# --workspace IS LOAD-BEARING. DO NOT REMOVE IT.
+#
+# The root Cargo.toml is BOTH a [package] and a [workspace], and no
+# default-members is set, so a bare `cargo test` runs the ROOT PACKAGE ONLY.
+# Measured 2026-07-29: 4327 tests without it, 5674 with. 1347 tests --
+# including the ENTIRE v4 block cold-store suite (persist, load, corruption
+# refusal), the thing that will hold Kindled context across restarts -- were
+# invisible to every target in this file.
+#
+# That mattered more than it sounds, because there is no second net: ci.yml
+# says in its own header that clippy and cargo-test do NOT run in any
+# workflow. The engine is MLX/Metal and CI is ubuntu-latest, which physically
+# cannot execute these tests. `make verify` is the ONLY test gate that exists,
+# and it was skipping a crate while printing "All tests passed!" in green.
+#
+# A gate whose "did not run" is indistinguishable from its "passed" is not a
+# gate. If you need to scope a run down, do it with -p on the command line,
+# not by weakening the targets everyone else relies on.
 .PHONY: test
 test: ## Run all tests
 	@echo "$(CYAN)Running tests...$(RESET)"
-	$(CARGO) test -- --test-threads=1
+	$(CARGO) test --workspace -- --test-threads=1
 	@echo "$(GREEN)All tests passed!$(RESET)"
 
 .PHONY: test-verbose
 test-verbose: ## Run tests with verbose output
 	@echo "$(CYAN)Running tests (verbose)...$(RESET)"
-	$(CARGO) test -- --nocapture --test-threads=1
+	$(CARGO) test --workspace -- --nocapture --test-threads=1
 
 .PHONY: test-lib
 test-lib: ## Run library tests only
-	$(CARGO) test --lib -- --test-threads=1
+	$(CARGO) test --workspace --lib -- --test-threads=1
 
 .PHONY: test-doc
 test-doc: ## Run documentation tests
-	$(CARGO) test --doc
+	$(CARGO) test --workspace --doc
 
 .PHONY: check
 check: ## Check code without building
@@ -392,7 +410,7 @@ verify-clippy: ## CI-faithful: clippy --all-targets --features metal,accelerate 
 .PHONY: verify-test
 verify-test: ## CI-faithful: cargo test --release --features metal,accelerate
 	@echo "$(CYAN)[verify] test (release, features=metal,accelerate)...$(RESET)"
-	$(CARGO) test --release --features metal,accelerate
+	$(CARGO) test --workspace --release --features metal,accelerate
 
 .PHONY: verify
 verify: verify-fmt verify-clippy verify-test ## Run the full CI-faithful gate locally (recommended before push)

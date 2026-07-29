@@ -1899,6 +1899,20 @@ impl BlockColdStore {
             return Err(ColdStoreError::NoMatch);
         }
 
+        // THE REQUEST'S OWN BLOCK ADDRESSES — hashed ONCE.
+        //
+        // This used to sit inside the per-manifest loop. Every input to it is
+        // loop-invariant (`tokens`, `block_size`, `load_cache_id`), and it is
+        // not lazy — it returns a fully materialised `Vec`, so `.zip()` could
+        // not short-circuit it. The whole Merkle chain over the entire token
+        // sequence was therefore recomputed once per candidate manifest:
+        // O(manifests x tokens) to answer a question that needs O(tokens).
+        //
+        // It grows on BOTH axes with use — more turns per conversation, more
+        // conversations persisted — which is exactly the direction Kindled
+        // serving moves in.
+        let request_block_hashes = compute_block_hashes(tokens, self.block_size, &load_cache_id);
+
         // Collect candidates
         let mut candidates = Vec::new();
         for entry in fs::read_dir(&manifests_dir)? {
@@ -1944,12 +1958,8 @@ impl BlockColdStore {
             let matched_blocks = manifest
                 .block_hashes
                 .iter()
-                .zip(compute_block_hashes(
-                    tokens,
-                    self.block_size,
-                    &load_cache_id,
-                ))
-                .take_while(|(a, b)| a == &b)
+                .zip(request_block_hashes.iter())
+                .take_while(|(a, b)| a == b)
                 .count();
 
             if matched_blocks == 0 {
