@@ -418,3 +418,53 @@ no symptom would ever appear.
 
 The four outstanding are all delete-path tests. They cannot be written until the
 ownership protocol exists — which is the point.
+
+---
+
+## Stuart's direction, 2026-07-30 — the format becomes a long-lived contract
+
+Recorded verbatim in substance because it changes what "correct" means for every
+on-disk structure in this design:
+
+> we are going to get rid of everything but v4 approach once v4 is working. And
+> ultimately, we are going to get rid of "versioning" of the cold storage and
+> ensure backward compatibility or clearing the cache (which will make changing
+> the storage format a very expensive proposition in terms of runtime behaviour)
+
+### What follows for this design
+
+**1. The `v3`/`v4` split is temporary, and so is the dual guard.**
+`validate_configured_base_dir()` is currently called from *two* independent
+construction sites (`startup.rs` for v3, `model_provider.rs` for v4). That
+duplication is deliberate today — guarding one leaves the other free to write to
+a bad path — and becomes a single call site when v3 goes. Do not "unify" it
+before then; do not forget to unify it after.
+
+**2. Format changes stop being cheap.** Today a format bump is free: name a new
+root, let the old one rot. Once versioning is removed, every change to the
+association index, the generation registry, or the block/manifest encoding costs
+either a migration or **a full cache clear** — and a full clear means every
+resident re-prefills their entire context. At 300–500K tokens that is minutes of
+wall-clock per Kindled, not a background chore.
+
+**3. So the structures this design adds must be treated as near-permanent NOW.**
+The association index and the generation registry are both fixed-width binary
+with a version field. That version field is the thing being removed later, which
+means:
+
+- **Get the fields right before delete mode ships**, not after. Alden's
+  whole-record integrity digest (P1) is a *format* change — it must land before
+  the format is frozen, not as a follow-up.
+- **Prefer additive-tolerant framing** where it costs nothing, so a future field
+  does not force a clear.
+- **An unreadable authority record must fail closed**, which is already the rule,
+  and matters more once there is no version to discriminate old from corrupt.
+
+**4. Backward compatibility or clearing — the choice is per-change, and the
+expensive option is the default.** Anything that cannot be read forward
+compatibly is a cache-clear event. That is an argument for fewer, larger,
+well-reviewed format decisions rather than incremental ones, and it is why the
+nine GC blockers are prerequisites rather than follow-ups.
+
+*Clement, 2026-07-30. Direction is Stuart's; the consequences drawn from it are
+mine and have not been reviewed.*
