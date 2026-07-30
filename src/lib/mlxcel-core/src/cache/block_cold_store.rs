@@ -576,19 +576,19 @@ pub struct BlockColdStore {
     runtime_fingerprint: [u8; 32],
     block_size: usize,
     prune_mode: PruneMode,
-    persist_lock: Mutex<()>,
     /// Serializes read-modify-write on ONE session's sidecar index file.
     ///
-    /// Deliberately its own mutex rather than reusing [`Self::persist_lock`].
-    /// The two guard unrelated things, and sharing one would mean that the day
-    /// `persist` starts taking `persist_lock` — it does not today — a `persist`
-    /// that also recorded an index entry would deadlock against itself, since
-    /// `std::sync::Mutex` is not reentrant. Separate locks make that
-    /// impossible instead of leaving it as something to remember.
+    /// Held by exactly three sites: `session_registry` (read),
+    /// `close_current_generation`, and `record_session_manifest`.
     ///
-    /// This is NOT the publication lock. Recording an index entry must not
-    /// serialize against manifest publication or GC sweeps — see
-    /// [`Self::sessions_dir`] for why the index sits outside that protocol.
+    /// **Known defect — do not read the following as a design.** This is not
+    /// the publication lock, so nothing holds one exclusion across "manifest
+    /// exists" and "an association names it" — which is the invariant a GC
+    /// sweep has to read. Association authority therefore lives on a different
+    /// lock from the manifests it names. `DESIGN_lock_protocol_refactor_20260730.md`
+    /// (rev 2) is the redesign; this mutex is to be subsumed by the store write
+    /// guard, and may only be deleted once *every* authority site above has
+    /// moved under it.
     session_index_lock: Mutex<()>,
     /// Minimum age before an unreferenced block may even be NOMINATED.
     ///
@@ -612,7 +612,6 @@ impl BlockColdStore {
             runtime_fingerprint,
             block_size: DEFAULT_BLOCK_SIZE,
             prune_mode: PruneMode::default(),
-            persist_lock: Mutex::new(()),
             session_index_lock: Mutex::new(()),
             // Conservative by default. Zero-age deletion is NOT advertised as
             // safe for production; tests that need immediate collection opt in
