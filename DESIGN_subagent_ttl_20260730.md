@@ -1,6 +1,42 @@
 # Design: TTL for subagent session associations
 
-**Status: PROPOSAL, awaiting Alden's review. Nothing built.**
+# ⛔ STATUS: HOLD AS WRITTEN — Alden, 2026-07-30. Do not build from this document.
+
+**Four blockers, all accepted. Nothing built, and this must not enter through
+the compaction proof model.** If it proceeds at all it is a separately named and
+authorized **lossy eviction policy for regenerable cache artifacts**, audited as
+`ttl_eviction`, never described as proof of unreachability.
+
+1. **"Expires an association, never a manifest" does not remove deletion
+   authority.** If expiry is a necessary premise of a deletion, expiry
+   authorized it. §"TWO CONSTRAINTS" below separates *stages* and calls it
+   separating *authority* — read it as the defect, not the safety rail.
+2. **`x-parent-session-id` is NOT authoritative.** `Session.CreateInput` accepts
+   `parentID` from decoded client JSON
+   (`session.ts:262`, handler `session.ts:166,175`), so Task is the normal
+   producer, not the only one — *and* any client reaching mlxcel can simply send
+   the header. **A client-supplied string cannot classify sessions for a
+   destructive policy.** Classification must be an authenticated claim bound
+   durably to the incarnation/ticket; a later request must not flip the class.
+   §"The discriminator already exists on the wire" is wrong as written.
+3. **The harm asymmetry below is asserted, not measured.** "Seconds" and "longer
+   than any observed run" are both unmeasured, and subagents use the same
+   overflow/compaction machinery as roots — there is no intrinsic subagent
+   context bound. What *is* supported is narrower: eviction does not delete
+   durable history, so recovery is re-prefill, not content loss. Requires
+   measured p95/p99 re-prefill cost before any hour is chosen.
+4. **Last-touched is a field idea, not a protocol.** Four distinct states
+   (`OPEN_RECENT`, `OPEN_EXPIRED_BY_POLICY`, `PROVEN_CLOSED`,
+   `UNMANAGED/UNKNOWN`); expiry must **never** advance `closed_through`; refresh
+   at admission-before-lookup bound to the server-issued ticket; unreadable
+   authority input fails closed; resume-versus-eviction has exactly two legal
+   outcomes (touch wins and M remains, or tombstone wins and the request
+   re-prefills) and must never adopt M while deletion commits behind it.
+
+**Start observe-only.** All nine existing GC blockers remain prerequisites.
+Alden's required deterministic test classes are in his 2026-07-30 review.
+
+**Superseded status line:** *PROPOSAL, awaiting Alden's review. Nothing built.*
 Stuart's ruling, 2026-07-30. Read with
 `DESIGN_session_association_gc_20260729.md` — this does not override anything
 there, and specifically does not weaken the ownership rule.
