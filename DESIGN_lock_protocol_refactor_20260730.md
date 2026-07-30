@@ -258,15 +258,53 @@ serialised under a process-wide exclusive lock, on every publication and every
 load-exclusion path. One server does not make an unbounded hold acceptable —
 it makes it *global*.
 
-What is actually required before this refactor lands:
+### 7.1 The measurement (taken 2026-07-31 01:45, this machine)
 
-1. A bound on index **entries**, not just bytes.
-2. Append-mostly recording, or some other end to full-file rewrite under the
-   guard.
-3. A **measured** worst-case hold time at the bound. I have not measured it.
+`index_rewrite_cost_at_scale`, `#[ignore]`d, times exactly the read →
+digest-verify → parse → push → re-encode → re-seal → write cycle that
+`record_session_manifest` performs at `:1099`:
 
-Until then the honest answer to rev 1's open question 3 is **no** — subsuming
-`session_index_lock` widens the critical section unacceptably.
+| entries | bytes | guard hold |
+|---:|---:|---:|
+| 1 | 136 | 432 µs *(first iteration; warmup, not signal)* |
+| 100 | 5 680 | 192 µs |
+| 1 000 | 56 080 | 989 µs |
+| 10 000 | 560 080 | 9.44 ms |
+| **1 198 371** *(the cap)* | 67 108 856 | **1.095 s** |
+
+Linear at ≈0.9 µs/entry. Format verified against the live store: header 48 +
+32-byte trailing digest + 56/entry; a real one-association file is exactly 104
+bytes at v2.
+
+### 7.2 What the numbers change
+
+**The severity is lower than I claimed at 23:35, and the defect is different.**
+Real usage is **one** association per session (six sessions on the live store,
+all n=1). At any plausible size this is free — 989 µs at a thousand entries.
+
+The defect is not that indexes reach 64 MiB. It is that **a byte cap three
+orders of magnitude above real usage is not a bound on the critical section** —
+it is a bound on pathology. It permits a **1.1-second hold of a process-wide
+exclusive lock**, and that lock is the same one `acquire_read_lease` (`:716`)
+takes, so a pathological index stalls *adoption* for every other resident's
+turn, not merely publication.
+
+### 7.3 Recommendation
+
+Cap **entries**, near real usage, so unexpected growth fails loud while it is
+still cheap:
+
+- **4 096 entries** (≈224 KiB, worst-case hold ≈3.7 ms by the measured slope).
+  Roughly 40× headroom over any session I can construct, and a hold time I am
+  willing to state as a bound.
+
+The byte cap stays as the outer allocation guard; the entry cap is the one that
+bounds the lock. Append-mostly recording would remove the rewrite entirely, but
+it is not required to land this refactor once the hold is 3.7 ms.
+
+**Revised answer to rev 1's open question 3:** subsuming `session_index_lock` is
+acceptable **once an entry cap is in place**. Without one it is not, and rev 1
+asserted "association writes are small" with no number behind it.
 
 ---
 
@@ -307,13 +345,16 @@ Stuart: localhost, no auth, for now. An explicit accepted scope, not a blocker.
    the two established; I have not had his ruling on *which*.
 2. **`PruneMode::Delete`** (§6) — disable structurally, or fix forward to
    association-aware pruning? Stuart's call.
-3. **Index bound shape** (§7) — entry cap, append-mostly, or both, and what
-   hold time is acceptable. Needs a measurement I have not taken.
+3. **Index entry cap** (§7.3) — measurement taken; I propose **4 096 entries**
+   (≈3.7 ms worst-case hold). What remains open is whether that ceiling is
+   right, and what a session legitimately accumulates over a long run. Six live
+   sessions all show n=1, which is evidence about *today*, not about a bound.
 
 ## Ordering
 
 1. Delete the dead `persist_lock` field (independent, trivial, removes a false signal).
-2. Bound the index — entries and hold time (§7). **Gate for everything below.**
+2. Add the **entry cap** (§7.3). Hold time is now measured; the cap is the one
+   remaining piece. **Gate for everything below.**
 3. Guard types + reentrancy detector (§3).
 4. Composite with pin evidence (§4), all authority sites moved (§5).
 5. `session_index_lock` deleted — last, not first.

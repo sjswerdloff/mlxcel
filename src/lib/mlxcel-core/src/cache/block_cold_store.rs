@@ -4376,6 +4376,63 @@ mod authority_size_bound_tests {
         assert_eq!(read_session_index_file(&path).unwrap().associations.len(), 500);
     }
 
+    /// MEASUREMENT, not a test — `#[ignore]` by default, run explicitly:
+    /// `cargo test --workspace -- --ignored --nocapture index_rewrite_cost`
+    ///
+    /// # What this is for
+    ///
+    /// `DESIGN_lock_protocol_refactor_20260730.md` §7 says the refactor may not
+    /// land until the guard hold time is *measured*. This is that measurement.
+    /// It times exactly the work `record_session_manifest` does between
+    /// `:1099` and its write — read, digest-verify, parse, push, re-encode,
+    /// re-seal, write — because that is what would sit inside the store write
+    /// guard once association recording moves under it.
+    ///
+    /// It asserts nothing about timing. A wall-clock assertion is flaky by
+    /// construction on a shared machine, and a flaky gate teaches people to
+    /// re-run until green. The output is for a human to read and put in the
+    /// design; the only assertion here is that the data is the size claimed.
+    #[test]
+    #[ignore = "measurement; run explicitly with --ignored --nocapture"]
+    fn index_rewrite_cost_at_scale() {
+        // (48 header + 32 trailing digest) + 56/entry, verified against the
+        // live store: a real 1-association file is exactly 104 bytes at v2.
+        const PER_ENTRY: u64 = 56;
+        let ceiling_entries = (MAX_SESSION_INDEX_BYTES - 80) / PER_ENTRY;
+        println!("\n  ceiling admits {ceiling_entries} associations (observed in production: 1)");
+        println!("  {:>10}  {:>12}  {:>12}", "entries", "bytes", "rewrite");
+
+        for n in [1u64, 100, 1_000, 10_000, ceiling_entries] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("k.idx");
+            let assocs: Vec<_> = (0..n)
+                .map(|i| SessionAssociation {
+                    incarnation: [1u8; 16],
+                    generation: i,
+                    manifest_hash: [2u8; 32],
+                })
+                .collect();
+            let bytes = encode_session_index_file(&[3u8; 32], &assocs);
+            assert_eq!(bytes.len() as u64, 80 + n * PER_ENTRY, "size model wrong at n={n}");
+            fs::write(&path, &bytes).unwrap();
+
+            // The full read-modify-write, as it happens under the lock.
+            let t0 = std::time::Instant::now();
+            let mut existing = read_session_index_file(&path).unwrap();
+            existing.associations.push(SessionAssociation {
+                incarnation: [9u8; 16],
+                generation: n,
+                manifest_hash: [8u8; 32],
+            });
+            let out = encode_session_index_file(&[3u8; 32], &existing.associations);
+            fs::write(&path, &out).unwrap();
+            let dt = t0.elapsed();
+
+            println!("  {:>10}  {:>12}  {:>12?}", n, bytes.len(), dt);
+        }
+        println!();
+    }
+
     /// A registry larger than one record is corrupt by definition — its length
     /// is fixed — so the ceiling is exact rather than generous.
     #[test]
