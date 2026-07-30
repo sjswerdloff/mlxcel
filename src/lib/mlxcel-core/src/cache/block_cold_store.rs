@@ -3604,16 +3604,6 @@ struct SessionIndexFile {
 /// session is indistinguishable from a clean one — so nothing would ever be
 /// released and no symptom would ever appear.
 fn read_session_index_file(path: &Path) -> Result<SessionIndexFile, ColdStoreError> {
-    let raw = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Ok(SessionIndexFile {
-                key_digest: None,
-                associations: Vec::new(),
-            });
-        }
-        Err(e) => return Err(e.into()),
-    };
     const HEADER: usize = 8 + 4 + 32 + 4;
     const ENTRY: usize = 16 + 8 + 32;
     let malformed = |why: &str| {
@@ -3623,6 +3613,15 @@ fn read_session_index_file(path: &Path) -> Result<SessionIndexFile, ColdStoreErr
              under-reported session looks exactly like a clean one.",
             path.display()
         ))
+    };
+    // Size ceiling BEFORE the read. Absent stays absent — a missing index is a
+    // session with no associations, which is a legitimate state, unlike a
+    // malformed one.
+    let Some(raw) = read_bounded(path, MAX_SESSION_INDEX_BYTES, &malformed)? else {
+        return Ok(SessionIndexFile {
+            key_digest: None,
+            associations: Vec::new(),
+        });
     };
     // Integrity FIRST. Until the digest verifies, the declared count is not
     // trustworthy either, so bounding the allocation on it would be bounding on
@@ -3687,11 +3686,6 @@ fn read_session_registry_file(
     path: &Path,
     expect_key_digest: &[u8; 32],
 ) -> Result<Option<SessionRegistry>, ColdStoreError> {
-    let raw = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
     const LEN: usize = 8 + 4 + 32 + 16 + 8 + 8 + 32;
     let bad = |why: &str| {
         invalid_data(format!(
@@ -3700,6 +3694,12 @@ fn read_session_registry_file(
              that authorizes cleanup and would look like a brand-new session.",
             path.display()
         ))
+    };
+    // The registry is FIXED length, so its ceiling is exact rather than
+    // generous: anything larger is corrupt by definition and is refused without
+    // being read into memory.
+    let Some(raw) = read_bounded(path, (LEN + AUTHORITY_DIGEST_LEN) as u64, &bad)? else {
+        return Ok(None);
     };
     // Integrity FIRST, before any field is read. A same-length flip in the
     // incarnation, cutoff or event id parses cleanly and reads as an ordinary
@@ -3766,6 +3766,43 @@ fn write_session_registry_file(
     write_file(&tmp, &out)?;
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Hard ceiling on a session index file, enforced BEFORE the bytes are read.
+///
+/// One entry is 56 bytes, so this admits ~1.2 million associations for a single
+/// session — orders of magnitude beyond any real conversation, while bounding
+/// what a corrupt or hostile file can make the process allocate.
+const MAX_SESSION_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read a file only after its size is known to be sane.
+///
+/// `fs::read` allocates for the WHOLE file before any header, digest or length
+/// check can run, so every check downstream is already too late to prevent the
+/// allocation. The size is the one property available without reading, so it is
+/// the only place this can be bounded.
+fn read_bounded(
+    path: &Path,
+    max: u64,
+    malformed: &dyn Fn(&str) -> ColdStoreError,
+) -> Result<Option<Vec<u8>>, ColdStoreError> {
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if meta.len() > max {
+        return Err(malformed(&format!(
+            "is {} bytes, over the {max}-byte ceiling; refusing to read it into \
+             memory",
+            meta.len()
+        )));
+    }
+    match fs::read(path) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Bytes of the trailing whole-record digest on both session authority files.
@@ -4288,5 +4325,88 @@ mod authority_integrity_tests {
         old.extend_from_slice(&[0xABu8; 32]);
         fs::write(&path, &old).unwrap();
         assert!(read_session_index_file(&path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod authority_size_bound_tests {
+    use super::*;
+
+    /// An oversized index is refused WITHOUT being read into memory. `fs::read`
+    /// allocates for the whole file before any header, digest or length check
+    /// can run, so those checks are already too late to prevent the allocation.
+    #[test]
+    fn oversized_index_is_refused_before_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k.idx");
+        // Sparse file: declares a size past the ceiling without occupying it,
+        // so the test cannot itself become the memory problem it is about.
+        let f = fs::File::create(&path).unwrap();
+        f.set_len(MAX_SESSION_INDEX_BYTES + 1).unwrap();
+        drop(f);
+        let err = match read_session_index_file(&path) {
+            Err(e) => e,
+            Ok(v) => panic!(
+                "an oversized index was READ and parsed into {} associations \
+                 instead of being refused on size",
+                v.associations.len()
+            ),
+        };
+        assert!(
+            format!("{err}").contains("ceiling"),
+            "expected a size refusal, got: {err}"
+        );
+    }
+
+    /// The ceiling must not reject legitimate files — otherwise "refuses
+    /// oversized" would be trivially satisfied by refusing everything.
+    #[test]
+    fn a_normal_index_is_under_the_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k.idx");
+        let assocs: Vec<_> = (0..500)
+            .map(|i| SessionAssociation {
+                incarnation: [1u8; 16],
+                generation: i,
+                manifest_hash: [2u8; 32],
+            })
+            .collect();
+        let bytes = encode_session_index_file(&[3u8; 32], &assocs);
+        assert!((bytes.len() as u64) < MAX_SESSION_INDEX_BYTES);
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_session_index_file(&path).unwrap().associations.len(), 500);
+    }
+
+    /// A registry larger than one record is corrupt by definition — its length
+    /// is fixed — so the ceiling is exact rather than generous.
+    #[test]
+    fn oversized_registry_is_refused_before_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k.gen");
+        let f = fs::File::create(&path).unwrap();
+        f.set_len(4 * 1024 * 1024).unwrap();
+        drop(f);
+        let err = read_session_registry_file(&path, &[1u8; 32]).unwrap_err();
+        assert!(
+            format!("{err}").contains("ceiling"),
+            "expected a size refusal, got: {err}"
+        );
+    }
+
+    /// Absent must stay absent. A missing index is a session with no
+    /// associations — a legitimate state — and must not become an error, or
+    /// every first-ever persist would fail.
+    #[test]
+    fn missing_files_remain_absent_not_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = match read_session_index_file(&tmp.path().join("nope.idx")) {
+            Ok(v) => v,
+            Err(e) => panic!("absent index must not error: {e}"),
+        };
+        assert!(idx.associations.is_empty());
+        assert!(idx.key_digest.is_none());
+        assert!(read_session_registry_file(&tmp.path().join("nope.gen"), &[1u8; 32])
+            .unwrap()
+            .is_none());
     }
 }
