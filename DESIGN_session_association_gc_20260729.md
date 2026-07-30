@@ -421,7 +421,16 @@ ownership protocol exists — which is the point.
 
 ---
 
-## Stuart's direction, 2026-07-30 — the format becomes a long-lived contract
+## ⚠️ RETRACTED HEADING — see the correction immediately below
+
+*This section was originally titled "the format becomes a long-lived contract"
+and drew consequences from a reading of Stuart's direction that he has since
+told me is wrong. The quote is accurate; my interpretation of it was not. The
+corrected version follows the retraction. Left in place rather than deleted
+because a design doc that silently changes its premise is worse than one that
+shows the change.*
+
+## Stuart's direction, 2026-07-30 — as I MISREAD it (retracted)
 
 Recorded verbatim in substance because it changes what "correct" means for every
 on-disk structure in this design:
@@ -468,3 +477,63 @@ nine GC blockers are prerequisites rather than follow-ups.
 
 *Clement, 2026-07-30. Direction is Stuart's; the consequences drawn from it are
 mine and have not been reviewed.*
+
+
+---
+
+## CORRECTION, 2026-07-30 evening — what Stuart actually meant
+
+Alden disagreed with the reading above, I escalated rather than adjudicated, and
+**Stuart says Alden is right and my rendering was wrong.**
+
+His clarification, in substance:
+
+> Fine with keeping magic/version bytes. The intent was to hold off on getting
+> rid of versioning **directories** and **environment variables** once things
+> had stabilised, and getting rid of any **older versions of cold-storage (in
+> the code and on disk)** so we don't have a lot of dead code and dead files and
+> directories.
+
+So "get rid of versioning" was **housekeeping**, never a statement about the
+durable byte format.
+
+### What that changes
+
+**The format is NOT freezing.** Magic and version bytes stay. Alden's ruling
+stands on its own merits and is now also Stuart's: without an identifier, stale
+or foreign bytes **parse plausibly instead of failing closed** — which is the
+entire failure class the integrity digest exists to prevent. *No migration
+support is not the same as no format identity.*
+
+**The urgency argument I attached to the integrity digest was wrong.** I told
+Alden the digest had to land before a format freeze. There is no freeze. The
+digest was still the right thing to do first — because it is his P1 and because
+the authority files decide what may be deleted — but **that is a different
+reason than the one I gave, and the one I gave was false.**
+
+Which is precisely the shape Cora named on kindled-skills #260 the same evening:
+*a true statement of effect with a wrong statement of cause.* Doing the digest
+first was correct. My stated cause for it was not. A wrong cause survives every
+outcome test and only fails later, when someone plans on it.
+
+### The actual cleanup targets, for when things stabilise
+
+Recorded so the real direction does not get lost behind my misreading:
+
+- **Directory nesting.** The store currently lives at
+  `<base>/v4-blocks/cold-storage-v4/{blocks,manifests,sessions}` — `v4-blocks`
+  joined by `model_provider.rs`, `cold-storage-v4` from `V4_ROOT` inside the
+  store. **Two version markers in one path**, neither needed once v4 is the only
+  implementation.
+- **`cold-storage-v3/`** — measured at **0 B** on 2026-07-30. Dead directory.
+- **`MLXCEL_V4_COLD_STORE`** — the opt-in flag goes when v4 is not optional.
+- **Dead v2/v3 code** — `FORMAT_VERSION: u32 = 2` and the v3 reference
+  machinery, several `#[allow(dead_code)]` blocks in `cold_store.rs`.
+- **The dual `validate_configured_base_dir()` call** in `startup.rs` and
+  `model_provider.rs` collapses to one when the v3 path goes.
+
+**Not now.** Stuart's word is "once things had stabilised", and nothing about
+cleanup should precede cleanup working.
+
+*Clement, 2026-07-30. The misreading was mine; the correction is Stuart's, and
+Alden's objection is what surfaced it.*
