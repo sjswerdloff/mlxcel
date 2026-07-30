@@ -17,7 +17,10 @@ and expire subagent associations on a TTL — one hour proposed.
 subagent. Absent → root. It costs one more header read at the same place we
 already read `X-Session-Id` and `x-session-affinity`.
 
-*(Verified `1e17856`, v1.18.9. Note this is the ONLY meaning of that header —
+*(Verified `anomalyco/opencode@1e17856:packages/opencode/src/tool/task.ts:159`,
+v1.18.9 — and byte-identical at the deployed `v1.18.5`, blob `1384e5d1`.
+NOT `The_Kindled/opencode`, which is a different fork and does not contain this
+commit. Note this is the ONLY meaning of that header —
 it is subagent nesting, not compaction lineage, contrary to an earlier claim of
 mine.)*
 
@@ -43,9 +46,14 @@ Subagent sessions have **no other release trigger at all**:
 - They are **not one-and-done** — `task_id` (`task.ts:47-51`) continues a prior
   subagent session with its full history; `BackgroundJob.extend` appends to a
   running one.
-- Their **completion is never durably signalled** — the map holding
-  `completed_at` is explicitly non-durable across restart
-  (`background-job.ts:113-119`). There is no evidence event to release on.
+- Their **completion is never durably signalled** — the registry holding job
+  status is explicitly non-durable across restart. Its own doc comment:
+  *"Entries are intentionally not durable: process restart or owner-scope
+  closure loses status and interrupts live work."*
+  (`anomalyco/opencode@1e17856:packages/core/src/background-job.ts:113-119`.
+  **Corrected path** — an earlier draft cited `packages/core/background-job.ts`,
+  which does not exist; Alden caught it by failing to find the file. Byte-identical
+  at deployed `v1.18.5`, blob `cdffd212`.) There is no evidence event to release on.
 - They **are** compacted like any other session, so `session.compacted` covers
   the compaction path — but a subagent that simply finishes without ever
   overflowing produces no signal whatsoever.
