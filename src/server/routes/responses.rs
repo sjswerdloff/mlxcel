@@ -60,7 +60,7 @@ use crate::server::types::responses_stream::ResponseStreamEvent;
 
 use super::chat::{
     build_generate_options, build_prompt_cache_request_context, parse_priority_header,
-    parse_session_header,
+    parse_session_header, session_header_malformed,
 };
 
 /// POST /v1/responses
@@ -132,6 +132,17 @@ pub async fn create_response(
     // Headers are visible ONLY here — resolve the per-conversation identity
     // now and carry it down as a value, exactly as `priority` does.
     let header_session_id = parse_session_header(&headers);
+    // A malformed PRESENT header is not absence. `parse_session_header`
+    // drops it via `to_str().ok()`, so without this nothing distinguishes
+    // "client sent garbage" from "client sent nothing".
+    if let Some(name) = session_header_malformed(&headers) {
+        tracing::warn!(
+            header = %name,
+            "session header PRESENT but its bytes are not a valid string — this \
+             conversation falls back to the shared anonymous bucket and will not \
+             be persisted. It is NOT the same as sending no header."
+        );
+    }
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let created_at = chrono::Utc::now().timestamp() as f64;
 

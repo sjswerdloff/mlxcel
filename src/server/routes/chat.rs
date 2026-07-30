@@ -153,12 +153,52 @@ pub(crate) fn build_prompt_cache_request_context(
 /// [`resolve_session_key`] rejects empty strings: a header a proxy filled in
 /// with nothing must not become a bucket everyone shares.
 pub(crate) fn parse_session_header(headers: &HeaderMap) -> Option<String> {
-    for name in ["x-session-id", "x-session-affinity"] {
+    for name in SESSION_HEADER_NAMES {
         if let Some(v) = headers.get(name)
             && let Ok(s) = v.to_str()
             && !s.trim().is_empty()
         {
             return Some(s.trim().to_string());
+        }
+    }
+    None
+}
+
+/// The headers carrying conversation identity, in precedence order.
+///
+/// ONE list, read by both [`parse_session_header`] and
+/// [`session_header_malformed`]. Two copies would be free to drift, and a
+/// malformed-detector that scanned a different set than the resolver would
+/// report "no malformed header" about headers it never looked at.
+pub(crate) const SESSION_HEADER_NAMES: [&str; 2] = ["x-session-id", "x-session-affinity"];
+
+/// Name the first session header that is PRESENT but whose bytes are not a
+/// valid string, or `None` if there is no such header.
+///
+/// # Why this exists separately
+///
+/// [`parse_session_header`] drops such a header via `to_str().ok()`, so a
+/// malformed value becomes indistinguishable from an absent one — and
+/// `header_session_present`, derived from that same `Option`, then reports
+/// `false`. **That is exactly the distinction the presence flag was added to
+/// make** (a stripped header versus an absent one), defeated through a
+/// different path than the one it was guarding.
+///
+/// A malformed PRESENT header is not absence. It means a client tried to name
+/// its conversation and failed, so its cache silently lands in the shared
+/// anonymous bucket — which is not persisted at all under Stuart's 2026-07-30
+/// ruling. The client loses caching entirely and nothing says so.
+///
+/// This reports rather than rejects: refusing the request would be a behaviour
+/// change for a value that is a cache-namespacing hint today. If closing a
+/// generation ever becomes authorized by this header, revisit — an unparseable
+/// identity should not be able to reach a destructive path at all.
+pub(crate) fn session_header_malformed(headers: &HeaderMap) -> Option<&'static str> {
+    for name in SESSION_HEADER_NAMES {
+        if let Some(v) = headers.get(name)
+            && v.to_str().is_err()
+        {
+            return Some(name);
         }
     }
     None
@@ -362,6 +402,17 @@ pub async fn chat_completions(
     // Headers are visible ONLY here. Resolve the per-conversation identity now
     // and carry it as a value, the same way `priority` travels.
     let header_session_id = parse_session_header(&headers);
+    // Read from the SAME HeaderMap in the same place, so the two cannot
+    // disagree about one request. A malformed PRESENT header is not absence.
+    let header_session_malformed = session_header_malformed(&headers).is_some();
+    if let Some(name) = session_header_malformed(&headers) {
+        tracing::warn!(
+            header = %name,
+            "session header PRESENT but its bytes are not a valid string — this \
+             conversation falls back to the shared anonymous bucket and will not \
+             be persisted. It is NOT the same as sending no header."
+        );
+    }
     if request.stream {
         stream_chat_completion(
             state,
@@ -1147,7 +1198,7 @@ pub(crate) fn build_generate_options(
 
 #[cfg(test)]
 mod session_header_tests {
-    use super::parse_session_header;
+    use super::{parse_session_header, session_header_malformed};
     use axum::http::HeaderMap;
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -1568,5 +1619,78 @@ mod tests {
         // `MessageContent::Text` branch.
         req.messages[0].content = MessageContent::Text("hi".to_string());
         assert!(!request_has_video_blocks(&req));
+    }
+}
+
+#[cfg(test)]
+mod malformed_session_header_tests {
+    use super::{SESSION_HEADER_NAMES, parse_session_header, session_header_malformed};
+    use axum::http::{HeaderMap, HeaderValue};
+
+    /// Bytes that are a legal HTTP header value but not a valid string, so
+    /// `to_str()` fails on them the way it would for a real mis-encoded client.
+    fn invalid_utf8_value() -> HeaderValue {
+        HeaderValue::from_bytes(&[0xF0, 0x28, 0x8C, 0x28]).expect("legal header bytes")
+    }
+
+    /// The defect: a PRESENT malformed header is dropped by the resolver, so it
+    /// reads as absent — and `header_session_present`, derived from that same
+    /// `Option`, reports false. Both together say "the client sent nothing".
+    #[test]
+    fn a_malformed_header_is_invisible_to_the_resolver_and_visible_to_the_detector() {
+        let mut h = HeaderMap::new();
+        h.insert("x-session-id", invalid_utf8_value());
+
+        assert_eq!(
+            parse_session_header(&h),
+            None,
+            "resolver still drops it — this is the behaviour being reported, not fixed"
+        );
+        assert_eq!(
+            session_header_malformed(&h),
+            Some("x-session-id"),
+            "the detector must see what the resolver cannot"
+        );
+    }
+
+    /// Control: a VALID header must not trip the detector, or "detects
+    /// malformed" would be satisfied by flagging everything.
+    #[test]
+    fn a_valid_header_is_not_reported_malformed() {
+        let mut h = HeaderMap::new();
+        h.insert("x-session-id", HeaderValue::from_static("sess-abc"));
+        assert_eq!(parse_session_header(&h).as_deref(), Some("sess-abc"));
+        assert_eq!(session_header_malformed(&h), None);
+    }
+
+    /// Control: absent is absent. Silence here must mean "no header", which is
+    /// the state the warning exists to distinguish itself from.
+    #[test]
+    fn an_absent_header_is_not_reported_malformed() {
+        assert_eq!(session_header_malformed(&HeaderMap::new()), None);
+    }
+
+    /// The fallback header is covered too — one list, read by both functions.
+    #[test]
+    fn the_affinity_fallback_is_covered_by_the_detector() {
+        let mut h = HeaderMap::new();
+        h.insert("x-session-affinity", invalid_utf8_value());
+        assert_eq!(session_header_malformed(&h), Some("x-session-affinity"));
+    }
+
+    /// Guards the shared list: if someone adds a header to the resolver and not
+    /// the detector, the detector would report "nothing malformed" about a
+    /// header it never looked at.
+    #[test]
+    fn both_functions_read_the_same_header_list() {
+        for name in SESSION_HEADER_NAMES {
+            let mut h = HeaderMap::new();
+            h.insert(name, invalid_utf8_value());
+            assert_eq!(
+                session_header_malformed(&h),
+                Some(name),
+                "{name} is in the resolver's list but the detector does not see it"
+            );
+        }
     }
 }

@@ -60,7 +60,7 @@ use crate::server::types::anthropic_stream::{
 
 use super::chat::{
     MAX_TOOLS, build_generate_options, build_prompt_cache_request_context, parse_priority_header,
-    parse_session_header,
+    parse_session_header, session_header_malformed,
 };
 
 /// POST /v1/messages
@@ -118,6 +118,17 @@ pub async fn anthropic_messages(
     // sends these headers on Anthropic-shaped endpoints too, so this path
     // needs the channel every bit as much as the OpenAI-shaped one.
     let header_session_id = parse_session_header(&headers);
+    // A malformed PRESENT header is not absence. `parse_session_header`
+    // drops it via `to_str().ok()`, so without this nothing distinguishes
+    // "client sent garbage" from "client sent nothing".
+    if let Some(name) = session_header_malformed(&headers) {
+        tracing::warn!(
+            header = %name,
+            "session header PRESENT but its bytes are not a valid string — this \
+             conversation falls back to the shared anonymous bucket and will not \
+             be persisted. It is NOT the same as sending no header."
+        );
+    }
 
     if request.stream {
         stream_messages(
