@@ -3465,10 +3465,10 @@ const SESSION_INDEX_MAGIC: &[u8; 8] = b"MLXSIDX1";
 /// rejected rather than upgraded: it cannot say WHICH incarnation of a session
 /// key its entries belong to, and guessing would hand a recreated session
 /// authority over a lost one's manifests.
-const SESSION_INDEX_VERSION: u32 = 2;
+const SESSION_INDEX_VERSION: u32 = 3; // 3: trailing whole-record SHA-256
 
 const SESSION_REGISTRY_MAGIC: &[u8; 8] = b"MLXSGEN1";
-const SESSION_REGISTRY_VERSION: u32 = 1;
+const SESSION_REGISTRY_VERSION: u32 = 2; // 2: trailing whole-record SHA-256
 
 /// ON-DISK sentinel for "no generation has been closed yet".
 ///
@@ -3624,6 +3624,10 @@ fn read_session_index_file(path: &Path) -> Result<SessionIndexFile, ColdStoreErr
             path.display()
         ))
     };
+    // Integrity FIRST. Until the digest verifies, the declared count is not
+    // trustworthy either, so bounding the allocation on it would be bounding on
+    // an attacker-controlled number.
+    let raw = open_authority_record(&raw, &malformed)?;
     if raw.len() < HEADER {
         return Err(malformed("shorter than its header"));
     }
@@ -3697,6 +3701,10 @@ fn read_session_registry_file(
             path.display()
         ))
     };
+    // Integrity FIRST, before any field is read. A same-length flip in the
+    // incarnation, cutoff or event id parses cleanly and reads as an ordinary
+    // answer, so every check below is meaningless until this one passes.
+    let raw = open_authority_record(&raw, &bad)?;
     if raw.len() != LEN {
         return Err(bad("wrong length"));
     }
@@ -3753,10 +3761,66 @@ fn write_session_registry_file(
             .to_le_bytes(),
     );
     out.extend_from_slice(&reg.last_event_id);
+    let out = seal_authority_record(out);
     let tmp = path.with_extension("gen.tmp");
     write_file(&tmp, &out)?;
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Bytes of the trailing whole-record digest on both session authority files.
+const AUTHORITY_DIGEST_LEN: usize = 32;
+
+/// Seal an authority record by appending SHA-256 over **everything preceding**.
+///
+/// # Why a whole-record digest and not per-field checks
+///
+/// Magic, version and declared-length checks all pass a **same-length bit
+/// flip**. Flip a bit in an incarnation and a live association is disowned as
+/// belonging to a prior lifetime; flip one in `closed_through` and a cutoff
+/// moves; flip one in a manifest hash and the record names a *different*
+/// manifest that some other session may depend on. Every one of those parses
+/// cleanly and reads as a valid, ordinary answer — which is why nothing
+/// downstream can catch it.
+///
+/// The digest covers the complete record rather than any field, so there is no
+/// "which fields are protected" question to get wrong later.
+fn seal_authority_record(mut body: Vec<u8>) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(&body);
+    body.extend_from_slice(&hasher.finalize());
+    body
+}
+
+/// Verify and strip the trailing digest, returning the record body.
+///
+/// **Fails closed.** An unreadable authority input must never degrade to "no
+/// associations" — that is indistinguishable from a clean session and would let
+/// a sweep conclude a live manifest is unreferenced.
+fn open_authority_record<'a>(
+    raw: &'a [u8],
+    malformed: &dyn Fn(&str) -> ColdStoreError,
+) -> Result<&'a [u8], ColdStoreError> {
+    if raw.len() < AUTHORITY_DIGEST_LEN {
+        return Err(malformed("shorter than its integrity digest"));
+    }
+    let split = raw.len() - AUTHORITY_DIGEST_LEN;
+    let (body, stored) = raw.split_at(split);
+    let mut hasher = Sha256::new();
+    hasher.update(body);
+    let actual = hasher.finalize();
+    if actual.as_slice() != stored {
+        // Deliberately does NOT say which field differs: nothing here knows
+        // whether this is corruption or tampering, and naming a field would
+        // invite a caller to "repair" one.
+        return Err(malformed(
+            "integrity digest mismatch — the record was altered after it was \
+             written. Refusing to interpret ANY field: a same-length flip in an \
+             incarnation, generation, cutoff or manifest hash parses cleanly and \
+             reads as an ordinary answer",
+        ));
+    }
+    Ok(body)
 }
 
 /// Serialize a session index file.
@@ -3771,7 +3835,7 @@ fn encode_session_index_file(key_digest: &[u8; 32], entries: &[SessionAssociatio
         out.extend_from_slice(&e.generation.to_le_bytes());
         out.extend_from_slice(&e.manifest_hash);
     }
-    out
+    seal_authority_record(out)
 }
 
 /// THE predicate for "this directory entry is a COMMITTED manifest", and the
@@ -4074,3 +4138,155 @@ mod tests {
 #[cfg(test)]
 #[path = "block_cold_store_tests.rs"]
 mod block_cold_store_tests;
+
+// ---------------------------------------------------------------------------
+// Whole-record integrity of the session authority files (Alden P1, #253-era)
+//
+// These files decide which manifests a session still needs. A same-length bit
+// flip in an incarnation disowns a live association; in `closed_through` it
+// moves a cutoff; in a manifest hash it makes the record name a DIFFERENT
+// manifest another session may depend on. Every one of those parsed cleanly
+// before this, and read as an ordinary answer.
+//
+// The sweep below is the claim: EVERY stored byte is covered, with no
+// enumerated exceptions.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod authority_integrity_tests {
+    use super::*;
+
+    fn sample_assocs() -> Vec<SessionAssociation> {
+        vec![
+            SessionAssociation { incarnation: [7u8; 16], generation: 3, manifest_hash: [0xABu8; 32] },
+            SessionAssociation { incarnation: [9u8; 16], generation: 4, manifest_hash: [0xCDu8; 32] },
+        ]
+    }
+    fn sample_registry() -> SessionRegistry {
+        SessionRegistry {
+            incarnation: [5u8; 16],
+            current_generation: 11,
+            closed_through: Some(9),
+            last_event_id: [2u8; 32],
+        }
+    }
+
+    #[test]
+    fn index_round_trips_through_the_seal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k.idx");
+        let kd = [1u8; 32];
+        fs::write(&path, encode_session_index_file(&kd, &sample_assocs())).unwrap();
+        let got = read_session_index_file(&path).unwrap();
+        assert_eq!(got.associations, sample_assocs());
+        assert_eq!(got.key_digest, Some(kd));
+    }
+
+    #[test]
+    fn registry_round_trips_through_the_seal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k.gen");
+        let kd = [1u8; 32];
+        write_session_registry_file(&path, &kd, &sample_registry()).unwrap();
+        let got = read_session_registry_file(&path, &kd).unwrap().unwrap();
+        assert_eq!(got, sample_registry());
+    }
+
+    /// THE test Alden asked for: flip one bit in EVERY byte, one at a time, and
+    /// require the read to fail. No enumerated exceptions — a byte that can be
+    /// changed without detection is a byte an attacker or a failing disk can
+    /// change without detection.
+    #[test]
+    fn every_stored_byte_of_the_index_is_covered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k.idx");
+        let kd = [1u8; 32];
+        let good = encode_session_index_file(&kd, &sample_assocs());
+
+        // Positive control: unmutated bytes MUST read cleanly, or "every
+        // mutation fails" would be trivially true and prove nothing.
+        fs::write(&path, &good).unwrap();
+        read_session_index_file(&path).expect("unmutated index must parse");
+
+        let mut unprotected = Vec::new();
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0x01;
+            fs::write(&path, &bad).unwrap();
+            if read_session_index_file(&path).is_ok() {
+                unprotected.push(i);
+            }
+        }
+        assert!(
+            unprotected.is_empty(),
+            "these byte offsets can be altered without detection: {unprotected:?} \
+             (of {} total)",
+            good.len()
+        );
+    }
+
+    #[test]
+    fn every_stored_byte_of_the_registry_is_covered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k.gen");
+        let kd = [1u8; 32];
+        write_session_registry_file(&path, &kd, &sample_registry()).unwrap();
+        let good = fs::read(&path).unwrap();
+
+        read_session_registry_file(&path, &kd)
+            .expect("unmutated registry must parse")
+            .expect("and must be Some");
+
+        let mut unprotected = Vec::new();
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0x01;
+            fs::write(&path, &bad).unwrap();
+            if read_session_registry_file(&path, &kd).is_ok() {
+                unprotected.push(i);
+            }
+        }
+        assert!(
+            unprotected.is_empty(),
+            "these byte offsets can be altered without detection: {unprotected:?} \
+             (of {} total)",
+            good.len()
+        );
+    }
+
+    /// Truncation must not degrade to "no associations" — that is
+    /// indistinguishable from a clean session and would let a sweep conclude a
+    /// live manifest is unreferenced.
+    #[test]
+    fn truncation_fails_closed_rather_than_reading_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k.idx");
+        let good = encode_session_index_file(&[1u8; 32], &sample_assocs());
+        for cut in [0usize, 8, 31, good.len() - 1] {
+            fs::write(&path, &good[..cut]).unwrap();
+            assert!(
+                read_session_index_file(&path).is_err(),
+                "a {cut}-byte truncation was accepted"
+            );
+        }
+    }
+
+    /// A file written by the pre-digest format must be REFUSED, not
+    /// reinterpreted. Its trailing bytes are association data, not a digest, so
+    /// silently accepting it would read real entries as a checksum.
+    #[test]
+    fn pre_digest_format_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k.idx");
+        // v2 layout: header + entries, NO trailing digest.
+        let mut old = Vec::new();
+        old.extend_from_slice(SESSION_INDEX_MAGIC);
+        old.extend_from_slice(&2u32.to_le_bytes());
+        old.extend_from_slice(&[1u8; 32]);
+        old.extend_from_slice(&1u32.to_le_bytes());
+        old.extend_from_slice(&[7u8; 16]);
+        old.extend_from_slice(&3u64.to_le_bytes());
+        old.extend_from_slice(&[0xABu8; 32]);
+        fs::write(&path, &old).unwrap();
+        assert!(read_session_index_file(&path).is_err());
+    }
+}
