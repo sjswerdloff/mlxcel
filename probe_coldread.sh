@@ -59,3 +59,21 @@ DO NOT ACCEPT (test was void, not passed):
 A high cached_tokens with an in-memory MATCH means the run proved nothing about
 the cold store. Restart and run this before anything else touches the endpoint.
 MSG
+
+# ---------------------------------------------------------------------------
+# RESULT, 2026-07-30 19:13 NZST — PASSED, on a fresh process, log-confirmed:
+#
+#   store_entries=0                                    memory empty (precondition)
+#   SSD cold-store probe HIT   match_len=10240 total=10386
+#   SSD cold-store has longer match  mem_raw=0  ssd_raw=10240  alignment=128
+#   SSD cold-store ADOPTED — state installed  adopted_tokens=10240
+#
+# mem_raw=0 is what makes it airtight: memory supplied nothing, so all 10,240
+# tokens were reconstructed from /Volumes/T7 Shield. ~940 MB read and installed
+# in under one second (probe 57.170 -> adopted 58.137). 5.6 s wall against ~57 s
+# for the cold prefill, about 10x.
+#
+# PROVES: persist -> external drive -> process restart -> KV state reconstructed.
+# DOES NOT PROVE: anything about deletion. Nothing has ever deleted a block, and
+# nothing should until the lock protocol lands.
+# ---------------------------------------------------------------------------
