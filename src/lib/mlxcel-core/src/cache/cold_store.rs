@@ -1220,6 +1220,127 @@ fn default_base_dir() -> PathBuf {
     PathBuf::from("/tmp/mlxcel/cold-storage")
 }
 
+/// Why a configured cold-store directory was refused. Carries the resolved path
+/// so the operator sees the thing that was checked, not the thing they typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColdStoreDirRefusal {
+    /// The directory does not exist. We deliberately do NOT create it: see
+    /// [`validate_configured_base_dir`].
+    Missing(PathBuf),
+    /// The path exists but is not a directory.
+    NotADirectory(PathBuf),
+    /// Under `/Volumes/<name>` whose root is NOT a mount point — i.e. the
+    /// external drive is unmounted and this is a stub on the boot disk.
+    VolumeNotMounted { path: PathBuf, volume: PathBuf },
+}
+
+impl std::fmt::Display for ColdStoreDirRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(p) => write!(
+                f,
+                "MLXCEL_COLD_STORE_DIR={} does not exist. It is NOT created \
+                 automatically: creating it is exactly how an unmounted drive \
+                 ends up filling the boot disk. Create it yourself (or mount \
+                 the drive) and restart.",
+                p.display()
+            ),
+            Self::NotADirectory(p) => write!(
+                f,
+                "MLXCEL_COLD_STORE_DIR={} exists but is not a directory.",
+                p.display()
+            ),
+            Self::VolumeNotMounted { path, volume } => write!(
+                f,
+                "MLXCEL_COLD_STORE_DIR={} is under {}, which is NOT a mount \
+                 point — the drive is not mounted. Writing here would land on \
+                 the BOOT DISK, and would become invisible the moment the \
+                 drive mounts over it. Mount the drive and restart.",
+                path.display(),
+                volume.display()
+            ),
+        }
+    }
+}
+
+/// Validate an operator-configured `MLXCEL_COLD_STORE_DIR`.
+///
+/// Returns `Ok(None)` when the variable is unset — the default under `$HOME` is
+/// always acceptable and this check does not apply to it.
+///
+/// # Why this refuses instead of creating
+///
+/// `acquire_store_lock` calls `fs::create_dir_all(&self.base_dir)`
+/// unconditionally. That is correct for the default path and catastrophic for a
+/// configured one: on macOS, `/Volumes/<name>` is an ordinary directory on the
+/// boot disk until something mounts over it. Point the store at an unmounted
+/// drive and `create_dir_all` silently materialises the tree **on the boot
+/// disk** — writes succeed, the cache works, nothing complains, and the volume
+/// the operator was trying to protect fills up anyway. When the drive is later
+/// mounted it covers those bytes, which then consume space while being
+/// unreachable through that path.
+///
+/// The failure mode is therefore indistinguishable from success at every point
+/// where anyone would look. So the configured directory must ALREADY EXIST and,
+/// if it lives under `/Volumes`, its volume root must be a real mount point.
+/// An unmounted drive becomes a loud refusal rather than a silent redirect.
+///
+/// This validates *configuration*, not permissions: a writability probe would
+/// have to create something to be meaningful, which is the act being prevented.
+/// An unwritable directory still fails loudly at first use.
+pub fn validate_configured_base_dir() -> Result<Option<PathBuf>, ColdStoreDirRefusal> {
+    let Ok(raw) = std::env::var("MLXCEL_COLD_STORE_DIR") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(raw);
+
+    if !path.exists() {
+        return Err(ColdStoreDirRefusal::Missing(path));
+    }
+    if !path.is_dir() {
+        return Err(ColdStoreDirRefusal::NotADirectory(path));
+    }
+
+    // `/Volumes/<name>/...` -> require `<name>` to be a genuine mount point.
+    // Compared by device id rather than by consulting a mount table: a mount
+    // point is precisely a directory whose device differs from its parent's,
+    // which is the property that matters and needs no external command.
+    if let Some(volume) = volume_root_of(&path) {
+        if !is_mount_point(&volume) {
+            return Err(ColdStoreDirRefusal::VolumeNotMounted { path, volume });
+        }
+    }
+    Ok(Some(path))
+}
+
+/// `/Volumes/T7 Shield/mlxcel` -> `Some(/Volumes/T7 Shield)`; anything not under
+/// `/Volumes` -> `None`, because the mount-point rule only applies there.
+fn volume_root_of(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    if components.next()? != std::path::Component::RootDir {
+        return None;
+    }
+    if components.next()?.as_os_str() != "Volumes" {
+        return None;
+    }
+    let name = components.next()?;
+    Some(Path::new("/Volumes").join(name))
+}
+
+/// True when `dir` sits on a different device than its parent — the definition
+/// of a mount point. Unreadable metadata returns `false`, which routes to a
+/// refusal: unknown must not read as mounted.
+fn is_mount_point(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(parent) = dir.parent() else {
+        return false;
+    };
+    match (fs::metadata(dir), fs::metadata(parent)) {
+        (Ok(d), Ok(p)) => d.dev() != p.dev(),
+        _ => false,
+    }
+}
+
 #[allow(dead_code)] // v2 header helper; kept for the retained v2 tests
 fn write_string(w: &mut impl Write, s: &str) -> io::Result<()> {
     w.write_all(&(s.len() as u32).to_le_bytes())?;
@@ -2484,5 +2605,177 @@ pub(crate) mod tests {
         let mut buf = Vec::new();
         write_header(&mut buf, &base(2, 3)).unwrap();
         assert!(read_header(&mut &buf[..]).is_ok(), "healthy header rejected");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Configured-base-dir validation tests
+//
+// These guard a SILENT failure: pointing the store at an unmounted drive makes
+// `create_dir_all` materialise the tree on the boot disk, where every
+// observable signal says success. There is no red test to be had after the
+// fact, so the check is what has to be tested.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod configured_base_dir_tests {
+    use super::*;
+
+    /// Saves and restores `MLXCEL_COLD_STORE_DIR`. The suite runs
+    /// `--test-threads=1`, so a process-global env var is safe here; the
+    /// restore exists so these tests cannot leak into the ones that construct
+    /// a real store from the default path.
+    struct EnvGuard(Option<String>);
+    impl EnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prior = std::env::var("MLXCEL_COLD_STORE_DIR").ok();
+            match value {
+                Some(v) => unsafe { std::env::set_var("MLXCEL_COLD_STORE_DIR", v) },
+                None => unsafe { std::env::remove_var("MLXCEL_COLD_STORE_DIR") },
+            }
+            Self(prior)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => unsafe { std::env::set_var("MLXCEL_COLD_STORE_DIR", v) },
+                None => unsafe { std::env::remove_var("MLXCEL_COLD_STORE_DIR") },
+            }
+        }
+    }
+
+    #[test]
+    fn unset_does_not_apply() {
+        let _g = EnvGuard::set(None);
+        assert_eq!(validate_configured_base_dir(), Ok(None));
+    }
+
+    #[test]
+    fn existing_directory_outside_volumes_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = EnvGuard::set(Some(tmp.path().to_str().unwrap()));
+        assert_eq!(
+            validate_configured_base_dir(),
+            Ok(Some(tmp.path().to_path_buf()))
+        );
+    }
+
+    /// The load-bearing one. A missing directory must NOT be created, because
+    /// creating it is precisely how an unmounted drive fills the boot disk.
+    #[test]
+    fn missing_directory_is_refused_and_not_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("not-there");
+        let _g = EnvGuard::set(Some(absent.to_str().unwrap()));
+
+        assert_eq!(
+            validate_configured_base_dir(),
+            Err(ColdStoreDirRefusal::Missing(absent.clone()))
+        );
+        assert!(
+            !absent.exists(),
+            "validation must not create the directory it is refusing"
+        );
+    }
+
+    #[test]
+    fn a_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("regular-file");
+        fs::write(&file, b"x").unwrap();
+        let _g = EnvGuard::set(Some(file.to_str().unwrap()));
+        assert_eq!(
+            validate_configured_base_dir(),
+            Err(ColdStoreDirRefusal::NotADirectory(file))
+        );
+    }
+
+    #[test]
+    fn volume_root_is_extracted_only_under_volumes() {
+        assert_eq!(
+            volume_root_of(Path::new("/Volumes/T7 Shield/mlxcel/cold")),
+            Some(PathBuf::from("/Volumes/T7 Shield"))
+        );
+        // The volume root itself, with nothing below it.
+        assert_eq!(
+            volume_root_of(Path::new("/Volumes/T7 Shield")),
+            Some(PathBuf::from("/Volumes/T7 Shield"))
+        );
+        // Not under /Volumes -> the mount-point rule does not apply.
+        assert_eq!(volume_root_of(Path::new("/Users/x/.cache/mlxcel")), None);
+        assert_eq!(volume_root_of(Path::new("/Volumes")), None);
+        assert_eq!(volume_root_of(Path::new("relative/path")), None);
+    }
+
+    /// An ordinary directory is not a mount point — structurally identical to
+    /// the `/Volumes/<name>` stub left behind when a drive is unmounted.
+    #[test]
+    fn ordinary_directory_is_not_a_mount_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        assert!(!is_mount_point(&sub));
+    }
+
+    /// Positive control for `is_mount_point`: without one, every "not a mount
+    /// point" result in this module could equally mean the device comparison
+    /// never works at all.
+    ///
+    /// Do NOT reach for `/System/Volumes/Data` here — it looks like the obvious
+    /// choice and it is wrong. Measured on this host: it reports dev=16777233,
+    /// *identical* to its parent `/System/Volumes` and to `/`, because it is an
+    /// APFS **firmlink** within one volume rather than a device mount. A real
+    /// external drive does differ: `/Volumes/T7 Shield` dev=16777244 against
+    /// `/Volumes` dev=16777233. The firmlink cost this control one red run.
+    ///
+    /// So the control locates a genuine device mount at runtime instead of
+    /// naming one, and skips loudly when the host has none attached.
+    #[test]
+    fn known_mount_point_is_detected() {
+        // Candidates come from the MOUNT TABLE, never from `is_mount_point`.
+        // Selecting with the function under test would make this tautological:
+        // it would pass on whatever it selected, and a wholly broken
+        // implementation would select nothing and silently skip.
+        let Ok(out) = std::process::Command::new("/sbin/mount").output() else {
+            eprintln!("SKIPPED: could not run /sbin/mount; negatives UNCONTROLLED");
+            return;
+        };
+        let table = String::from_utf8_lossy(&out.stdout);
+        let mounted: Vec<PathBuf> = table
+            .lines()
+            .filter_map(|l| l.split(" on ").nth(1))
+            .filter_map(|rest| rest.rsplit_once(" ("))
+            .map(|(mount_point, _opts)| PathBuf::from(mount_point))
+            .filter(|p| p.starts_with("/Volumes/"))
+            .collect();
+
+        if mounted.is_empty() {
+            eprintln!(
+                "SKIPPED: mount table lists no volume under /Volumes on this \
+                 host, so the negative mount-point results in this module are \
+                 UNCONTROLLED."
+            );
+            return;
+        }
+        for m in &mounted {
+            assert!(
+                is_mount_point(m),
+                "the mount table lists {} as mounted but the device comparison \
+                 disagrees — every negative result in this module would then be \
+                 meaningless",
+                m.display()
+            );
+        }
+    }
+
+    #[test]
+    fn refusals_name_the_path_they_checked() {
+        let msg = ColdStoreDirRefusal::VolumeNotMounted {
+            path: PathBuf::from("/Volumes/T7 Shield/mlxcel"),
+            volume: PathBuf::from("/Volumes/T7 Shield"),
+        }
+        .to_string();
+        assert!(msg.contains("/Volumes/T7 Shield/mlxcel"));
+        assert!(msg.contains("BOOT DISK"));
     }
 }

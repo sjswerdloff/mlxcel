@@ -1776,6 +1776,19 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
             "Cold-storage disabled: format v2 does not include LoRA adapter identity"
         );
         None
+    } else if let Err(refusal) = mlxcel_core::cache::cold_store::validate_configured_base_dir() {
+        // Refuse rather than fall back to the default under $HOME. Someone who
+        // sets MLXCEL_COLD_STORE_DIR is usually doing it BECAUSE the boot disk
+        // is short of space, so quietly writing there anyway defeats the point
+        // — and `create_dir_all` under an unmounted volume would put the bytes
+        // on the boot disk while looking like it used the drive.
+        // No cold store is slower. A silently mis-placed one is worse.
+        tracing::error!(
+            %refusal,
+            "Cold-storage DISABLED: MLXCEL_COLD_STORE_DIR is not usable. \
+             Sessions will re-prefill instead of loading from disk."
+        );
+        None
     } else {
         let model_path_str = startup.model_path.to_string_lossy().to_string();
         let store = Arc::new(mlxcel_core::cache::cold_store::ColdStore::new(&model_path_str));

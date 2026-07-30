@@ -152,6 +152,20 @@ fn build_block_cold_store(
         );
         return None;
     }
+    // Refuse a bad MLXCEL_COLD_STORE_DIR before any store exists. Checked here
+    // as well as in startup.rs because these are independent construction
+    // paths: guarding only one leaves the other free to materialise the tree on
+    // the boot disk under an unmounted volume, which is the silent failure this
+    // whole check exists for.
+    if let Err(refusal) = mlxcel_core::cache::cold_store::validate_configured_base_dir() {
+        tracing::error!(
+            %refusal,
+            "v4 block cold store DISABLED: MLXCEL_COLD_STORE_DIR is not usable. \
+             Not falling back to the default under $HOME — that would write to \
+             the disk the variable was set to avoid."
+        );
+        return None;
+    }
     let path_str = model_path.to_string_lossy().to_string();
     let base = mlxcel_core::cache::cold_store::ColdStore::new(&path_str)
         .base_dir()
