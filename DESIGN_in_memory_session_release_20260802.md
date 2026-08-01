@@ -89,16 +89,40 @@ newly assert something stronger than is true either:
    cache-namespace input, not proof. Unlike the disk case the blast radius is a
    cache miss, so I believe a lower bar is defensible here; that is a belief,
    not a ruling, and it is yours.
-2. **Paged pins under bulk release.** `stash_paged_pins_for_release` queues
-   un-adopted paged blocks per removed entry. Releasing a whole session queues
-   many at once. I have not established whether that queue is bounded or what
-   drains it — flagging rather than assuming.
-3. **Is `strong_count > 1` the right liveness signal**, or is there a better
+2. **Is `strong_count > 1` the right liveness signal**, or is there a better
    one already in the codebase? It is racy by nature; I want it as an honest
    indicator, not a guarantee.
-4. **Does release need to touch snapshots too?** `snapshots` is a separate map
-   with its own `remove_snapshot`. Compaction presumably obsoletes those as
-   well, and I have not checked.
+
+## Questions I closed myself (2026-08-02, after sending v1)
+
+**Paged pins under bulk release — ANSWERED, and it adds a third eventual-ness.**
+`pending_paged_releases` is an unbounded `Vec` (push-only). It is drained by
+`drain_store_paged_releases()`, called from **three** production sites in the
+scheduler (`:1778`, `:2848`, `:3902`), documented as "a cheap no-op when the
+queue is empty" and deliberately placed on serving paths "so pins are reclaimed
+promptly during serving."
+
+So: unbounded in principle, drained continuously in practice — **except when
+idle.** A bulk release with no traffic behind it leaves paged pins queued until
+the next request touches a drain site. Compaction is normally followed by the
+next turn, so this drains promptly in the expected case; it is the *idle* case
+that holds memory. Worth knowing, because "release memory to avoid OOM" and
+"nothing is running" are not mutually exclusive states.
+
+**That makes three distinct ways release is eventual, and they are not the
+same mechanism:**
+1. an outstanding `Arc` clone held by an in-flight request,
+2. paged pins queued but not yet drained,
+3. and (1) and (2) can each be true while the store reports the entry gone.
+
+Any honest metric has to distinguish them or it will report success in all
+three states.
+
+**Snapshots — ANSWERED: yes, they need releasing.** `SnapshotSlot` carries the
+same `bucket: BucketKey` + `sessionless` shape as `EntrySlot`, so snapshots are
+session-scoped too. `remove_snapshot` is the parallel primitive, already used
+by `evict_oldest_snapshot`. Release must cover both maps or it silently leaves
+half a session resident.
 
 ## Not started. Design only.
 
