@@ -6508,3 +6508,129 @@ fn closing_makes_exactly_the_closed_generation_releasable() {
         "the closed generation is releasable; the open one is not"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Authority-record preamble: version before seal.
+//
+// Every session authority file on the production store is pre-seal (index v2,
+// registry v1). Under the old parse order those files had their last 32 bytes
+// split off as a "seal", the remainder hashed, and the mismatch reported as
+// *the record was altered after it was written* — a legacy file diagnosed as
+// TAMPERING. See FINDING_session_authority_version_skew_20260802.md.
+//
+// The pair below is deliberately a pair: the first proves the new diagnosis
+// fires, and the second proves the reorder did not DISABLE integrity checking.
+// Without the second, moving a check earlier could silently make tampering
+// undetectable and the first test would still be green.
+// ---------------------------------------------------------------------------
+
+/// A pre-seal (v2) index is refused as an unsupported VERSION, and explicitly
+/// not as an altered record.
+#[test]
+fn pre_seal_index_reports_unsupported_version_not_tampering() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+    let key = "legacy-session";
+    let key_digest = BlockColdStore::session_key_digest(key);
+
+    // Exactly the v2 shape: header + one entry, and NO trailing seal.
+    let mut body = Vec::new();
+    body.extend_from_slice(SESSION_INDEX_MAGIC);
+    body.extend_from_slice(&2u32.to_le_bytes());
+    body.extend_from_slice(&key_digest);
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(&[0u8; 16]); // incarnation
+    body.extend_from_slice(&0u64.to_le_bytes()); // generation
+    body.extend_from_slice(&[9u8; 32]); // manifest hash
+    assert_eq!(body.len(), 104, "the shape found on the production store");
+
+    let path = store.session_index_path(key);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &body).unwrap();
+
+    let err = read_session_index_file(&path).expect_err("must refuse a pre-seal file");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unsupported/unsealed authority-record version 2"),
+        "expected a version diagnosis, got: {msg}"
+    );
+    assert!(
+        !msg.contains("altered after it was written"),
+        "a legacy file must NOT be diagnosed as tampering: {msg}"
+    );
+}
+
+/// THE CONTROL. A CURRENT-version file whose body was altered must still be
+/// caught by the seal. Moving the version check earlier must not have moved
+/// integrity checking out of the way.
+///
+/// MUTATION: delete the `open_authority_record` call in `read_session_index_file`
+/// and this goes red while the test above stays green.
+#[test]
+fn sealed_current_version_with_a_flipped_body_still_reports_tampering() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+    let key = "current-session";
+    let key_digest = BlockColdStore::session_key_digest(key);
+
+    let mut sealed = encode_session_index_file(
+        &key_digest,
+        &[SessionAssociation {
+            incarnation: [1u8; 16],
+            manifest_hash: [9u8; 32],
+            generation: 0,
+        }],
+    );
+    // Sanity: it parses before we damage it.
+    let path = store.session_index_path(key);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &sealed).unwrap();
+    assert_eq!(
+        read_session_index_file(&path).expect("clean file must parse").associations.len(),
+        1
+    );
+
+    // Flip one bit inside a MANIFEST HASH — a same-length change that parses
+    // cleanly and reads as an ordinary answer, which is precisely why the seal
+    // exists. Magic and version are untouched, so the new preamble check passes
+    // and only the seal can catch this.
+    let flip = 48 + 16 + 8; // HEADER + incarnation + generation
+    sealed[flip] ^= 0x01;
+    std::fs::write(&path, &sealed).unwrap();
+
+    let err = read_session_index_file(&path).expect_err("a flipped body must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("altered after it was written"),
+        "the seal must still catch a same-length flip: {msg}"
+    );
+}
+
+/// The registry got the identical reordering, so it gets the identical pair's
+/// first half. Its production shape is v1.
+#[test]
+fn pre_seal_registry_reports_unsupported_version_not_tampering() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+    let key = "legacy-session";
+    let key_digest = BlockColdStore::session_key_digest(key);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(SESSION_REGISTRY_MAGIC);
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(&key_digest);
+    body.resize(76, 0); // pad to the v1 fixed length observed on disk
+
+    let path = store.session_registry_path(key);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &body).unwrap();
+
+    let err = read_session_registry_file(&path, &key_digest)
+        .expect_err("must refuse a pre-seal registry");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unsupported/unsealed authority-record version 1"),
+        "expected a version diagnosis, got: {msg}"
+    );
+    assert!(!msg.contains("altered after it was written"), "not tampering: {msg}");
+}

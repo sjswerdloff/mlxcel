@@ -8,7 +8,7 @@
 // See docs/DESIGN_cold_store_block_storage_v4_2026-07-26.md for the
 // full design.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -3689,6 +3689,7 @@ pub struct SessionIndexEntry {
 }
 
 /// One parsed session index file.
+#[derive(Debug)]
 struct SessionIndexFile {
     /// Digest of the session key this file claims to belong to; `None` when
     /// the file does not exist.
@@ -3731,19 +3732,26 @@ fn read_session_index_file(path: &Path) -> Result<SessionIndexFile, ColdStoreErr
             associations: Vec::new(),
         });
     };
-    // Integrity FIRST. Until the digest verifies, the declared count is not
-    // trustworthy either, so bounding the allocation on it would be bounding on
-    // an attacker-controlled number.
+    // MAGIC AND VERSION FIRST, at their FIXED offsets.
+    //
+    // This does NOT weaken the integrity-first rule, which exists because the
+    // declared COUNT at offset 44 cannot be trusted before the digest verifies —
+    // bounding an allocation on it would bound on an attacker-controlled number.
+    // Magic (0..8) and version (8..12) are at fixed positions and their reading
+    // depends on no declared length, so checking them first trusts nothing.
+    //
+    // WHY IT MATTERS: every session authority file on the production store is
+    // pre-seal (index v2, registry v1). Under the old order those files had
+    // their last 32 bytes split off as a "seal", the remainder hashed, and the
+    // mismatch reported as *the record was altered after it was written* — an
+    // old file diagnosed as TAMPERING, which is the most alarming message this
+    // store can emit, for its most benign cause. See
+    // FINDING_session_authority_version_skew_20260802.md.
+    check_authority_preamble(&raw, SESSION_INDEX_MAGIC, SESSION_INDEX_VERSION, &malformed)?;
+    // Integrity next, before any VARIABLE-length field is read.
     let raw = open_authority_record(&raw, &malformed)?;
     if raw.len() < HEADER {
         return Err(malformed("shorter than its header"));
-    }
-    if &raw[0..8] != SESSION_INDEX_MAGIC {
-        return Err(malformed("bad magic"));
-    }
-    let version = u32::from_le_bytes(raw[8..12].try_into().expect("4 bytes"));
-    if version != SESSION_INDEX_VERSION {
-        return Err(malformed(&format!("unsupported version {version}")));
     }
     let mut key_digest = [0u8; 32];
     key_digest.copy_from_slice(&raw[12..44]);
@@ -3809,19 +3817,17 @@ fn read_session_registry_file(
     let Some(raw) = read_bounded(path, (LEN + AUTHORITY_DIGEST_LEN) as u64, &bad)? else {
         return Ok(None);
     };
-    // Integrity FIRST, before any field is read. A same-length flip in the
-    // incarnation, cutoff or event id parses cleanly and reads as an ordinary
-    // answer, so every check below is meaningless until this one passes.
+    // MAGIC AND VERSION FIRST, at their FIXED offsets. See the identical
+    // reordering in `read_session_index_file` for why this does not weaken the
+    // integrity-first rule: neither field's position depends on any declared
+    // length, so reading them trusts nothing.
+    check_authority_preamble(&raw, SESSION_REGISTRY_MAGIC, SESSION_REGISTRY_VERSION, &bad)?;
+    // Integrity next, before any VARIABLE field is read. A same-length flip in
+    // the incarnation, cutoff or event id parses cleanly and reads as an
+    // ordinary answer, so every check below is meaningless until this passes.
     let raw = open_authority_record(&raw, &bad)?;
     if raw.len() != LEN {
         return Err(bad("wrong length"));
-    }
-    if &raw[0..8] != SESSION_REGISTRY_MAGIC {
-        return Err(bad("bad magic"));
-    }
-    let version = u32::from_le_bytes(raw[8..12].try_into().expect("4 bytes"));
-    if version != SESSION_REGISTRY_VERSION {
-        return Err(bad(&format!("unsupported version {version}")));
     }
     if &raw[12..44] != expect_key_digest.as_slice() {
         return Err(bad("stored key digest does not match this session key"));
@@ -3935,6 +3941,42 @@ fn seal_authority_record(mut body: Vec<u8>) -> Vec<u8> {
     hasher.update(&body);
     body.extend_from_slice(&hasher.finalize());
     body
+}
+
+/// Check an authority record's magic and version at their FIXED offsets, before
+/// the integrity seal is verified.
+///
+/// **The diagnosis cannot say merely "unsupported version N."** Without a valid
+/// seal, a genuine legacy file and a current file whose version field was
+/// altered are indistinguishable, so the message must claim only what is
+/// established: the version is not one this build writes, and integrity could
+/// not be established either way. Both outcomes refuse. (Alden, 2026-08-02.)
+///
+/// One audit surface: the caller does NOT re-check these fields on the opened
+/// body. Two places asserting the same thing is two places free to drift.
+fn check_authority_preamble(
+    raw: &[u8],
+    magic: &[u8],
+    expected_version: u32,
+    bad: &dyn Fn(&str) -> ColdStoreError,
+) -> Result<(), ColdStoreError> {
+    const PREAMBLE: usize = 8 + 4;
+    if raw.len() < PREAMBLE {
+        return Err(bad("shorter than its magic and version"));
+    }
+    if &raw[0..8] != magic {
+        return Err(bad("bad magic"));
+    }
+    let version = u32::from_le_bytes(raw[8..12].try_into().expect("4 bytes"));
+    if version != expected_version {
+        return Err(bad(&format!(
+            "unsupported/unsealed authority-record version {version}; this build \
+             writes {expected_version}. Integrity cannot be established: without a \
+             valid seal, a genuine pre-seal file and a current file whose version \
+             field was altered are indistinguishable. Refusing either way"
+        )));
+    }
+    Ok(())
 }
 
 /// Verify and strip the trailing digest, returning the record body.
