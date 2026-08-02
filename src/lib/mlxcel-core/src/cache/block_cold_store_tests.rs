@@ -6634,3 +6634,62 @@ fn pre_seal_registry_reports_unsupported_version_not_tampering() {
     );
     assert!(!msg.contains("altered after it was written"), "not tampering: {msg}");
 }
+
+/// A CURRENT-version file whose version field was altered is refused with the
+/// same non-attributing message as a genuine legacy file — deliberately.
+///
+/// The version lives inside the sealed body, so altering it also breaks the
+/// seal. We therefore cannot distinguish "written by an old build" from
+/// "version field flipped by something else", and the diagnosis must not claim
+/// to. This pins that as a contract rather than an accident of ordering.
+#[test]
+fn flipped_version_on_a_sealed_file_is_not_attributed_to_legacy() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+    let key = "flip-version";
+    let key_digest = BlockColdStore::session_key_digest(key);
+    let mut sealed = encode_session_index_file(
+        &key_digest,
+        &[SessionAssociation {
+            incarnation: [1u8; 16],
+            manifest_hash: [9u8; 32],
+            generation: 0,
+        }],
+    );
+    sealed[8] = 2; // version 3 -> 2, inside the sealed body
+    let path = store.session_index_path(key);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &sealed).unwrap();
+
+    let msg = read_session_index_file(&path)
+        .expect_err("a flipped version must be refused")
+        .to_string();
+    assert!(
+        msg.contains("unsupported/unsealed authority-record version 2"),
+        "expected the non-attributing version message, got: {msg}"
+    );
+    assert!(
+        msg.contains("indistinguishable"),
+        "the message must not claim to know which cause it is: {msg}"
+    );
+}
+
+/// Flipped magic on a current-version file is refused as bad magic, before the
+/// seal — the preamble's first gate.
+#[test]
+fn flipped_magic_is_refused_at_the_preamble() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = BlockColdStore::new(dir.path().to_path_buf(), [7u8; 32]);
+    let key = "flip-magic";
+    let key_digest = BlockColdStore::session_key_digest(key);
+    let mut sealed = encode_session_index_file(&key_digest, &[]);
+    sealed[0] ^= 0xff;
+    let path = store.session_index_path(key);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &sealed).unwrap();
+
+    let msg = read_session_index_file(&path)
+        .expect_err("flipped magic must be refused")
+        .to_string();
+    assert!(msg.contains("bad magic"), "got: {msg}");
+}

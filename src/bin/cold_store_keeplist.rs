@@ -5,7 +5,7 @@
 //! delete... what I might end up having to do is list the X-Session-Ids that I
 //! do not want deleted and get back the rest."*
 //!
-//! Revision 3, against Alden's re-review of `f4272bd`. See
+//! Revision 4, against Alden's review of `d6d0ca4`. See
 //! `DESIGN_keeplist_report_20260802.md` — its normative body is revision-3
 //! semantics; the superseded contract is quarantined in a historical section.
 //!
@@ -84,8 +84,11 @@ sealed artifact would attest to a snapshot nobody can establish. No deletion
 tool consumes it, and durable-evidence machinery with no consumer is where three
 of the last four defects came from.
 
-Redirect stdout if you want the report on disk. It is not evidence and does not
-claim to be.";
+This program writes no file. Capturing its output is a separate operation whose
+path and overwrite policy are yours to make explicit — ordinary `>` truncates
+its destination before this process even starts, and can be pointed inside the
+store, which would move the destructive step into the shell and out of review.
+So it is not recommended here as a substitute.";
 
 /// The v4 root directory name. `--store` is its PARENT: `BlockColdStore`
 /// appends this itself, so every path this tool derives must go through
@@ -175,8 +178,8 @@ EXIT CODES:
   3  report INCOMPLETE — figures withheld; do not act on this run
   2  usage, validation, or I/O error
 
-EVIDENCE, NOT A GRANT. It says what nothing in THIS keep list protects, and it
-is stale the moment anything writes to the store.
+DIAGNOSTIC REPORT, NOT EVIDENCE OR A GRANT. It says what nothing in THIS keep
+list protects, and it is stale the moment anything writes to the store.
 "
     .to_string()
 }
@@ -378,7 +381,7 @@ pub struct Report {
 
 pub enum Outcome {
     Complete(Report),
-    /// Report produced, but a named session matched nothing. No artifact.
+    /// Report produced, but a named session matched nothing. Identities withheld.
     Unmatched(Report),
     /// Figures withheld; nothing here may be acted on.
     Incomplete(String),
@@ -571,6 +574,30 @@ fn print_report(args: &Args, r: &Report) {
          safe to delete.\nAn unnamed session may be active, resumable, or simply \
          forgotten."
     );
+
+    // THE OBJECT IDENTITIES. Counts alone do not answer the question this tool
+    // claims to answer — *which* manifests — and leaving only counts would let
+    // the original manual-selection need look satisfied while it was silently
+    // deferred. (Alden, 2026-08-02.)
+    //
+    // Printed in full, never truncated: a capped list reads as a complete one.
+    if !r.buckets.unprotected.is_empty() {
+        println!();
+        println!("unprotected manifests ({}):", r.buckets.unprotected.len());
+        for m in &r.buckets.unprotected {
+            println!("  {}", hex(m));
+        }
+    }
+    if !r.candidate_blocks.is_empty() {
+        println!();
+        println!(
+            "blocks reachable ONLY from those manifests ({}):",
+            r.candidate_blocks.len()
+        );
+        for b in &r.candidate_blocks {
+            println!("  {}", hex(b));
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -597,8 +624,8 @@ fn main() -> ExitCode {
             for i in &r.unmatched {
                 println!("  keep-list entry {}  ({})", i + 1, pseudonym(&args.keep[*i]));
             }
-            println!("\nNO ARTIFACT WRITTEN: a keep list with an entry that protects");
-            println!("nothing is not evidence anyone should act on.");
+            println!("\nOBJECT IDENTITIES WITHHELD: a keep list with an entry that");
+            println!("protects nothing is not a report anyone should act on.");
             ExitCode::from(1)
         }
         Outcome::Complete(r) => {

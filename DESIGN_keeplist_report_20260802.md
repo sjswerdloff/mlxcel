@@ -1,7 +1,7 @@
 # Design: the keep-list report
 
-**Status: REVISION 3. Read-only reporting tool. NOT deletion authority.**
-Implemented at `src/bin/cold_store_keeplist.rs`; 15 tests, two mutation-verified.
+**Status: REVISION 4. Read-only DIAGNOSTIC tool. Not evidence, not deletion
+authority.** Implemented at `src/bin/cold_store_keeplist.rs`; 14 tests.
 
 Stuart, 2026-07-31: *"I need a way to know which data I should manually delete
 to effect the equivalent of a session-release... what I might end up having to
@@ -21,7 +21,7 @@ list*. It is not a claim that anything is safe to delete — an unnamed session 
 be active, resumable, unknown to the operator, or simply forgotten.
 
 Hence the bucket is **UNPROTECTED**, no byte figure is called *reclaimable*, and
-the artifact says in its first line that it is evidence and not a grant.
+the program calls its own output a diagnostic report rather than evidence.
 
 ## Why the keep-list form is structurally forced
 
@@ -69,14 +69,14 @@ session K then adds a reference to M; the report enumerates M and classifies it
 from the stale read; M is reported as unprotected while a named conversation
 depends on it.
 
-So `--store-is-quiescent` is **mandatory**, recorded in the artifact as
-`operator-asserted`, and never described as verified. A `pgrep` contradiction
+So `--store-is-quiescent` is **mandatory**, printed with the report as
+`OPERATOR-ASSERTED`, and never described as verified. A `pgrep` contradiction
 probe refuses on a positive, and **fails closed** on any outcome that is not a
 clean no-match: a check that could not run is not a check that found nothing.
 
-**Even a correct artifact is stale after any store mutation.** A later deletion
-boundary must revalidate these exact roots under authoritative cross-process
-exclusion.
+**The report is stale the moment anything writes to the store.** A later
+deletion boundary must revalidate these exact roots under authoritative
+cross-process exclusion.
 
 *The real fix is to extend the cross-process lock to cover session index
 writes.* That is a serving-path change, not this tool's to make, and it would
@@ -120,8 +120,12 @@ be proved, so a sealed artifact would attest to a snapshot nobody can
 establish. No deletion tool consumes it. Three of the last four defects came
 from durable-evidence machinery with no consumer.
 
-The report prints to stdout. Redirect it if you want it on disk. It is not
-evidence and no longer claims to be.
+The report prints to stdout, including the exact manifest and block hashes —
+counts alone would leave Stuart's manual-selection need looking satisfied while
+it was silently deferred. **Capturing that output is deliberately not
+recommended here:** ordinary `>` truncates its destination before this process
+starts and can be pointed inside the store, which moves the destructive step
+into the shell and out of review.
 
 **The invariant this leaves, and how it is enforced:** the production path
 performs no destructive filesystem call. That is held by review, not by a test
@@ -138,7 +142,7 @@ shipped exactly that green-but-vacuous test.
 | any block unsizeable, or the total overflows | byte total withheld; exit 3 |
 | index vanished mid-scan | exit 3 — the store was not quiescent |
 | stem/header disagreement, symlink, bad store level | exit 2 |
-| a named session matched nothing | report printed, **no artifact**, exit 1 |
+| a named session matched nothing | counts printed, **object identities withheld**, exit 1 |
 
 An unreadable manifest cannot prove what it references, and an unknown root can
 overlap any candidate — so no figure is approximated. A qualified number still
@@ -169,11 +173,28 @@ rejecting symlinks), and `enumerate_manifest_hashes`.
 - **Fixture block directories carry a payload file but no real KV data.** That
   is sufficient for a report that only enumerates and sizes, and insufficient
   for any test of block I/O.
-- The legacy v2/v1 parser still reports an integrity mismatch before a precise
-  unsupported-version diagnosis. It fails closed; the diagnostic repair is
-  pending Stuart's migration ruling.
+- The legacy diagnostic repair **landed** at `e777097`: magic and version are
+  checked at fixed offsets before the seal, and a pre-seal file now reports an
+  unsupported/unsealed version rather than tampering. What remains pending on
+  Stuart is the **migration policy** — what should happen to v1/v2 files.
+- **Correction to a claim made at `43e1ba8`, now measured rather than
+  attributed.** I wrote that disabling the seal comparison reddens *exactly* the
+  new control. Asserted from a FILTERED run that could only see my own two
+  tests. Alden identified two existing exhaustive corruption tests that catch
+  the same mutation; the unfiltered run confirms him and gives the real number:
 
-*Clement, 2026-08-02, revision 3 against Alden's re-review of `f4272bd`.*
+  > `FAILED. 1232 passed; 3 failed` — `every_stored_byte_of_the_index_is_covered`,
+  > `every_stored_byte_of_the_registry_is_covered`, and my control.
+
+  **Three of 1235, not one.** And the two I did not know about are the stronger
+  pair: they enumerate *every* byte offset in the record and prove each is
+  covered, where mine flips one offset. Under the mutation they report 158 of
+  192 index bytes and 89 of 140 registry bytes as freely alterable.
+
+  *Mutation proves necessity, not exclusivity — and a denominator asserted from
+  a filtered run is not a denominator.* I had that written down.
+
+*Clement, 2026-08-02, revision 4 against Alden's review of `d6d0ca4`.*
 
 ---
 
