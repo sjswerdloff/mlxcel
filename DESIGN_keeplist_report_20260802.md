@@ -1,5 +1,179 @@
 # Design: the keep-list report
 
+**Status: REVISION 3. Read-only reporting tool. NOT deletion authority.**
+Implemented at `src/bin/cold_store_keeplist.rs`; 15 tests, two mutation-verified.
+
+Stuart, 2026-07-31: *"I need a way to know which data I should manually delete
+to effect the equivalent of a session-release... what I might end up having to
+do is list the X-Session-Ids that I do not want deleted and get back the rest."*
+
+> **The superseded revision-1 contract — `RELEASABLE`, "reported as deletable",
+> "GiB reclaimable" — is quarantined at the bottom of this file under
+> HISTORICAL. It must not be read as a specification.** Revision 2 appended its
+> corrections and left the rejected contract as the first thing a reader met,
+> which is the failure mode this whole document is about. (Alden, 2026-08-02.)
+
+## What the report answers, and what it does not
+
+**One question: which manifests were referenced only by sessions the operator
+did not name in this run?** That is an observation about *this invocation's keep
+list*. It is not a claim that anything is safe to delete — an unnamed session may
+be active, resumable, unknown to the operator, or simply forgotten.
+
+Hence the bucket is **UNPROTECTED**, no byte figure is called *reclaimable*, and
+the artifact says in its first line that it is evidence and not a grant.
+
+## Why the keep-list form is structurally forced
+
+**The raw session key is never stored.** The index filename is the key's digest
+and the file's header carries only that digest. From the store alone, sessions
+are digests.
+
+That kills the delete-list form: *"show me what is deletable"* would offer an
+operator hex strings to choose between. A keep-list requires identification
+**only of what is kept** — the conversations the operator is in. Identification
+is required exactly where the operator has it.
+
+## The three buckets
+
+Per **manifest**, never per session. Manifests are content-addressed and
+prefixes are shared, so one manifest can be referenced by a kept session and an
+unkept one at once.
+
+| bucket | definition | what happens to it |
+|---|---|---|
+| **KEEP** | referenced by ≥1 named session | protected; its blocks are roots |
+| **UNPROTECTED** | referenced by ≥1 session, and **every** referencing session was unnamed | listed, with its blocks; **not** called deletable |
+| **UNATTRIBUTED** | referenced by **no** session index | protected; its blocks are roots; never proposed |
+
+**Kept wins.** A manifest touched by any named session is KEEP. This is the
+safety property and it is mutation-verified: swapping the two arms reddens
+`shared_manifest_is_protected_by_any_keeper` and only that test.
+
+### Why UNATTRIBUTED is its own answer
+
+A manifest with no association is **indistinguishable from** one whose
+association was lost — persisted before session tracking, lost to the crash
+window `session_associations` documents, or belonging to an index whose digest
+did not match. Folding it into UNPROTECTED would expose a live conversation's
+cache; folding it into KEEP would hide a leak. Its blocks join the **protected**
+root set.
+
+## Quiescence: required, asserted, never proved
+
+`record_session_manifest` serialises on a **process-local `Mutex`**, not the
+cross-process `flock` on `store.lock`. **A separate binary therefore cannot
+exclude session index writes and cannot take a coherent snapshot.** Alden's
+interleaving: the report reads unkept session U referencing manifest M; kept
+session K then adds a reference to M; the report enumerates M and classifies it
+from the stale read; M is reported as unprotected while a named conversation
+depends on it.
+
+So `--store-is-quiescent` is **mandatory**, recorded in the artifact as
+`operator-asserted`, and never described as verified. A `pgrep` contradiction
+probe refuses on a positive, and **fails closed** on any outcome that is not a
+clean no-match: a check that could not run is not a check that found nothing.
+
+**Even a correct artifact is stale after any store mutation.** A later deletion
+boundary must revalidate these exact roots under authoritative cross-process
+exclusion.
+
+*The real fix is to extend the cross-process lock to cover session index
+writes.* That is a serving-path change, not this tool's to make, and it would
+also close an undocumented single-writer-process assumption: mutual exclusion
+for session indexes currently rests on a shell script's pre-flight check.
+
+## Identity checks
+
+**Path/header agreement, on the path actually enumerated.** `enumerate_session_indexes`
+returns the file's own path alongside the digest its header claims. The stem
+must be 64 hex characters and must equal that digest. Revision 2 instead derived
+the filename that *should* hold the digest and checked whether such a file
+existed — a different question, which `a.idx` claiming digest `b` passes
+whenever `b.idx` also exists. Mutation-verified.
+
+**Symlinks are rejected at enumeration**, where `DirEntry::file_type` can still
+see them. Once opened, a link to another session's index is indistinguishable
+from that session's own file.
+
+**A mismatch fails the whole report** and is never converted to absence.
+
+## The artifact
+
+Written **only** on a complete report with no unmatched keep entries. Revision 2
+wrote it before the unmatched check, so a typo produced a detached file saying
+`completeness=complete` while protecting nothing.
+
+Contains: canonical store path, **SHA-256 of the running binary** (ordinary
+builds do not set `MLXCEL_GIT_SHA`, so revision 2's provenance field would have
+read `unknown`; hashing the executable also captures uncommitted changes),
+quiescence basis, sessions enumerated, keep named/matched/unmatched, completeness,
+every bucket's manifest hashes, the candidate block hashes, the byte total, and a
+trailing `artifact_sha256` over all of it.
+
+**Session pseudonyms are deliberately excluded.** A stable 48-bit unsalted digest
+prefix of a guessable id is an offline confirmation oracle, and this file
+persists. Pseudonyms appear on the console only, and are labelled pseudonymous
+rather than non-reversible.
+
+Refuses to clobber, refuses a path inside the store, creates `0600`, fsyncs, and
+renames onto a path verified absent.
+
+## Failure behaviour
+
+| condition | result |
+|---|---|
+| any manifest unreadable | **all** block and byte figures withheld; exit 3 |
+| any block unsizeable, or the total overflows | byte total withheld; exit 3 |
+| index vanished mid-scan | exit 3 — the store was not quiescent |
+| stem/header disagreement, symlink, bad store level | exit 2 |
+| a named session matched nothing | report printed, **no artifact**, exit 1 |
+
+An unreadable manifest cannot prove what it references, and an unknown root can
+overlap any candidate — so no figure is approximated. A qualified number still
+gets read as a number.
+
+## What it needs from `mlxcel-core`
+
+Three read-only additions, no existing behaviour changed: `key_digest_of`,
+`enumerate_session_indexes` (returning path + claimed digest + associations, and
+rejecting symlinks), and `enumerate_manifest_hashes`.
+
+## What this deliberately does NOT do
+
+- **No deletion, no `--force`, no `--yes`.** A report that can delete is not a
+  report.
+- **No TTL, age or LRU.** Sessions are resumable; an idle one is not finished.
+- **No claim that UNPROTECTED is safe to delete.**
+
+## Known gaps, stated rather than implied
+
+- **The happy path now runs against a real fixture**, built with the store's own
+  `write_manifest` / `record_session_manifest`. It has still never produced a
+  complete report against the *production* store, because every index there is
+  pre-seal — see `FINDING_session_authority_version_skew_20260802.md`.
+- **The quiescence refusal has no live positive control.** `ServerRunning` is
+  unit-tested against a synthetic `pgrep` result; it has never been observed
+  firing against an actual running server.
+- **Fixture block directories carry a payload file but no real KV data.** That
+  is sufficient for a report that only enumerates and sizes, and insufficient
+  for any test of block I/O.
+- The legacy v2/v1 parser still reports an integrity mismatch before a precise
+  unsupported-version diagnosis. It fails closed; the diagnostic repair is
+  pending Stuart's migration ruling.
+
+*Clement, 2026-08-02, revision 3 against Alden's re-review of `f4272bd`.*
+
+---
+
+# HISTORICAL — superseded revision 1 and 2 text
+
+**Everything below is retained for provenance and is NOT a specification.** The
+revision-1 body used `RELEASABLE`, described that bucket as *"reported as
+deletable"*, and printed *"GiB reclaimable"* — all three rejected in review.
+
+# Design: the keep-list report
+
 **Status: DESIGN. Read-only tool, nothing implemented yet. For Alden before code.**
 
 Stuart, 2026-07-31: *"I need a way to know which data I should manually delete

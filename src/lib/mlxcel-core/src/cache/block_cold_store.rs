@@ -1240,8 +1240,22 @@ impl BlockColdStore {
             if path.extension().and_then(|e| e.to_str()) != Some("idx") {
                 continue;
             }
+            // A SYMLINK IS REJECTED HERE, not by the caller. `DirEntry::file_type`
+            // does not follow links, so this is the only place the distinction is
+            // still visible: once the path is opened, a link to another session's
+            // index is indistinguishable from that session's own file, and its
+            // associations would be attributed to whichever name the link carries.
+            if !entry.file_type()?.is_file() {
+                return Err(invalid_data(format!(
+                    "session index {} is not a regular file. A symlink here would \
+                     attribute one session's associations to another's name, and \
+                     associations authorize deletion.",
+                    path.display()
+                )));
+            }
             let parsed = read_session_index_file(&path)?;
             out.push(SessionIndexEntry {
+                path,
                 key_digest: parsed.key_digest,
                 associations: parsed.associations,
             });
@@ -3653,6 +3667,15 @@ pub struct SessionAssociation {
 /// One session index as found on disk by [`BlockColdStore::enumerate_session_indexes`].
 #[derive(Debug, Clone)]
 pub struct SessionIndexEntry {
+    /// The path this entry was actually read from.
+    ///
+    /// **Required for the caller to check path/header agreement at all.** An
+    /// earlier version returned only the header digest, so a caller could
+    /// derive the filename that *should* hold that digest and check whether
+    /// such a file exists — which is a different question. `a.idx` claiming
+    /// digest `b` passes that check whenever `b.idx` also exists, and its
+    /// associations are then attributed to session `b`. (Alden, 2026-08-02.)
+    pub path: PathBuf,
     /// The digest the file itself claims, taken from its header rather than
     /// from its filename. Deriving it from the name would attribute an identity
     /// the file does not assert, and a manufactured identity is what authorizes
