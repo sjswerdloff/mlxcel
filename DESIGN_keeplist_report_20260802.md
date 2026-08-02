@@ -154,13 +154,26 @@ withheld — revision 2's artifact-ordering failure in a new medium. Fixing an
 ordering in one place and reintroducing it by adding a feature to a shared
 renderer is the shape to watch for.
 
-| outcome | counts | object identities | exit |
-|---|:---:|:---:|:---:|
-| Complete, all keep ids matched, all blocks sized | yes | yes | 0 |
-| Complete, all matched, **sizing failed** | yes | yes, byte total withheld | 3 |
-| Unmatched keep id | yes | **no** | 1 |
-| Incomplete scan | no | no | 3 |
-| Refused validation or quiescence | no | no | 2 |
+| outcome | `bytes` | counts | object identities | exit |
+|---|---|:---:|:---:|:---:|
+| Complete, all matched, all sized | `Some` | yes | yes | 0 |
+| Complete, all matched, per-block sizing failed | `None`, unsized > 0 | yes | yes, total withheld | 3 |
+| Complete, all matched, **aggregate overflow** | `None`, unsized = **0** | yes | yes, total withheld | 3 |
+| Unmatched keep id, fully sized | `Some` | yes | **no** | 1 |
+| Unmatched keep id, sizing failed | `None` | yes | **no** | **3** |
+| Incomplete scan | — | no actionable classification or byte figures | no | 3 |
+| Refused validation or quiescence | — | no | no | 2 |
+
+**Exit status keys on `bytes.is_none()`, not on `unsized_blocks > 0`.** Aggregate
+overflow also yields no total while leaving that count at zero, so keying on the
+count printed `SIZE WITHHELD` and exited **0** — contradicting both the usage
+text and this table. `unsized_blocks` stays the honest count it is rather than
+being falsified to drive control flow.
+
+**Unmatched *and* size-incomplete exits 3, not 1.** Both conditions are real and
+the more conservative machine-readable status dominates; a caller keying on 1
+would treat a size-incomplete run as merely mis-typed. Identities stay withheld
+either way, because the keep input did not match.
 
 **The sizing-failure row prints identities deliberately.** A block that cannot
 be sized does not invalidate manifest or block *reachability* — the
@@ -169,8 +182,20 @@ is withheld, and exit 3 says the run is not clean.
 
 Pinned by `emission_decision_table`, which asserts on emitted **text** rather
 than on the returned enum: the regression lived in the renderer, where an
-enum-level test could not see it. Mutation-verified — calling
-`render_identities` from the `Unmatched` arm reddens exactly that test.
+enum-level test could not see it.
+
+**Its first version covered four of seven rows, and the three it omitted were
+the sizing rows — which is exactly why the exit-0 overflow bug survived the
+barrier this test was written to be.** A test named for a decision table asserts
+coverage of that table by its name. The sizing rows are now synthesised from a
+constructed `Report` rather than provoked, since an 18-EiB filesystem is not
+needed to pin what `decide` does with `bytes: None`. The Refused and Incomplete
+exits are asserted exactly; the first version accepted 2 *or* 3 for either, so
+swapping them would have stayed green.
+
+Mutation-verified twice: calling `render_identities` from the `Unmatched` arm
+reddens the identity assertion, and keying the exit back on `unsized_blocks`
+reddens the overflow row while every other row stays green.
 
 An unreadable manifest cannot prove what it references, and an unknown root can
 overlap any candidate — so no figure is approximated. A qualified number still

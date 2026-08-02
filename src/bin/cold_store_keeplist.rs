@@ -619,7 +619,8 @@ fn render_identities(r: &Report) -> String {
 /// |---|---|---|---|
 /// | Complete, all matched, all sized | yes | yes | 0 |
 /// | Complete, all matched, sizing failed | yes | yes, byte total withheld | 3 |
-/// | Unmatched keep id | yes | **no** | 1 |
+/// | Unmatched keep id, fully sized | yes | **no** | 1 |
+/// | Unmatched keep id, sizing failed | yes | **no** | 3 |
 /// | Incomplete scan | no | no | 3 |
 /// | Refused | no | no | 2 |
 ///
@@ -655,6 +656,18 @@ fn decide(args: &Args, outcome: &Outcome) -> Emission {
                  nothing classified with less protection than you intended, so naming\n\
                  the objects would name a set you did not ask for.\n",
             );
+            // PRECEDENCE, stated because silence would leave scripts to infer
+            // it: unmatched AND size-incomplete exits 3, not 1. Both conditions
+            // are real and the more conservative machine-readable status has to
+            // dominate — a caller keying on 1 would treat a size-incomplete run
+            // as merely mis-typed.
+            if r.bytes.is_none() {
+                body.push_str(
+                    "\nExit 3, not 1: this run is BOTH unmatched and size-incomplete, \
+                     and the\nmore conservative status dominates.\n",
+                );
+                return Emission { body, exit: 3 };
+            }
             Emission { body, exit: 1 }
         }
         Outcome::Complete(r) => {
@@ -662,7 +675,12 @@ fn decide(args: &Args, outcome: &Outcome) -> Emission {
             body.push_str(&render_identities(r));
             Emission {
                 body,
-                exit: if r.unsized_blocks > 0 { 3 } else { 0 },
+                // `bytes.is_none()`, NOT `unsized_blocks > 0`. Aggregate
+                // OVERFLOW also yields no total while leaving that count at
+                // zero, so keying on the count printed SIZE WITHHELD and exited
+                // 0. `unsized_blocks` stays the honest count it is rather than
+                // being falsified to drive control flow. (Alden, 2026-08-02.)
+                exit: if r.bytes.is_none() { 3 } else { 0 },
             }
         }
     }
@@ -978,16 +996,60 @@ mod tests {
             "the identity section must be absent entirely"
         );
 
-        // Refused and Incomplete -> no counts, no identities.
-        for o in [
-            Outcome::Refused("x".into()),
-            Outcome::Incomplete("y".into()),
-        ] {
-            let e = decide(&a, &o);
-            assert!(e.exit == 2 || e.exit == 3);
-            assert!(!e.body.contains("UNPROTECTED"));
-            assert!(!e.body.contains(&other_hex));
-        }
+        // Refused and Incomplete -> EXACT exits. The previous version accepted
+        // 2 or 3 for either, so swapping them would have stayed green.
+        let e = decide(&a, &Outcome::Refused("x".into()));
+        assert_eq!(e.exit, 2, "Refused is 2, and only 2");
+        assert!(!e.body.contains("UNPROTECTED") && !e.body.contains(&other_hex));
+        let e = decide(&a, &Outcome::Incomplete("y".into()));
+        assert_eq!(e.exit, 3, "Incomplete is 3, and only 3");
+        assert!(!e.body.contains("UNPROTECTED") && !e.body.contains(&other_hex));
+
+        // ---- the sizing rows, which the first version of this test omitted ----
+        //
+        // That omission is why the exit-0 overflow bug survived the barrier this
+        // test was written to be. A test named for a decision table asserts
+        // coverage of the table by its name. (Alden, 2026-08-02.)
+        //
+        // Synthesised rather than provoked: an 18-EiB filesystem is not needed
+        // to pin what `decide` does with `bytes: None`.
+        let synth = |bytes: Option<u64>, unsized_blocks: usize, unmatched: Vec<usize>| Report {
+            buckets: classify(&[idx(20, &[2])], &[other.hash()], &HashSet::new()),
+            candidate_blocks: vec![h(2)],
+            bytes,
+            unsized_blocks,
+            sessions_enumerated: 1,
+            unmatched,
+        };
+
+        // Complete, per-block sizing failure -> identities kept, exit 3.
+        let e = decide(&a, &Outcome::Complete(synth(None, 2, vec![])));
+        assert_eq!(e.exit, 3, "per-block size failure must not exit 0");
+        assert!(e.body.contains("SIZE WITHHELD"));
+        assert!(
+            e.body.contains("blocks reachable ONLY"),
+            "sizing failure does not invalidate reachability"
+        );
+
+        // Complete, AGGREGATE OVERFLOW -> bytes None with unsized_blocks ZERO.
+        // MUTATION: key the exit on `unsized_blocks > 0` and this row goes red
+        // while every other row stays green.
+        let e = decide(&a, &Outcome::Complete(synth(None, 0, vec![])));
+        assert_eq!(e.exit, 3, "aggregate overflow must exit 3, not 0");
+        assert!(e.body.contains("SIZE WITHHELD"));
+
+        // Unmatched AND size-incomplete -> the conservative status dominates.
+        let e = decide(&a, &Outcome::Unmatched(synth(None, 1, vec![0])));
+        assert_eq!(e.exit, 3, "unmatched + size-incomplete is 3, not 1");
+        assert!(e.body.contains("OBJECT IDENTITIES WITHHELD"));
+        assert!(
+            !e.body.contains("blocks reachable ONLY"),
+            "still no identities: the keep input did not match"
+        );
+
+        // Unmatched, fully sized -> 1.
+        let e = decide(&a, &Outcome::Unmatched(synth(Some(1024), 0, vec![0])));
+        assert_eq!(e.exit, 1);
     }
 
     /// A typo'd keep id yields Unmatched rather than a clean report.
