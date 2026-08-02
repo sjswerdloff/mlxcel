@@ -6,7 +6,7 @@
 //! do not want deleted and get back the rest."*
 //!
 //! Revision 4, against Alden's review of `d6d0ca4`. See
-//! `DESIGN_keeplist_report_20260802.md` — its normative body is revision-3
+//! `DESIGN_keeplist_report_20260802.md` — its normative body is revision-4
 //! semantics; the superseded contract is quarantined in a historical section.
 //!
 //! # Invariant: the production path performs no destructive filesystem call
@@ -538,64 +538,132 @@ pub fn run(args: &Args) -> Outcome {
 
 
 
-fn print_report(args: &Args, r: &Report) {
-    println!("cold store    {}", v4_root(&args.store).display());
-    println!("quiescence    OPERATOR-ASSERTED, not verified by this tool");
-    println!(
-        "sessions      {} indexes; {} named{}, {} matched",
+/// Summary only. Counts, never object identities.
+///
+/// Returned as a `String` rather than printed so the output boundary is
+/// reachable by a test — the identity-disclosure regression below lived
+/// exactly here and the enum-level test could not see it.
+fn render_summary(args: &Args, r: &Report) -> String {
+    let mut o = String::new();
+    o.push_str(&format!("cold store    {}\n", v4_root(&args.store).display()));
+    o.push_str("quiescence    OPERATOR-ASSERTED, not verified by this tool\n");
+    o.push_str(&format!(
+        "sessions      {} indexes; {} named{}, {} matched\n\n",
         r.sessions_enumerated,
         args.keep.len(),
         if args.keep_none { " (--keep-none)" } else { "" },
         r.buckets.matched_digests.len()
-    );
-    println!();
-    println!("KEEP          {:>6} manifests", r.buckets.keep.len());
-    println!(
+    ));
+    o.push_str(&format!("KEEP          {:>6} manifests\n", r.buckets.keep.len()));
+    o.push_str(&format!(
         "UNPROTECTED   {:>6} manifests   → {} blocks referenced by no KEEP or \
-         UNATTRIBUTED manifest",
+         UNATTRIBUTED manifest\n",
         r.buckets.unprotected.len(),
         r.candidate_blocks.len()
-    );
-    println!(
-        "UNATTRIBUTED  {:>6} manifests   [protected; never proposed]",
+    ));
+    o.push_str(&format!(
+        "UNATTRIBUTED  {:>6} manifests   [protected; never proposed]\n\n",
         r.buckets.unattributed.len()
-    );
-    println!();
+    ));
     match r.bytes {
-        Some(n) => println!("those blocks occupy {:.2} GiB on disk", gib(n)),
-        None => println!(
-            "SIZE WITHHELD: {} block(s) could not be sized, or the total overflowed",
+        Some(n) => o.push_str(&format!("those blocks occupy {:.2} GiB on disk\n", gib(n))),
+        None => o.push_str(&format!(
+            "SIZE WITHHELD: {} block(s) could not be sized, or the total overflowed\n",
             r.unsized_blocks
-        ),
+        )),
     }
-    println!();
-    println!(
-        "UNPROTECTED means: nothing in THIS keep list references it. It does NOT mean \
-         safe to delete.\nAn unnamed session may be active, resumable, or simply \
-         forgotten."
+    o.push_str(
+        "\nUNPROTECTED means: nothing in THIS keep list references it. It does NOT \
+         mean safe to delete.\nAn unnamed session may be active, resumable, or \
+         simply forgotten.\n",
     );
+    o
+}
 
-    // THE OBJECT IDENTITIES. Counts alone do not answer the question this tool
-    // claims to answer — *which* manifests — and leaving only counts would let
-    // the original manual-selection need look satisfied while it was silently
-    // deferred. (Alden, 2026-08-02.)
-    //
-    // Printed in full, never truncated: a capped list reads as a complete one.
+/// The exact objects. **Only a fully matched run may call this.**
+///
+/// Revision 4 put this inside the shared renderer, which `Outcome::Unmatched`
+/// also called — so a typoed keep id classified with less protection than the
+/// operator intended, printed the complete candidate list, and then announced
+/// that identities were withheld. That is revision 2's artifact-ordering
+/// failure in a new medium: I fixed the ordering in one place and reintroduced
+/// it by adding a feature to a renderer two outcomes share. (Alden, 2026-08-02.)
+///
+/// Printed in full, never truncated: a capped list reads as a complete one.
+fn render_identities(r: &Report) -> String {
+    let mut o = String::new();
     if !r.buckets.unprotected.is_empty() {
-        println!();
-        println!("unprotected manifests ({}):", r.buckets.unprotected.len());
+        o.push_str(&format!(
+            "\nunprotected manifests ({}):\n",
+            r.buckets.unprotected.len()
+        ));
         for m in &r.buckets.unprotected {
-            println!("  {}", hex(m));
+            o.push_str(&format!("  {}\n", hex(m)));
         }
     }
     if !r.candidate_blocks.is_empty() {
-        println!();
-        println!(
-            "blocks reachable ONLY from those manifests ({}):",
+        o.push_str(&format!(
+            "\nblocks reachable ONLY from those manifests ({}):\n",
             r.candidate_blocks.len()
-        );
+        ));
         for b in &r.candidate_blocks {
-            println!("  {}", hex(b));
+            o.push_str(&format!("  {}\n", hex(b)));
+        }
+    }
+    o
+}
+
+/// What an outcome is allowed to emit, as one decision this file makes once.
+///
+/// | outcome | counts | identities | exit |
+/// |---|---|---|---|
+/// | Complete, all matched, all sized | yes | yes | 0 |
+/// | Complete, all matched, sizing failed | yes | yes, byte total withheld | 3 |
+/// | Unmatched keep id | yes | **no** | 1 |
+/// | Incomplete scan | no | no | 3 |
+/// | Refused | no | no | 2 |
+///
+/// Sizing failure does not invalidate reachability, so identities stay coherent
+/// on that row; only the byte total is withheld and the exit code says so.
+struct Emission {
+    body: String,
+    exit: u8,
+}
+
+fn decide(args: &Args, outcome: &Outcome) -> Emission {
+    match outcome {
+        Outcome::Refused(why) => Emission {
+            body: format!("REFUSING: {why}\n"),
+            exit: 2,
+        },
+        Outcome::Incomplete(why) => Emission {
+            body: format!("REPORT INCOMPLETE: {why} Do not act on this run.\n"),
+            exit: 3,
+        },
+        Outcome::Unmatched(r) => {
+            let mut body = render_summary(args, r);
+            body.push_str("\nUNMATCHED — these protected nothing (pseudonyms, not anonymous):\n");
+            for i in &r.unmatched {
+                body.push_str(&format!(
+                    "  keep-list entry {}  ({})\n",
+                    i + 1,
+                    pseudonym(&args.keep[*i])
+                ));
+            }
+            body.push_str(
+                "\nOBJECT IDENTITIES WITHHELD: a keep list with an entry that protects\n\
+                 nothing classified with less protection than you intended, so naming\n\
+                 the objects would name a set you did not ask for.\n",
+            );
+            Emission { body, exit: 1 }
+        }
+        Outcome::Complete(r) => {
+            let mut body = render_summary(args, r);
+            body.push_str(&render_identities(r));
+            Emission {
+                body,
+                exit: if r.unsized_blocks > 0 { 3 } else { 0 },
+            }
         }
     }
 }
@@ -608,34 +676,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(&args) {
-        Outcome::Refused(why) => {
-            eprintln!("REFUSING: {why}");
-            ExitCode::from(2)
-        }
-        Outcome::Incomplete(why) => {
-            eprintln!("REPORT INCOMPLETE: {why} Do not act on this run.");
-            ExitCode::from(3)
-        }
-        Outcome::Unmatched(r) => {
-            print_report(&args, &r);
-            println!();
-            println!("UNMATCHED — these protected nothing (pseudonyms, not anonymous):");
-            for i in &r.unmatched {
-                println!("  keep-list entry {}  ({})", i + 1, pseudonym(&args.keep[*i]));
-            }
-            println!("\nOBJECT IDENTITIES WITHHELD: a keep list with an entry that");
-            println!("protects nothing is not a report anyone should act on.");
-            ExitCode::from(1)
-        }
-        Outcome::Complete(r) => {
-            print_report(&args, &r);
-            if r.unsized_blocks > 0 {
-                return ExitCode::from(3);
-            }
-            ExitCode::SUCCESS
-        }
+    let outcome = run(&args);
+    let e = decide(&args, &outcome);
+    match outcome {
+        Outcome::Refused(_) | Outcome::Incomplete(_) => eprint!("{}", e.body),
+        _ => print!("{}", e.body),
     }
+    ExitCode::from(e.exit)
 }
 
 #[cfg(test)]
@@ -875,6 +922,72 @@ mod tests {
         std::os::unix::fs::symlink(&alpha, sessions.join(format!("{}.idx", "d".repeat(64))))
             .unwrap();
         assert!(matches!(run(&args_for(&f.base, &["alpha"])), Outcome::Refused(_)));
+    }
+
+    /// THE DECISION TABLE, at the output boundary rather than the enum.
+    ///
+    /// The regression this pins lived in the renderer, not in `run`: an
+    /// unmatched run printed the complete object-identity list and then
+    /// announced that identities were withheld. The enum-level test could not
+    /// see it, which is why this one asserts on emitted TEXT.
+    ///
+    /// MUTATION: call `render_identities` from the `Unmatched` arm of `decide`
+    /// and this goes red.
+    #[test]
+    fn emission_decision_table() {
+        let f = fixture();
+        install_blocks(&f.base, &[1, 2], 512);
+        let store = BlockColdStore::new(f.base.clone(), [7u8; 32]);
+        let kept = manifest(&[1], "kept");
+        let other = manifest(&[2], "other");
+        store.write_manifest(&kept).unwrap();
+        store.write_manifest(&other).unwrap();
+        store.record_session_manifest("keep-me", &kept.hash()).unwrap();
+        store.record_session_manifest("drop-me", &other.hash()).unwrap();
+        let other_hex = hex(&other.hash());
+
+        // Complete, all matched -> counts AND identities, exit 0.
+        let a = args_for(&f.base, &["keep-me"]);
+        let o = run(&a);
+        assert!(matches!(o, Outcome::Complete(_)));
+        let e = decide(&a, &o);
+        assert_eq!(e.exit, 0);
+        assert!(e.body.contains("UNPROTECTED"), "counts must appear");
+        assert!(
+            e.body.contains(&other_hex),
+            "a fully matched run must name the objects"
+        );
+
+        // Unmatched -> counts, pseudonyms, NO identities, exit 1.
+        let a = args_for(&f.base, &["keep-me", "typoo"]);
+        let o = run(&a);
+        assert!(matches!(o, Outcome::Unmatched(_)));
+        let e = decide(&a, &o);
+        assert_eq!(e.exit, 1);
+        assert!(e.body.contains("UNPROTECTED"), "counts still appear");
+        assert!(
+            e.body.contains("OBJECT IDENTITIES WITHHELD"),
+            "the claim must be made"
+        );
+        assert!(
+            !e.body.contains(&other_hex),
+            "and it must be TRUE: no manifest hash may appear on an unmatched run"
+        );
+        assert!(
+            !e.body.contains("unprotected manifests ("),
+            "the identity section must be absent entirely"
+        );
+
+        // Refused and Incomplete -> no counts, no identities.
+        for o in [
+            Outcome::Refused("x".into()),
+            Outcome::Incomplete("y".into()),
+        ] {
+            let e = decide(&a, &o);
+            assert!(e.exit == 2 || e.exit == 3);
+            assert!(!e.body.contains("UNPROTECTED"));
+            assert!(!e.body.contains(&other_hex));
+        }
     }
 
     /// A typo'd keep id yields Unmatched rather than a clean report.

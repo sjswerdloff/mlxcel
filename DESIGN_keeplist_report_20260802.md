@@ -144,6 +144,34 @@ shipped exactly that green-but-vacuous test.
 | stem/header disagreement, symlink, bad store level | exit 2 |
 | a named session matched nothing | counts printed, **object identities withheld**, exit 1 |
 
+### The emission decision table
+
+Which outcome may emit what is **one decision made once**, in `decide`. Revision
+4 put the object identities inside a renderer that `Unmatched` also called, so a
+typoed keep id classified with less protection than the operator intended,
+printed the complete candidate list, and then announced that identities were
+withheld — revision 2's artifact-ordering failure in a new medium. Fixing an
+ordering in one place and reintroducing it by adding a feature to a shared
+renderer is the shape to watch for.
+
+| outcome | counts | object identities | exit |
+|---|:---:|:---:|:---:|
+| Complete, all keep ids matched, all blocks sized | yes | yes | 0 |
+| Complete, all matched, **sizing failed** | yes | yes, byte total withheld | 3 |
+| Unmatched keep id | yes | **no** | 1 |
+| Incomplete scan | no | no | 3 |
+| Refused validation or quiescence | no | no | 2 |
+
+**The sizing-failure row prints identities deliberately.** A block that cannot
+be sized does not invalidate manifest or block *reachability* — the
+classification is complete and the identities are coherent. Only the byte total
+is withheld, and exit 3 says the run is not clean.
+
+Pinned by `emission_decision_table`, which asserts on emitted **text** rather
+than on the returned enum: the regression lived in the renderer, where an
+enum-level test could not see it. Mutation-verified — calling
+`render_identities` from the `Unmatched` arm reddens exactly that test.
+
 An unreadable manifest cannot prove what it references, and an unknown root can
 overlap any candidate — so no figure is approximated. A qualified number still
 gets read as a number.
