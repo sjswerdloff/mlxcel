@@ -132,3 +132,79 @@ No existing behaviour changes.
   is the entire point of putting it in front of him.
 
 *Clement, 2026-08-02. Design only. Facts read at the bytes at `4acebc8`.*
+
+---
+
+# REVISION 2 — against Alden's review of `84edcb4`
+
+He returned four P0s and the verdict *do not use this report to select data for
+manual deletion.* All four are accepted. What changed:
+
+**RELEASABLE is renamed UNPROTECTED, and no byte figure is called
+"reclaimable".** The bucket only ever meant *nothing in THIS keep list
+references it*. An unnamed session may be active, resumable, unknown to the
+operator, or forgotten. The design said as much and the artifact said the
+opposite — the finding lived where I last wrote rather than where a reader
+lands.
+
+**An empty keep list is refused** unless `--keep-none` is passed. The previous
+version had a *test asserting* that an empty list reports every attributed
+manifest as unprotected and exits 0, so an unset shell variable would have
+produced a whole-store report that read as authoritative. The test certified
+the hazard.
+
+**Quiescence is required and cannot be proved.** `record_session_manifest`
+serialises on a **process-local `Mutex`**, not the cross-process `flock` on
+`store.lock` — verified at the bytes. So a separate binary cannot exclude
+session index writes and cannot take a coherent snapshot. `--store-is-quiescent`
+is now mandatory, recorded in the artifact as *operator-asserted*, and
+contradicted by a `pgrep` probe that **fails closed**: a probe that could not
+run is refused rather than treated as a probe that found nothing.
+
+*The real fix is to extend the cross-process lock to cover session index
+writes.* That is a serving-path change and not this tool's to make. It would
+also close an undocumented single-writer-process assumption: today, mutual
+exclusion for session indexes rests on a shell script's pre-flight check.
+
+**Path/header agreement is checked, not trusted.** `session_associations(key)`
+compares a file's header digest against an *expected* one; an enumeration has no
+expectation, so the filename stem is the only independent witness. A file placed
+or symlinked under one session's name while claiming another would otherwise
+expose the first session's manifests as unprotected. A mismatch fails the whole
+report and is never converted to absence. **My design's earlier claim that
+"digest mismatch is read as empty" applies here was wrong** — that behaviour
+belongs to the keyed lookup, not the enumeration.
+
+**An `--artifact` emits the exact sorted manifest and block hashes** with store
+path, code commit, quiescence basis, keep-list labels and completeness status.
+Aggregate counts cannot authorize specific objects, and a later tool recomputing
+the set would not inherit this review. The artifact is evidence for a separate
+deletion decision; it is not a grant.
+
+**Session ids stay out of the report body.** Unmatched entries are identified by
+input line and a 12-hex label. `--keep-file` is preferred over `--keep` because
+argv is world-readable. Duplicates are refused rather than silently skewing the
+named-versus-matched counts.
+
+## Two bugs the revision introduced, both caught by RUNNING it
+
+**`--store` level was inverted.** I validated that `--store` names
+`cold-storage-v4`. `BlockColdStore` appends that root itself, so the validated
+form produced `cold-storage-v4/cold-storage-v4`, enumerated nothing, and printed
+a clean zero report — *exactly the P1 the validation was written to prevent*.
+The contract was in code I had already read this same session.
+
+**The quiescence probe failed open.** `.unwrap_or(false)` turned "could not
+check" into "no server found". Now a three-way result: match, clean no-match,
+or could-not-run — and the third refuses.
+
+## Still open, and not claimed as done
+
+- **Filesystem and CLI integration tests.** The eight unit tests cover the pure
+  classifier and the label; the guards were exercised by hand against the live
+  store and their exit codes confirmed, which is not a regression barrier.
+- **The happy path has never run.** Every index on the only real store is
+  pre-seal (v2), so the tool has never produced a complete report against real
+  data. It fails loud, which is right, and it is not evidence the report works.
+- **The quiescence refusal has no positive control.** The server was down for
+  every run, so `ServerRunning` has never been observed firing.
