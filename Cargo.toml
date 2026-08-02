@@ -60,6 +60,14 @@ path = "src/bin/kvarn_decode_bench.rs"
 name = "cold-store-bench"
 path = "src/bin/cold_store_bench.rs"
 
+# READ-ONLY keep-list report over the v4 cold store. Names the sessions to
+# PROTECT and reports what nothing protects — the only expressible form, since
+# the raw session key is never stored. Deletes nothing and creates no registry.
+# See DESIGN_keeplist_report_20260802.md and the module docs.
+[[bin]]
+name = "cold-store-keeplist"
+path = "src/bin/cold_store_keeplist.rs"
+
 [features]
 default = ["surgery"]
 metal = ["mlxcel-core/metal"]

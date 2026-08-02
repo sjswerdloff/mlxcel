@@ -1200,6 +1200,77 @@ impl BlockColdStore {
             .collect())
     }
 
+    /// The digest under which `session_key`'s index and registry are stored.
+    ///
+    /// Exposed so an operator tool can turn typed session ids into a keep-set
+    /// without any raw key reaching disk or a log. It delegates to the existing
+    /// private derivation rather than restating it: a second implementation of
+    /// this hash would partition the store silently, with every lookup missing
+    /// and nothing reporting an error.
+    pub fn key_digest_of(session_key: &str) -> [u8; 32] {
+        Self::session_key_digest(session_key)
+    }
+
+    /// Every session index present on disk.
+    ///
+    /// ENUMERATED FROM THE DIRECTORY, because the raw session key is never
+    /// stored (`session_key_digest`, `:901`). There is no way to ask which
+    /// sessions exist by name, so a keep-list is the only expressible form:
+    /// the caller names what it keeps and everything else is, by construction,
+    /// unprotected.
+    ///
+    /// PROPAGATES on a malformed index, matching `mark_reachable_blocks` and
+    /// deliberately NOT the fail-soft `continue` a reader would use. An index
+    /// this cannot parse is not an index with no associations — treating it as
+    /// empty would move its manifests into the unattributed bucket, where they
+    /// present as unreferenced.
+    ///
+    /// Read-only: opens nothing for write and creates no registry. Asking what
+    /// is attributed must not create the state that decides the answer.
+    pub fn enumerate_session_indexes(&self) -> Result<Vec<SessionIndexEntry>, ColdStoreError> {
+        let dir = self.sessions_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            // `.gen` registries live in the same directory and are not indexes.
+            if path.extension().and_then(|e| e.to_str()) != Some("idx") {
+                continue;
+            }
+            let parsed = read_session_index_file(&path)?;
+            out.push(SessionIndexEntry {
+                key_digest: parsed.key_digest,
+                associations: parsed.associations,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every committed manifest hash on disk.
+    ///
+    /// The same root enumeration `mark_reachable_blocks` performs (`:1937`),
+    /// exposed without the marking so a report can classify manifests without
+    /// computing reachability. Propagates on I/O error for the same reason it
+    /// does there: a manifest missing from an enumeration is a manifest whose
+    /// blocks a caller could conclude are unreferenced.
+    pub fn enumerate_manifest_hashes(&self) -> Result<Vec<[u8; 32]>, ColdStoreError> {
+        let dir = self.manifests_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if let Some(h) = committed_manifest_hash(&entry)? {
+                out.push(h);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }
@@ -3577,6 +3648,21 @@ pub struct SessionAssociation {
     /// proves who; only a generation proves WHEN, and reachability is a
     /// question about when. (Alden, 2026-07-29.)
     pub generation: u64,
+}
+
+/// One session index as found on disk by [`BlockColdStore::enumerate_session_indexes`].
+#[derive(Debug, Clone)]
+pub struct SessionIndexEntry {
+    /// The digest the file itself claims, taken from its header rather than
+    /// from its filename. Deriving it from the name would attribute an identity
+    /// the file does not assert, and a manufactured identity is what authorizes
+    /// deleting the wrong cache.
+    ///
+    /// `None` means the file vanished between the directory scan and the read.
+    /// Reported rather than dropped: a session that disappears mid-scan is not
+    /// a session with no manifests.
+    pub key_digest: Option<[u8; 32]>,
+    pub associations: Vec<SessionAssociation>,
 }
 
 /// One parsed session index file.

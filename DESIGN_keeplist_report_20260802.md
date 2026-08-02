@@ -51,11 +51,21 @@ structural, not observable:
 - persisted before session tracking existed;
 - association lost to the crash window `session_associations` already documents
   at `:1132-1135`;
-- an index file whose `key_digest` is `None` — the field is `Option`, so an
-  older file cannot be matched against a keep-set **at all**, and its manifests
-  fall out of every attributed set silently;
 - an index whose digest mismatches, which `session_associations` deliberately
   treats as empty rather than trusting.
+
+> **RETRACTED, 2026-08-02, before implementation.** A fourth cause appeared in
+> the first draft of this document: *an index file whose `key_digest` is `None`,
+> so an older file cannot be matched against a keep-set at all.* **It does not
+> exist.** `SessionIndexFile.key_digest` is `Option` because `None` means *the
+> file is absent* — `read_session_index_file` returns it from the
+> `read_bounded` miss at `:3619-3623`. Every file that parses carries a digest
+> at bytes `12..44` of a fixed-width header (`:3638-3639`), so there is no
+> legacy shape without one.
+>
+> I inferred a legacy-file case from the presence of an `Option` and shipped it
+> to a reviewer as the most interesting of the four. It is a claim about what a
+> mechanism **reaches**, which is the class I already know I under-check.
 
 Folding UNATTRIBUTED into RELEASABLE would delete cache belonging to a live
 conversation whose bookkeeping failed. Folding it into KEEP would hide a leak
