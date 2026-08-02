@@ -98,26 +98,37 @@ from that session's own file.
 
 **A mismatch fails the whole report** and is never converted to absence.
 
-## The artifact
+## No durable evidence artifact — WITHDRAWN in revision 4
 
-Written **only** on a complete report with no unmatched keep entries. Revision 2
-wrote it before the unmatched check, so a typo produced a detached file saying
-`completeness=complete` while protecting nothing.
+Revision 3 wrote a sealed `--artifact`. **It is withdrawn, not repaired.**
 
-Contains: canonical store path, **SHA-256 of the running binary** (ordinary
-builds do not set `MLXCEL_GIT_SHA`, so revision 2's provenance field would have
-read `unknown`; hashing the executable also captures uncommitted changes),
-quiescence basis, sessions enumerated, keep named/matched/unmatched, completeness,
-every bucket's manifest hashes, the candidate block hashes, the byte total, and a
-trailing `artifact_sha256` over all of it.
+Alden's writer review found that it contained
+`let _ = std::fs::remove_file(&tmp)` on a predictable sibling path with the
+error discarded — **an unconditional delete of a file the invocation may not
+have created, inside a tool whose entire contract is that it deletes nothing.**
+It also claimed no-clobber semantics it did not have: it checked the
+destination was absent and then used `rename`, which replaces.
 
-**Session pseudonyms are deliberately excluded.** A stable 48-bit unsalted digest
-prefix of a guessable id is an offline confirmation oracle, and this file
-persists. Pseudonyms appear on the console only, and are labelled pseudonymous
-rather than non-reversible.
+Both were mine, and the first is the sharpest thing anyone caught: I built this
+report so that the first deletion on the store would be one a human authorized,
+and put an unauthorized delete in it.
 
-Refuses to clobber, refuses a path inside the store, creates `0600`, fsyncs, and
-renames onto a path verified absent.
+**Why withdrawn rather than fixed.** The artifact was built ahead of its own
+precondition. Alden's original requirement was an immutable artifact *after the
+snapshot problem was solved*; quiescence here is operator-asserted and cannot
+be proved, so a sealed artifact would attest to a snapshot nobody can
+establish. No deletion tool consumes it. Three of the last four defects came
+from durable-evidence machinery with no consumer.
+
+The report prints to stdout. Redirect it if you want it on disk. It is not
+evidence and no longer claims to be.
+
+**The invariant this leaves, and how it is enforced:** the production path
+performs no destructive filesystem call. That is held by review, not by a test
+— a search of this source for `remove_file` cannot tell a call from a mention,
+and fires on the withdrawal notice that quotes the offending line. Absence is a
+claim about structure; a string search cannot establish it. Revision 4 briefly
+shipped exactly that green-but-vacuous test.
 
 ## Failure behaviour
 

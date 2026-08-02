@@ -9,6 +9,19 @@
 //! `DESIGN_keeplist_report_20260802.md` — its normative body is revision-3
 //! semantics; the superseded contract is quarantined in a historical section.
 //!
+//! # Invariant: the production path performs no destructive filesystem call
+//!
+//! No `remove_file`, no `remove_dir`, no `rename`, no truncation. The report's
+//! whole premise is that the first deletion on this store is one a human
+//! authorized against a list he read.
+//!
+//! **This is enforced by review, not by a test, and the distinction is the
+//! point.** A test that greps this source for `remove_file` cannot tell a call
+//! from a mention — it fires on the withdrawal notice below, which quotes the
+//! offending line. Absence is a claim about STRUCTURE, and a string search
+//! cannot establish it. A green search-based test here would assert a property
+//! it never checked. Revision 4 briefly had exactly that test.
+//!
 //! # What this report is, precisely
 //!
 //! It answers one question: **which manifests were referenced only by sessions
@@ -43,17 +56,36 @@
 //! serving process (`record_session_manifest`), not by the cross-process
 //! `flock` on `store.lock`. **A separate binary cannot exclude them and cannot
 //! take a coherent snapshot.** So quiescence is asserted by the operator, never
-//! proved here, and even a correct artifact is stale after any store mutation:
-//! a later deletion boundary must revalidate the exact roots under authoritative
-//! cross-process exclusion.
+//! proved here. A later deletion boundary must revalidate the exact roots under
+//! authoritative cross-process exclusion — this report cannot carry that
+//! guarantee forward, which is why it writes no durable evidence at all.
 
 use std::collections::HashSet;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mlxcel_core::cache::block_cold_store::BlockColdStore;
-use sha2::{Digest, Sha256};
+
+/// Why `--artifact` no longer exists.
+const ARTIFACT_WITHDRAWN: &str = "\
+--artifact is WITHDRAWN.
+
+The writer it invoked contained `let _ = std::fs::remove_file(&tmp)` on a
+predictable sibling path, with the error discarded — an unconditional delete of
+a file this invocation may not have created, inside a tool whose entire contract
+is that it deletes nothing. It also claimed no-clobber semantics it did not
+have: it checked the destination was absent and then used `rename`, which
+replaces. (Alden, 2026-08-02.)
+
+It is withdrawn rather than repaired because it was built ahead of its own
+precondition. The requirement was an immutable artifact AFTER the snapshot
+problem was solved; quiescence here is operator-asserted, not proved, so a
+sealed artifact would attest to a snapshot nobody can establish. No deletion
+tool consumes it, and durable-evidence machinery with no consumer is where three
+of the last four defects came from.
+
+Redirect stdout if you want the report on disk. It is not evidence and does not
+claim to be.";
 
 /// The v4 root directory name. `--store` is its PARENT: `BlockColdStore`
 /// appends this itself, so every path this tool derives must go through
@@ -74,8 +106,8 @@ fn hex(d: &[u8]) -> String {
 /// NOT non-reversible, and revision 2 claimed it was. It is 48 bits of unsalted
 /// SHA-256 over a possibly-guessable id, so it is an offline confirmation
 /// oracle and it is stable across runs. It appears on the console only, to let
-/// an operator tell two keep-list entries apart; it is **excluded from the
-/// artifact**, which persists. (Alden, 2026-08-02.)
+/// an operator tell two keep-list entries apart, and nothing persists it.
+/// (Alden, 2026-08-02.)
 fn pseudonym(session_key: &str) -> String {
     hex(&BlockColdStore::key_digest_of(session_key))[..12].to_string()
 }
@@ -111,27 +143,11 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
-/// SHA-256 of the running binary.
-///
-/// Revision 2 recorded `option_env!("MLXCEL_GIT_SHA").unwrap_or("unknown")`,
-/// which ordinary builds do not set — so every artifact would have claimed
-/// provenance it did not have. Hashing the executable pins the exact code that
-/// produced the artifact, including uncommitted changes, which a commit id
-/// cannot. Failure to compute it refuses the artifact rather than degrading to
-/// a placeholder.
-fn running_binary_digest() -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let bytes = std::fs::read(&exe).map_err(|e| format!("read {}: {e}", exe.display()))?;
-    let mut h = Sha256::new();
-    h.update(&bytes);
-    Ok(hex(&h.finalize()))
-}
-
+#[derive(Debug)]
 pub struct Args {
     pub store: PathBuf,
     pub keep: Vec<String>,
     pub keep_none: bool,
-    pub artifact: Option<PathBuf>,
     /// Set only by tests. Production always probes.
     pub skip_server_probe: bool,
 }
@@ -142,7 +158,7 @@ cold-store-keeplist — READ-ONLY report. Deletes nothing. NOT deletion authorit
 
 USAGE:
   cold-store-keeplist --store <DIR-CONTAINING-cold-storage-v4> \\
-      --store-is-quiescent --keep-file <FILE> [--artifact <OUT>]
+      --store-is-quiescent --keep-file <FILE>
 
   --store <DIR>           the directory CONTAINING 'cold-storage-v4'
   --keep-file <FILE>      session ids to PROTECT, one per line; '#' comments.
@@ -152,18 +168,15 @@ USAGE:
                           id is also supplied — the two assertions contradict.
   --store-is-quiescent    REQUIRED. Asserts no server is writing this store.
                           This tool CANNOT verify it.
-  --artifact <OUT>        exact manifest and block hashes with provenance, as
-                          evidence for a LATER, separate deletion decision.
-                          Refuses to clobber, refuses a path inside the store.
 
 EXIT CODES:
   0  report complete; every named session matched an index
-  1  report complete, but a named session matched nothing (no artifact written)
+  1  report complete, but a named session matched nothing
   3  report INCOMPLETE — figures withheld; do not act on this run
   2  usage, validation, or I/O error
 
-EVIDENCE, NOT A GRANT. It says what nothing in THIS keep list protects. Even a
-correct artifact is stale after any store mutation.
+EVIDENCE, NOT A GRANT. It says what nothing in THIS keep list protects, and it
+is stale the moment anything writes to the store.
 "
     .to_string()
 }
@@ -172,7 +185,6 @@ pub fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut store: Option<PathBuf> = None;
     let mut keep: Vec<String> = Vec::new();
     let (mut keep_none, mut quiescent) = (false, false);
-    let mut artifact: Option<PathBuf> = None;
     let mut it = argv.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -191,9 +203,10 @@ pub fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             }
             "--keep-none" => keep_none = true,
             "--store-is-quiescent" => quiescent = true,
-            "--artifact" => {
-                artifact = Some(PathBuf::from(it.next().ok_or("--artifact needs a path")?))
-            }
+            // WITHDRAWN. See the module docs: the writer it used to invoke
+            // contained an unconditional `remove_file` on a predictable sibling
+            // path, in a tool whose contract is that it deletes nothing.
+            "--artifact" => return Err(ARTIFACT_WITHDRAWN.to_string()),
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("unknown argument {other}\n\n{}", usage())),
         }
@@ -255,7 +268,6 @@ pub fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         store,
         keep,
         keep_none,
-        artifact,
         skip_server_probe: false,
     })
 }
@@ -521,85 +533,7 @@ pub fn run(args: &Args) -> Outcome {
     Outcome::Complete(report)
 }
 
-/// Write the evidence artifact.
-///
-/// Called ONLY on a complete report with no unmatched keep entries. Revision 2
-/// wrote it before the unmatched check, so a typo produced a detached file
-/// saying `completeness=complete` while protecting nothing.
-pub fn write_artifact(path: &Path, args: &Args, r: &Report) -> Result<(), String> {
-    let canon_store = v4_root(&args.store)
-        .canonicalize()
-        .map_err(|e| format!("cannot canonicalize store: {e}"))?;
-    if let Some(parent) = path.parent() {
-        if let Ok(p) = parent.canonicalize() {
-            if p.starts_with(&canon_store) {
-                return Err(
-                    "--artifact points inside the store. Evidence about a store must \
-                     not be written into the thing it describes."
-                        .into(),
-                );
-            }
-        }
-    }
-    if path.symlink_metadata().is_ok() {
-        return Err(format!(
-            "{} already exists. Refusing to clobber: a later run would silently \
-             replace the exact object a human reviewed.",
-            path.display()
-        ));
-    }
-    let code = running_binary_digest()?;
 
-    let mut out = String::new();
-    out.push_str("# cold-store-keeplist artifact — EVIDENCE, NOT A DELETION GRANT\n");
-    out.push_str("# Stale after ANY store mutation. A deletion boundary must revalidate\n");
-    out.push_str("# these exact roots under authoritative cross-process exclusion.\n");
-    out.push_str(&format!("store\t{}\n", canon_store.display()));
-    out.push_str(&format!("binary_sha256\t{code}\n"));
-    out.push_str("quiescence\toperator-asserted\n");
-    out.push_str(&format!("sessions_enumerated\t{}\n", r.sessions_enumerated));
-    out.push_str(&format!("keep_named\t{}\n", args.keep.len()));
-    out.push_str(&format!("keep_matched\t{}\n", r.buckets.matched_digests.len()));
-    out.push_str("keep_unmatched\t0\n");
-    out.push_str("completeness\tcomplete\n");
-    // Session pseudonyms are deliberately absent: a stable 48-bit digest prefix
-    // of a guessable id is an offline confirmation oracle, and this file persists.
-    for h in &r.buckets.keep {
-        out.push_str(&format!("keep_manifest\t{}\n", hex(h)));
-    }
-    for h in &r.buckets.unattributed {
-        out.push_str(&format!("unattributed_manifest\t{}\n", hex(h)));
-    }
-    for h in &r.buckets.unprotected {
-        out.push_str(&format!("unprotected_manifest\t{}\n", hex(h)));
-    }
-    for b in &r.candidate_blocks {
-        out.push_str(&format!("candidate_block\t{}\n", hex(b)));
-    }
-    if let Some(n) = r.bytes {
-        out.push_str(&format!("candidate_bytes\t{n}\n"));
-    }
-    let mut h = Sha256::new();
-    h.update(out.as_bytes());
-    out.push_str(&format!("artifact_sha256\t{}\n", hex(&h.finalize())));
-
-    // Create-new + 0600, fsync, then rename onto a path verified absent above.
-    let tmp = path.with_extension("partial");
-    let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
-    f.write_all(out.as_bytes())
-        .map_err(|e| format!("write: {e}"))?;
-    f.sync_all().map_err(|e| format!("fsync: {e}"))?;
-    drop(f);
-    std::fs::rename(&tmp, path).map_err(|e| format!("publish: {e}"))
-}
-
-use std::os::unix::fs::OpenOptionsExt as _;
 
 fn print_report(args: &Args, r: &Report) {
     println!("cold store    {}", v4_root(&args.store).display());
@@ -669,15 +603,6 @@ fn main() -> ExitCode {
         }
         Outcome::Complete(r) => {
             print_report(&args, &r);
-            if let Some(path) = &args.artifact {
-                match write_artifact(path, &args, &r) {
-                    Ok(()) => println!("\nartifact      {}", path.display()),
-                    Err(e) => {
-                        eprintln!("cannot write artifact: {e}");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
             if r.unsized_blocks > 0 {
                 return ExitCode::from(3);
             }
@@ -742,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn bucket_output_is_sorted_for_artifact_determinism() {
+    fn bucket_output_is_sorted_and_deterministic() {
         let b = classify(&[idx(20, &[5, 1, 3])], &[h(5), h(1), h(3)], &HashSet::new());
         assert_eq!(b.unprotected, vec![h(1), h(3), h(5)]);
     }
@@ -839,7 +764,6 @@ mod tests {
             store: base.to_path_buf(),
             keep: keep.iter().map(|s| s.to_string()).collect(),
             keep_none: keep.is_empty(),
-            artifact: None,
             skip_server_probe: true,
         }
     }
@@ -926,10 +850,9 @@ mod tests {
         assert!(matches!(run(&args_for(&f.base, &["alpha"])), Outcome::Refused(_)));
     }
 
-    /// A typo'd keep id yields Unmatched, and NO artifact may be produced.
-    /// Revision 2 wrote a `completeness=complete` artifact before this check.
+    /// A typo'd keep id yields Unmatched rather than a clean report.
     #[test]
-    fn unmatched_keep_entry_yields_no_artifact() {
+    fn unmatched_keep_entry_is_not_a_complete_report() {
         let f = fixture();
         install_blocks(&f.base, &[1], 512);
         let store = BlockColdStore::new(f.base.clone(), [7u8; 32]);
@@ -937,57 +860,27 @@ mod tests {
         store.write_manifest(&m).unwrap();
         store.record_session_manifest("real", &m.hash()).unwrap();
 
-        let out_path = f.base.join("artifact.tsv");
-        let mut a = args_for(&f.base, &["real", "typoo"]);
-        a.artifact = Some(out_path.clone());
+        let a = args_for(&f.base, &["real", "typoo"]);
         let o = run(&a);
         assert!(matches!(o, Outcome::Unmatched(_)));
-        // `main` only calls write_artifact on Complete; assert the file is absent.
-        assert!(!out_path.exists(), "no artifact may exist for an unmatched run");
     }
-
-    #[test]
-    fn artifact_refuses_to_clobber_and_seals_itself() {
-        let f = fixture();
-        install_blocks(&f.base, &[1], 512);
-        let store = BlockColdStore::new(f.base.clone(), [7u8; 32]);
-        let m = manifest(&[1], "m");
-        store.write_manifest(&m).unwrap();
-        store.record_session_manifest("real", &m.hash()).unwrap();
-        let a = args_for(&f.base, &["real"]);
-        let Outcome::Complete(r) = run(&a) else {
-            panic!("expected complete")
-        };
-
-        let dest = f.base.join("evidence.tsv");
-        write_artifact(&dest, &a, &r).expect("first write");
-        let body = std::fs::read_to_string(&dest).unwrap();
-        assert!(body.contains("artifact_sha256\t"));
-        assert!(body.contains("binary_sha256\t"));
-        assert!(!body.contains("keep_label"), "pseudonyms must not persist");
-        assert!(write_artifact(&dest, &a, &r).is_err(), "must not clobber");
-    }
-
-    #[test]
-    fn artifact_inside_the_store_is_refused() {
-        let f = fixture();
-        install_blocks(&f.base, &[1], 512);
-        let store = BlockColdStore::new(f.base.clone(), [7u8; 32]);
-        let m = manifest(&[1], "m");
-        store.write_manifest(&m).unwrap();
-        store.record_session_manifest("real", &m.hash()).unwrap();
-        let a = args_for(&f.base, &["real"]);
-        let Outcome::Complete(r) = run(&a) else {
-            panic!("expected complete")
-        };
-        let inside = v4_root(&f.base).join("sessions").join("evidence.tsv");
-        assert!(write_artifact(&inside, &a, &r).is_err());
-    }
-
-    // ---------- argument contract ----------
 
     fn argv(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// The withdrawal is enforced, not merely documented. The writer this used
+    /// to reach carried an unconditional `remove_file` on a predictable
+    /// sibling path — in a tool whose contract is that it deletes nothing.
+    #[test]
+    fn artifact_flag_is_refused() {
+        let f = fixture();
+        let s = f.base.to_str().unwrap();
+        let e = parse_args(argv(&[
+            "--store", s, "--store-is-quiescent", "--keep-none", "--artifact", "/tmp/x",
+        ]))
+        .expect_err("--artifact must be refused");
+        assert!(e.contains("WITHDRAWN"), "unexpected message: {e}");
     }
 
     #[test]
