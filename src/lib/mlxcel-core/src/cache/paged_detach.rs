@@ -68,9 +68,12 @@ use super::{CachePool, KVCache, KVCacheMode, SequenceCacheSet, SequenceId, Seque
 /// variant.
 #[derive(Debug, Clone)]
 pub enum ReleaseError {
-    /// Some blocks failed to release. `failed` is the count of failures,
-    /// `first` is the error message from the first failure.
-    Partial { failed: usize, first: String },
+    /// Some blocks failed to release. `failed` is the count of failures
+    /// (guaranteed > 0), `first` is the error message from the first failure.
+    Partial {
+        failed: std::num::NonZeroUsize,
+        first: String,
+    },
 }
 
 impl std::fmt::Display for ReleaseError {
@@ -1188,7 +1191,9 @@ impl CachePool {
                 }
             }
             if failed > 0 {
-                return Err(ReleaseError::Partial { failed, first: first_error });
+                // Safety: failed > 0, so NonZeroUsize::new is Some
+                let failed_nz = std::num::NonZeroUsize::new(failed).unwrap();
+                return Err(ReleaseError::Partial { failed: failed_nz, first: first_error });
             }
         }
         // Dropping `detached` here runs the normal `Drop`, which at this
