@@ -1153,10 +1153,23 @@ impl CachePool {
         if let Some(blocks) = detached.retained_blocks.take() {
             // Invariant: paged_pool is only ever set to Some (at paged_detach.rs:1186),
             // never cleared. If retained_blocks are present, a pool must exist.
-            let pool = self.paged_pool.as_ref().expect(
-                "release_detached_paged: retained_blocks present but paged_pool is None — \
-                 this is a broken invariant, not a runtime error",
-            );
+            // debug_assert! in dev/tests; in release, log and leak (not panic).
+            let pool = match self.paged_pool.as_ref() {
+                Some(pool) => pool,
+                None => {
+                    debug_assert!(
+                        false,
+                        "release_detached_paged: retained_blocks present but paged_pool is None"
+                    );
+                    tracing::error!(
+                        "release_detached_paged: retained_blocks present but paged_pool is None — \
+                         leaking {} blocks",
+                        blocks.len()
+                    );
+                    // Leak the blocks rather than crashing the server.
+                    return Ok(());
+                }
+            };
             let mut pool = pool.borrow_mut();
             let mut failed = 0usize;
             let mut first_error = String::new();
