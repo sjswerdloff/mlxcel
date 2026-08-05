@@ -60,6 +60,33 @@ use super::detach::{DetachedHandle, DetachedKVCache};
 use super::paged::{PagedBlockId, PagedBlockPool, PagedKvLayout, PagedSequenceState};
 use super::{CachePool, KVCache, KVCacheMode, SequenceCacheSet, SequenceId, SequenceStateBackend};
 
+/// Error type for `release_detached_paged`.
+///
+/// Two states that mean different things, neither mistaken for success:
+/// - `PoolUnavailable`: the paged pool was `None`, so nothing was released.
+///   This is a silent leak path that must be reported.
+/// - `Partial`: some blocks failed to release. The caller can decide whether
+///   to retry, log, or accept the leak.
+#[derive(Debug, Clone)]
+pub enum ReleaseError {
+    /// The paged pool was `None` — released NOTHING.
+    PoolUnavailable,
+    /// Some blocks failed to release. `failed` is the count of failures,
+    /// `first` is the error message from the first failure.
+    Partial { failed: usize, first: String },
+}
+
+impl std::fmt::Display for ReleaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReleaseError::PoolUnavailable => write!(f, "paged pool unavailable, released nothing"),
+            ReleaseError::Partial { failed, first } => {
+                write!(f, "{failed} block(s) failed to release; first error: {first}")
+            }
+        }
+    }
+}
+
 /// Inert snapshot of a paged-backend sequence, analogous to
 /// [`super::DetachedCacheSet`] for the dense backend.
 ///
@@ -1115,33 +1142,58 @@ impl CachePool {
     /// Safe to call on an already-released set (which carries no retained
     /// blocks) — the `retained_blocks.take()` guard makes the whole body a
     /// no-op so neither reference is released twice.
-    pub fn release_detached_paged(&mut self, mut detached: DetachedPagedCacheSet) {
+    ///
+    /// Returns `Ok(())` on success, `Err(ReleaseError)` on failure:
+    /// - `PoolUnavailable` if `paged_pool` is `None` while blocks are retained
+    ///   (silent leak path)
+    /// - `Partial { failed, first }` if some blocks failed to release
+    pub fn release_detached_paged(
+        &mut self,
+        mut detached: DetachedPagedCacheSet,
+    ) -> Result<(), ReleaseError> {
         if let Some(blocks) = detached.retained_blocks.take() {
-            if let Some(pool) = self.paged_pool.as_ref() {
-                let mut pool = pool.borrow_mut();
-                // Release the detach pins.
-                for block_id in &blocks {
-                    if let Err(err) = pool.release_block(*block_id) {
-                        eprintln!(
-                            "[mlxcel::cache::paged_detach] CachePool::release_detached_paged: failed to release pin for block {block_id}: {err}"
+            let pool = self.paged_pool.as_ref().ok_or(ReleaseError::PoolUnavailable)?;
+            let mut pool = pool.borrow_mut();
+            let mut failed = 0usize;
+            let mut first_error = String::new();
+            // Release the detach pins.
+            for block_id in &blocks {
+                if let Err(err) = pool.release_block(*block_id) {
+                    failed += 1;
+                    if first_error.is_empty() {
+                        first_error = format!("pin release for block {block_id}: {err}");
+                    }
+                    tracing::warn!(
+                        block_id = %block_id,
+                        error = %err,
+                        "release_detached_paged: failed to release pin"
+                    );
+                }
+            }
+            // Release the origin allocation the block table still carries.
+            for layer in &detached.paged_state.layers {
+                for &block_id in &layer.block_ids {
+                    if let Err(err) = pool.release_block(block_id) {
+                        failed += 1;
+                        if first_error.is_empty() {
+                            first_error = format!("allocation release for block {block_id}: {err}");
+                        }
+                        tracing::warn!(
+                            block_id = %block_id,
+                            error = %err,
+                            "release_detached_paged: failed to release allocation"
                         );
                     }
                 }
-                // Release the origin allocation the block table still carries.
-                for layer in &detached.paged_state.layers {
-                    for &block_id in &layer.block_ids {
-                        if let Err(err) = pool.release_block(block_id) {
-                            eprintln!(
-                                "[mlxcel::cache::paged_detach] CachePool::release_detached_paged: failed to release allocation for block {block_id}: {err}"
-                            );
-                        }
-                    }
-                }
+            }
+            if failed > 0 {
+                return Err(ReleaseError::Partial { failed, first: first_error });
             }
         }
         // Dropping `detached` here runs the normal `Drop`, which at this
         // point sees an empty `retained_blocks` and stays silent.
         drop(detached);
+        Ok(())
     }
 
     /// Peek at a parked set as a paged variant. Returns `None` if the handle
