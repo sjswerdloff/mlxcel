@@ -62,12 +62,16 @@ use super::{CachePool, KVCache, KVCacheMode, SequenceCacheSet, SequenceId, Seque
 
 /// Error type for `release_detached_paged`.
 ///
-/// Reports partial failure when some blocks could not be released.
+/// Reports when release could not happen or partially failed.
 /// `PoolUnavailable` is an invariant violation (paged_pool is only ever set
-/// to `Some`, never cleared), so it is expressed as a panic rather than a
-/// variant.
+/// to `Some`, never cleared), so it fires debug_assert in dev/tests.
+/// In release, it logs and leaks rather than crashing.
 #[derive(Debug, Clone)]
 pub enum ReleaseError {
+    /// The paged pool was `None` while retained blocks were present.
+    /// Invariant violation: pool is set once and never cleared.
+    /// In dev/tests: debug_assert fires. In release: logs and leaks.
+    PoolUnavailable,
     /// Some blocks failed to release. `failed` is the count of failures
     /// (guaranteed > 0), `first` is the error message from the first failure.
     Partial {
@@ -79,6 +83,9 @@ pub enum ReleaseError {
 impl std::fmt::Display for ReleaseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ReleaseError::PoolUnavailable => {
+                write!(f, "paged pool unavailable — retained blocks present but pool is None")
+            }
             ReleaseError::Partial { failed, first } => {
                 write!(f, "{failed} block(s) failed to release; first error: {first}")
             }
@@ -1159,15 +1166,16 @@ impl CachePool {
                 None => {
                     debug_assert!(
                         false,
-                        "release_detached_paged: retained_blocks present but paged_pool is None"
+                        "release_detached_paged: retained_blocks present but paged_pool is None — \
+                         invariant violated: pool is set once and never cleared"
                     );
                     tracing::error!(
                         "release_detached_paged: retained_blocks present but paged_pool is None — \
                          leaking {} blocks",
                         blocks.len()
                     );
-                    // Leak the blocks rather than crashing the server.
-                    return Ok(());
+                    // Leak rather than crash, but tell the caller we leaked.
+                    return Err(ReleaseError::PoolUnavailable);
                 }
             };
             let mut pool = pool.borrow_mut();
