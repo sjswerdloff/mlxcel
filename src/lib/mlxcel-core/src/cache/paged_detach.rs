@@ -62,15 +62,12 @@ use super::{CachePool, KVCache, KVCacheMode, SequenceCacheSet, SequenceId, Seque
 
 /// Error type for `release_detached_paged`.
 ///
-/// Two states that mean different things, neither mistaken for success:
-/// - `PoolUnavailable`: the paged pool was `None`, so nothing was released.
-///   This is a silent leak path that must be reported.
-/// - `Partial`: some blocks failed to release. The caller can decide whether
-///   to retry, log, or accept the leak.
+/// Reports partial failure when some blocks could not be released.
+/// `PoolUnavailable` is an invariant violation (paged_pool is only ever set
+/// to `Some`, never cleared), so it is expressed as a panic rather than a
+/// variant.
 #[derive(Debug, Clone)]
 pub enum ReleaseError {
-    /// The paged pool was `None` — released NOTHING.
-    PoolUnavailable,
     /// Some blocks failed to release. `failed` is the count of failures,
     /// `first` is the error message from the first failure.
     Partial { failed: usize, first: String },
@@ -79,7 +76,6 @@ pub enum ReleaseError {
 impl std::fmt::Display for ReleaseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReleaseError::PoolUnavailable => write!(f, "paged pool unavailable, released nothing"),
             ReleaseError::Partial { failed, first } => {
                 write!(f, "{failed} block(s) failed to release; first error: {first}")
             }
@@ -1152,7 +1148,12 @@ impl CachePool {
         mut detached: DetachedPagedCacheSet,
     ) -> Result<(), ReleaseError> {
         if let Some(blocks) = detached.retained_blocks.take() {
-            let pool = self.paged_pool.as_ref().ok_or(ReleaseError::PoolUnavailable)?;
+            // Invariant: paged_pool is only ever set to Some (at paged_detach.rs:1186),
+            // never cleared. If retained_blocks are present, a pool must exist.
+            let pool = self.paged_pool.as_ref().expect(
+                "release_detached_paged: retained_blocks present but paged_pool is None — \
+                 this is a broken invariant, not a runtime error",
+            );
             let mut pool = pool.borrow_mut();
             let mut failed = 0usize;
             let mut first_error = String::new();
