@@ -64,8 +64,9 @@ process-local epoch resets and silently loses the distinction.
 
 ## The mechanism was already mine and I designed around it anyway
 
-`kindled-opencode-plugins` PR #1, `docs/PROPOSAL_compaction_generation.md`,
-30 July, specifies the two-hook latch and states: *"The close is a
+My own compaction-generation plugin proposals — the two-hook latch for
+witnessing a compaction close (`kindled-opencode-plugins` PR #1,
+`docs/PROPOSAL_compaction_generation.md`, 30 July) — state: *"The close is a
 compare-and-swap on `expected_generation`."* Three days later I sent Alden a
 design whose surface was `release_session(&session_key: &str)` — a bare string
 with no generation at all — and he had to spend a review pass deriving the
