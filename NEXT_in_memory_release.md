@@ -11,11 +11,23 @@ v2 of the in-memory release design as blocked for ten days. A large part of it w
 blocked: whether release is reachability-scoped or session-scoped is independent of how
 the close event travels.
 
-**Written, REVIEWED, and REVISED:** `DESIGN_shared_prefix_release_20260812.md`,
-revision 2 at `176c41d`. Alden reviewed revision 1 at blob `d3ea131` and found three P0s;
-revision 2 replaces the body rather than patching it (revision 1 is at `b073874`). It now
-separates the three ownership systems — in-memory entries, cold manifests, cold blocks —
-each with its own root set and release operation. **Awaiting Alden's re-review.**
+**Written, REVIEWED TWICE, at revision 3** (`0d4e258`, design blob `dab48f1b5584`).
+Revision 1 `b073874`, revision 2 `176c41d`. Alden's re-review cleared all five revision-1
+findings; revision 3 closes the three it raised. It separates the three ownership systems
+— in-memory entries, cold manifests, cold blocks — each with its own root set and release
+operation. **Awaiting his verdict on revision 3.**
+
+**Release scope is a TYPE, and it is not `RecordableSessionKey`.** That proves only
+non-empty and non-sentinel; it still admits `user` (end-user scope — a per-conversation
+delete would remove every conversation that user cached, `key.rs:438-442`) and
+uncontracted `prompt_cache_key`. Use `CompactionScopedSessionKey`, `SessionHeader` alone
+at this tree (`key.rs:435-437`). This rule was already in `DESIGN_session_association_gc
+_20260729.md:256-262` — my own document — before I proposed the weaker guard.
+
+**`mark_reachable_blocks`'s doc comment (`:2000-2015`) is STALE and says the delete-mode
+prerequisites are unimplemented. They are implemented** — `:1484`, `:2222`, `:2237-2243`,
+`:699-740`, `:2410`. Judge the code. Fixing the comment is worth its own commit
+(Xander's file).
 
 Two answers worth not re-deriving, both pinned at `414c788`:
 
