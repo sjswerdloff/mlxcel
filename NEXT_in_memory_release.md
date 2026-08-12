@@ -11,17 +11,24 @@ v2 of the in-memory release design as blocked for ten days. A large part of it w
 blocked: whether release is reachability-scoped or session-scoped is independent of how
 the close event travels.
 
-**Written and REVIEWED — REVISION REQUIRED:** `DESIGN_shared_prefix_release_20260812.md`,
-now `b073874`. Alden reviewed at blob `d3ea131` against independently hashed source and
-found three P0s: it conflates per-session in-memory entries with shared manifests and
-shared blocks; `releasable_manifests` is session-local candidate selection, not release
-authority; and the N+1 claim is unimplemented at `414c788`. **The banner at the top of
-that file has the detail. Do not build on the body.** His full review is the artifact to
-revise against.
-Three agents share a system prompt, one compacts — what clears and when. Its central
-claim: **ordering and scope are two properties, not one.** The generation comparison
-fixes ordering; it does nothing about scope, and a correct generation implementation with
-session-scoped release still frees the other two agents' prefix out from under them.
+**Written, REVIEWED, and REVISED:** `DESIGN_shared_prefix_release_20260812.md`,
+revision 2 at `176c41d`. Alden reviewed revision 1 at blob `d3ea131` and found three P0s;
+revision 2 replaces the body rather than patching it (revision 1 is at `b073874`). It now
+separates the three ownership systems — in-memory entries, cold manifests, cold blocks —
+each with its own root set and release operation. **Awaiting Alden's re-review.**
+
+Two answers worth not re-deriving, both pinned at `414c788`:
+
+- **Reachability crosses sessions for BLOCKS, not for MANIFESTS.** `mark_reachable_blocks`
+  walks every committed manifest (`block_cold_store.rs:2016`); `releasable_manifests` reads
+  one session's registry and returns candidates, not authority (`:1181`).
+- **The in-memory tier does not share KV between distinct-keyed agents — it DUPLICATES.**
+  `session_key` is hashed into the entry digest (`key.rs:358-361`). I4's permission to share
+  is currently unexercised in memory. The one real sharing path is the anonymous sentinel,
+  and `recordable_session_key` already refuses it at the recording boundary (`key.rs:520`).
+  **Actionable:** `release_session` is still unwritten, so type its parameter
+  `RecordableSessionKey<'_>` rather than `&str` and the shared-bucket release becomes
+  unrepresentable at no cost.
 
 **Still genuinely open and still Stuart's: transport for the compaction-close event.**
 It affects the ordering half only.
