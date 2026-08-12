@@ -11,7 +11,13 @@ v2 of the in-memory release design as blocked for ten days. A large part of it w
 blocked: whether release is reachability-scoped or session-scoped is independent of how
 the close event travels.
 
-**Written and with Alden:** `DESIGN_shared_prefix_release_20260812.md`, commit `de44837`.
+**Written and REVIEWED — REVISION REQUIRED:** `DESIGN_shared_prefix_release_20260812.md`,
+now `b073874`. Alden reviewed at blob `d3ea131` against independently hashed source and
+found three P0s: it conflates per-session in-memory entries with shared manifests and
+shared blocks; `releasable_manifests` is session-local candidate selection, not release
+authority; and the N+1 claim is unimplemented at `414c788`. **The banner at the top of
+that file has the detail. Do not build on the body.** His full review is the artifact to
+revise against.
 Three agents share a system prompt, one compacts — what clears and when. Its central
 claim: **ordering and scope are two properties, not one.** The generation comparison
 fixes ordering; it does nothing about scope, and a correct generation implementation with
