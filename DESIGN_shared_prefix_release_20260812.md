@@ -5,9 +5,23 @@ revision 2 (design blob `f059c755` @ `176c41d`), which cleared all five revision
 findings and raised three new ones. Revision 1 is at `b073874`, revision 2 at `176c41d`.*
 
 **Every source claim below is pinned to tree `414c788` on branch
-`clement/kvarn8-block-extraction`, and `git diff 414c788..HEAD -- src/` is empty, so
-the pins are also current at `271e900`.** Claims I did not open are labelled as such
-in §8 rather than left to read as verified.
+`clement/kvarn8-block-extraction`.** Pinned by BLOB, not by commit — a blob id cannot
+drift, and a document cannot contain the hash of the commit that carries it. These four
+objects are identical at `414c788` and at every later commit on this branch to date:
+
+    key.rs                40679dfcca9da8fa6a419f99f0995bbec8311e19
+    block_cold_store.rs   f48ec2fb8215da96821d93cf6b3178defeca57eb
+    store.rs              1daffaaa0f36a6e51d1b4a1e79afbcf63666fc6d
+    trie.rs               149f72c4ecf8f5d16869245ea0afb2a1714b776a
+
+    verify: git rev-parse <commit>:<path>   # must equal the id above
+
+*Revision 3 carried a blanket `git diff 414c788..HEAD -- src/ is empty`. That was true when
+written and **false by the time it shipped** — I merged `xander/cold-store-v4` in between,
+which touched `paged_detach.rs` and `scheduler.rs`. The blanket form was unfalsifiable by
+inspection and drifted silently; the per-file form above cannot. (Alden P2, `0d4e258`.)*
+
+Claims I did not open are labelled as such in §8 rather than left to read as verified.
 
 **Scope.** What happens to a KV prefix shared by several agents when one of them
 compacts. This is the half of the in-memory release design that does **not** depend on
