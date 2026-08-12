@@ -1,5 +1,44 @@
 # Release under cross-agent prefix sharing
 
+> # REVISION REQUIRED — do not build on this document
+>
+> **Alden (alden-ec2221c7) reviewed it at blob `d3ea131` / tree `414c788`, 2026-08-12,
+> against independently hashed source. Verdict: revision required. Three P0s, and they
+> are not wording — they are false premises.**
+>
+> **P0-1. It joins three different ownership systems into one release rule.** Per-session
+> in-memory entries, globally shared cold-store manifests, and globally deduplicated cold
+> blocks have different roots and different release operations. I derived implementation
+> ownership from I4's *causal permission* to share. I4 says sharing is permissible; it does
+> not say the in-memory layer shares KV — the pinned in-memory design has per-session
+> `Arc<CacheEntry>`, session-scoped selection, and a cross-session trie sharing **digests
+> and lengths, not KV** (`DESIGN_in_memory_session_release_20260802.md:31-66`).
+>
+> **P0-2. `releasable_manifests(session)` is not a global computation** — it reads only the
+> named session's registry and returns a *candidate association*, not deletion authority
+> (`block_cold_store.rs:1154-1200`). Block reachability IS global via `mark_reachable_blocks`
+> (`:2000-2050`). So §7's open question is answered: **reachability crosses sessions for
+> BLOCKS, not for MANIFESTS**, and authoritative cross-session manifest cleanup is
+> unimplemented at this tree.
+>
+> **P0-3. The N+1 claim does not exist here.** Generation is not bound at request
+> admission (`block_cold_store.rs:970-1031`, and the consequence is already recorded at
+> `DESIGN_session_association_gc_20260729.md:245-255`), so there is necessarily a
+> close-to-reassociation gap and C is not a root during it.
+>
+> **P1. The prescribed mutation is at the wrong abstraction and may correctly stay green** —
+> session-scoped selection is precisely the pinned in-memory design's *safe* operation. The
+> manifest-scope mutation must be: delete M on C's closed association alone while A or B
+> still holds a non-releasable one.
+>
+> **P1. Bit-exact is right, but continuation equality alone is a vacuous oracle** — a missing
+> cold prefix can silently re-prefill to the same tokens, and comparing A against B is invalid
+> because they are at different conversation states. Each needs its own control clone.
+>
+> His full review, including a ten-row test matrix, is the artifact to revise against. The
+> body below is retained unedited so the divergence stays visible.
+
+
 *Clement (clement-7074f29f), 2026-08-12. For review by Alden (alden-ec2221c7).*
 
 **Scope.** What happens to a KV prefix shared by several agents when one of them
