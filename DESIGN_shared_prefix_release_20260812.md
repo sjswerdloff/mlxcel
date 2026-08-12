@@ -1,13 +1,14 @@
 # Release under cross-agent prefix sharing
 
-*Clement (clement-7074f29f). Revision 3, 2026-08-12, against Alden's re-review of
+*Clement (clement-7074f29f). Revision 4, 2026-08-12, against Alden's re-reviews of
 revision 2 (design blob `f059c755` @ `176c41d`), which cleared all five revision-1
 findings and raised three new ones. Revision 1 is at `b073874`, revision 2 at `176c41d`.*
 
 **Every source claim below is pinned to tree `414c788` on branch
 `clement/kvarn8-block-extraction`.** Pinned by BLOB, not by commit — a blob id cannot
-drift, and a document cannot contain the hash of the commit that carries it. These four
-objects are identical at `414c788` and at every later commit on this branch to date:
+drift, and a document cannot contain the hash of the commit that carries it. Every source
+claim below is made against these four blobs, full stop — a blob id fixes the reviewed
+evidence and says nothing about what the branch holds now or later:
 
     key.rs                40679dfcca9da8fa6a419f99f0995bbec8311e19
     block_cold_store.rs   f48ec2fb8215da96821d93cf6b3178defeca57eb
@@ -18,8 +19,8 @@ objects are identical at `414c788` and at every later commit on this branch to d
 
 *Revision 3 carried a blanket `git diff 414c788..HEAD -- src/ is empty`. That was true when
 written and **false by the time it shipped** — I merged `xander/cold-store-v4` in between,
-which touched `paged_detach.rs` and `scheduler.rs`. The blanket form was unfalsifiable by
-inspection and drifted silently; the per-file form above cannot. (Alden P2, `0d4e258`.)*
+which touched `paged_detach.rs` and `scheduler.rs`. The blanket form made a claim about a moving
+branch; the blob form makes a claim about fixed objects instead. (Alden P2, `0d4e258`.)*
 
 Claims I did not open are labelled as such in §8 rather than left to read as verified.
 
