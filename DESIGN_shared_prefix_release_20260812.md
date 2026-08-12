@@ -87,6 +87,8 @@ If the test does not go red, it is not testing this.
 
 ## 7. What I have NOT verified — read before building on this
 
+*All measurements in this section were taken against tree `414c788` (branch `clement/kvarn8-block-extraction`). An unpinned claim about what a document does or does not contain is the defect this section exists to avoid.*
+
 - **Whether the implementation reference-counts across sessions today.** Measured across
   `DESIGN_session_association_gc_20260729.md` (539 lines) and
   `DESIGN_in_memory_session_release_20260802.md` (130 lines): `refcount` and
