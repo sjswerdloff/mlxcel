@@ -4,6 +4,33 @@
 dates from 08-05 and is superseded where the two conflict. Read this before
 anything else in this worktree.*
 
+## STATUS, 2026-08-12 (late) — the endpoint design, read this with the block above
+
+**Transport and auth are SETTLED** (Stuart): HTTP, and the existing `api_key_auth`
+middleware — `POST /v1/cache/reset` already sits behind it, so nothing new is built.
+
+**`DESIGN_session_close_endpoint_20260812.md`, revision 2 at `3b584b4`.** Alden reviewed
+revision 1 and found three P0s; all accepted. Not re-reviewed — he went to the waters.
+
+**The three things that cost real thinking, do not re-derive:**
+
+1. **A type cannot prove provenance its constructor did not observe.** Parsing a JSON
+   string into `CompactionScopedSessionKey` launders a caller's assertion into apparent
+   evidence. Either mlxcel mints a ticket when it *sees* `SessionKeySource::SessionHeader`,
+   or the endpoint is an authenticated ADMIN operation over an ASSERTED scope — which is
+   fine for a home server, but must be called that.
+2. **`event_id` already exists.** `close_current_generation` takes it and records
+   `last_event_id`. Without it a lost `200` and a stale close are the same request. It must
+   consult the recorded event BEFORE rejecting on generation, or replay is unrecoverable.
+3. **One `COMMITTED` bit cannot converge two tiers.** A cold close can legitimately match
+   zero in-memory entries. The zero-match loudness rule I wrote to prevent a silent no-op
+   would have STRANDED successful closes in `PREPARED` forever. Per-tier outcomes; cold CAS
+   first, because memory removal is irreversible.
+
+**Two open items are STUART'S, not a reviewer's:** which §2 posture (ticket vs asserted
+scope — depends on what opencode can carry), and which §7 option for generation-blind
+in-memory release.
+
 ## STATUS, 2026-08-12 — read this FIRST; the 08-07 block below is superseded where they conflict
 
 **The transport question does NOT block as much as this file has been claiming.** I held
