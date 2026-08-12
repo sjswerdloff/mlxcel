@@ -577,19 +577,6 @@ pub struct BlockColdStore {
     block_size: usize,
     prune_mode: PruneMode,
     /// Serializes read-modify-write on ONE session's sidecar index file.
-    ///
-    /// Held by exactly three sites: `session_registry` (read),
-    /// `close_current_generation`, and `record_session_manifest`.
-    ///
-    /// **Known defect — do not read the following as a design.** This is not
-    /// the publication lock, so nothing holds one exclusion across "manifest
-    /// exists" and "an association names it" — which is the invariant a GC
-    /// sweep has to read. Association authority therefore lives on a different
-    /// lock from the manifests it names. `DESIGN_lock_protocol_refactor_20260730.md`
-    /// (rev 2) is the redesign; this mutex is to be subsumed by the store write
-    /// guard, and may only be deleted once *every* authority site above has
-    /// moved under it.
-    session_index_lock: Mutex<()>,
     /// Minimum age before an unreferenced block may even be NOMINATED.
     ///
     /// Defence in depth, explicitly NOT a correctness gate (Alden, finding 4:
@@ -612,7 +599,6 @@ impl BlockColdStore {
             runtime_fingerprint,
             block_size: DEFAULT_BLOCK_SIZE,
             prune_mode: PruneMode::default(),
-            session_index_lock: Mutex::new(()),
             // Conservative by default. Zero-age deletion is NOT advertised as
             // safe for production; tests that need immediate collection opt in
             // explicitly via `with_min_gc_age`.
@@ -931,9 +917,7 @@ impl BlockColdStore {
                 "session_registry: empty session key".to_string(),
             ));
         }
-        let _guard = self.session_index_lock.lock().map_err(|_| {
-            invalid_data("session_registry: session index lock poisoned".into())
-        })?;
+        let _guard = self.acquire_store_lock()?;
         self.session_registry_locked(session_key)
     }
 
@@ -989,9 +973,7 @@ impl BlockColdStore {
     ) -> Result<SessionRegistry, ColdStoreError> {
         let path = self.session_registry_path(session_key);
         let key_digest = Self::session_key_digest(session_key);
-        let _guard = self.session_index_lock.lock().map_err(|_| {
-            invalid_data("close_current_generation: session index lock poisoned".into())
-        })?;
+        let _guard = self.acquire_store_lock()?;
         let current: SessionRegistry = read_session_registry_file(&path, &key_digest)?
             .ok_or_else(|| {
             invalid_data(
@@ -1020,6 +1002,21 @@ impl BlockColdStore {
                     .to_string(),
             )
         })?;
+        // Reject all-zero event_id: a fresh registry has last_event_id = [0u8; 32],
+        // so accepting all-zeros produces a registry byte-identical on that field
+        // to one that has never been closed. Any replay recognition of the form
+        // "does the recorded event match mine?" then matches a fresh registry
+        // against a zero-event caller — a false replay, which is worse than a
+        // missed one: the caller concludes its close already committed when
+        // nothing happened. (Clement, finding 4.)
+        if event_id == [0u8; 32] {
+            return Err(invalid_data(
+                "close_current_generation: event_id is all zeros. This is \
+                 indistinguishable from a fresh registry (never closed). Use a \
+                 non-zero event_id to distinguish your close from a fresh start."
+                    .to_string(),
+            ));
+        }
         let updated = SessionRegistry {
             incarnation: current.incarnation,
             current_generation: next,
@@ -1090,9 +1087,7 @@ impl BlockColdStore {
         // It also serializes appends: two requests on one session can persist
         // concurrently, and read-modify-write on a shared file is where an
         // entry silently vanishes.
-        let _guard = self.session_index_lock.lock().map_err(|_| {
-            invalid_data("record_session_manifest: session index lock poisoned".into())
-        })?;
+        let _guard = self.acquire_store_lock()?;
         let registry = self.session_registry_locked(session_key)?;
         let generation = registry.current_generation;
 
@@ -2007,12 +2002,21 @@ impl BlockColdStore {
     /// reference set." Skipping one is precisely how corruption becomes
     /// deletion — the block it referenced would look unreachable.
     ///
-    /// NOT YET IMPLEMENTED, and this function is not safe for delete mode
-    /// without them (finding 4, remaining bullets): publication/sweep
-    /// exclusion via a shared lock or generation epoch, re-verification of
-    /// every candidate after the grace interval, and active-load leases. The
-    /// mark below is a point-in-time snapshot; a writer may commit a manifest
-    /// referencing a candidate the instant after it is taken.
+    /// Delete-mode prerequisites (Alden finding 4):
+    /// - Publication/sweep exclusion: `acquire_store_lock()` at publication
+    ///   time (line 1484) and sweep time (line 2222) ensures a publisher and
+    ///   GC cannot interleave.
+    /// - Authoritative re-verification under the lock (lines 2237-2243):
+    ///   every candidate is re-checked after the grace interval, even if the
+    ///   epoch is unchanged, because epoch and manifest are two files and a
+    ///   prior process can crash after one operation.
+    /// - Active-load lease (`acquire_read_lease`, lines 699-740): a shared
+    ///   `LOCK_SH` held for the whole read (manifest AND blocks) prevents GC
+    ///   from tombstoning a block between manifest read and block open.
+    ///
+    /// The mark below is a point-in-time snapshot; a writer may commit a
+    /// manifest referencing a candidate the instant after it is taken. The
+    /// exclusion above is what makes the snapshot safe to act on.
     fn mark_reachable_blocks(&self) -> Result<HashSet<[u8; 32]>, ColdStoreError> {
         let mut live: HashSet<[u8; 32]> = HashSet::new();
         let manifests_dir = self.manifests_dir();
@@ -3857,7 +3861,18 @@ fn read_session_registry_file(
     }))
 }
 
-/// Write a session registry file atomically.
+/// Write a session registry file atomically with full durability.
+///
+/// Durability sequence (Clement, finding 2):
+/// 1. Write to temp file
+/// 2. `sync_all` the temp file (data + metadata durable on disk)
+/// 3. Rename temp → final (atomic on the same filesystem)
+/// 4. `sync_all` the parent directory (directory entry durable)
+/// 5. Only then acknowledge success
+///
+/// Steps 2 and 4 are the ones people drop. Without step 2, power loss can
+/// leave the temp file with partial data. Without step 4, the rename itself
+/// can be lost — the file data is durable but the directory entry is not.
 fn write_session_registry_file(
     path: &Path,
     key_digest: &[u8; 32],
@@ -3878,7 +3893,24 @@ fn write_session_registry_file(
     let out = seal_authority_record(out);
     let tmp = path.with_extension("gen.tmp");
     write_file(&tmp, &out)?;
+
+    // Step 2: sync the temp file before rename. Without this, power loss
+    // can leave the temp file with partial data that looks complete.
+    let file = File::open(&tmp)?;
+    file.sync_all()?;
+    drop(file);
+
+    // Step 3: atomic rename.
     fs::rename(&tmp, path)?;
+
+    // Step 4: sync the parent directory. Without this, the rename itself
+    // can be lost on power loss — the file data is durable but the
+    // directory entry is not.
+    if let Some(parent) = path.parent() {
+        let dir = File::open(parent)?;
+        dir.sync_all()?;
+    }
+
     Ok(())
 }
 
