@@ -2425,7 +2425,7 @@ impl BatchScheduler {
                         to = adoptable,
                         "prompt-cache adopt: block-floored paged match below the minimum prefix; releasing and falling back to cold prefill"
                     );
-                    self.cache_pool.release_detached_paged(paged);
+                    let _ = self.cache_pool.release_detached_paged(paged);
                     return None;
                 }
                 if adoptable < paged_seq_len {
@@ -2436,8 +2436,8 @@ impl BatchScheduler {
                         tracing::warn!(
                             "prompt-cache adopt: paged partial trim to {adoptable} failed ({err}); falling back to cold prefill"
                         );
-                        self.cache_pool.release_detached_paged(paged);
-                        return None;
+                    let _ = self.cache_pool.release_detached_paged(paged);
+                    return None;
                     }
                     tracing::debug!(
                         from = paged_seq_len,
@@ -2501,7 +2501,7 @@ impl BatchScheduler {
         match detached {
             DetachedKvSet::Dense(_) => {}
             DetachedKvSet::Paged(paged) => {
-                self.cache_pool.release_detached_paged(paged);
+                let _ = self.cache_pool.release_detached_paged(paged);
             }
         }
     }
@@ -2520,7 +2520,7 @@ impl BatchScheduler {
             _ => return,
         };
         for paged in store.drain_pending_paged_releases() {
-            self.cache_pool.release_detached_paged(paged);
+            let _ = self.cache_pool.release_detached_paged(paged);
         }
     }
 

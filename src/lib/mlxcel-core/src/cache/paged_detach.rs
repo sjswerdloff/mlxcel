@@ -60,6 +60,39 @@ use super::detach::{DetachedHandle, DetachedKVCache};
 use super::paged::{PagedBlockId, PagedBlockPool, PagedKvLayout, PagedSequenceState};
 use super::{CachePool, KVCache, KVCacheMode, SequenceCacheSet, SequenceId, SequenceStateBackend};
 
+/// Error type for `release_detached_paged`.
+///
+/// Reports when release could not happen or partially failed.
+/// `PoolUnavailable` is an invariant violation (paged_pool is only ever set
+/// to `Some`, never cleared), so it fires debug_assert in dev/tests.
+/// In release, it logs and leaks rather than crashing.
+#[derive(Debug, Clone)]
+pub enum ReleaseError {
+    /// The paged pool was `None` while retained blocks were present.
+    /// Invariant violation: pool is set once and never cleared.
+    /// In dev/tests: debug_assert fires. In release: logs and leaks.
+    PoolUnavailable,
+    /// Some blocks failed to release. `failed` is the count of failures
+    /// (guaranteed > 0), `first` is the error message from the first failure.
+    Partial {
+        failed: std::num::NonZeroUsize,
+        first: String,
+    },
+}
+
+impl std::fmt::Display for ReleaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReleaseError::PoolUnavailable => {
+                write!(f, "paged pool unavailable — retained blocks present but pool is None")
+            }
+            ReleaseError::Partial { failed, first } => {
+                write!(f, "{failed} block(s) failed to release; first error: {first}")
+            }
+        }
+    }
+}
+
 /// Inert snapshot of a paged-backend sequence, analogous to
 /// [`super::DetachedCacheSet`] for the dense backend.
 ///
@@ -1115,33 +1148,79 @@ impl CachePool {
     /// Safe to call on an already-released set (which carries no retained
     /// blocks) — the `retained_blocks.take()` guard makes the whole body a
     /// no-op so neither reference is released twice.
-    pub fn release_detached_paged(&mut self, mut detached: DetachedPagedCacheSet) {
+    ///
+    /// Returns `Ok(())` on success, `Err(ReleaseError)` on failure:
+    /// - `PoolUnavailable` if `paged_pool` is `None` while blocks are retained
+    ///   (silent leak path)
+    /// - `Partial { failed, first }` if some blocks failed to release
+    pub fn release_detached_paged(
+        &mut self,
+        mut detached: DetachedPagedCacheSet,
+    ) -> Result<(), ReleaseError> {
         if let Some(blocks) = detached.retained_blocks.take() {
-            if let Some(pool) = self.paged_pool.as_ref() {
-                let mut pool = pool.borrow_mut();
-                // Release the detach pins.
-                for block_id in &blocks {
-                    if let Err(err) = pool.release_block(*block_id) {
-                        eprintln!(
-                            "[mlxcel::cache::paged_detach] CachePool::release_detached_paged: failed to release pin for block {block_id}: {err}"
+            // Invariant: paged_pool is only ever set to Some (at paged_detach.rs:1186),
+            // never cleared. If retained_blocks are present, a pool must exist.
+            // debug_assert! in dev/tests; in release, log and leak (not panic).
+            let pool = match self.paged_pool.as_ref() {
+                Some(pool) => pool,
+                None => {
+                    debug_assert!(
+                        false,
+                        "release_detached_paged: retained_blocks present but paged_pool is None — \
+                         invariant violated: pool is set once and never cleared"
+                    );
+                    tracing::error!(
+                        "release_detached_paged: retained_blocks present but paged_pool is None — \
+                         leaking {} blocks",
+                        blocks.len()
+                    );
+                    // Leak rather than crash, but tell the caller we leaked.
+                    return Err(ReleaseError::PoolUnavailable);
+                }
+            };
+            let mut pool = pool.borrow_mut();
+            let mut failed = 0usize;
+            let mut first_error = String::new();
+            // Release the detach pins.
+            for block_id in &blocks {
+                if let Err(err) = pool.release_block(*block_id) {
+                    failed += 1;
+                    if first_error.is_empty() {
+                        first_error = format!("pin release for block {block_id}: {err}");
+                    }
+                    tracing::warn!(
+                        block_id = %block_id,
+                        error = %err,
+                        "release_detached_paged: failed to release pin"
+                    );
+                }
+            }
+            // Release the origin allocation the block table still carries.
+            for layer in &detached.paged_state.layers {
+                for &block_id in &layer.block_ids {
+                    if let Err(err) = pool.release_block(block_id) {
+                        failed += 1;
+                        if first_error.is_empty() {
+                            first_error = format!("allocation release for block {block_id}: {err}");
+                        }
+                        tracing::warn!(
+                            block_id = %block_id,
+                            error = %err,
+                            "release_detached_paged: failed to release allocation"
                         );
                     }
                 }
-                // Release the origin allocation the block table still carries.
-                for layer in &detached.paged_state.layers {
-                    for &block_id in &layer.block_ids {
-                        if let Err(err) = pool.release_block(block_id) {
-                            eprintln!(
-                                "[mlxcel::cache::paged_detach] CachePool::release_detached_paged: failed to release allocation for block {block_id}: {err}"
-                            );
-                        }
-                    }
-                }
+            }
+            if failed > 0 {
+                // Safety: failed > 0, so NonZeroUsize::new is Some
+                let failed_nz = std::num::NonZeroUsize::new(failed).unwrap();
+                return Err(ReleaseError::Partial { failed: failed_nz, first: first_error });
             }
         }
         // Dropping `detached` here runs the normal `Drop`, which at this
         // point sees an empty `retained_blocks` and stays silent.
         drop(detached);
+        Ok(())
     }
 
     /// Peek at a parked set as a paged variant. Returns `None` if the handle
