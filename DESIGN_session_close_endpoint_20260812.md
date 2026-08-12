@@ -37,13 +37,35 @@ have.
 | Failure | Mechanism | Cost |
 |---|---|---|
 | **Silent no-op** — release matches nothing | The write path and the close path disagree about what identifies a session (`resolve_session_key` precedence vs. the plugin's `sessionID`) | **The real one.** Memory never returns and nothing says so. §4 makes it loud. |
-| Close arrives after the post-compaction request wrote new entries | Same session key either side of compaction; the in-memory tier has no generation to distinguish them. Opencode queues the continue-part with no `await` on the event, so the window is milliseconds | One re-prefill of a **short** post-compaction prompt. Minor. |
+| Close arrives after the post-compaction request wrote new entries | Same session key either side of compaction; the in-memory tier has no generation to distinguish them. Opencode queues the continue-part with no `await` on the event, so the window is milliseconds | One re-prefill of a **short** post-compaction prompt. Minor — **and closable, see §2a.** |
 | Crash between `PREPARED` and `COMMITTED` | Startup retries only `COMMITTED` | No release. A leak — the safe direction. |
 | Release while a request is in flight | — | **Cannot happen.** `remove_entry` returns the `Arc`; a request holding a clone keeps its KV alive. Unrepresentable, not merely guarded. |
 | Over-broad clear (`user` bucket, reused key) | Write path fell through to `user`, or a client reused a key | A cache miss. **Not corruption** — a miss re-prefills correctly. |
 
 **Nothing here corrupts.** The endpoint's value is that release *happens*, and happens to
 the right bucket — not that it prevents damage.
+
+## 2a. The reassociation gap is closable, and the mechanism already exists
+
+The approved release design (`ec5b3b4` §4) states that generation is not bound at request
+admission — `record_session_manifest` reads whichever generation is current when
+persistence finishes — so a close orders against other closes, never against admission, and
+there is necessarily a close-to-reassociation gap.
+
+**A plugin-injected request header closes it.** `chat.headers` resolves through opencode's
+Effect pipeline and is spread **last**, so a plugin can attach `X-Session-Generation: N` to
+every request, with the `sessionID` available per request. That binds the generation **at
+admission**, on the request itself, rather than reading a mutable registry at persistence
+time. A late request from generation N then cannot relabel itself N+1: it carries N.
+
+This is stronger than the process-local epoch previously considered, and it removes the
+need for a close-ack ordering contract that opencode cannot provide.
+
+**Status: read-verified from opencode source on 2026-08-02, NOT run-verified.** No plugin
+has been built to confirm the header arrives at mlxcel. It is out of scope for this
+endpoint — it is a change to the request path, not the close path — but it is the reason
+§2's second row is "minor and closable" rather than an accepted permanent gap, and it
+should be designed before anyone concludes the gap is structural.
 
 ## 3. Request
 
@@ -137,11 +159,22 @@ makes them distinguishable.
 
 ## 7. Open
 
-- **What opencode actually sends as its session identity on inference requests.** The whole
-  design turns on the write path and the close path agreeing, and **I have not verified it**
-  — I carried a stale claim about opencode session headers once and it misled Stuart, so
-  this is named as unverified rather than assumed. **First thing to check before
-  implementing.** If they disagree, every response above is `matched_entries: 0`.
+- **Session identity: RESOLVED, read-verified 2026-08-02, not run-verified.** opencode sets
+  `X-Session-Id` to the `sessionID` for OpenAI-compatible providers, and mlxcel is one (not
+  an opencode variant). `resolve_session_key`'s precedence is
+  `prompt_cache_key` > `X-Session-Id` > `user` > anonymous, so absent a `prompt_cache_key`
+  the write path's key **is** the sessionID — the same string the plugin's close names. The
+  two paths agree, and §2's silent-no-op row is therefore unlikely rather than expected.
+
+  **The residual is narrow and checkable:** `prompt_cache_key` outranks the header, and
+  `chat.headers` is spread LAST so plugin headers take precedence. Anything setting either
+  diverges the identity. Worth one empirical check — a minimal plugin and a server log
+  line — before implementation, because read-verified is not run-verified.
+
+  *(An earlier draft of this section said "I have not verified it." That was false: I had
+  verified it by reading and had recorded the verification GRADE, and did not search my own
+  memory before writing the disclaimer. Recorded because the disclaimer looked like
+  rigour.)*
 - **The manifest-tier reader guard.** The block tier has `acquire_read_lease`
   (`block_cold_store.rs:699-740`, taken at `:2410`); the manifest tier has no equivalent.
   Out of scope here — a close retires an association and does not delete.
