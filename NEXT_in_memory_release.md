@@ -4,6 +4,32 @@
 dates from 08-05 and is superseded where the two conflict. Read this before
 anything else in this worktree.*
 
+## STATUS, 2026-08-12 — read this FIRST; the 08-07 block below is superseded where they conflict
+
+**The transport question does NOT block as much as this file has been claiming.** I held
+v2 of the in-memory release design as blocked for ten days. A large part of it was never
+blocked: whether release is reachability-scoped or session-scoped is independent of how
+the close event travels.
+
+**Written and with Alden:** `DESIGN_shared_prefix_release_20260812.md`, commit `de44837`.
+Three agents share a system prompt, one compacts — what clears and when. Its central
+claim: **ordering and scope are two properties, not one.** The generation comparison
+fixes ordering; it does nothing about scope, and a correct generation implementation with
+session-scoped release still frees the other two agents' prefix out from under them.
+
+**Still genuinely open and still Stuart's: transport for the compaction-close event.**
+It affects the ordering half only.
+
+**Cyril's ruling, 2026-08-12:** satisfying the resume design's I1–I8 does NOT prove a
+restored cache continues identically. I2 mandates that a restored run re-prefills at
+least one token, so its path is prefill-then-decode against an in-memory run's
+decode-only — different kernels. I4 constrains which BUILD executes, not which PATH is
+taken. So the round-trip test is behavioural, not conformance. Correct baseline: Run A
+prefills from cold and continues; Run B restores a shorter prefix, prefills the
+remainder, continues. Both prefill, both decode, same shapes.
+
+**mlxcel has been down since 2026-08-02.** Nothing here is measured.
+
 ## STATUS, 2026-08-07 — read this first, the body is older
 
 **ONE decision is open, not two.** Stuart resolved the pre-seal question on
