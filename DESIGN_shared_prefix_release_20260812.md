@@ -1,9 +1,8 @@
 # Release under cross-agent prefix sharing
 
-*Clement (clement-7074f29f). Revision 2, 2026-08-12, against Alden's review of
-revision 1 (blob `d3ea131`, tree `414c788`). Revision 1's body is not patched — it
-is replaced. Read it at `git show b073874:DESIGN_shared_prefix_release_20260812.md`
-if you need to see what changed.*
+*Clement (clement-7074f29f). Revision 3, 2026-08-12, against Alden's re-review of
+revision 2 (design blob `f059c755` @ `176c41d`), which cleared all five revision-1
+findings and raised three new ones. Revision 1 is at `b073874`, revision 2 at `176c41d`.*
 
 **Every source claim below is pinned to tree `414c788` on branch
 `clement/kvarn8-block-extraction`, and `git diff 414c788..HEAD -- src/` is empty, so
@@ -57,10 +56,17 @@ none of them.
 
 **But there is one real in-memory sharing path, and it is reachable today.** Every
 caller that supplies neither `prompt_cache_key`, nor a session header, nor `user`
-resolves to `ANONYMOUS_SESSION_SENTINEL` (`key.rs:454-475`). Those callers share a
-session key, therefore a digest, therefore **one entry and one `Arc`**. A
-release-by-session that accepted that sentinel would drop the single entry every
-anonymous caller is using.
+resolves to `ANONYMOUS_SESSION_SENTINEL` (`key.rs:454-475`).
+
+**Precisely, and revision 2 overstated this:** the session key is one of *seven* digest
+dimensions — model, LoRA, template signature, session key, multimodal digest, prefix
+length, and the token prefix itself (`key.rs:343-375`). Anonymous callers share the
+**session-key dimension only**. They collapse to one entry and one `Arc` **when every
+other dimension also matches** — same model, same LoRA, same template, same modality
+digest, same prefix. That is not exotic (it is the ordinary case for two anonymous clients
+of one served model with a shared system prompt), but it is a conjunction, not an
+implication. A release-by-session accepting the sentinel would drop the entry shared by
+every anonymous caller *in that matched bucket*.
 
 **That hazard is already named and already made unrepresentable — one tier over.**
 `recordable_session_key` returns `None` for the sentinel (`key.rs:520-525`), and the
@@ -74,11 +80,41 @@ zero: `command grep -rc "fn release_session" --include='*.rs' src/` is empty whi
 identical form finds `fn remove_entry` in `store.rs`, and the in-memory design files it
 under "## Proposed surface" (`DESIGN_in_memory_session_release_20260802.md:55`). Its
 proposed signature takes a bare `&str`
-(`DESIGN_in_memory_session_release_20260802.md:55-60`). **It should take
-`RecordableSessionKey<'_>` instead.** That reuses an existing guard rather than adding a
-check, costs nothing while the function is still unwritten, and makes the shared-bucket
-release unrepresentable at the in-memory tier the way it already is at the recording
-boundary. Nobody has to remember anything.
+(`DESIGN_in_memory_session_release_20260802.md:55-60`). **It must not take `&str` — and
+it must not take `RecordableSessionKey` either.**
+
+*Revision 2 proposed `RecordableSessionKey<'_>`. Alden's re-review rejected it and he is
+right, on a point my own GC design already recorded.* `recordable_session_key` proves only
+non-empty and non-sentinel (`key.rs:520-525`). It still admits:
+
+- **`user`** — which `key.rs:438-442` explicitly documents as END-USER scope, *"COARSER
+  than a conversation: bucketing by it would make a per-conversation delete remove every
+  conversation that user ever cached."*
+- **`prompt_cache_key`** — a client-controlled caching hint with no established
+  one-conversation contract.
+
+So reusing it would make the **wrong authority structural**: one conversation's close
+could release every in-memory entry sharing a user or a broader caching namespace. The
+type's own doc says it *"prevents shared-bucket RECORDING"* and *"authenticates nothing"*
+(`key.rs:477-492`) — deliberately weaker than release authority.
+`DESIGN_session_association_gc_20260729.md:256-262` already states the rule: **recordability
+must depend on SOURCE / proven granularity, not on the string being non-empty and
+non-sentinel.** I proposed a fix my own document had already flagged as insufficient.
+
+**The correct shape is a narrower, source-aware type** — call it
+`CompactionScopedSessionKey` — constructible only from channels with a positive
+per-conversation contract. At this tree that is **`SessionHeader` alone**: `key.rs:435-437`
+names `X-Session-Id` *"the CONVERSATION granularity, which is what compaction-scoped GC
+needs."* `PromptCacheKey` stays excluded until its contract is settled; `User` and
+`Anonymous` are rejected. Both the future close operation and the future in-memory release
+consume that type or a server-minted handle — never `&str`, never `RecordableSessionKey`.
+
+**The transferable error, stated so it does not recur:** I reached for an existing guard
+because reuse felt like the disciplined move, and did not check that the guard's
+*contract* matched the new use. Moving a mechanism across a boundary requires naming the
+precondition that made it true where it came from. `RecordableSessionKey`'s precondition is
+*prevents fusing unrelated callers into one index entry*. Release authority is strictly
+stronger, and nothing carried it.
 
 ## 4. Ordering and scope — still two properties, now correctly scoped
 
@@ -109,13 +145,26 @@ a root at all.** A design may not count C as a root that does not yet exist.
 ## 5. Cross-session reachability, as implemented
 
 - **Blocks: global.** `mark_reachable_blocks` walks every committed manifest regardless of
-  session (`block_cold_store.rs:2016-2050`). Its own doc records that it is **not safe for
-  delete mode** without publication/sweep exclusion, post-grace re-verification, and
-  active-load leases (`:2000-2015`).
+  session (`block_cold_store.rs:2016-2050`).
+
+  **Source inconsistency, and the code wins.** Its doc comment at `:2000-2015` says the
+  three delete-mode prerequisites are *"NOT YET IMPLEMENTED."* They are implemented, later
+  in the same file — publication/sweep exclusion at `:1484` and `:2222`, authoritative
+  re-verification under the lock at `:2237-2243`, and a shared active-load lease at
+  `:699-740` taken by load at `:2410`. Verified at the bytes by me, not carried from the
+  review that raised it. The comment predates the fixes (their own text credits Alden's
+  findings) and was never updated. **Revision 2 reported the comment as current behaviour
+  — reading a stale comment instead of the code, in a document whose §8 claims everything
+  is pinned.** The stale comment is worth fixing in its own commit: a doc comment that
+  understates implemented safety invites someone to re-implement it.
 - **Manifests: not global.** Per above.
-- **`cold_store_keeplist`** scans every session index and protects a manifest if any named
-  keeper reaches it (`cold_store_keeplist.rs:319-367,476-503`) — explicitly hypothetical,
-  read-only reporting. Not a cleanup root set. *(Alden's pin; I did not open this file.)*
+*Carried from external review, NOT independently verified, and therefore not part of the
+"as implemented" findings above:* Alden reports that `cold_store_keeplist` scans every
+session index and protects a manifest if any named keeper reaches it
+(`cold_store_keeplist.rs:319-367,476-503`) — hypothetical, read-only reporting, not a
+cleanup root set. **I did not open that file.** A pin establishes object identity, not that
+the carried interpretation is independently verified; anyone relying on this line should
+verify it or treat it as one reviewer's reading.
 
 So §7 of revision 1 asked whether reachability crosses sessions. **It does for blocks and
 does not for manifests**, and authoritative cross-session manifest cleanup is unimplemented
@@ -146,7 +195,7 @@ mutation per tier:
 | Tier | Mutation | Check-specific red |
 |---|---|---|
 | In-memory | Remove only C's per-session `EntrySlot` | **Stays green** — and must, in the current representation. Not a defect. |
-| In-memory (bucket) | Call release with `ANONYMOUS_SESSION_SENTINEL` | Should not compile once §3's signature change lands. Until then: every anonymous caller's entry disappears. |
+| In-memory (bucket) | Call release with `ANONYMOUS_SESSION_SENTINEL` | Should not compile once §3's `CompactionScopedSessionKey` lands (the sentinel has no admitting source). Until then: the entry shared by every anonymous caller **in the matched bucket** disappears. |
 | Manifest | Delete M on C's closed association alone while A or B holds a non-releasable one | A/B's forced cold-load names M and fails |
 | Block | Remove X after M is unreferenced, while committed manifest N still reaches X | N's load reports X missing |
 
@@ -171,6 +220,8 @@ property she accepted is relevant; correctness here is not one person's call.
 - **Any timing.** mlxcel has been down since 2026-08-02. Nothing here is measured.
 - **Transport for the compaction-close event** — Stuart's, open since 2026-08-02. Affects
   §4 ordering only; §2, §3, §5 and §6 stand whatever the answer.
-- **The reader in-use guard** — a lease/refcount composes with §4: closed marks eligible,
-  release happens at zero readers. `mark_reachable_blocks` names its absence as a blocker
-  for delete mode. Not specified here.
+- **The reader in-use guard at the MANIFEST tier** — a lease/refcount composes with §4:
+  closed marks eligible, release happens at zero readers. Not specified here. *(At the
+  BLOCK tier this exists: `acquire_read_lease`, `block_cold_store.rs:699-740`, taken by
+  load at `:2410`. Revision 2 said it was missing, on the strength of a stale comment —
+  see §5.)*
