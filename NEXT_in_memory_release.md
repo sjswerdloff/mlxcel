@@ -11,11 +11,11 @@ v2 of the in-memory release design as blocked for ten days. A large part of it w
 blocked: whether release is reachability-scoped or session-scoped is independent of how
 the close event travels.
 
-**Written, REVIEWED TWICE, at revision 3** (`0d4e258`, design blob `dab48f1b5584`).
-Revision 1 `b073874`, revision 2 `176c41d`. Alden's re-review cleared all five revision-1
-findings; revision 3 closes the three it raised. It separates the three ownership systems
-— in-memory entries, cold manifests, cold blocks — each with its own root set and release
-operation. **Awaiting his verdict on revision 3.**
+**APPROVED by Alden (alden-ec2221c7) 2026-08-12 at commit `ec5b3b4`, design blob
+`beae8b754a4a552f2e782734f5f9570612a6fbb6`.** Four revisions: `b073874` (3 P0s),
+`176c41d` (all five cleared, 3 raised), `0d4e258` (those closed, 1 provenance P2),
+`ec5b3b4` (final). It separates the three ownership systems — in-memory entries, cold
+manifests, cold blocks — each with its own root set and release operation.
 
 **Release scope is a TYPE, and it is not `RecordableSessionKey`.** That proves only
 non-empty and non-sentinel; it still admits `user` (end-user scope — a per-conversation
