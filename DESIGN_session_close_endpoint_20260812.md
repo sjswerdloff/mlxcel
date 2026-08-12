@@ -1,181 +1,231 @@
 # `POST /v1/cache/session/close` — the compaction-close endpoint
 
-*Clement (clement-7074f29f), 2026-08-12. For review by Alden (alden-ec2221c7).*
-*Consumes the release model approved at `ec5b3b4` (design blob `beae8b754a4a`).*
+*Clement (clement-7074f29f). Revision 2, 2026-08-12, against Alden's review of revision 1
+(blob `643f3d81df45` @ `8a490ad`). Revision 1 is at `8a490ad`.*
+*Consumes the release model approved at `ec5b3b4` (blob `beae8b754a4a`).*
 
-**Source pins by blob, not commit:**
+**Source pins, by blob id.** *Revision 1's header carried `git rev-parse <commit>:<path>`
+in the pin column — a command, not an identifier. Alden's verification limits caught it.
+A pin that instructs the reader to go and compute it is not a pin.*
 
-    app.rs         (routing + api_key_auth layer)   git rev-parse <commit>:src/server/app.rs
-    routes/cache.rs (cache_reset precedent)         git rev-parse <commit>:src/server/routes/cache.rs
-    key.rs         40679dfcca9da8fa6a419f99f0995bbec8311e19
-    store.rs       1daffaaa0f36a6e51d1b4a1e79afbcf63666fc6d
+    app.rs               a270b87f04f2c5742585ceed3e14ce4043ee8356
+    routes/cache.rs      04ac74d27f5df26f0eb3040dab7b4bbb4b6ec760
+    key.rs               40679dfcca9da8fa6a419f99f0995bbec8311e19
+    store.rs             1daffaaa0f36a6e51d1b4a1e79afbcf63666fc6d
+    block_cold_store.rs  f48ec2fb8215da96821d93cf6b3178defeca57eb
+
+Claims about **opencode** source are date-described (2026-08-02), **not object-pinned and
+not run-verified**, and are marked inline wherever they appear.
 
 ---
 
-## 1. Transport and authorization — both settled, neither new
+## 1. Transport and authentication — settled
 
-**Transport: HTTP, not MQTT.** Stuart's ruling, 2026-08-12, and it is the better answer
-than the MQTT recommendation this project carried for eleven days. MQTT publish-success is
-not delivery; the `PREPARED -> COMMITTED` state machine the plugin proposals already went
-four revisions to build *needs a response to drive it*, and a publish supplies nothing to
-drive it with. mlxcel also already owns the state being closed.
+**HTTP, not MQTT** (Stuart, 2026-08-12). MQTT publish-success is not delivery, and the
+`PREPARED -> COMMITTED` machine needs a response to drive it.
 
-**Authorization: the existing `api_key_auth` middleware.** It layers the whole router
-(`app.rs:213`), and **`POST /v1/cache/reset` already sits behind it** (`:163`) — the
-comment at `:164-165` names that route as the reference posture for later admin endpoints.
-A session-close route inherits it by being mounted. **Nothing new is built here.**
+**Authentication is the existing `api_key_auth` middleware** — it layers the whole router
+(`app.rs`), and `POST /v1/cache/reset` already sits behind it. Nothing new is built.
 
-*Scope note, so nobody later mistakes auth for correctness:* the API key proves the caller
-is legitimate. It does not prove the caller owns the named session — every client on this
-host holds the same key. That is not an auth gap; it is why §3's scope type exists.
+**Authentication is not authorization of scope, and revision 1 blurred them.** See §2.
 
-## 2. What can actually go wrong, priced
+## 2. What this endpoint's scope claim actually rests on
 
-Recorded because a later reader will otherwise re-derive a severity this design does not
-have.
+Revision 1 said: put `session_key` in the body, parse it into `CompactionScopedSessionKey`,
+and the type proves the key came from `SessionHeader`. **It cannot, and I should not have
+written it.** The body contains a string. Any holder of the shared API key can put any
+string there. The server never observed `SessionKeySource::SessionHeader` at this boundary,
+so the private type would encode a fact its constructor has no evidence for — converting a
+caller's assertion into apparent proof. A type removes forgotten checks only when its
+constructor **possesses** the evidence; otherwise it launders the assertion. (Alden.)
 
-| Failure | Mechanism | Cost |
-|---|---|---|
-| **Silent no-op** — release matches nothing | The write path and the close path disagree about what identifies a session (`resolve_session_key` precedence vs. the plugin's `sessionID`) | **The real one.** Memory never returns and nothing says so. §4 makes it loud. |
-| Close arrives after the post-compaction request wrote new entries | Same session key either side of compaction; the in-memory tier has no generation to distinguish them. Opencode queues the continue-part with no `await` on the event, so the window is milliseconds | One re-prefill of a **short** post-compaction prompt. Minor — **and closable, see §2a.** |
-| Crash between `PREPARED` and `COMMITTED` | Startup retries only `COMMITTED` | No release. A leak — the safe direction. |
-| Release while a request is in flight | — | **Cannot happen.** `remove_entry` returns the `Arc`; a request holding a clone keeps its KV alive. Unrepresentable, not merely guarded. |
-| Over-broad clear (`user` bucket, reused key) | Write path fell through to `user`, or a client reused a key | A cache miss. **Not corruption** — a miss re-prefills correctly. |
+Two honest options, and this design picks the first:
 
-**Nothing here corrupts.** The endpoint's value is that release *happens*, and happens to
-the right bucket — not that it prevents damage.
+**(a) Server-minted ticket — the target.** When mlxcel serves an inference request and
+`resolve_session_key` reports `SessionKeySource::SessionHeader`, it mints an opaque handle
+bound to `(session key digest, incarnation, current generation)` and returns it. The close
+presents the handle. The constructor then holds evidence the server itself observed, and
+the type means what it says.
 
-## 2a. The reassociation gap is closable, and the mechanism already exists
+**(b) Raw key in the body — the fallback, named for what it is.** If opencode cannot carry
+a ticket, the endpoint is **an authenticated administrative operation over an asserted
+scope**. That is a legitimate posture for a single-tenant home server. It is *not*
+ownership-safe, and this document must not call it that.
 
-The approved release design (`ec5b3b4` §4) states that generation is not bound at request
-admission — `record_session_manifest` reads whichever generation is current when
-persistence finishes — so a close orders against other closes, never against admission, and
-there is necessarily a close-to-reassociation gap.
+The 2026-08-02 opencode reading establishes that the write and close paths agree on the
+key **in the ordinary case**. That is path agreement, not authentication of an arbitrary
+later close body. Do not let the first stand in for the second.
 
-**A plugin-injected request header closes it.** `chat.headers` resolves through opencode's
-Effect pipeline and is spread **last**, so a plugin can attach `X-Session-Generation: N` to
-every request, with the `sessionID` available per request. That binds the generation **at
-admission**, on the request itself, rather than reading a mutable registry at persistence
-time. A late request from generation N then cannot relabel itself N+1: it carries N.
+## 3. The two tiers are separate operations with separate outcomes
 
-This is stronger than the process-local epoch previously considered, and it removes the
-need for a close-ack ordering contract that opencode cannot provide.
+The approved release model separates in-memory entries, cold manifests, and cold blocks.
+Revision 1 collapsed the first two into one `closed` flag and one `COMMITTED` bit. **That
+cannot represent partial success, and the failure is not symmetric.**
 
-**Status: read-verified from opencode source on 2026-08-02, NOT run-verified.** No plugin
-has been built to confirm the header arrives at mlxcel. It is out of scope for this
-endpoint — it is a change to the request path, not the close path — but it is the reason
-§2's second row is "minor and closable" rather than an accepted permanent gap, and it
-should be designed before anyone concludes the gap is structural.
+A cold close can legitimately match **zero** in-memory entries — memory was evicted, the
+server restarted, or the session only ever existed in cold storage. Under revision 1's rule
+(*zero matched ⇒ do not commit*) the cold CAS has committed and the plugin stays `PREPARED`
+forever, retrying into an ambiguous `409`. **Revision 1's loudness rule would have stranded
+successful closes.**
 
-## 3. Request
+**Order: cold CAS first, then in-memory release.** Memory removal is not reversible, and
+the cold CAS is the operation that can refuse. Doing the refusable one first means the
+irreversible one never runs for a close that was going to be rejected.
+
+**The plugin commits when every REQUESTED tier has reached a terminal postcondition** — not
+when a single flag is true.
+
+## 4. Request
 
 ```
 POST /v1/cache/session/close
-Authorization: Bearer <api key>        # existing middleware, when a key is configured
+Authorization: Bearer <api key>
 
 {
-  "session_key": "<X-Session-Id value of the conversation that compacted>",
-  "generation":  <u64>                 # cold tier only; omitted = in-memory tier only
+  "ticket":     "<opaque server-minted handle>",   // §2(a); or "session_key" under §2(b)
+  "generation": 41,                                 // omit to request the memory tier only
+  "event_id":   "<32-byte hex, minted by the plugin, durable BEFORE the request>"
 }
 ```
 
-**`session_key` must be a `CompactionScopedSessionKey`**, per the approved design:
-constructible only from `SessionHeader`, the one source `key.rs:435-437` documents as
-*"the CONVERSATION granularity, which is what compaction-scoped GC needs."*
-`PromptCacheKey` is excluded until its contract is settled; `User` and `Anonymous` are
-rejected — `user` is end-user scope, where a per-conversation delete removes every
-conversation that user ever cached (`key.rs:438-442`).
+**`event_id` is required and is the plugin's, not the server's.** `close_current_generation`
+already accepts `event_id: [u8; 32]` and durably records it as `last_event_id`
+(`block_cold_store.rs`) — the mechanism exists and revision 1 simply did not use it.
 
-Rejection is by **type at the boundary**, not by a check inside the handler: parse the
-body into the scoped type or fail. A handler that receives a `String` and validates it is
-one refactor away from a handler that forgets to.
+The plugin mints and durably stores it while `PREPARED`, **before** sending, and every
+retry carries the identical `(ticket, incarnation, generation, event_id)`. Without it a
+lost `200` and a genuinely stale close are the same request, and no amount of retrying can
+tell them apart.
 
-**`generation` is required for the cold tier and must not be caller-derived.** The cold
-store already refuses a caller-supplied cutoff — `releasable_manifests` derives it from
-the registry precisely because *"a deletion-authority query must not be constructible with
-the wrong bound."* This endpoint honours that: it names the generation being closed, and
-`close_current_generation` compares it against the registry's current value and refuses on
-mismatch, without mutation.
+**Implementation consequence, load-bearing:** `close_current_generation` currently rejects
+`expected != current` **before** consulting `last_event_id`. For replay recovery it must
+consult the recorded event first: if the generation has advanced *and* `last_event_id`
+matches this request, that is **my own successful close whose response I lost** — return
+the original result, not a conflict.
 
-## 4. Response — and the zero case is the point
+## 5. Response — per tier, with discriminated outcomes
 
 ```jsonc
 200 OK
 {
-  "closed": true,
-  "matched_entries": 7,       // in-memory entries selected
-  "freed_bytes": 1342177280,  // FROM THE STORE, not returned to the OS (Arc caveat)
-  "generation_closed": 41,    // cold tier; null when not applicable
-  "warnings": []
+  "cold": {
+    "requested": true,
+    "generation": 41,
+    "event_id": "…",
+    "outcome": "closed_now"        // closed_now | replayed | not_requested
+  },
+  "memory": {
+    "requested": true,
+    "matched_entries": 7,
+    "matched_snapshots": 2,
+    "released_bytes": 1342177280,   // FROM THE STORE — see the Arc note in §6
+    "outcome": "released_now"       // released_now | already_absent | unknown_scope
+                                    //             | zero_match (ambiguous)
+  }
 }
 ```
 
-Shape deliberately parallel to `CacheResetResponse` (`routes/cache.rs:158-168`).
+**Snapshots are in the release, and revision 1 dropped them.** The approved in-memory
+design requires releasing entries *and* snapshots; `SnapshotSlot` is session-scoped and
+`remove_snapshot` is the parallel primitive (verified present in `store.rs`). A
+snapshot-only session would otherwise report as a no-op while obsolete KV stays resident.
+**Zero-match is defined over every requested in-memory object class**, not over entries.
 
-**`matched_entries == 0` must be loud.** This is the failure mode that costs something, and
-it is invisible by construction: a release that matches nothing and a release that works
-both return, neither errors, and memory simply never comes back. So:
+**Zero memory matches is a diagnostic, not universally a failure.** Discriminate where the
+protocol can prove it:
 
-- `warnings` carries `"no entries matched session_key"` — a machine-readable string, not
-  prose in a log line;
-- the server logs it at WARN with the resolved key;
-- the plugin treats a zero-match as **failure to release, not success**, and does not mark
-  `COMMITTED` on it.
+- `already_absent` — the scope is known and had nothing resident. Success.
+- `unknown_scope` — the scope was never seen. **This is the silent-no-op**: the write and
+  close paths disagree, memory never comes back, and nothing else would say so. WARN, and
+  carry it in the response as a machine-readable outcome.
+- `zero_match` — cannot prove which of the above. Ambiguous; report it, and **never let it
+  undo a successful cold close.**
 
-That last clause is the load-bearing one. Without it the plugin records a successful close
-for a release that did nothing, and the record is worse than silence.
+## 6. Failure modes, priced — with the severity claims scoped
 
-**`freed_bytes` names the store, not the OS.** Release is *eventual* — an in-flight request
-holding an `Arc` clone keeps the memory. Any monitoring built on this number must not read
-it as RSS.
+Revision 1 stated several of these absolutely. Corrected:
 
-## 5. Status codes, mapped onto the plugin's state machine
-
-| Code | Meaning | Plugin action |
+| Failure | Cost | Scope of the claim |
 |---|---|---|
-| `200` | Closed; body says what matched | `COMMITTED` — **only if `matched_entries > 0`** |
-| `400` | Body is not a valid `CompactionScopedSessionKey`, or `generation` malformed | Do not retry. Terminal — a wrong-source key will not become right |
-| `401` | Missing/invalid API key | Do not retry blindly; surface it |
-| `409` | Generation mismatch — the registry has moved on | Do not retry. **The close is obsolete, not failed**; a later generation owns the state |
-| `503` | Cache disabled, or store unavailable | Retry — stays `PREPARED` |
-| `5xx` | Anything else | Retry — stays `PREPARED` |
+| `unknown_scope` on both tiers | Memory never returns; nothing says so | The one worth engineering against |
+| Close lands after the post-compaction request wrote entries | One re-prefill of a **short** prompt | Real; §7 |
+| Crash while `PREPARED` | No release — a leak | Safe direction; see the note below |
+| Concurrent release during an in-flight request | The request **cannot lose its KV**: `remove_entry` returns the `Arc` and the holder keeps the object alive | *Revision 1 said "cannot happen." Wrong — the release runs concurrently. What cannot happen is the in-flight request losing the object.* |
+| Over-broad clear | A cache miss, re-prefilled correctly | **Scoped to in-memory eviction only.** Revision 1's "nothing here corrupts" is not supportable for the cold tier: this endpoint commits cleanup *authority*, and the downstream manifest-deletion protocol is unimplemented |
 
-**Idempotent on repeat.** A second close for an already-closed generation returns `409`,
-not `200`, and `409` is explicitly *not* an error to retry. This is the distinction the
-plugin's revision-1 data-loss path turned on: a surviving pre-compaction record has two
-indistinguishable causes, and retrying both closed generations still being extended. `409`
-makes them distinguishable.
+**On `PREPARED`/`COMMITTED`, and this one is not a typo.** Alden flagged "startup retries
+only `COMMITTED`" as apparently reversed. It is deliberate and it is the fix for a
+data-loss path found in revision 1 of the plugin proposals: a surviving pre-compaction
+record has **two indistinguishable causes**, and retrying both closed generations that were
+still being extended. The states mean *"compaction is about to happen"* (`PREPARED`) and
+*"compaction succeeded, so a close is owed"* (`COMMITTED`) — only the success hook marks
+`COMMITTED`, and only `COMMITTED` is retried. Retrying `PREPARED` would close generations
+that never compacted. Recorded here because the reasoning lives in PR history and a reader
+of this document alone would reasonably read it as backwards.
 
-## 6. Tests, one per claim
+## 7. What the admission-generation header does and does not close
+
+*(opencode claim: read-verified 2026-08-02, not object-pinned, not run-verified.)*
+Because `chat.headers` is spread last, a plugin can attach `X-Session-Generation: N` to
+every inference request, binding generation **at admission**.
+
+**It closes the cold donation race** — a late generation-N persist cannot relabel itself
+N+1 — **but only after mlxcel validates the value against the server-owned registry and
+refuses stale donation.** A caller-supplied header is transport, not authority; merely
+carrying N does not make N trustworthy. Same error as §2, one layer out.
+
+**It does not protect in-memory release**, because the pinned in-memory digest has **no
+generation dimension** — selection is by bucket alone, so a session-scoped release is
+generation-blind. Three options, and this design does not pick one:
+
+1. Require the close to run before any N+1 in-memory write (an ordering contract opencode
+   cannot provide — the continue-part is queued with no `await`);
+2. Add generation to in-memory entry ownership (a digest-schema change, `v2` → `v3`);
+3. Accept and **report** that a close may evict new-generation memory.
+
+(3) is a cache miss rather than corruption, but it is still an imprecise release, and it
+must be stated rather than discovered.
+
+## 8. State table — the contract, not an illustration
+
+| Registry / request | Cold | Memory | Plugin |
+|---|---|---|---|
+| current N, new valid event | commit N → N+1 | release entries **and snapshots** | `COMMITTED` when both requested tiers terminal |
+| current N+1, **same event** | `replayed` — return the original result | finish or report idempotent postcondition | `200` → `COMMITTED` |
+| current > N+1, different event | `stale_generation`, no mutation | no release unless separately proven pending | terminal |
+| current < requested | `future_generation`, no mutation | none | **terminal protocol error — not obsolete success** |
+| cold committed, response lost | same-event replay recovers | finish or report memory | converge to `COMMITTED` |
+| cold committed, memory zero | success **retained** | ambiguous / `already_absent` | **do not collapse cold success into failure** |
+| generation omitted | `not_requested` | entries and snapshots | commit on the memory tier alone |
+| ticket/scope invalid | no mutation | no mutation | terminal refusal |
+
+**Reasons are machine-readable and the plugin's action derives from reason + per-tier
+state, never from the HTTP status alone.** Revision 1 made every mismatch a terminal `409`;
+that is right only for a positively stale request whose success is no longer needed, and
+wrong for future skew, for same-event replay, and for a stale cold transition with an
+unfinished memory tier.
+
+## 9. Tests
 
 | Claim | Test | Mutation that must redden it |
 |---|---|---|
-| A non-`SessionHeader` key cannot reach the handler | POST with a `user`-sourced key → `400`, store untouched | Accept `String` at the boundary → the release runs |
-| Zero match is not success | POST an unknown key → `200` with `matched_entries: 0` and the warning present | Drop the warning → the plugin commits a no-op |
-| Live request unharmed | Hold an `Arc` clone, close, assert the clone still reads | *(none — this is `Arc`, not a guard. Test documents it; it cannot fail)* |
-| Generation mismatch does not mutate | Close generation N-1 → `409`, registry unchanged | Compare-then-advance without the guard → registry advances |
-| Repeat close is not a retryable failure | Close twice → `200` then `409` | Return `500` on the second → the plugin retries forever |
-| Auth is inherited, not reimplemented | POST without a key on a keyed server → `401` before the handler runs | Mount the route outside the middleware layer |
+| Lost `200` is recoverable | Cold CAS commits, response dropped, exact-event retry | Consult generation before `last_event_id` → `409`, unrecoverable |
+| Replay ≠ stale | Same generation, different event | Collapse both to `stale_generation` |
+| Future is not obsolete-success | `expected > current` | Map it to `stale_generation` → the plugin commits a close that never happened |
+| Partial success converges | Deterministic failure after cold CAS, before memory release; retry | Single `COMMITTED` bit → cold success stranded |
+| Cold success survives zero memory | Cold commits, memory matches nothing | Zero-match vetoes commit → stranded `PREPARED` |
+| Snapshots are released | Snapshot-only session | Count entries only → reported as a no-op |
+| Exactly one advance | Concurrent same-event and distinct-event closes | Drop the CAS → double advance |
+| N+1 memory write before N close | Write, then close | *(documents §7 option 3 — must state the outcome, not assert safety)* |
+| Scope is what we claim | Body naming another session's raw key under a valid shared key | Whichever posture §2 lands on, the test names it |
+| Admission generation is validated | absent / stale / future / malformed / valid | Trust the header → donation relabels |
+| Auth inherited, not reimplemented | No key on a keyed server → `401` before the handler | Mount outside the middleware layer |
 
-## 7. Open
+## 10. Open
 
-- **Session identity: RESOLVED, read-verified 2026-08-02, not run-verified.** opencode sets
-  `X-Session-Id` to the `sessionID` for OpenAI-compatible providers, and mlxcel is one (not
-  an opencode variant). `resolve_session_key`'s precedence is
-  `prompt_cache_key` > `X-Session-Id` > `user` > anonymous, so absent a `prompt_cache_key`
-  the write path's key **is** the sessionID — the same string the plugin's close names. The
-  two paths agree, and §2's silent-no-op row is therefore unlikely rather than expected.
-
-  **The residual is narrow and checkable:** `prompt_cache_key` outranks the header, and
-  `chat.headers` is spread LAST so plugin headers take precedence. Anything setting either
-  diverges the identity. Worth one empirical check — a minimal plugin and a server log
-  line — before implementation, because read-verified is not run-verified.
-
-  *(An earlier draft of this section said "I have not verified it." That was false: I had
-  verified it by reading and had recorded the verification GRADE, and did not search my own
-  memory before writing the disclaimer. Recorded because the disclaimer looked like
-  rigour.)*
-- **The manifest-tier reader guard.** The block tier has `acquire_read_lease`
-  (`block_cold_store.rs:699-740`, taken at `:2410`); the manifest tier has no equivalent.
-  Out of scope here — a close retires an association and does not delete.
-- **Nothing measured.** mlxcel has been down since 2026-08-02.
+- **§2's posture** — ticket (a) or asserted-scope admin operation (b). Needs Stuart: it is
+  a question about what opencode can carry, not about what is safest.
+- **§7's three options** for generation-blind in-memory release.
+- **Nothing measured.** mlxcel down since 2026-08-02.
+- **The opencode claims are read-verified only.** One minimal plugin and one server log
+  line settles them.
