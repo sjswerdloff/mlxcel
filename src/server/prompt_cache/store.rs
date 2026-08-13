@@ -33,7 +33,7 @@ use mlxcel_core::cache::DetachedPagedCacheSet;
 use super::apc_lookup::{ApcStoreStats, apc_consistent_prefix_len};
 use super::block_hash::{ApcBlockHash, BlockHashChain};
 use super::entry::{CacheEntry, DetachedKvSet, DetachedKvSetHolder, ModelSnapshotEntry};
-use super::key::{PromptCacheKey, PromptCacheKeyDigest};
+use super::key::{ANONYMOUS_SESSION_SENTINEL, PromptCacheKey, PromptCacheKeyDigest};
 use super::metrics::{NoopPromptCacheMetrics, PromptCacheMetrics};
 use super::policy::{PromptCacheConfig, PromptCacheStats};
 use super::trie::RadixTrie;
@@ -351,6 +351,41 @@ impl Inner {
 /// Construct once via [`PromptCacheStore::new`] / [`PromptCacheStore::with_config`]
 /// and share via `Arc<PromptCacheStore>`. All methods take `&self`; internal
 /// mutation goes through an `RwLock`.
+/// Why a [`PromptCacheStore::release_session`] call ended the way it did.
+///
+/// Discriminated on purpose. A release that matched nothing and one that
+/// worked are otherwise indistinguishable from the caller's side — both
+/// return, neither errors, and the memory simply never comes back. That
+/// silence is the failure this endpoint exists to make visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseStatus {
+    /// At least one entry or snapshot was removed from the store.
+    ReleasedNow,
+    /// The session key is well-formed but nothing in the store belongs to it.
+    /// Usually means the write path and the release path disagree about what
+    /// identifies a session — the caller should treat this as a diagnostic,
+    /// not as success.
+    NothingMatched,
+    /// The caller named the shared anonymous bucket. Refused without touching
+    /// the store: every caller that supplies no `prompt_cache_key`, no session
+    /// header and no `user` resolves to that one key, so releasing "that
+    /// session" would drop entries belonging to unrelated callers.
+    RefusedSharedBucket,
+}
+
+/// Outcome of releasing one session's in-memory cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseOutcome {
+    pub status: ReleaseStatus,
+    pub matched_entries: usize,
+    pub matched_snapshots: usize,
+    /// Bytes removed **from the store** — NOT bytes returned to the OS.
+    /// `remove_entry` hands back the `Arc`, so an in-flight request holding a
+    /// clone keeps its KV alive and release is eventual. Any monitoring built
+    /// on this number must not read it as RSS.
+    pub released_bytes: usize,
+}
+
 pub struct PromptCacheStore {
     inner: RwLock<Inner>,
     metrics: Arc<dyn PromptCacheMetrics>,
@@ -1033,6 +1068,95 @@ impl PromptCacheStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.evict_oldest()
+    }
+
+    /// Release every in-memory entry and snapshot belonging to `session_key`.
+    ///
+    /// This is the eviction-after-compaction path: when a conversation
+    /// compacts, the KV it accumulated is dead weight, and this is what
+    /// returns it. Selection is by the session component of the bucket key,
+    /// and removal goes through the existing exact-digest primitives — so an
+    /// entry belonging to any other session cannot be touched, whatever it
+    /// shares a trie with.
+    ///
+    /// **At-least-once, not idempotent, and deliberately so.** It releases
+    /// whatever is resident *now*. A retry after the session has written new
+    /// entries will release those too, because in-memory entries carry no
+    /// generation. The cost of that is one re-prefill of an
+    /// already-shortened prompt; the alternative is a generation dimension in
+    /// the entry digest, which is a schema change and not this function's to
+    /// make. Callers must not read a second call's counts as describing the
+    /// first call's work.
+    ///
+    /// Refuses [`ANONYMOUS_SESSION_SENTINEL`] rather than serving it. That key
+    /// is shared by every caller who supplies no session identity, so
+    /// releasing it would drop unrelated callers' entries — the one real
+    /// cross-session hazard the in-memory tier has.
+    pub fn release_session(&self, session_key: &str) -> ReleaseOutcome {
+        if session_key.is_empty() || session_key == ANONYMOUS_SESSION_SENTINEL {
+            return ReleaseOutcome {
+                status: ReleaseStatus::RefusedSharedBucket,
+                matched_entries: 0,
+                matched_snapshots: 0,
+                released_bytes: 0,
+            };
+        }
+
+        let mut guard = match self.inner.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // Collect first, mutate second: `remove_entry` mutates the maps being
+        // scanned, and it also prunes the shared trie, so borrowing across the
+        // removal is not available.
+        let entry_digests: Vec<PromptCacheKeyDigest> = guard
+            .entries
+            .iter()
+            .filter(|(_, slot)| slot.bucket.session_key.as_deref() == Some(session_key))
+            .map(|(digest, _)| *digest)
+            .collect();
+        let snapshot_digests: Vec<PromptCacheKeyDigest> = guard
+            .snapshots
+            .iter()
+            .filter(|(_, slot)| slot.bucket.session_key.as_deref() == Some(session_key))
+            .map(|(digest, _)| *digest)
+            .collect();
+
+        let mut released_bytes = 0usize;
+        let mut matched_entries = 0usize;
+        for digest in &entry_digests {
+            if let Some((_, entry)) = guard.remove_entry(digest) {
+                released_bytes = released_bytes.saturating_add(entry.size_bytes);
+                matched_entries += 1;
+            }
+        }
+        let mut matched_snapshots = 0usize;
+        for digest in &snapshot_digests {
+            if let Some((_, entry)) = guard.remove_snapshot(digest) {
+                released_bytes = released_bytes.saturating_add(entry.size_bytes);
+                matched_snapshots += 1;
+            }
+        }
+
+        let status = if matched_entries + matched_snapshots > 0 {
+            ReleaseStatus::ReleasedNow
+        } else {
+            // Loud on purpose. See ReleaseStatus::NothingMatched.
+            tracing::warn!(
+                session_key = %session_key,
+                "prompt-cache release matched NOTHING — the write path and the release path \
+                 may disagree about what identifies a session; this memory will not come back"
+            );
+            ReleaseStatus::NothingMatched
+        };
+
+        ReleaseOutcome {
+            status,
+            matched_entries,
+            matched_snapshots,
+            released_bytes,
+        }
     }
 
     /// Drop every entry. Primarily for tests and shutdown paths.

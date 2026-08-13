@@ -23,7 +23,8 @@ use super::super::entry::{CacheEntry, ModelSnapshotEntry};
 use super::super::key::{MultimodalDigest, PromptCacheKey};
 use super::super::metrics::AtomicPromptCacheMetrics;
 use super::super::policy::PromptCacheConfig;
-use super::{InsertError, PromptCacheStore};
+use super::super::key::ANONYMOUS_SESSION_SENTINEL;
+use super::{InsertError, PromptCacheStore, ReleaseStatus};
 
 fn cfg(capacity_bytes: usize, max_entries: usize, min_prefix_tokens: usize) -> PromptCacheConfig {
     PromptCacheConfig::new(
@@ -704,3 +705,175 @@ fn clear_drops_everything() {
 // `super::prefix_matcher_tests`; keeping them in a sibling test module
 // keeps this file focused on store-level invariants (insert/evict/lookup
 // mechanics) and cleanly below the 500-line code-file limit.
+
+// ---------------------------------------------------------------------------
+// release_session — eviction after compaction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn release_session_removes_only_the_named_session() {
+    // Contract: releasing A leaves B's entries intact. This is the whole
+    // safety claim of the operation — sessions share a radix trie, so a
+    // selection bug here corrupts an uninvolved conversation.
+    let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 4));
+    let a = tokens(0, 16);
+    let b = tokens(100, 16);
+    store
+        .insert(
+            &key_for_session("m", Some("sess-a"), &a),
+            CacheEntry::new_for_test(a.clone(), 1024),
+        )
+        .expect("insert a");
+    store
+        .insert(
+            &key_for_session("m", Some("sess-b"), &b),
+            CacheEntry::new_for_test(b.clone(), 1024),
+        )
+        .expect("insert b");
+
+    let out = store.release_session("sess-a");
+
+    assert_eq!(out.status, ReleaseStatus::ReleasedNow);
+    assert_eq!(out.matched_entries, 1);
+    assert_eq!(out.released_bytes, 1024);
+    assert!(
+        store
+            .lookup_longest_prefix(&key_for_session("m", Some("sess-a"), &a), &a)
+            .is_none(),
+        "A's entry survived its own release"
+    );
+    assert!(
+        store
+            .lookup_longest_prefix(&key_for_session("m", Some("sess-b"), &b), &b)
+            .is_some(),
+        "B's entry was destroyed by A's release"
+    );
+}
+
+#[test]
+fn release_session_releases_snapshots_too() {
+    // Contract: a snapshot-only session is not reported as a no-op while its
+    // state stays resident. Counting entries alone would pass this wrongly.
+    let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 4));
+    let toks = tokens(0, 16);
+    store
+        .insert_snapshot(
+            &key_for_session("m", Some("sess-a"), &toks),
+            snapshot_entry_for_test(toks.clone(), "fam"),
+        )
+        .expect("insert snapshot");
+
+    let out = store.release_session("sess-a");
+
+    assert_eq!(out.status, ReleaseStatus::ReleasedNow);
+    assert_eq!(out.matched_entries, 0);
+    assert_eq!(out.matched_snapshots, 1);
+    assert!(
+        store
+            .lookup_snapshot_prefix(&key_for_session("m", Some("sess-a"), &toks), &toks)
+            .is_none(),
+        "snapshot survived the release"
+    );
+}
+
+#[test]
+fn release_session_refuses_the_shared_anonymous_bucket() {
+    // Contract: the sentinel is refused WITHOUT touching the store. Every
+    // caller supplying no session identity resolves to that one key, so
+    // serving it would drop unrelated callers' entries.
+    let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 4));
+    let toks = tokens(0, 16);
+    store
+        .insert(
+            &key_for_session("m", Some(ANONYMOUS_SESSION_SENTINEL), &toks),
+            CacheEntry::new_for_test(toks.clone(), 1024),
+        )
+        .expect("insert anon");
+
+    let out = store.release_session(ANONYMOUS_SESSION_SENTINEL);
+
+    assert_eq!(out.status, ReleaseStatus::RefusedSharedBucket);
+    assert_eq!(out.matched_entries, 0);
+    assert_eq!(out.released_bytes, 0);
+    assert_eq!(store.len(), 1, "refusal still mutated the store");
+}
+
+#[test]
+fn release_session_reports_nothing_matched_rather_than_success() {
+    // Contract: an unknown scope is a DIAGNOSTIC, not a success. This is the
+    // failure that looks exactly like a working release from outside — the
+    // write path and the release path disagreeing on session identity, and
+    // memory never coming back with nothing to say so.
+    let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 4));
+    let toks = tokens(0, 16);
+    store
+        .insert(
+            &key_for_session("m", Some("sess-a"), &toks),
+            CacheEntry::new_for_test(toks.clone(), 1024),
+        )
+        .expect("insert");
+
+    let out = store.release_session("sess-never-seen");
+
+    assert_eq!(out.status, ReleaseStatus::NothingMatched);
+    assert_eq!(out.matched_entries, 0);
+    assert_eq!(store.len(), 1, "an unmatched release removed something");
+}
+
+#[test]
+fn release_session_is_at_least_once_not_idempotent() {
+    // Contract, stated rather than discovered: a second release removes what
+    // is resident NOW, including entries written after the first call. In-memory
+    // entries carry no generation, so the operation cannot distinguish them.
+    // A caller must not read the second call's counts as describing the first
+    // call's work.
+    let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 4));
+    let first = tokens(0, 16);
+    store
+        .insert(
+            &key_for_session("m", Some("sess-a"), &first),
+            CacheEntry::new_for_test(first.clone(), 1024),
+        )
+        .expect("insert first");
+
+    let out1 = store.release_session("sess-a");
+    assert_eq!(out1.matched_entries, 1);
+
+    let second = tokens(500, 16);
+    store
+        .insert(
+            &key_for_session("m", Some("sess-a"), &second),
+            CacheEntry::new_for_test(second.clone(), 2048),
+        )
+        .expect("insert post-compaction");
+
+    let out2 = store.release_session("sess-a");
+    assert_eq!(out2.status, ReleaseStatus::ReleasedNow);
+    assert_eq!(out2.matched_entries, 1, "the NEW entry was not released");
+    assert_eq!(out2.released_bytes, 2048, "counts describe the first call");
+}
+
+#[test]
+fn release_session_cannot_pull_kv_from_an_in_flight_request() {
+    // Documents `Arc` behaviour rather than guarding it: release removes the
+    // store's reference, and a caller already holding a clone keeps its KV.
+    // This test CANNOT fail while the store hands back `Arc<CacheEntry>` — it
+    // is here so the property is written down, not because it is at risk.
+    let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 4));
+    let toks = tokens(0, 16);
+    store
+        .insert(
+            &key_for_session("m", Some("sess-a"), &toks),
+            CacheEntry::new_for_test(toks.clone(), 1024),
+        )
+        .expect("insert");
+
+    let (in_flight, _) = store
+        .lookup_longest_prefix(&key_for_session("m", Some("sess-a"), &toks), &toks)
+        .expect("request holds the entry");
+
+    store.release_session("sess-a");
+
+    assert_eq!(in_flight.tokens, toks, "the in-flight request lost its KV");
+    assert_eq!(store.len(), 0, "the store kept the entry");
+}
