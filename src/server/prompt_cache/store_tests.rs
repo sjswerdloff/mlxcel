@@ -751,6 +751,53 @@ fn release_session_removes_only_the_named_session() {
 }
 
 #[test]
+fn release_session_removes_every_generation_of_the_session() {
+    // Contract: release is keyed on the SESSION, not on a generation, so it
+    // removes every prefix that session holds — however many compactions have
+    // accumulated. This is what makes the operation deterministic rather than
+    // dependent on when the release lands: the stale prefix is reclaimed in
+    // EVERY ordering. A late release additionally takes the post-compaction
+    // entry (a wasted prefill, never data loss); an early one does not.
+    //
+    // Guarding against a plausible wrong implementation: collecting the FIRST
+    // matching digest instead of all of them would satisfy every other test in
+    // this file, because they each hold one entry per session.
+    let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 8));
+    let gen_n = tokens(0, 16);
+    let gen_n1 = tokens(200, 16);
+    store
+        .insert(
+            &key_for_session("m", Some("sess-a"), &gen_n),
+            CacheEntry::new_for_test(gen_n.clone(), 1024),
+        )
+        .expect("insert generation N");
+    store
+        .insert(
+            &key_for_session("m", Some("sess-a"), &gen_n1),
+            CacheEntry::new_for_test(gen_n1.clone(), 2048),
+        )
+        .expect("insert generation N+1");
+
+    let out = store.release_session("sess-a");
+
+    assert_eq!(out.status, ReleaseStatus::ReleasedNow);
+    assert_eq!(out.matched_entries, 2, "release stopped after one generation");
+    assert_eq!(out.released_bytes, 3072, "byte accounting missed a generation");
+    assert!(
+        store
+            .lookup_longest_prefix(&key_for_session("m", Some("sess-a"), &gen_n), &gen_n)
+            .is_none(),
+        "the STALE generation survived — this is the leak release exists to prevent"
+    );
+    assert!(
+        store
+            .lookup_longest_prefix(&key_for_session("m", Some("sess-a"), &gen_n1), &gen_n1)
+            .is_none(),
+        "the fresh generation survived a release that named its session"
+    );
+}
+
+#[test]
 fn release_session_releases_snapshots_too() {
     // Contract: a snapshot-only session is not reported as a no-op while its
     // state stays resident. Counting entries alone would pass this wrongly.
