@@ -727,3 +727,100 @@ fn concurrent_reset_and_lookup_does_not_corrupt_store() {
         "byte total must be consistent with entry count after concurrent resets"
     );
 }
+
+// ---------------------------------------------------------------------------
+// POST /v1/cache/session/release
+// ---------------------------------------------------------------------------
+
+fn release_store() -> crate::server::prompt_cache::PromptCacheStore {
+    use crate::server::prompt_cache::PromptCacheConfig;
+    crate::server::prompt_cache::PromptCacheStore::with_config(PromptCacheConfig::new(
+        true,
+        1 << 20,
+        64,
+        std::time::Duration::from_secs(3600),
+        4,
+    ))
+}
+
+#[test]
+fn session_release_reports_released_now_with_counts() {
+    use crate::server::prompt_cache::entry::CacheEntry;
+    use crate::server::prompt_cache::key::{MultimodalDigest, PromptCacheKey};
+
+    let store = release_store();
+    let toks: Vec<i32> = (0..16).collect();
+    let key = PromptCacheKey::new_full(
+        "m",
+        None,
+        "tpl",
+        Some("sess-a"),
+        MultimodalDigest::empty(),
+        &toks,
+    );
+    store
+        .insert(&key, CacheEntry::new_for_test(toks.clone(), 1024))
+        .expect("insert");
+
+    let resp = super::super::cache::build_session_release_response(Some(&store), "sess-a");
+
+    assert_eq!(resp.status, "released_now");
+    assert_eq!(resp.matched_entries, 1);
+    assert_eq!(resp.released_bytes, 1024);
+    assert!(resp.warning.is_none(), "a clean release carried a warning");
+}
+
+#[test]
+fn session_release_carries_a_warning_in_the_body_when_nothing_matched() {
+    // Contract: the silent-no-op case must reach the CALLER, not only the log.
+    // A release that matched nothing and one that worked are otherwise
+    // identical from outside — same status code, no error, memory gone for good.
+    let store = release_store();
+
+    let resp = super::super::cache::build_session_release_response(Some(&store), "never-seen");
+
+    assert_eq!(resp.status, "nothing_matched");
+    assert_eq!(resp.matched_entries, 0);
+    assert!(
+        resp.warning.is_some(),
+        "nothing_matched returned no warning — the no-op is silent to the caller"
+    );
+}
+
+#[test]
+fn session_release_refuses_the_shared_anonymous_bucket_over_the_wire() {
+    use crate::server::prompt_cache::key::ANONYMOUS_SESSION_SENTINEL;
+    let store = release_store();
+
+    let resp =
+        super::super::cache::build_session_release_response(Some(&store), ANONYMOUS_SESSION_SENTINEL);
+
+    assert_eq!(resp.status, "refused_shared_bucket");
+    assert!(resp.warning.is_some(), "the refusal was not explained");
+}
+
+#[test]
+fn session_release_on_a_disabled_cache_is_reported_not_pretended() {
+    // Contract: a disabled cache says so. Returning released_now with zeroes
+    // would tell a caller its memory was freed when no cache existed at all.
+    let resp = super::super::cache::build_session_release_response(None, "sess-a");
+
+    assert_eq!(resp.status, "cache_disabled");
+    assert!(resp.warning.is_some());
+}
+
+#[test]
+fn session_release_route_is_actually_mounted() {
+    // Chain check, not a component check. `release_session` shipping correct
+    // and unreachable is the failure this exists to catch: every layer below
+    // can be green while nothing can call it.
+    let src = include_str!("../app.rs");
+    assert!(
+        src.contains("/v1/cache/session/release"),
+        "the release route is not registered in app.rs"
+    );
+    assert!(
+        src.contains("routes::cache_session_release"),
+        "the release route is registered to the wrong handler"
+    );
+}

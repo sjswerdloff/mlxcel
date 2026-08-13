@@ -26,6 +26,8 @@
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 
+use crate::server::prompt_cache::ReleaseStatus;
+
 use crate::server::AppState;
 use crate::server::batch::ObservabilitySnapshot;
 
@@ -183,6 +185,104 @@ pub async fn cache_stats(State(state): State<AppState>) -> Json<CacheStatsRespon
 /// response with `freed_bytes = 0, freed_entries = 0`.
 pub async fn cache_reset(State(state): State<AppState>) -> Json<CacheResetResponse> {
     Json(build_reset_response(state.prompt_cache.as_deref()))
+}
+
+/// Request body for `POST /v1/cache/session/release`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionReleaseRequest {
+    /// The conversation's session key — the `X-Session-Id` value its inference
+    /// requests carried. **Asserted, not authenticated:** the API key proves a
+    /// legitimate caller, not that the caller owns this session. That is an
+    /// acceptable posture here only because the worst outcome of a wrong key
+    /// is a cache miss; it would not be if this authorised cold deletion.
+    pub session_key: String,
+}
+
+/// Response for `POST /v1/cache/session/release`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionReleaseResponse {
+    /// `released_now` | `nothing_matched` | `refused_shared_bucket` | `cache_disabled`
+    pub status: String,
+    pub matched_entries: usize,
+    pub matched_snapshots: usize,
+    /// Bytes removed **from the store**, not returned to the OS — an in-flight
+    /// request holding the `Arc` keeps its KV, so release is eventual. Do not
+    /// read this as RSS.
+    pub released_bytes: usize,
+    /// Present only when something needs a human. Machine-readable, so a
+    /// caller can branch on it without parsing prose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// `POST /v1/cache/session/release` — release one conversation's in-memory
+/// prompt cache. The eviction-after-compaction path.
+///
+/// **At-least-once, not idempotent.** It releases whatever is resident now; a
+/// retry after the session has written again releases that too, because
+/// in-memory entries carry no generation. Callers must not read a second
+/// call's counts as describing the first call's work.
+///
+/// Always `200`. The outcome is in the body because three of the four cases
+/// are diagnostics rather than errors, and collapsing them onto status codes
+/// is what makes a no-op indistinguishable from success.
+pub async fn cache_session_release(
+    State(state): State<AppState>,
+    Json(req): Json<SessionReleaseRequest>,
+) -> Json<SessionReleaseResponse> {
+    Json(build_session_release_response(
+        state.prompt_cache.as_deref(),
+        &req.session_key,
+    ))
+}
+
+/// Pure helper, extracted for the same reason as the others: route-level tests
+/// can drive it without building an `AppState` (which would load a model).
+pub(crate) fn build_session_release_response(
+    store: Option<&crate::server::prompt_cache::PromptCacheStore>,
+    session_key: &str,
+) -> SessionReleaseResponse {
+    let Some(store) = store else {
+        return SessionReleaseResponse {
+            status: "cache_disabled".to_string(),
+            matched_entries: 0,
+            matched_snapshots: 0,
+            released_bytes: 0,
+            warning: Some("prompt cache is disabled; nothing to release".to_string()),
+        };
+    };
+
+    let out = store.release_session(session_key);
+    let (status, warning) = match out.status {
+        ReleaseStatus::ReleasedNow => ("released_now", None),
+        ReleaseStatus::NothingMatched => (
+            "nothing_matched",
+            // The failure that looks exactly like success. Carried in the body
+            // so a caller can act on it, not only logged where nobody reads it.
+            Some(
+                "no entries matched this session key — the write path and the release path \
+                 may disagree about what identifies a session, and this memory will not \
+                 come back"
+                    .to_string(),
+            ),
+        ),
+        ReleaseStatus::RefusedSharedBucket => (
+            "refused_shared_bucket",
+            Some(
+                "refused: that key is the shared anonymous bucket, and releasing it would \
+                 drop entries belonging to unrelated callers"
+                    .to_string(),
+            ),
+        ),
+    };
+
+    SessionReleaseResponse {
+        status: status.to_string(),
+        matched_entries: out.matched_entries,
+        matched_snapshots: out.matched_snapshots,
+        released_bytes: out.released_bytes,
+        warning,
+    }
 }
 
 /// Pure helper: build a [`CacheStatsResponse`] from a prompt-cache store and

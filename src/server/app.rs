@@ -161,6 +161,12 @@ pub fn create_app(state: AppState) -> Router {
         // off so monitoring clients can poll without conditional logic).
         .route("/v1/cache/stats", get(routes::cache_stats))
         .route("/v1/cache/reset", post(routes::cache_reset))
+        // Eviction after compaction. Same auth posture as /v1/cache/reset —
+        // inherited from the api_key_auth layer below, not reimplemented here.
+        .route(
+            "/v1/cache/session/release",
+            post(routes::cache_session_release),
+        )
         // Runtime decode-path config (harness plan §H2). Same auth posture
         // as /v1/cache/reset: behind api_key_auth when a key is configured.
         .route(

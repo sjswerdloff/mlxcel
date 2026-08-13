@@ -36,7 +36,7 @@ pub mod tokenize;
 
 pub use anthropic::{anthropic_count_tokens, anthropic_messages};
 pub use audio::{audio_speech, audio_transcriptions, audio_translations};
-pub use cache::{cache_reset, cache_stats};
+pub use cache::{cache_reset, cache_session_release, cache_stats};
 pub use chat::chat_completions;
 pub use completions::completions;
 pub use decode_config::{decode_config_get, decode_config_set};

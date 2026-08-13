@@ -72,3 +72,5 @@ pub use metrics::{AtomicPromptCacheMetrics, NoopPromptCacheMetrics, PromptCacheM
 pub use policy::{ApcConfig, PromptCacheConfig, PromptCacheStats};
 pub use store::PromptCacheStore;
 pub use types::{BucketKey, InsertError};
+
+pub use store::{ReleaseOutcome, ReleaseStatus};
