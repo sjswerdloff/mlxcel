@@ -4,6 +4,53 @@
 dates from 08-05 and is superseded where the two conflict. Read this before
 anything else in this worktree.*
 
+## STATUS, 2026-08-13 evening — BUILT. Read this first.
+
+**The eviction-after-compaction path is implemented and end-to-end on this branch.** Not
+designed — built, tested, pushed.
+
+- `4842c73` — `PromptCacheStore::release_session(session_key) -> ReleaseOutcome`
+  (`src/server/prompt_cache/store.rs`). Selection by the session component of the bucket
+  key; removal via the existing exact-digest primitives, so another session's entries cannot
+  be touched whatever trie they share. Releases entries **and snapshots**.
+- `ee914e6` — `POST /v1/cache/session/release` (`routes/cache.rs`, mounted in `app.rs`
+  inside the existing `api_key_auth` layer — auth inherited, not reimplemented).
+
+**3805 passed, 0 failed.** Eleven new tests; five mutation-checked (widen the session
+filter, drop the sentinel guard, drop the snapshot loop, unmount the route, drop the
+nothing-matched warning — each reddens its own test).
+
+**Three properties a future me must not quietly "fix":**
+
+1. **It refuses `ANONYMOUS_SESSION_SENTINEL`** without touching the store. Every caller with
+   no session identity resolves to that one key; serving it would drop unrelated callers'
+   entries. This is the only real cross-session hazard the in-memory tier has.
+2. **`nothing_matched` is a discriminated status with a warning in the BODY.** A release
+   that matches nothing and one that works are otherwise identical from outside. Do not
+   collapse it into `released_now`.
+3. **At-least-once, NOT idempotent.** A retry releases what is resident now, including
+   post-compaction entries, because in-memory entries carry no generation. Stated in the doc
+   comment and pinned by a test. Making it "idempotent" requires a generation dimension in
+   the entry digest — a schema change, not a tidy-up.
+
+**Why the narrow scope:** two of the full protocol's five blockers were missing mechanisms
+in the cold store, not design defects. This tier touches none of them — `store.rs` has zero
+references to `block_cold_store`, `BlockColdStore` or `SessionRegistry`. The full two-tier
+protocol stays designed-not-built at `3b584b4`.
+
+**NEXT, and Stuart named it: the opencode plugin.** Nothing calls the endpoint yet. The
+plugin witnesses `session.compacted` and POSTs to it. Design at
+`DESIGN_session_close_endpoint_20260812.md`; the `PREPARED -> COMMITTED` machine and the
+`event_id` work there are for the COLD tier and are **not needed** for the narrow endpoint —
+it takes a session key and nothing else.
+
+**Xander (confirmed 2026-08-13, not assumed):** he is committing **on top of this branch**;
+`xander/cold-store-v4` carries this design history. He is staying on it and will rebase. He
+is **not** working near `src/server/prompt_cache/`. He owns the two remaining cold-store
+tests (fsync fault-injection or mock-fs — **syscall tracing is ruled out**, SIP is enabled
+and dtrace needs root; and two independently constructed stores for the lock). File-metadata
+checks were eliminated: `stat` cannot distinguish fsynced from not.
+
 ## STATUS, 2026-08-12 (late) — the endpoint design, read this with the block above
 
 **Transport and auth are SETTLED** (Stuart): HTTP, and the existing `api_key_auth`
